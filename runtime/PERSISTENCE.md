@@ -180,10 +180,16 @@ blocker.
 ## Engine contract additions (the engine track owns the details)
 
 - **Resume**: beside `identity-import(bundle)`, a platform-posture
-  resume — the bundle variant carries a key REFERENCE (namespace/key
-  id) instead of a seed; the webcrypto port re-hands the persisted
-  non-extractable handle. Port API addition (polymorph-webcrypto),
-  versioned and republished.
+  resume. Shape per webcrypto#391's ruling (the WIT keystore fell:
+  store-a-handle is browser-specific, so persistence is an EMBEDDER
+  library and the guest-facing function is APP-OWNED WIT): the engine
+  world grows its own `device-identity`-shaped import returning an
+  optional signing-key; the embedder implements it by loading the
+  persisted non-extractable handle from the device namespace (the
+  device store's identity library — the wosh pattern) and turning it
+  into the port's typed handle via `webcryptoHost().inject.signingKey`
+  (polymorph-webcrypto PR #390). The checkpoint records posture only;
+  no key reference travels in engine state.
 - **State persistence**: the engine world gains wasi:filesystem
   imports; chunk store / keyhive archive / us state persist into the
   mounted per-device OPFS directory (browser) or real files (wasmtime —
@@ -217,15 +223,21 @@ account UX beyond the picker.
 
 ## Tracks and gates
 
-- **T-A (polymorph-webcrypto)**: persisted-key feature — create-or-load
-  non-extractable keys by (namespace, id), handle re-issue across
-  instantiations. Gate: port test suite + a browser probe reloading
-  around it.
-- **T-B (engine)**: wasi:filesystem persistence + kill-and-resume act;
-  platform-posture resume once T-A publishes. Gates: native acts with a
+- **T-A (polymorph-webcrypto)**: DONE as webcrypto#390 per the #391
+  pivot — `webcryptoHost() → { imports, inject }`: embedder-held
+  CryptoKeys as typed handles (signing-key, derivation-key), kind
+  validated at the wrap, policy reported by the existing getters. The
+  IndexedDB persistence library moved OUT of the port and into T-C
+  (this repo owns it; honestly browser-only).
+- **T-B (engine)**: wasi:filesystem persistence + kill-and-resume act
+  (landed); platform-posture resume via the app-owned device-identity
+  import + injection, once #390 releases. Gates: native acts with a
   restart act, pairing-bringup restart smoke, engine clippy.
 - **T-C (runtime/device-store)**: index, namespaces, locks, DEK/KEK
-  ladder, checkpoint anchor + sweep, the worker host + RPC envelope.
+  ladder, checkpoint anchor + sweep, the identity-key library
+  (persist/load non-extractable handles with validate-on-load — the
+  wosh pattern, absorbed here per the #391 pivot), the worker host +
+  RPC envelope.
   Gate: a browser-driven test page (spike-style) covering mint/unseal/
   reload/rehydrate/sweep/reseal.
 - **T-D (solo page)**: picker, promotion, unseal ceremony,

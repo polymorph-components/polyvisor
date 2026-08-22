@@ -115,7 +115,8 @@ enum Posture {
     Seed,
     /// A non-extractable WebCrypto handle. The guest cannot see the
     /// private half, so nothing identity-shaped is written; resume is
-    /// refused pending the persisted-key port (PERSISTENCE.md T-A).
+    /// refused pending the app-owned device-identity import
+    /// (webcrypto#391; PERSISTENCE.md "Engine contract additions").
     Platform,
 }
 
@@ -327,10 +328,11 @@ pub(crate) async fn checkpoint() -> Result<(), String> {
         }
         // CONTRACT: engine.wit's `state-checkpoint` — "In `platform`
         // posture the snapshot is written WITHOUT identity material".
-        // Everything else is still captured, so when the persisted-key
-        // port lands (PERSISTENCE.md T-A) these generations become
-        // resumable by adding a key REFERENCE beside them; refusing to
-        // checkpoint at all would have thrown that away.
+        // Everything else is still captured, so when the app-owned
+        // device-identity import lands (webcrypto#391) these generations
+        // become resumable with the identity arriving from OUTSIDE the
+        // checkpoint; refusing to checkpoint at all would have thrown
+        // that away.
         IdentityKey::Platform(_) => Posture::Platform,
     };
 
@@ -440,17 +442,18 @@ pub(crate) async fn resume() -> Result<bool, String> {
     };
 
     // CONTRACT / THE DOCUMENTED SEAM (engine.wit's `state-resume`):
-    // `platform` posture rests as a non-extractable WebCrypto handle. Its
-    // resume needs a key REFERENCE and a port that can re-hand the handle
-    // — polymorph-webcrypto's persisted-key feature, PERSISTENCE.md T-A.
+    // `platform` posture rests as a non-extractable WebCrypto handle the
+    // guest cannot see; its resume arrives from outside the checkpoint,
+    // through an app-owned device-identity import the embedder implements
+    // via the port's inject API (webcrypto#391, PERSISTENCE.md).
     // Refusing is the conservative reading: answering `false` here would
     // send the embedder to `init`, which mints a NEW identity, and the
     // device would silently lose every membership it held.
     if manifest.posture == Posture::Platform {
         return Err(format!(
             "checkpoint generation {n} rests in `platform` posture: resuming a \
-             non-extractable device key needs the persisted-key port \
-             (polymorph-webcrypto; PERSISTENCE.md T-A) and is not wired at this \
+             non-extractable device key needs the device-identity import \
+             (webcrypto#391; PERSISTENCE.md) and is not wired at this \
              rev. Use `init(exportable-identity: true)` for a resumable device."
         ));
     }
