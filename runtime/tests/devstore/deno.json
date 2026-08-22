@@ -1,0 +1,29 @@
+{
+  "//": [
+    "PINS COPIED FROM demo/deno.json (module identity), narrowed to what",
+    "this harness actually resolves: the device-store modules import no",
+    "package at all (runtime/README.md's resolution model — the EMBEDDER",
+    "maps the bare specifiers), and the only package the probe page needs",
+    "is @polyengine/wasi's filesystem-web, because the sealed-fs case",
+    "proves the wrapper against the REAL published fragment rather than a",
+    "fake. Any bump in demo/deno.json should be mirrored here or this",
+    "harness stops measuring the filesystem the demo ships.",
+    "",
+    "Three path segments deep (runtime/tests/devstore), hence no relative",
+    "entries: everything here is JSR."
+  ],
+  "nodeModulesDir": "auto",
+  "minimumDependencyAge": "PT1M",
+  "imports": {
+    "@polyengine/wasi": "jsr:@polyengine/wasi@0.3.1",
+    "@polyengine/wasi/filesystem-web": "jsr:@polyengine/wasi@0.3.1/filesystem-web"
+  },
+  "compilerOptions": {
+    "lib": [
+      "deno.ns",
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ]
+  }
+}

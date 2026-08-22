@@ -32,6 +32,29 @@ relative path.
   composite's imports need to satisfy, even though nothing in a
   browser embedding actually opens a socket.
 
+- **`device-store/`** — the browser-side home of all devices on an
+  origin (#20's G5, track T-C). **`PERSISTENCE.md` is the governing
+  design record: read it first, and its vocabulary — index, namespace,
+  tier, seal/unseal, posture, the KEK ladder, the T0 anchor and sweep —
+  is this module family's vocabulary.** The unsealed `index.ts` (what
+  may exist before unseal, and the long list of what may never),
+  `namespace.ts` (one IndexedDB database plus one OPFS directory per
+  device, strictly partitioned), `seal.ts` (the per-device DEK and the
+  KEK ladder's v1 rungs), `identity-keys.ts` (non-extractable signing
+  handles persisted per device, with validate-on-load — absorbed here
+  from the webcrypto port by the #391 ruling: storing a handle is a
+  browser capability, not a WebCrypto one), `sealed-fs.ts` (an OPFS
+  directory proxy that seals the engine's state root while the guest
+  sees plaintext), `locks.ts` (the device lock, the lease, and the T0
+  sweep) and `anchor.ts` (the tab's sessionStorage pointer). The worker
+  host and its RPC envelope are the NEXT track; everything here is
+  callable from a page or a worker and holds no long-lived connection.
+
+  Its gate is `just test` in this directory: a browser-driven probe
+  matrix (Playwright over a bundled page, spike-style — none of
+  IndexedDB, OPFS, Web Locks, CryptoKey persistence or sessionStorage
+  can be asserted in Deno).
+
 - **`tools/translate.ts`** — build-time translation from a component
   binary to an envelope (plan + FACT adapters). This runs at build
   time, not at import time, but it's an embedder concern like the
@@ -46,3 +69,12 @@ mapping has to live with the consumer, not the runtime, or two
 embedders in the same process tree could get two different identities
 for what should be the same module). `demo/deno.json` is the only
 example of that mapping so far.
+
+`device-store/` imports NO package at all — only the platform and its
+own siblings — so it type-checks under any embedder's config and cannot
+be mis-pinned. `sealed-fs.ts` declares the OPFS handle interfaces
+`@polyengine/wasi/filesystem-web` consumes rather than importing them,
+which is what buys that. The one place a pin is needed is the probe
+harness, which mounts the REAL published fragment; it carries its own
+`tests/devstore/deno.json` with the pins copied from `demo/deno.json`,
+exactly as each spike does.

@@ -23,8 +23,13 @@ import { INDEX_DB, INDEX_STORE, nsDbName, nsDirName } from "./names.ts";
  * - `meta` — unsealed per-device bookkeeping the sweep needs: the lease.
  *   NOTHING PERSONAL: this store rests in the clear exactly like the
  *   index, so it carries timestamps and nothing else.
+ * - `identity` — the device's signing identity as NON-EXTRACTABLE
+ *   CryptoKey handles (identity-keys.ts). Unsealed by construction and
+ *   deliberately so: the handles are unreadable because the platform
+ *   says so, not because a DEK hides them (PERSISTENCE.md, "Device
+ *   signing identity").
  */
-export const NS_STORES = ["seal", "sealed", "meta"] as const;
+export const NS_STORES = ["seal", "sealed", "meta", "identity"] as const;
 export type NsStore = (typeof NS_STORES)[number];
 
 /**

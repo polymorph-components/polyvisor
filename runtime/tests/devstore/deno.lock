@@ -1,0 +1,106 @@
+{
+  "version": "5",
+  "specifiers": {
+    "jsr:@polyengine/protocol@0.1": "0.1.0",
+    "jsr:@polyengine/runtime@~0.3.1": "0.3.1",
+    "jsr:@polyengine/wasi@0.3.1": "0.3.1",
+    "jsr:@std/cli@^1.0.12": "1.0.32",
+    "jsr:@std/encoding@^1.0.7": "1.0.11",
+    "jsr:@std/fmt@^1.0.5": "1.0.10",
+    "jsr:@std/html@^1.0.3": "1.0.7",
+    "jsr:@std/http@1.0.13": "1.0.13",
+    "jsr:@std/internal@^1.0.14": "1.0.14",
+    "jsr:@std/media-types@^1.1.0": "1.1.0",
+    "jsr:@std/net@^1.0.4": "1.0.6",
+    "jsr:@std/path@^1.0.8": "1.1.6",
+    "jsr:@std/streams@^1.0.9": "1.1.2",
+    "npm:playwright@1.57.0": "1.57.0"
+  },
+  "jsr": {
+    "@polyengine/protocol@0.1.0": {
+      "integrity": "0c97f34166f22ba55e7b084148df96e47aebe47cd9dd13930057759c9161bb1c"
+    },
+    "@polyengine/runtime@0.3.1": {
+      "integrity": "1bacade5b3330fb5aba9ba3e7111010c11cd4c5e867a1848cb13342b2b1e3cbb",
+      "dependencies": [
+        "jsr:@polyengine/protocol"
+      ]
+    },
+    "@polyengine/wasi@0.3.1": {
+      "integrity": "0f7c5b3cc3753ceea233df5ffb03096cdbd8df3f4a398f5345c83f8188abe8ea",
+      "dependencies": [
+        "jsr:@polyengine/protocol",
+        "jsr:@polyengine/runtime"
+      ]
+    },
+    "@std/cli@1.0.32": {
+      "integrity": "188b3a100d6202d64e3f5bd3d799c7fa4f6d77f92cc65eb7f641c1fa0aa92a66"
+    },
+    "@std/encoding@1.0.11": {
+      "integrity": "e7cef2f0b3153bccc17431e7c864a1de03a4b6d9647389c43e08aaa775d37385"
+    },
+    "@std/fmt@1.0.10": {
+      "integrity": "90dfba288802ac6de82fb31d0917eb9e4450b9925b954d5e51fc29ac07419db5"
+    },
+    "@std/html@1.0.7": {
+      "integrity": "175c818905a6e75743c69c251395e273d82698e58cfe7dd76268d70e28b8d8fe"
+    },
+    "@std/http@1.0.13": {
+      "integrity": "d29618b982f7ae44380111f7e5b43da59b15db64101198bb5f77100d44eb1e1e",
+      "dependencies": [
+        "jsr:@std/cli",
+        "jsr:@std/encoding",
+        "jsr:@std/fmt",
+        "jsr:@std/html",
+        "jsr:@std/media-types",
+        "jsr:@std/net",
+        "jsr:@std/path",
+        "jsr:@std/streams"
+      ]
+    },
+    "@std/internal@1.0.14": {
+      "integrity": "291516b3d4c35024d6ffbc0a9df5bf4c64116e05b50012cf846710152d2ffdf7"
+    },
+    "@std/media-types@1.1.0": {
+      "integrity": "c9d093f0c05c3512932b330e3cc1fe1d627b301db33a4c2c2185c02471d6eaa4"
+    },
+    "@std/net@1.0.6": {
+      "integrity": "110735f93e95bb9feb95790a8b1d1bf69ec0dc74f3f97a00a76ea5efea25500c"
+    },
+    "@std/path@1.1.6": {
+      "integrity": "c68485c2a4dfbb5ae3cc74fae4e8c4e5d874cf8a8ed12927917235c758b46cbe",
+      "dependencies": [
+        "jsr:@std/internal"
+      ]
+    },
+    "@std/streams@1.1.2": {
+      "integrity": "0249bf9b78a999f57032ca4d8e7ccaa57579090242640b35ddc948fbb745d3af"
+    }
+  },
+  "npm": {
+    "fsevents@2.3.2": {
+      "integrity": "sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==",
+      "os": ["darwin"],
+      "scripts": true
+    },
+    "playwright-core@1.57.0": {
+      "integrity": "sha512-agTcKlMw/mjBWOnD6kFZttAAGHgi/Nw0CZ2o6JqWSbMlI219lAFLZZCyqByTsvVAJq5XA5H8cA6PrvBRpBWEuQ==",
+      "bin": true
+    },
+    "playwright@1.57.0": {
+      "integrity": "sha512-ilYQj1s8sr2ppEJ2YVadYBN0Mb3mdo9J0wQ+UuDhzYqURwSoW4n1Xs5vs7ORwgDGmyEh33tRMeS8KhdkMoLXQw==",
+      "dependencies": [
+        "playwright-core"
+      ],
+      "optionalDependencies": [
+        "fsevents"
+      ],
+      "bin": true
+    }
+  },
+  "workspace": {
+    "dependencies": [
+      "jsr:@polyengine/wasi@0.3.1"
+    ]
+  }
+}

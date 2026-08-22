@@ -1,0 +1,79 @@
+# runtime/ — the embedding runtime's own gates.
+#
+# The device store (device-store/, PERSISTENCE.md's T-C) is browser
+# machinery: IndexedDB, OPFS, Web Locks, WebCrypto handle persistence,
+# sessionStorage. None of it can be asserted in Deno, so its gate is a
+# BROWSER-DRIVEN PROBE MATRIX in the shape the worker-host spike
+# established (spikes/worker-host/justfile): bundle a page, serve it on
+# an ephemeral port, drive it with Playwright, print a verdict per row.
+#
+# Pinned in ONE place, as demo/justfile explains at length: the version
+# below is both what `deps` installs a browser for and what
+# tests/devstore/run.ts imports. A mismatch downloads a browser revision
+# the library will not launch.
+
+PLAYWRIGHT := "npm:playwright@1.57.0"
+DEVSTORE := "tests/devstore"
+
+default: test
+
+# Type-check every device-store module and the harness.
+#
+# RESOLUTION MODEL (runtime/README.md): the runtime's modules import
+# bare specifiers that the EMBEDDER maps. The device-store modules
+# import no package at all, so they check under any config; the probe
+# page needs @polyengine/wasi, so the config that maps it lives with the
+# harness (tests/devstore/deno.json, pins copied from demo/deno.json)
+# and every check here runs against it.
+check:
+    cd {{DEVSTORE}} && deno check --config deno.json \
+        ../../device-store/*.ts page.ts run.ts
+
+# Bundle the probe page for the browser and assemble serve/.
+build: check
+    mkdir -p {{DEVSTORE}}/serve
+    cd {{DEVSTORE}} && deno bundle --config deno.json --platform browser \
+        -o serve/page.js page.ts
+    # No `node:` builtin may survive into the bundle: the browser would
+    # try to fetch it as a URL and the page would die before the first
+    # probe (demo/justfile's `site` documents the failure).
+    ! grep -q 'node:' {{DEVSTORE}}/serve/page.js || \
+        { echo "serve/page.js imports a node: builtin" >&2; exit 1; }
+    cp {{DEVSTORE}}/probe.html {{DEVSTORE}}/serve/
+
+# The browser Playwright needs. PROBE-THEN-INSTALL (demo/justfile's
+# `e2e-deps`, verbatim reasoning): a launch that already works is left
+# alone, so this is a no-op after the first run.
+deps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if deno eval "import { chromium } from '{{PLAYWRIGHT}}';
+                  const b = await chromium.launch({ args: ['--no-sandbox'] });
+                  await b.close();" >/dev/null 2>&1; then
+        echo "playwright chromium: already launchable"
+    else
+        echo "playwright chromium: installing…"
+        pwver="{{PLAYWRIGHT}}"; pwver="${pwver#npm:playwright@}"
+        if command -v npx >/dev/null 2>&1; then
+            if [ -n "${CI:-}" ]; then
+                npx --yes "playwright@${pwver}" install --with-deps chromium
+            else
+                npx --yes "playwright@${pwver}" install chromium
+            fi
+        else
+            if [ -n "${CI:-}" ]; then deno run -A {{PLAYWRIGHT}} install-deps chromium || true; fi
+            deno run -A {{PLAYWRIGHT}} install chromium
+        fi
+    fi
+
+# THE GATE: the whole device-store matrix in a real headless Chromium.
+test: deps build
+    cd {{DEVSTORE}} && deno run -A --config deno.json run.ts
+
+# Serve the probe for hand-driving (`globalThis.probe(op, arg)` in a
+# console). Ephemeral port, read back from the server's own output.
+probe-serve: build
+    deno run --allow-net --allow-read jsr:@std/http/file-server {{DEVSTORE}}/serve --port 0
+
+clean:
+    rm -rf {{DEVSTORE}}/serve {{DEVSTORE}}/last-run.json
