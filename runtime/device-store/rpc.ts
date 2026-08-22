@@ -95,6 +95,17 @@ export interface WireError {
  * survives a `postMessage`. The brand on the client's error is MINTED
  * FRESH from the envelope's `isWitError` bit, on this side, in this
  * realm.
+ *
+ * SUCCESSOR, ALREADY UPSTREAM (polyengine A19, runtime 0.3.2): the
+ * embedder now exports `toCloneable`/`fromCloneable` — a sanctioned,
+ * round-trip-exact crossing for the whole branded error taxonomy,
+ * built with THIS seam as its named consumer. The 0.3.2 bump replaces
+ * this envelope's error walk and this hand-rolled key with those forms
+ * (the client then rehydrates a real branded ComponentException, cause
+ * chain and all), and note the key below is renamed AGAIN by A19
+ * (`polyengine.componentException/1`) — adopting the forms rather than
+ * chasing the spelling is the point. Until the bump, this key matches
+ * the pinned 0.3.1 and row 18 stands guard.
  */
 const WIT_ERROR_BRAND: symbol = Symbol.for("polyengine.witError/1");
 

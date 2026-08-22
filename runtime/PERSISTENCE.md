@@ -233,8 +233,9 @@ account UX beyond the picker.
   owns it; honestly browser-only).
 - **T-B (engine)**: wasi:filesystem persistence + kill-and-resume act
   (landed); platform-posture resume via the app-owned device-identity
-  import + injection, once #390 releases. Gates: native acts with a
-  restart act, pairing-bringup restart smoke, engine clippy.
+  import + the fromCryptoKey seam, once webcrypto's #392 releases.
+  Gates: native acts with a restart act, pairing-bringup restart smoke,
+  engine clippy.
 - **T-C (runtime/device-store)**: index, namespaces, locks, DEK/KEK
   ladder, checkpoint anchor + sweep, the identity-key library
   (persist/load non-extractable handles with validate-on-load — the
@@ -246,3 +247,24 @@ account UX beyond the picker.
   device-name strip rule. Gate: e2e.
 - **T-E (e2e)**: reload-survival, promote-then-restart, reseal, two-
   device index, swept-pointer degrade. Suite stays green throughout.
+
+## The next-release bump checklist (recorded 2026-08-22, pre-release)
+
+When @polyengine 0.3.2 and @polymorph/webcrypto 0.3.1 roll:
+
+- Pins: demo/deno.json runtime/translator/wasi 0.3.1 → 0.3.2;
+  webcrypto 0.3.0 → 0.3.1 (the #392 fromCryptoKey/toCryptoKey seams).
+- rpc.ts: replace the error-envelope walk and the hand-rolled brand
+  with the embedder's `toCloneable`/`fromCloneable` (A19 — built with
+  this seam as its named consumer; the brand key also renamed again,
+  `polyengine.componentException/1`, which adopting the forms makes
+  irrelevant). Row 18 arbitrates.
+- Watch #147's may_leave tightening through the full battery: a guest
+  realloc that lowers an import now traps where it was silently
+  tolerated (expected transparent for this engine's plain cabi_realloc).
+- sealed-fs assumptions unaffected (no wasi/ changes in the window).
+- Then the platform-posture slice unblocks: the engine's app-owned
+  device-identity import + identity-keys.ts + `SigningKey.fromCryptoKey`
+  (and `toCryptoKey` at mint time to persist).
+- POLYVISOR-1 (#83): the docs spike's vendored deltic-0.1.0 bundle —
+  its own turn, not the bump's.
