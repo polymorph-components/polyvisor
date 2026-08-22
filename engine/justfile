@@ -124,6 +124,24 @@ run: compose minio relay-bin
         --endpoint http://127.0.0.1:9000 --bucket pm-tasks \
         --access minioadmin --secret minioadmin
 
+# The #20 G5 kill-and-resume acts: the engine checkpoints into a mounted
+# state root and a FRESH instance resumes from it, then proves it is still
+# the same device by syncing with a live peer. Relay only — no bucket.
+#
+# The state root is a real temp directory, so this is the native-parity
+# half of the browser's OPFS path: same guest `std::fs` code, real files.
+resume: compose relay-bin
+    #!/usr/bin/env bash
+    set -euo pipefail
+    relay=".deps/relay/bin/iroh-relay"
+    [ -x "$relay" ] || { echo "iroh-relay not installed at $relay (run: just relay-bin)" >&2; exit 1; }
+    "$relay" --dev &
+    relay_pid=$!
+    trap 'kill $relay_pid 2>/dev/null || true' EXIT
+    sleep 0.5
+    cargo run --release -p engine-host -- target/composed.wasm \
+        --acts resume --relay http://127.0.0.1:3340
+
 check:
     cargo clippy --target wasm32-wasip2 \
         -p provider-common -p provider-s3 -p provider-dropbox -- -D warnings

@@ -87,6 +87,30 @@ export interface Driver {
     secret: Uint8Array | undefined,
   ): Promise<string>;
 
+  // --- state persistence (#20 G5) --- (engine.wit's `state-checkpoint` /
+  // `state-resume`; the full contract, including the platform-posture
+  // seam, is the doc comment there — not repeated here to keep one
+  // authority.)
+
+  /** Write a crash-consistent snapshot into the mounted state root.
+   * Cadence is the EMBEDDER's: there is no timer in the guest, so
+   * whoever holds the engine decides when a checkpoint is worth taking.
+   * Rejects when no state root was mounted. */
+  stateCheckpoint(): Promise<void>;
+
+  /** Resume from the state root INSTEAD of `init` — call this first and
+   * only call `init` when it answers `false`:
+   *
+   * ```ts
+   * if (!await engine.driver.stateResume()) await engine.driver.init(true);
+   * ```
+   *
+   * `false` means "nothing to resume" (no state root, or none valid) and
+   * is the fresh-boot path, never an error. A rejection is a real fault —
+   * a corrupt root, or a checkpoint in `platform` posture, whose resume
+   * awaits the persisted-key port (PERSISTENCE.md T-A). */
+  stateResume(): Promise<boolean>;
+
   // --- device pairing (#10) + user-system (#36) --- (engine.wit ~214-280)
 
   pairJoinStart(): Promise<PairOffer>;
@@ -305,10 +329,81 @@ export interface EngineNet {
   signer: StoreSign;
 }
 
+/**
+ * THE STATE ROOT (#20 G5; runtime/PERSISTENCE.md "State persistence").
+ *
+ * The engine treats ONE preopened directory as its state root and reaches
+ * it through `wasi:filesystem@0.2` — the track `wasm32-wasip2`'s `std::fs`
+ * links, which `@polyengine/wasi` serves from BOTH real backends
+ * (`filesystem-node` = `node:fs`, sync by construction; `filesystem-web` =
+ * OPFS, parking through JSPI, which this engine already requires).
+ *
+ * Two accepted forms:
+ *
+ * - a directory handle — `navigator.storage.getDirectory()` or a
+ *   subdirectory of it. The browser's per-device OPFS namespace; mounted
+ *   here through `@polyengine/wasi/filesystem-web`.
+ * - `{ imports }` — a `wasi:filesystem` fragment the embedder built
+ *   itself. This is how NON-BROWSER hosts mount a state root, and it is
+ *   deliberately the only way: see below.
+ *
+ * WHY THERE IS NO `string` HOST-PATH FORM, though it would read better.
+ * The Deno/Node backend is `@polyengine/wasi/filesystem-node`, which
+ * reaches `node:fs` through `process.getBuiltinModule`. This module is
+ * bundled into `serve/demo.js` and `serve/solo.js`, and `deno bundle`
+ * inlines DYNAMIC imports too — so merely naming that specifier here,
+ * even on a branch no browser consumer ever takes, puts a `node:` builtin
+ * into the browser bundles. That is not a hypothetical: it tripped
+ * `demo/justfile`'s own "NO node: BUILTIN MAY SURVIVE INTO EITHER BUNDLE"
+ * check the first time this was written the ergonomic way. Server-side
+ * hosts import `filesystemNode` themselves and pass the fragment, which
+ * costs them three lines (demo/host/bringup.ts's `denoStateRoot`) and
+ * costs the browser nothing.
+ *
+ * OMITTING IT IS THE DEFAULT AND CHANGES NOTHING. `wasi()`'s batteries
+ * already carry a filesystem fragment whose `preopens.get-directories`
+ * answers an empty list, so a guest with no state root fails at its first
+ * `std::fs` call — which the engine reads as "fresh boot": `stateResume()`
+ * answers `false` and `stateCheckpoint()` refuses. Every existing consumer
+ * passes nothing here and is byte-for-byte the engine it was before.
+ *
+ * THE MOUNT IS THE SEALED BOUNDARY. Whatever directory is handed over
+ * receives PLAINTEXT — keyhive archive, chunk-envelope keys, and in seed
+ * posture the identity seed. PERSISTENCE.md's per-device DEK seals the
+ * directory, not the bytes; mounting an unsealed one is choosing an
+ * unsealed device.
+ */
+export type PersistDir =
+  | { imports: Record<string, unknown> }
+  // The OPFS handle, structurally. `FileSystemDirectoryHandle` does not
+  // structurally satisfy the impl's own handle interface (writer parameter
+  // form, `Uint8Array<ArrayBufferLike>` vs `ArrayBuffer`), so the cast at
+  // the mount site below is expected rather than a smell — the spike hit
+  // the same thing (spikes/worker-host/README.md Q2, `worker.ts:198`).
+  | { getFileHandle: unknown; getDirectoryHandle: unknown };
+
+/** Build the `wasi:filesystem` fragment for one state root.
+ *
+ * `filesystem-web` is safe to name here — it is pure web-platform code
+ * over OPFS and drags in no `node:` builtin — and it is loaded lazily all
+ * the same, so a host that never persists never pays for it. */
+async function persistImports(dir: PersistDir): Promise<Record<string, unknown>> {
+  if ("imports" in dir) return dir.imports as Record<string, unknown>;
+  const { filesystemWeb } = await import("@polyengine/wasi/filesystem-web");
+  // `writable: true` IS REQUIRED and is the trap the spike found: the
+  // published @polyengine/wasi defaults the whole filesystem fragment to
+  // READ-ONLY, and every create/truncate/write throws `read-only` without
+  // it (spikes/worker-host/README.md Q2). A checkpoint into a read-only
+  // mount is the exact silent-looking failure this comment exists to stop.
+  // deno-lint-ignore no-explicit-any -- the structural-shape gap above.
+  return filesystemWeb({ preopens: { "/": dir as any }, writable: true }).imports;
+}
+
 export async function newEngine(
   label: string,
   artifacts: EngineArtifacts,
   net: EngineNet,
+  persistDir?: PersistDir,
 ): Promise<Engine> {
   const shims = wasi({ cli: { args: [`engine-${label}`] } });
   const imports = {
@@ -338,6 +433,13 @@ export async function newEngine(
     // above can stay — whereas a missing one would be fatal if a future
     // translator does surface it.
     "polyvisor:engine/store-fetch-types@0.1.0": {},
+    // THE STATE ROOT, last so it REPLACES the batteries' empty-preopens
+    // filesystem on the `@0.2` track rather than sitting beside it: the
+    // resolver refuses a track key and an exact-versioned sibling on one
+    // track as ambiguous (@polyengine/wasi's mod.ts, "Per-interface
+    // override"). Absent — every existing call site — the batteries stub
+    // stays and the guest sees no preopens at all.
+    ...(persistDir === undefined ? {} : await persistImports(persistDir)),
   };
   const instance = await instantiate(
     artifactsFromEnvelope(artifacts.envelope, artifacts.bytes),

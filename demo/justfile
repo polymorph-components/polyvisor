@@ -50,6 +50,14 @@ pairing-bringup: translate
     deno check host/pairing-bringup.ts
     deno run -A host/pairing-bringup.ts
 
+# The #20 G5 kill-and-resume beat: the engine checkpoints into a real
+# directory (@polyengine/wasi's `filesystem-node` backend) and a FRESH
+# DENO PROCESS resumes from it. Needs no infra at all — the assertion is
+# about state surviving a process death, not about the wire.
+resume-bringup: translate
+    deno check host/bringup.ts
+    deno run -A host/bringup.ts resume
+
 # Build the app guest and translate both components.
 app:
     cd ../examples/todomvc/guest && cargo build --release --target wasm32-unknown-unknown

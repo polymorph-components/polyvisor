@@ -22,6 +22,7 @@ wit_bindgen::generate!({
 });
 
 mod pairing;
+mod persist;
 mod usdoc;
 
 use std::cell::{Cell, RefCell};
@@ -2933,6 +2934,17 @@ impl DriverGuest for Component {
             s.active = Some(payload.partition.clone());
         })?;
         Ok(hex::encode(payload.verifying))
+    }
+
+    // --- state persistence (#20 G5; see persist.rs for the layout and
+    // --- the crash-consistency argument) ---
+
+    async fn state_checkpoint() -> Result<(), String> {
+        persist::checkpoint().await
+    }
+
+    async fn state_resume() -> Result<bool, String> {
+        persist::resume().await
     }
 
     async fn iroh_bind(relay_url: String) -> Result<String, String> {
