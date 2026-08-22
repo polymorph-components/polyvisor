@@ -55,6 +55,8 @@ import stripOwnership from "./scenarios/strip-ownership.ts";
 import devicePairing from "./scenarios/device-pairing.ts";
 import devicePairingMock from "./scenarios/device-pairing-mock.ts";
 import soloPairing from "./scenarios/solo-pairing.ts";
+import soloPersistence from "./scenarios/solo-persistence.ts";
+import soloEphemeral from "./scenarios/solo-ephemeral.ts";
 import visorReset from "./scenarios/visor-reset.ts";
 
 // Re-exported so a scenario imports its whole contract from one place:
@@ -108,6 +110,17 @@ const SCENARIOS: Scenario[] = [
   // enrollment's peer ids, discover the tasks partition through the
   // account), not in the ceremony.
   soloPairing,
+  // THE DEVICE STORE'S OWN TWO (PERSISTENCE.md's T-E). They follow the
+  // pairing scenario because they are about what a device is BETWEEN
+  // ceremonies — kept, reloaded, resealed, or never kept at all — and a
+  // failure here with solo-pairing green says the fault is in the device
+  // store rather than in anything the two pages say to each other.
+  //
+  // Persistence first: it is the one whose beats a reader should meet in
+  // order (try, keep, reload, reseal), and the ephemeral one is the
+  // negative space around it.
+  soloPersistence,
+  soloEphemeral,
   // The erase ceremony: seeds a name, a petname and a storage sentinel,
   // then reloads the page (twice) as part of its own claim. It runs
   // after the other identity/naming scenarios and before the one that

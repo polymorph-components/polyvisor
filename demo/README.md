@@ -439,19 +439,74 @@ as the demo's, reached from the visor's own settings sheet.
 
 Its storage keys are `pm-solo-*`: the two pages share an origin, and an
 identity shared between them would make the "separate device" claim
-false.
+false. Those keys are now only the visor's **boot cache** (a colour, a
+name, the trust table) — which devices exist and what opens them is the
+device store's, in IndexedDB and OPFS.
+
+### The device survives (G5)
+
+The engine no longer runs in the page. It runs in the device's
+**SharedWorker** — one per device, owning the engine instance, the
+namespace, the device lock and the unsealed key — and the page is a view
+onto it over a MessagePort (`runtime/device-store/`, designed in
+`runtime/PERSISTENCE.md`). The three storage seams and the signer still
+REFUSE; what changed is only that they refuse in the worker.
+
+- **Try, then keep.** A first visit asks nothing: a device exists, it is
+  T0 (ephemeral), and it survives a *reload* — the tab holds the only
+  pointer to its namespace, in sessionStorage, and hands it to the fresh
+  worker, which rehydrates from the checkpoint. A pointer to a namespace
+  the sweep has collected is a fresh device, silently, never an error.
+- **"Keep this device"** is a settings-sheet ceremony, and it is where
+  the seal choices are asked: a **petname** — which the sheet says out
+  loud rests *unencrypted*, because the picker has to read it before
+  anything is open — and one of two rungs. `until-reseal` opens the
+  device with no interaction, and the sheet gives the honest sentence
+  for it: *login convenience, not protection against someone holding
+  this browser profile.* `every-session` derives the key from a
+  passphrase that is never stored, and is the real tier.
+- **Unseal is the login**, and the ordering is the anti-spoofing tell:
+  the picker is generic chrome — petnames and last-used, nothing else —
+  and the visor is not even constructed until the seal opens. Your
+  colour, your name and your icon appear at that moment and not one
+  pixel before, so a page imitating the picker has nothing of yours to
+  copy.
+- **Reseal** is an explicit control: it deletes the key kept here, drops
+  the worker's key material and returns you to the picker. On a device
+  that opens itself and has no passphrase anybody knows, it is an
+  **upgrade ceremony** rather than a plain exit — *sealing this device
+  means choosing what unseals it.* The worker re-keys the data key from
+  the platform rung (which is still there, which is why reseal time is
+  when this is possible) and only then deletes that rung, so the device
+  comes back as an `every-session` one under the same name. Reseal never
+  destroys a device by omission: an empty ceremony is refused, and
+  forgetting a device is a separate, explicit act.
+- **The device name on the strip** appears exactly when this browser
+  holds more than one device (pickable, not merely active). One device:
+  no label, it is noise.
 
 **What v1 does not have**, and does not pretend to: no bucket — the
 three storage seams and the signer are wired to REFUSE, which is the
 honest wiring for an instance with no destination — and therefore no
 storage picker and no provider panels; no collaborator; no three-pane
-theatre; and no engine identity across reloads (`init` mints a fresh one
-every boot), so every visit is a first run in practice.
+theatre. (The "no identity across reloads" caveat is gone: that was
+exactly what G5 fixed.)
 
-`just e2e solo-pairing` drives the whole thing: two `ctx.fresh()`
-contexts, todos typed into the real todomvc input inside the sandboxed
-frame, SAS equality asserted across two documents, and convergence in
-both directions plus a petname.
+`just e2e` drives all three of the page's scenarios:
+
+- `solo-pairing` — two `ctx.fresh()` contexts, todos typed into the real
+  todomvc input inside the sandboxed frame, SAS equality asserted across
+  two documents, convergence in both directions plus a petname. Both
+  devices now run in their own workers, cross-context.
+- `solo-persistence` — try, keep as "laptop", a REAL reload, the picker
+  offering the name, a silent unseal, the todo list intact, then the
+  reseal upgrade: an empty ceremony refused, a passphrase chosen, and a
+  picker that afterwards demands it (wrong one refused cleanly, right one
+  opening the device with the todos intact and nothing personal on screen
+  until it does).
+- `solo-ephemeral` — a T0 device surviving a reload through its anchor,
+  and both halves of the device-name rule, with the second device made
+  from the picker in a second tab.
 
 ## Deployment
 

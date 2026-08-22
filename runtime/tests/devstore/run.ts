@@ -724,6 +724,171 @@ async function main() {
       await probe(page, "hc-forget", { ids: [t1Device, sessionDevice] });
     });
 
+    // --- 19: the PROMOTION SEAM — a T0 device gains the user's rung -------
+    //
+    // THE PROBLEM THIS ROW EXISTS FOR. A T0 device is sealed with no
+    // ceremony, and the passphrase rung it carries was minted from 32
+    // random bytes that were then dropped on the floor (worker.ts's
+    // `sealT0`: "a door with no key"). So when the user later says "keep
+    // this device" and chooses `every-session`, there is no old
+    // passphrase to re-key from and the worker's own DEK handle is
+    // non-extractable — `wrapKey` cannot touch it. seal.ts's
+    // `rekeyFromPlatform` is the seam that resolves it: the re-wrap is
+    // authorized by the PLATFORM rung, which is the one door a T0 device
+    // does have, and is therefore authorized by exactly what the
+    // `until-reseal` tier is worth — possession of the profile. Anything
+    // that could call it could equally have called `unsealFromPlatform`
+    // and read the device outright, so it widens nothing.
+    //
+    // THE ASSERTION IS THE NEGATIVE ONE. It is easy to make a promotion
+    // look successful: the index row says `t1`, the status says the
+    // right policy, and the device still opens — because the PLATFORM
+    // WRAP IS STILL THERE. That device would auto-unseal forever and
+    // never ask the passphrase the user chose. So this row closes the
+    // connection, reconnects, and proves that an unseal with no
+    // passphrase is REFUSED before proving that the passphrase works.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "not yet kept",
+        policy: "while-open",
+        promote: false,
+      });
+      const id = made.id as string;
+      const opened = await probe(page, "hc-open", { id, unseal: {} });
+      await probe(page, "hc-add", { id, titles: TODOS });
+      await probe(page, "hc-checkpoint", { id });
+
+      const kept = await probe(page, "hc-promote", {
+        id,
+        petname: "laptop",
+        policy: "every-session",
+        passphrase: PASS,
+      });
+
+      // A NEW WORKER, so nothing in memory can be what opens it.
+      await probe(page, "hc-die", { id });
+      const silent = await probe(page, "hc-open", { id, unseal: {} });
+      const withPass = await probe(page, "hc-unseal", { id, opts: { passphrase: PASS } });
+      const items = await probe(page, "hc-items", { id });
+
+      const ok = opened.status.tier === "t0" && opened.status.sealed === false &&
+        kept.attempt.refused === false && kept.row.tier === "t1" &&
+        kept.row.petname === "laptop" &&
+        kept.row.policy === "every-session" &&
+        kept.status.rungs.untilReseal === false &&
+        silent.unseal.refused === true && silent.unseal.error.code === "no-rung" &&
+        silent.status.sealed === true &&
+        silent.status.needsPassphrase === true &&
+        withPass.attempt.refused === false && withPass.status.sealed === false &&
+        withPass.status.resumed === true &&
+        TODOS.every((t: string) => items.titles.includes(t));
+      record(
+        "19 host",
+        "promotion: a T0 device is re-keyed onto the user's own rung, and the platform door is shut",
+        ok,
+        `the device was ephemeral and open with no ceremony (tier=${j(opened.status.tier)} ` +
+          `sealed=${opened.status.sealed}); "keep this device" re-wrapped its DEK under the ` +
+          `user's passphrase (refused: ${kept.attempt.refused}) — authorized by the platform rung, ` +
+          `because the passphrase rung sealT0 left behind is a door whose key nobody kept — and ` +
+          `the index row followed LAST: ${j(kept.row)}. The platform wrap is GONE ` +
+          `(untilReseal=${kept.status.rungs.untilReseal}): a promotion that left it standing ` +
+          `would have produced a device that auto-unseals forever and never asks the passphrase ` +
+          `the user just chose. With the worker killed, an unseal carrying no passphrase is ` +
+          `refused (${j(silent.unseal.error)}) and the status agrees (sealed=${silent.status.sealed} ` +
+          `needsPassphrase=${silent.status.needsPassphrase}); the PASSPHRASE opens it, resumes ` +
+          `(${withPass.status.resumed}) and the state is intact — ${j(items.titles)}`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
+    // --- 20: reseal as an UPGRADE ceremony (the ruling) -------------------
+    //
+    // WHAT IT PROTECTS AGAINST. Reseal deletes the platform wrap. On a
+    // device kept with `until-reseal` and never given a passphrase, the
+    // rung that would remain is the one `sealT0` minted from 32 random
+    // bytes and dropped on the floor — so a plain reseal would leave a
+    // picker row demanding a passphrase THAT NEVER EXISTED, and a device
+    // destroyed as a side effect of signing out. Destroying a device is
+    // `removeDevice`'s job and is asked for explicitly.
+    //
+    // SO RESEAL ASKS, and reseal time is exactly when it can: the
+    // platform rung is still there to authorize `rekeyFromPlatform`, and
+    // the re-wrap lands BEFORE the deletion, so a refused ceremony
+    // leaves the device precisely as it was. This row asserts both
+    // directions — the refusal changes nothing, and the upgrade produces
+    // an `every-session` device that the right passphrase opens and the
+    // wrong one does not.
+    await guard(async () => {
+      // THE REAL PATH, not a shortcut: a T0 device gains its wraps by
+      // being opened (`sealT0`), and "keep this device" on the
+      // convenience rung is a no-op on the seal — which is exactly why
+      // the device ends up with no passphrase anybody knows.
+      const made = await probe(page, "hc-make", {
+        petname: "opens itself",
+        policy: "while-open",
+        promote: false,
+      });
+      const id = made.id as string;
+      await probe(page, "hc-open", { id, unseal: {} });
+      await probe(page, "hc-add", { id, titles: TODOS });
+      // EXPLICITLY, because the worker is killed below and the trailing
+      // debounce would be racing it — and because a reseal drops the
+      // engine, so a pending background checkpoint would find nothing to
+      // write.
+      await probe(page, "hc-checkpoint", { id });
+      const kept = await probe(page, "hc-promote", {
+        id,
+        petname: "opens itself",
+        policy: "until-reseal",
+      });
+
+      // (a) THE REFUSAL, and that it costs the device nothing.
+      const bare = await probe(page, "hc-reseal", { id });
+      // (b) THE UPGRADE.
+      const up = await probe(page, "hc-reseal", { id, passphrase: PASS, upgrade: true });
+
+      // A NEW WORKER, so nothing in memory can be what opens it.
+      await probe(page, "hc-die", { id });
+      const silent = await probe(page, "hc-open", { id, unseal: {} });
+      const wrong = await probe(page, "hc-unseal", { id, opts: { passphrase: PASS_WRONG } });
+      const right = await probe(page, "hc-unseal", { id, opts: { passphrase: PASS } });
+      const items = await probe(page, "hc-items", { id });
+
+      const ok = kept.status.rungs.untilReseal === true &&
+        bare.attempt.refused === true && bare.attempt.error.code === "no-rung" &&
+        bare.status.sealed === false && bare.status.rungs.untilReseal === true &&
+        up.attempt.refused === false && up.status.sealed === true &&
+        up.status.rungs.untilReseal === false && up.status.needsPassphrase === true &&
+        up.row.unsealPolicy === "every-session" && up.row.petname === "opens itself" &&
+        silent.unseal.refused === true &&
+        wrong.attempt.refused === true && wrong.attempt.error.code === "wrong-passphrase" &&
+        right.attempt.refused === false && right.status.resumed === true &&
+        TODOS.every((t: string) => items.titles.includes(t));
+      record(
+        "20 host",
+        "reseal on a device that opens itself is an UPGRADE ceremony, never a destruction",
+        ok,
+        `the device was kept on the convenience rung with no passphrase anybody knows ` +
+          `(untilReseal=${kept.status.rungs.untilReseal}; the passphrase rung it carries is ` +
+          `sealT0's, minted from random bytes and dropped). A reseal with NOTHING is REFUSED ` +
+          `(${j(bare.attempt.error.code)}: ${j(bare.attempt.error.message)}) and costs the ` +
+          `device nothing — still open (sealed=${bare.status.sealed}), platform wrap intact ` +
+          `(${bare.status.rungs.untilReseal}) — which is the whole point: a plain reseal here ` +
+          `would have left a picker row demanding a passphrase that never existed. With one, ` +
+          `the DEK is re-keyed from the platform rung BEFORE that rung is deleted, and the ` +
+          `device comes back an every-session one: sealed=${up.status.sealed} ` +
+          `untilReseal=${up.status.rungs.untilReseal} needsPassphrase=${up.status.needsPassphrase}, ` +
+          `index row ${j(up.row.unsealPolicy)} under the same name ${j(up.row.petname)}. Against a ` +
+          `FRESH worker: an unseal with no passphrase is refused, the WRONG passphrase is a ` +
+          `clean ${j(wrong.attempt.error.code)} (AES-KW's integrity check — no partial key ever ` +
+          `exists), and the right one opens it and resumes (${right.status.resumed}) with ` +
+          `${j(items.titles)} intact`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
     await ctx.close();
   } finally {
     await browser.close();

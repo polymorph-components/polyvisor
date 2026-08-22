@@ -49,6 +49,7 @@ export { deviceLockName, INDEX_DB, INDEX_STORE, nsDbName, nsDirName } from "./na
 export {
   createSealedDek,
   enableUntilReseal,
+  rekeyFromPlatform,
   rekeyPassphrase,
   reseal,
   SealError,
@@ -109,6 +110,8 @@ export {
   DRIVER_METHODS,
   type Hello,
   type HostMethod,
+  type PromoteOptions,
+  type ResealOptions,
   READONLY_METHODS,
   TASKS_METHODS,
   type UnsealOptions,

@@ -1934,6 +1934,53 @@ that separates "the visor's ceremonies broke" from "the engine or the
 transport broke". 13/13 scenarios, `just pairing-bringup` and the
 native `just pair` battery green, invariants 8/8.
 
+**Devices survive: the device store, sealing, and the worker host**
+(2026-08-22, the G5 round — #20's persistence gap, paying #11 down on
+the way; design record [runtime/PERSISTENCE.md](runtime/PERSISTENCE.md),
+platform matrix [spikes/worker-host/](spikes/worker-host/)). The round
+opened with a spike — the engine composite runs under JSPI inside a
+SharedWorker, OPFS mounts through the polyengine wasi filesystem (async
+handles; the published pin defaults READ-ONLY), non-extractable keys
+structured-clone into IndexedDB and survive a worker restart, and the
+worker RESPAWNS on every single-tab reload, which is what made T0
+reload-survival a checkpoint-and-rehydrate design rather than
+worker-memory luck. The engine learned `state-checkpoint`/`state-resume`
+(wasi:filesystem@0.2 imports arrive from `std::fs` itself; generation
+directories with a digest-verified manifest written last, no rename
+relied on — OPFS renames are emulated; a torn-manifest act falls back a
+generation; resume is not a join — the us-events drain is empty; commit
+signatures round-trip as stored attestations, never re-signed). The
+identity plumbing pivoted mid-round: webcrypto#389's WIT keystore fell
+(store-a-handle is browser-specific — real keystores mint inside and
+refuse import), superseded by webcrypto#391 — persistence is an
+embedder library (absorbed here as
+runtime/device-store/identity-keys.ts, the wosh-validated pattern),
+the guest-facing function is app-owned WIT per consumer, and the port
+ships only injection (`webcryptoHost().inject`, webcrypto#390).
+runtime/device-store/ is the embedder half: an unsealed index carrying
+exactly seven ruled fields (the anchor colour may never appear before
+unseal — the colour arriving IS the login's anti-spoofing tell), one
+IndexedDB database plus one OPFS directory per device, a per-device
+AES-GCM DEK under a two-rung KEK ladder (passphrase/PBKDF2 and a
+platform-wrapped convenience rung whose UI copy says the honest
+sentence), AES-KW wraps so a wrong passphrase is a refusal with no
+partial state, sealed-fs sealing the engine's state root beneath the
+digests it verifies, Web-Locks-sound T0 sweep, and one SharedWorker per
+device owning the engine, the lock, and the unseal state — tabs are
+views over an error envelope that re-mints the WIT brand client-side
+(symbols do not clone; a stale brand key interops wrong WITHOUT a
+diagnostic by design, and a matrix row pins the live pairing adapter
+against exactly that). The solo page becomes the consumer: first run is
+a T0 device with no ceremony, "keep this device" is the promotion that
+asks the seal questions, the picker renders nothing personal, unseal is
+the login, and resealing a device whose only rung is the platform wrap
+is an UPGRADE ceremony (choose what unseals it) rather than a disguised
+destroy — a zombie picker row demanding a passphrase that never existed
+is the trap the ruling closed. Gates: a 22-row browser matrix on the
+device store, e2e 16/16 (solo-persistence: reload → auto-unseal →
+todos intact; solo-ephemeral: the anchor round trip and the >1-device
+strip label), native and headless batteries unchanged.
+
 ## Parked and candidate non-goals
 
 - **Metadata privacy**: relays, push services, and origins see traffic

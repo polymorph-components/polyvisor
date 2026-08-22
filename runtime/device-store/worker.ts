@@ -52,6 +52,7 @@ import { type DeviceNamespace, openNamespace } from "./namespace.ts";
 import {
   createSealedDek,
   enableUntilReseal,
+  rekeyFromPlatform,
   reseal as resealNamespace,
   SealError,
   sealState,
@@ -65,7 +66,9 @@ import {
   type DeviceStatus,
   DRIVER_METHODS,
   type Hello,
+  type PromoteOptions,
   READONLY_METHODS,
+  type ResealOptions,
   type Req,
   type Res,
   TASKS_METHODS,
@@ -281,7 +284,10 @@ async function sealT0(namespace: DeviceNamespace): Promise<CryptoKey> {
     crypto.getRandomValues(new Uint8Array(32)),
     (b) => b.toString(16).padStart(2, "0"),
   ).join("");
-  const key = await createSealedDek(namespace, throwaway);
+  // `generated`: nothing kept this passphrase and nothing can reproduce
+  // it, and the record says so — see seal.ts's `PassphraseWrap.origin`
+  // and the reseal ceremony that consults it.
+  const key = await createSealedDek(namespace, throwaway, "generated");
   await enableUntilReseal(namespace, throwaway);
   return key;
 }
@@ -316,18 +322,118 @@ async function climbRung(
 }
 
 /**
+ * "KEEP THIS DEVICE" — the SEAL half (PERSISTENCE.md, "Tiers, as a
+ * promotion": "the promotion moment is where the seal choices are
+ * asked"). The index half is the tab's `promoteDevice`; see rpc.ts's
+ * `PromoteOptions` for why the split falls exactly there.
+ *
+ * IT REQUIRES THE DEVICE TO BE OPEN. Promotion is a thing the user does
+ * to a device they are using, and re-wrapping a DEK nobody has opened
+ * would mean acting on a device whose state we cannot even read.
+ *
+ * every-session: `rekeyFromPlatform` re-wraps the DEK under the user's
+ *   passphrase — authorized by the platform rung, because a T0 device's
+ *   existing passphrase rung was minted from bytes nobody kept (see
+ *   `sealT0`). The platform wrap is then DELETED: a user who asked to
+ *   be asked every session must not leave a door open that skips the
+ *   question. `reseal()`'s durable half is exactly that deletion, so it
+ *   is what does it.
+ *
+ * until-reseal: the platform wrap IS the rung, and a T0 device already
+ *   has one, so the ordinary path is a no-op on the seal. When it is
+ *   absent (a device that was resealed) a passphrase is required, and
+ *   `enableUntilReseal` re-arms from it.
+ *
+ * THE HONEST SENTENCE travels with the choice and belongs in the UI:
+ * `until-reseal` is login convenience, not protection against someone
+ * holding your profile. See `unseal` above and seal.ts's
+ * `enableUntilReseal`.
+ */
+async function promote(opts: PromoteOptions): Promise<DeviceStatus> {
+  if (!dek) throw new SealError("no-rung", "the device is sealed; open it before keeping it");
+  if (opts.policy === "every-session") {
+    if (opts.passphrase === undefined) {
+      throw new SealError("no-rung", "this rung is the passphrase; the ceremony needs one");
+    }
+    await rekeyFromPlatform(ns, opts.passphrase);
+    await resealNamespace(ns);
+  } else if (opts.policy === "until-reseal") {
+    const rungs = await sealState(ns);
+    if (!rungs.untilReseal) {
+      if (opts.passphrase === undefined) {
+        throw new SealError(
+          "no-rung",
+          "this device's platform wrap is gone (resealed?); re-arming it needs the passphrase",
+        );
+      }
+      await enableUntilReseal(ns, opts.passphrase);
+    }
+  } else {
+    // `while-open` is the T0 rung and is not a thing to be promoted TO
+    // (PERSISTENCE.md's ladder offers two rungs at the promotion
+    // moment). Refusing is honest; silently accepting would leave a
+    // device the index calls durable resting on a rung that dies with
+    // the worker.
+    throw new SealError("unsupported", `${opts.policy} is not a rung this ceremony offers`);
+  }
+  return await status();
+}
+
+/**
  * RESEAL (PERSISTENCE.md, "Unseal UX"): delete the persisted wrap, drop
  * the key material, return to the picker.
  *
- * The engine goes with it, and it has to: the mounted state root closes
- * over the DEK, so an engine left running would keep writing plaintext
- * through a key the user just asked us to forget. There is no dispose
- * call on an `Engine` — dropping the reference is what we have — so the
- * honest claim is: no NEW call can reach that instance, its key handle
- * is unreferenced from here, and the wasm instance is garbage. An
+ * IT IS SOMETIMES AN UPGRADE CEREMONY, AND THAT IS THE RULING.
+ *
+ * Deleting the platform wrap leaves whatever passphrase rung the device
+ * has. For a device kept on `every-session` that is the user's own and
+ * this is a plain sign-out. For a device kept on `until-reseal` and
+ * never given a passphrase, the only rung left would be the one
+ * `sealT0` minted from random bytes and dropped ("a door with no key"),
+ * so a plain reseal would produce a picker row that demands a passphrase
+ * NOBODY EVER CHOSE — a zombie entry. Destroying a device is
+ * `removeDevice`'s job and is asked for explicitly; reseal must not do
+ * it as a side effect.
+ *
+ * So for that device reseal ASKS: sealing it means choosing what unseals
+ * it. `rekeyFromPlatform` re-wraps the DEK under the new passphrase —
+ * and reseal time is exactly when that is still possible, because the
+ * platform rung has not been deleted yet — and only then does the wrap
+ * go. What comes back is an `every-session` device: sealed, and openable
+ * by the passphrase just chosen. The INDEX's policy tag has to follow
+ * (the picker must demand the passphrase afterwards), and that is the
+ * caller's half, on the tab's side, for the same reason promotion's is.
+ *
+ * ORDER IS LOAD-BEARING: the re-wrap lands before the deletion, so a
+ * failed ceremony leaves the device exactly as it was — still openable
+ * by the platform wrap, still upgradable.
+ *
+ * The engine goes with the key, and it has to: the mounted state root
+ * closes over the DEK, so an engine left running would keep writing
+ * plaintext through a key the user just asked us to forget. There is no
+ * dispose call on an `Engine` — dropping the reference is what we have —
+ * so the honest claim is: no NEW call can reach that instance, its key
+ * handle is unreferenced from here, and the wasm instance is garbage. An
  * in-flight call still holds its own closure until it settles.
  */
-async function reseal(): Promise<DeviceStatus> {
+async function reseal(opts: ResealOptions = {}): Promise<DeviceStatus> {
+  const rungs = await sealState(ns);
+  // WHOSE PASSPHRASE RUNG IS IT? Not a question the index can answer:
+  // its policy tag says which ceremony to OFFER, and a device may sit on
+  // `until-reseal` and also have the user's own passphrase (that is what
+  // `enableUntilReseal` being additive means). The durable answer is
+  // `PassphraseWrap.origin`, which `sealState` surfaces as
+  // `userPassphrase` — a rung somebody can actually walk through.
+  const platformOnly = !rungs.userPassphrase && rungs.untilReseal;
+  if (platformOnly) {
+    if (opts.passphrase === undefined) {
+      throw new SealError(
+        "no-rung",
+        "sealing this device means choosing what unseals it: this ceremony needs a passphrase",
+      );
+    }
+    await rekeyFromPlatform(ns, opts.passphrase);
+  }
   await resealNamespace(ns);
   dek = null;
   engine = null;
@@ -559,8 +665,10 @@ async function callHost(method: string, args: unknown[]): Promise<unknown> {
       return await status();
     case "unseal":
       return await unseal((args[0] as UnsealOptions) ?? {});
+    case "promote":
+      return await promote(args[0] as PromoteOptions);
     case "reseal":
-      return await reseal();
+      return await reseal((args[0] as ResealOptions) ?? {});
     case "checkpoint":
       return await checkpoint();
     case "status":

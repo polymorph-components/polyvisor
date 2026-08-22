@@ -67,6 +67,17 @@ export interface CreateSpec {
 /** What promotion asks (PERSISTENCE.md: "the promotion moment is where
  * the seal choices are asked"). */
 export interface PromoteSpec {
+  /**
+   * The user's word for this device, typed at the promotion ceremony.
+   *
+   * IT BELONGS HERE rather than only at creation because creation is
+   * where a T0 device gets a GENERATED placeholder — "try, then keep"
+   * means there is no ceremony to ask at, so the first real chance to
+   * ask is the moment the user says the device should outlive the tab.
+   * It rests in the clear like every other field of this record, and
+   * the ceremony has to say so in its own words.
+   */
+  petname?: string;
   posture?: Posture;
   unsealPolicy?: UnsealPolicy;
 }
@@ -189,6 +200,10 @@ export async function promoteDevice(
     const next: DeviceRecord = {
       ...row,
       tier: "t1",
+      // An empty or whitespace-only petname is not a rename, it is a
+      // ceremony the user left blank: the placeholder stays rather than
+      // being replaced with nothing.
+      petname: spec.petname?.trim() ? spec.petname.trim() : row.petname,
       posture: spec.posture ?? row.posture,
       unsealPolicy: spec.unsealPolicy ?? row.unsealPolicy,
       lastUsed: Date.now(),

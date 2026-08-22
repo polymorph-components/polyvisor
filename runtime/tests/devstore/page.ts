@@ -659,9 +659,53 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
     return { attempt, status: await conn.status() };
   },
 
-  "hc-reseal": async (arg: { id: string }) => ({
-    status: await conns.get(arg.id)!.reseal(),
-  }),
+  /**
+   * "KEEP THIS DEVICE", both halves, in the order an embedder must run
+   * them (device-store/client.ts's `promote`): the WORKER re-wraps the
+   * DEK, and only then does the INDEX row start claiming the new tier
+   * and rung. A failed re-wrap must never leave a row promising a rung
+   * the device does not have.
+   */
+  "hc-promote": async (arg: {
+    id: string;
+    petname: string;
+    policy: UnsealPolicy;
+    passphrase?: string;
+  }) => {
+    const conn = conns.get(arg.id)!;
+    const attempt = await refuses(() =>
+      conn.promote({ policy: arg.policy, passphrase: arg.passphrase })
+    );
+    const { record, persisted } = await promoteDevice(arg.id, {
+      petname: arg.petname,
+      unsealPolicy: arg.policy,
+    });
+    return {
+      attempt,
+      persisted,
+      row: { petname: record.petname, tier: record.tier, policy: record.unsealPolicy },
+      status: await conn.status(),
+    };
+  },
+
+  /**
+   * RESEAL, both halves. On a device whose only usable rung is the
+   * platform wrap this is an UPGRADE ceremony (worker.ts's `reseal`):
+   * the passphrase becomes the device's new `every-session` rung, and
+   * the INDEX's policy tag has to follow or the picker would keep
+   * trying to open silently something that now needs asking. The index
+   * write lands LAST, so a refused ceremony leaves the row honest.
+   */
+  "hc-reseal": async (arg: { id: string; passphrase?: string; upgrade?: boolean }) => {
+    const conn = conns.get(arg.id)!;
+    const attempt = await refuses(() =>
+      conn.reseal(arg.passphrase === undefined ? {} : { passphrase: arg.passphrase })
+    );
+    if (!attempt.refused && arg.upgrade) {
+      await promoteDevice(arg.id, { unsealPolicy: "every-session" });
+    }
+    return { attempt, status: await conn.status(), row: await getDevice(arg.id) };
+  },
 
   /** Drive the remote `tasks` surface: this is the structured-clone
    * claim, made by moving real strings and real bigint revisions. */

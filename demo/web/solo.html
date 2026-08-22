@@ -35,6 +35,31 @@
     #first-run .choice { display: flex; flex-direction: column; gap: .3em; }
     #first-run .choice button { align-self: flex-start; padding: .4em 1em; font-size: 14px; }
     #first-run .note { font-size: 12px; color: #666; line-height: 1.4; }
+    /* THE DEVICE PICKER. Deliberately the SAME plain page chrome as the
+       first-run fork and nothing more: this screen renders before
+       anything is unsealed, so it may carry no anchor colour, no name
+       and no icon (PERSISTENCE.md, "The index: what may exist before
+       unseal"). Generic is the feature — a page imitating this one
+       cannot paint your colour, because at this moment neither has the
+       real one. */
+    #device-picker { display: flex; flex-direction: column; gap: 1em;
+                     padding: 1.2em; background: #fff; border: 1px solid #ddd;
+                     border-radius: 4px; }
+    /* The same [hidden] trap the fork above hit: an explicit `display`
+       beats the UA default, or the card can never leave. */
+    #device-picker[hidden] { display: none; }
+    #device-picker h2 { margin: 0; font-size: 15px; font-weight: 600; color: #333; }
+    #device-picker .note { font-size: 12px; color: #666; line-height: 1.4; margin: 0; }
+    #device-list { display: flex; flex-direction: column; gap: .5em; }
+    .device-row { display: flex; flex-direction: column; gap: .15em; }
+    .device-row .device-pick { align-self: flex-start; padding: .4em 1em; font-size: 14px; }
+    .device-when { font-size: 11px; color: #888; }
+    #device-pass { display: flex; flex-direction: column; gap: .3em; }
+    #device-pass[hidden] { display: none; }
+    #device-pass label { font-size: 12px; color: #444; }
+    #device-pass input { padding: .35em; font-size: 14px; max-width: 22em; }
+    #device-problem { font-size: 12px; color: #a33; }
+    #device-problem[hidden] { display: none; }
     #solo-app { margin-top: 8px; }
   </style>
 </head>
@@ -59,6 +84,26 @@
   <div id="banner"><div class="bar-inner">booting…</div></div>
   <div id="page">
     <div class="status" id="solo-status">…</div>
+    <!-- THE DEVICE PICKER. Page furniture, like the fork below it, and
+         for a stronger reason: it renders BEFORE the seal opens, and the
+         visor is not constructed until it does. Everything on it comes
+         from the unsealed index — device petnames and last-used times —
+         because that is the whole of what the index is allowed to hold
+         (PERSISTENCE.md, "The index: what may exist before unseal").
+         host/solo.ts fills #device-list and unhides this. -->
+    <div id="device-picker" hidden>
+      <h2>Which device is this?</h2>
+      <p class="note">This browser holds more than one. Pick the one you want to open;
+        nothing of yours is shown until it is.</p>
+      <div id="device-list"></div>
+      <div id="device-pass" hidden>
+        <label for="device-pass-input">The passphrase for <span id="device-pass-for"></span></label>
+        <input id="device-pass-input" autocomplete="off">
+        <button type="button" id="device-pass-open">Open this device</button>
+      </div>
+      <div id="device-problem" hidden></div>
+      <button type="button" id="device-new">Set up a new device here</button>
+    </div>
     <!-- THE FIRST-RUN FORK. Page furniture, so it is markup — the same
          division index.html keeps (the page's own chrome is HTML; only
          the visor's ceremonies are built in TS). Two affordances,

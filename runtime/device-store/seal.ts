@@ -84,6 +84,29 @@ interface PassphraseWrap {
   salt: Uint8Array;
   /** The DEK wrapped with AES-KW under the derived KEK. */
   wrapped: Uint8Array;
+  /**
+   * WHETHER ANYBODY KNOWS THIS PASSPHRASE.
+   *
+   * `user` — a person chose it and can type it again. `generated` — it
+   * was minted from random bytes and dropped on the floor, which is how
+   * a T0 device is sealed with no ceremony (worker.ts's `sealT0`: "a
+   * door with no key").
+   *
+   * IT HAS TO BE RECORDED, because the two are otherwise
+   * indistinguishable: `sealState` can say a passphrase rung EXISTS but
+   * not that it is reachable, and the index's policy tag does not answer
+   * it either — a device may sit on `until-reseal` and ALSO have the
+   * user's own passphrase (that is what `enableUntilReseal` being
+   * ADDITIVE means). Deleting the platform wrap on a device whose only
+   * rung is `generated` would destroy it, so the ceremony that deletes
+   * that wrap needs this bit to know whether to ask for a replacement
+   * first.
+   *
+   * ABSENT MEANS `generated`, deliberately: the failure modes are not
+   * symmetric. Reading an unmarked rung as reachable risks destroying a
+   * device; reading it as unreachable costs one ceremony nobody needed.
+   */
+  origin?: "user" | "generated";
 }
 
 interface PlatformWrap {
@@ -96,8 +119,13 @@ interface PlatformWrap {
 /** What rungs this device actually has — the picker's question, asked
  * without opening anything. */
 export interface SealState {
-  /** A passphrase can open this device. */
+  /** A passphrase rung EXISTS. It says nothing about whether anybody
+   * knows the passphrase — see `userPassphrase`. */
   passphrase: boolean;
+  /** A passphrase rung exists AND a person chose it, so it is a door
+   * somebody can actually walk through. This is the bit a ceremony that
+   * deletes the platform wrap has to consult (`PassphraseWrap.origin`). */
+  userPassphrase: boolean;
   /** This device auto-unseals from the platform key until reseal. */
   untilReseal: boolean;
 }
@@ -107,7 +135,11 @@ export async function sealState(ns: DeviceNamespace): Promise<SealState> {
     ns.get<PassphraseWrap>("seal", KEY_PASSPHRASE_WRAP),
     ns.get<PlatformWrap>("seal", KEY_PLATFORM_WRAP),
   ]);
-  return { passphrase: p !== undefined, untilReseal: k !== undefined };
+  return {
+    passphrase: p !== undefined,
+    userPassphrase: p !== undefined && p.origin === "user",
+    untilReseal: k !== undefined,
+  };
 }
 
 // --- the DEK ----------------------------------------------------------------
@@ -209,6 +241,10 @@ async function wrappableDek(ns: DeviceNamespace, passphrase: string): Promise<Cr
 export async function createSealedDek(
   ns: DeviceNamespace,
   passphrase: string,
+  /** Whether a PERSON chose `passphrase`. `generated` is for the
+   * no-ceremony T0 seal and nothing else — see `PassphraseWrap.origin`
+   * for why the distinction has to be durable. */
+  origin: "user" | "generated" = "user",
 ): Promise<CryptoKey> {
   if ((await sealState(ns)).passphrase) {
     throw new SealError("already-sealed", "this device already has a passphrase rung");
@@ -224,6 +260,7 @@ export async function createSealedDek(
     iterations: PBKDF2_ITERATIONS,
     salt,
     wrapped,
+    origin,
   };
   await ns.put("seal", KEY_PASSPHRASE_WRAP, record);
   // Hand back the SAME key as a non-extractable handle rather than the
@@ -287,6 +324,8 @@ export async function rekeyPassphrase(
     iterations: PBKDF2_ITERATIONS,
     salt,
     wrapped: await wrapDek(dek, kek),
+    // A person chose this one, whatever the rung it replaces was.
+    origin: "user",
   };
   // One write, after every fallible step has already succeeded: a
   // failed re-key leaves the old passphrase working.
@@ -329,6 +368,85 @@ export async function enableUntilReseal(
   // report a rung it cannot actually use.
   await ns.put("seal", KEY_PLATFORM_KEK, kek);
   await ns.put("seal", KEY_PLATFORM_WRAP, { v: 1, wrapped } satisfies PlatformWrap);
+}
+
+/**
+ * THE PROMOTION SEAM: give this device a passphrase rung it did not
+ * choose for itself, authorized by the PLATFORM rung it already has.
+ *
+ * WHY IT HAS TO EXIST, and why `rekeyPassphrase` could not do the job.
+ * A T0 device is sealed with no ceremony (worker.ts's `sealT0`): the
+ * passphrase rung it carries was minted from 32 random bytes that were
+ * then dropped on the floor, so nobody — including this worker after a
+ * reload — can reproduce it. When the user later says "keep this
+ * device" and chooses `every-session`, the DEK has to be re-wrapped
+ * under THEIR passphrase, and there is no old passphrase to present.
+ * The DEK handle the worker is holding cannot stand in for one either:
+ * every handle this module hands out is `extractable: false`, and
+ * `wrapKey` needs an extractable key. So the authorization comes from
+ * the one door that IS open on a T0 device — the platform wrap.
+ *
+ * WHAT THIS IS AUTHORIZED BY, stated plainly: possession of the
+ * profile. That is exactly the `until-reseal` tier's honest strength
+ * (PERSISTENCE.md's ladder), and it is not a widening: anything that
+ * can call this could equally call `unsealFromPlatform` and read the
+ * device. It refuses outright when the platform rung is absent, so a
+ * device that has already been resealed cannot be re-keyed this way —
+ * that one needs its passphrase, which is what reseal is for.
+ *
+ * The salt rotates and the DEK does not, for `rekeyPassphrase`'s
+ * reasons. The single write lands after every fallible step.
+ */
+export async function rekeyFromPlatform(
+  ns: DeviceNamespace,
+  newPassphrase: string,
+): Promise<void> {
+  requirePassphrase(newPassphrase);
+  const dek = await wrappableDekFromPlatform(ns);
+  const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
+  const kek = await kekFromPassphrase(newPassphrase, salt, PBKDF2_ITERATIONS);
+  const record: PassphraseWrap = {
+    v: 1,
+    kdf: "PBKDF2-SHA-256",
+    iterations: PBKDF2_ITERATIONS,
+    salt,
+    wrapped: await wrapDek(dek, kek),
+    // THE POINT OF THIS CEREMONY: what it leaves behind is a rung
+    // somebody knows, where a moment ago there was only a door with no
+    // key.
+    origin: "user",
+  };
+  await ns.put("seal", KEY_PASSPHRASE_WRAP, record);
+}
+
+/**
+ * The platform rung's `wrappableDek`. Same discipline as that one: the
+ * extractable handle is a LOCAL of the ceremony that needs it, the raw
+ * bytes never enter JS, and nothing in this repo calls `exportKey`
+ * (demo/scripts/check-invariants.sh invariant (d)).
+ */
+async function wrappableDekFromPlatform(ns: DeviceNamespace): Promise<CryptoKey> {
+  const [rec, kek] = await Promise.all([
+    ns.get<PlatformWrap>("seal", KEY_PLATFORM_WRAP),
+    ns.get<CryptoKey>("seal", KEY_PLATFORM_KEK),
+  ]);
+  if (!rec || !kek) {
+    throw new SealError("no-rung", "this device has no platform rung to re-key from");
+  }
+  // Validate-on-load, for `unsealFromPlatform`'s reason: a planted
+  // EXTRACTABLE key here would be an attacker's handle we then used to
+  // unwrap the DEK.
+  if (!(kek instanceof CryptoKey) || kek.extractable !== false || kek.algorithm.name !== "AES-KW") {
+    throw new SealError(
+      "tampered",
+      "the persisted platform key is not a usable non-extractable AES-KW key",
+    );
+  }
+  try {
+    return await unwrapDek(rec.wrapped, kek, true);
+  } catch {
+    throw new SealError("tampered", "the platform wrap did not open");
+  }
 }
 
 /**

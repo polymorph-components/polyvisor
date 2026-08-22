@@ -351,6 +351,44 @@ export interface UnsealOptions {
   untilReseal?: boolean;
 }
 
+/**
+ * THE SEAL HALF OF "KEEP THIS DEVICE" (PERSISTENCE.md, "Tiers, as a
+ * promotion").
+ *
+ * The INDEX half — tier, petname, posture, policy — is `promoteDevice`
+ * and stays on the tab's side, because the index is the one unsealed
+ * database and needs no worker. What crosses the port is only what the
+ * worker can do and the page must not: re-wrapping the DEK. A page that
+ * did its own crypto here would have to hold key material, which is the
+ * entire property the worker host exists to keep.
+ */
+export interface PromoteOptions {
+  /** The rung the user chose. `every-session` re-wraps the DEK under
+   * `passphrase` and then DELETES the platform wrap (a rung the user
+   * asked to be asked past must not be left standing). `until-reseal`
+   * keeps or arms the platform wrap. */
+  policy: UnsealPolicy;
+  /** Required for `every-session`. Never persisted, never logged, never
+   * echoed back in `status()`. */
+  passphrase?: string;
+}
+
+/**
+ * What `reseal` may be told.
+ *
+ * THE PASSPHRASE IS AN UPGRADE, NOT A CHECK. Reseal never asks a device
+ * to prove anything — the caller is already holding it open. The
+ * passphrase is only needed when deleting the platform wrap would leave
+ * the device with no rung anybody knows (see the worker's `reseal`), in
+ * which case it becomes the device's new `every-session` rung and the
+ * INDEX's policy tag must be flipped to match by the caller.
+ */
+export interface ResealOptions {
+  /** Required when the device's only usable rung is the platform wrap.
+   * Never persisted, never logged, never echoed back in `status()`. */
+  passphrase?: string;
+}
+
 /** What the first client tells the worker so it can become a host. */
 export interface AttachSpec {
   deviceId: string;
@@ -371,8 +409,11 @@ export interface DeviceStatus {
    * headline fact. */
   sealed: boolean;
   /** Which rungs this device HAS (seal.ts's `sealState`) — the picker's
-   * question, answerable without opening anything. */
-  rungs: { passphrase: boolean; untilReseal: boolean };
+   * question, answerable without opening anything. `userPassphrase` is
+   * the one a reseal ceremony branches on: a passphrase rung EXISTS on
+   * every sealed device, but only a `user` one is a door anybody can
+   * walk through. */
+  rungs: { passphrase: boolean; userPassphrase: boolean; untilReseal: boolean };
   /** True when the next `unseal()` cannot succeed without one. */
   needsPassphrase: boolean;
   /**
@@ -402,6 +443,7 @@ export type HostMethod =
   | "attach"
   | "detach"
   | "unseal"
+  | "promote"
   | "reseal"
   | "checkpoint"
   | "status"

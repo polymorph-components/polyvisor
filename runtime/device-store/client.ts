@@ -32,7 +32,9 @@ import {
   DeviceHostError,
   DRIVER_METHODS,
   type Hello,
+  type PromoteOptions,
   rehydrate,
+  type ResealOptions,
   type Req,
   type Res,
   TASKS_METHODS,
@@ -40,7 +42,7 @@ import {
 } from "./rpc.ts";
 
 export { DeviceHostError };
-export type { DeviceStatus, UnsealOptions };
+export type { DeviceStatus, PromoteOptions, ResealOptions, UnsealOptions };
 
 /** Which device this tab wants. */
 export type DeviceChoice =
@@ -96,9 +98,28 @@ export interface DeviceConnection {
   /** Open the device. See the worker's `unseal` for the rung rules and
    * the honest sentence about what each tier is worth. */
   unseal(opts?: UnsealOptions): Promise<DeviceStatus>;
-  /** Forget the persisted wrap and drop the worker's key material. The
-   * engine goes down with it; the next `unseal` runs the ceremony. */
-  reseal(): Promise<DeviceStatus>;
+  /**
+   * "KEEP THIS DEVICE" — the SEAL half of promotion, which is all of it
+   * that needs the worker. The INDEX half (`promoteDevice`) is the
+   * caller's, on this side, because the index is unsealed and needs no
+   * worker; run them together and the index one last, so a failed
+   * re-wrap never leaves a row claiming a rung the device does not
+   * have. See the worker's `promote` for what each rung does.
+   */
+  promote(opts: PromoteOptions): Promise<DeviceStatus>;
+  /**
+   * Forget the persisted wrap and drop the worker's key material. The
+   * engine goes down with it; the next `unseal` runs the ceremony.
+   *
+   * SOMETIMES AN UPGRADE: on a device whose only usable rung is the
+   * platform wrap, this REQUIRES `passphrase` and the device comes back
+   * as an `every-session` one — see the worker's `reseal` for why
+   * reseal must not be able to destroy a device by omission. The caller
+   * owns the index half (`promoteDevice(id, {unsealPolicy:
+   * "every-session"})`) and runs it after this resolves, so a failed
+   * ceremony never leaves a row describing a rung the device lacks.
+   */
+  reseal(opts?: ResealOptions): Promise<DeviceStatus>;
   /** Force a checkpoint now. Resolves with its timestamp. */
   checkpoint(): Promise<number>;
   status(): Promise<DeviceStatus>;
@@ -288,7 +309,10 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
     driver: remote<Driver>("driver", DRIVER_METHODS),
     tasks: remote<Tasks>("tasks", TASKS_METHODS),
     unseal: (opts?: UnsealOptions) => send("host", "unseal", [opts ?? {}]) as Promise<DeviceStatus>,
-    reseal: () => send("host", "reseal", []) as Promise<DeviceStatus>,
+    promote: (opts: PromoteOptions) =>
+      send("host", "promote", [opts]) as Promise<DeviceStatus>,
+    reseal: (opts?: ResealOptions) =>
+      send("host", "reseal", [opts ?? {}]) as Promise<DeviceStatus>,
     checkpoint: () => send("host", "checkpoint", []) as Promise<number>,
     status: () => send("host", "status", []) as Promise<DeviceStatus>,
     close,
