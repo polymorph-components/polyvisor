@@ -228,9 +228,19 @@ const scenario: Scenario = {
       // the reset entry reverts the preview explicitly, by hand, instead.
       // Proven here directly: pick a hue that is certainly not the
       // committed one, then confirm the ANCHOR is back to the committed
-      // hue once the reset sheet is up.
+      // hue once the reset sheet is up. `freshAnchor: true` (above) means
+      // the boot rolled a RANDOM entry from VISOR_HUES (visor/ui/visor.ts)
+      // and persisted it under KEYS.hue — a hard-coded pick target would
+      // collide with that roll one run in ten and make this act's preview
+      // assertion fail on an identical before/after value with nothing
+      // wrong with the erase ceremony (issue #81). Read the committed
+      // ANGLE first and pick a different VISOR_HUES member instead.
       const committedHue = await anchorHue(page);
-      await hook(page, "settings.pickHue", 35);
+      const committedAngle = Number(
+        await page.evaluate((k: string) => localStorage.getItem(k), KEYS.hue),
+      );
+      const target = committedAngle === 35 ? 95 : 35;
+      await hook(page, "settings.pickHue", target);
       const previewed = await anchorHue(page);
       assert(
         previewed !== committedHue,
