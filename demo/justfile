@@ -50,6 +50,14 @@ pairing-bringup: translate
     deno check host/pairing-bringup.ts
     deno run -A host/pairing-bringup.ts
 
+# The #20 G5 kill-and-resume beat: the engine checkpoints into a real
+# directory (@polyengine/wasi's `filesystem-node` backend) and a FRESH
+# DENO PROCESS resumes from it. Needs no infra at all — the assertion is
+# about state surviving a process death, not about the wire.
+resume-bringup: translate
+    deno check host/bringup.ts
+    deno run -A host/bringup.ts resume
+
 # Build the app guest and translate both components.
 app:
     cd ../examples/todomvc/guest && cargo build --release --target wasm32-unknown-unknown
@@ -99,7 +107,7 @@ check:
 # Assemble the servable demo directory.
 site: translate app panels check
     mkdir -p serve
-    deno check host/demo.ts host/solo.ts ../visor/frame/frame.ts ../visor/frame/frame-backend.ts
+    deno check host/demo.ts host/solo.ts host/solo-worker.ts ../visor/frame/frame.ts ../visor/frame/frame-backend.ts
     deno bundle --platform browser --minify --external node-datachannel --external "node-datachannel/polyfill" --external werift -o serve/demo.js host/demo.ts
     # THE SOLO PAGE: the same served artifacts, a second and much smaller
     # embedder (host/solo.ts).
@@ -115,10 +123,21 @@ site: translate app panels check
     # and nothing else.) The `just check`-adjacent scan below is the
     # tripwire on it.
     deno bundle --platform browser --minify --external node-datachannel --external "node-datachannel/polyfill" --external werift -o serve/solo.js host/solo.ts
-    # NO node: BUILTIN MAY SURVIVE INTO EITHER BUNDLE. A bare specifier
+    # THE DEVICE HOST (PERSISTENCE.md's T-C/T-D): one SharedWorker per
+    # device, owning the engine, the namespace, the lock and the unsealed
+    # DEK. It is bundled SEPARATELY from the page and has to be — a
+    # SharedWorker script is its own module graph with its own global
+    # scope, and it is the ONLY one of the two bundles that instantiates
+    # the engine now. Same --external set, same node: tripwire; the entry
+    # is host/solo-worker.ts, whose whole body is one import (the device
+    # store cannot re-export the worker without dragging the engine's
+    # pins in front of every consumer of the index).
+    deno bundle --platform browser --minify --external node-datachannel --external "node-datachannel/polyfill" --external werift -o serve/solo-worker.js host/solo-worker.ts
+    # NO node: BUILTIN MAY SURVIVE INTO ANY BUNDLE. A bare specifier
     # for a node PACKAGE is fine (it is never evaluated); a `node:`
     # builtin is not, because the browser tries to fetch it as a URL.
     ! grep -q 'node:' serve/solo.js || { echo "serve/solo.js imports a node: builtin — check the --external set" >&2; exit 1; }
+    ! grep -q 'node:' serve/solo-worker.js || { echo "serve/solo-worker.js imports a node: builtin — check the --external set" >&2; exit 1; }
     ! grep -q 'node:' serve/demo.js || { echo "serve/demo.js imports a node: builtin — check the --external set" >&2; exit 1; }
     # The sandboxed surface frame (#16): its own entry, its own document.
     # No --external flags needed — the frame imports only the applier and

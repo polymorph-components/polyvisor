@@ -435,9 +435,30 @@ fn read_us<R>(f: impl FnOnce(&AutoCommit) -> R) -> Result<R, String> {
     })?
 }
 
-fn set_baseline() -> Result<(), String> {
+/// Take the announce-baseline from the document as it currently stands.
+///
+/// `pub(crate)` for the RESUME path (persist.rs): a device coming back
+/// from a checkpoint already announced everything in the restored
+/// document, so it must baseline rather than replay. A JOINING device
+/// deliberately does the opposite (`enrolled`, below, sets `last = None`).
+pub(crate) fn set_baseline() -> Result<(), String> {
     let snap = read_us(snapshot)?;
     with_state(|s| s.us.last = Some(snap))
+}
+
+/// The provenances this instance wrote, for the checkpoint (persist.rs).
+/// The repair rule keys off this set — only the owner of a losing write
+/// persists the repair — so a resumed device that dropped it would stop
+/// repairing its own collisions.
+pub(crate) fn my_marks(us: &UsDoc) -> Vec<String> {
+    let mut out: Vec<String> = us.my_marks.iter().cloned().collect();
+    out.sort();
+    out
+}
+
+/// Restore the set above on resume.
+pub(crate) fn set_my_marks(us: &mut UsDoc, marks: Vec<String>) {
+    us.my_marks = marks.into_iter().collect();
 }
 
 /// Re-baseline after a LOCAL write, without swallowing an invariant

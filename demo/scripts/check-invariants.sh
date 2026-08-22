@@ -84,7 +84,7 @@ echo "      (--visor-bg is scoped to the visor's own elements; inheriting it wou
 # `applyVisorHue` lives in the framework core now, so the scan follows
 # it there; host/*.ts stays in the list because a consumer painting the
 # anchor colour itself would be exactly the regression this catches.
-HUE_PAINTERS="host/*.ts ../runtime/*.ts ../visor/ui/*.ts"
+HUE_PAINTERS="host/*.ts ../runtime/*.ts ../runtime/device-store/*.ts ../visor/ui/*.ts"
 # shellcheck disable=SC2086
 ambient=$(grep -nE '(documentElement|:root)[^\n]*--visor-bg' $HUE_PAINTERS 2>/dev/null)
 if [ -n "$ambient" ]; then
@@ -119,7 +119,7 @@ done
 # explain the rule rather than perform it.
 echo "[4/8] the visor never exports a key"
 echo "      (escrowed signing keys are non-extractable; nothing reads them back)"
-exported=$(grep -n "exportKey" host/*.ts ../runtime/*.ts 2>/dev/null |
+exported=$(grep -n "exportKey" host/*.ts ../runtime/*.ts ../runtime/device-store/*.ts 2>/dev/null |
   grep -vE "^[^:]+:[0-9]+:[[:space:]]*(//|\*|/\*)")
 if [ -n "$exported" ]; then
   bad "exportKey appears in host or runtime code:"
@@ -181,7 +181,7 @@ else
 fi
 # shellcheck disable=SC2086
 definers=$(grep -rl "^function renderPairingCode(\|^function renderSas(" \
-  host/*.ts ../runtime/*.ts ../visor/ui/*.ts 2>/dev/null | grep -v '/visor/ui/pairing.ts$')
+  host/*.ts ../runtime/*.ts ../runtime/device-store/*.ts ../visor/ui/*.ts 2>/dev/null | grep -v '/visor/ui/pairing.ts$')
 if [ -n "$definers" ]; then
   bad "renderPairingCode()/renderSas() defined somewhere other than ../visor/ui/pairing.ts:"
   printf '%s\n' "$definers" | sed 's/^/       /'
@@ -269,7 +269,7 @@ fi
 # Any `markNomination()` read that is NOT inside the funnel: strip the
 # interface DECLARATIONS (which end in `;`), then require a
 # `readMarkNomination(` within the six lines above each survivor.
-raw=$(grep -n "markNomination()" host/*.ts ../runtime/*.ts |
+raw=$(grep -n "markNomination()" host/*.ts ../runtime/*.ts ../runtime/device-store/*.ts |
   grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|\*)' |
   grep -vE 'markNomination\(\): Promise')
 unguarded=""
@@ -318,7 +318,7 @@ echo "      (foreignToken() in ../visor/ui/visor.ts is the only door to the \"fo
 # A class ASSIGNMENT mentioning foreign, in any of the shapes the DOM
 # offers: className =, classList.add(...), setAttribute("class", ...).
 FOREIGN_ASSIGN='(className[[:space:]]*=|classList\.(add|toggle)\(|setAttribute\([[:space:]]*"class")[^\n]*foreign'
-VOICE_RENDERERS=$(ls host/*.ts ../runtime/*.ts ../visor/ui/*.ts 2>/dev/null | grep -v '/visor/ui/visor\.ts$')
+VOICE_RENDERERS=$(ls host/*.ts ../runtime/*.ts ../runtime/device-store/*.ts ../visor/ui/*.ts 2>/dev/null | grep -v '/visor/ui/visor\.ts$')
 handmade=""
 for f in $VOICE_RENDERERS; do
   hit=$(sed -E 's@^[[:space:]]*(//|\*|/\*).*@@' "$f" | grep -nE "$FOREIGN_ASSIGN")

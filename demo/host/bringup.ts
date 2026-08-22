@@ -11,6 +11,7 @@
 
 import { type Engine, hex, newEngine, unhex, until } from "../../runtime/engine.ts";
 import { probeNet, probeNoNet, probeReaderNet } from "./probe-net.ts";
+import { filesystemNode } from "@polyengine/wasi/filesystem-node";
 
 const RELAY = "http://127.0.0.1:3340";
 const S3 = {
@@ -225,10 +226,207 @@ async function bucket() {
   }
 }
 
+// --- phase: resume -----------------------------------------------------------
+//
+// The #20 G5 kill-and-resume beat under Deno (runtime/PERSISTENCE.md
+// "Checkpoint semantics"), through @polyengine/wasi's `filesystem-node`
+// backend — the owner's "Deno has a filesystem binding" is
+// `jsr:@polyengine/wasi@0.3.1/filesystem-node`, `node:fs` via
+// `process.getBuiltinModule`, which Deno's node compat serves. Same guest
+// `std::fs` code the browser drives over OPFS; real files here.
+//
+// THE KILL IS A REAL PROCESS DEATH. `resume` is an orchestrator: it
+// re-execs THIS FILE as `resume-write` and then as `resume-read`, so
+// nothing but the state root survives between the halves — no shared heap,
+// no shared instance, no shared Deno runtime. That is a strictly harsher
+// kill than the native acts' second-instance idiom, and it is the one that
+// matches `worker.terminate()`.
+
+/** The Deno state root, as a `wasi:filesystem` fragment.
+ *
+ * Built HERE rather than inside `newEngine` on purpose: naming
+ * `@polyengine/wasi/filesystem-node` from `runtime/engine.ts` would put
+ * `node:fs` into `serve/demo.js` and `serve/solo.js`, which
+ * `demo/justfile`'s "NO node: BUILTIN MAY SURVIVE INTO EITHER BUNDLE"
+ * check refuses (and did refuse, when this was first written the
+ * ergonomic way). This file is Deno-only and never bundled, so it is the
+ * right side of that line. `writable: true` is mandatory — the published
+ * @polyengine/wasi defaults the fragment to READ-ONLY (the spike's trap).
+ */
+function denoStateRoot(dir: string) {
+  return filesystemNode({ preopens: { "/": dir }, writable: true });
+}
+
+const RESUME_TODOS = ["buy milk", "survive the kill", "prove the checkpoint"];
+
+async function resumeWrite(dir: string) {
+  const artifacts = await loadArtifacts();
+  const a = await newEngine("resume-write", artifacts, probeNoNet, denoStateRoot(dir));
+  try {
+    // `exportable-identity: true` is REQUIRED for a resumable device at
+    // this rev: the default platform posture rests as a non-extractable
+    // WebCrypto handle the guest cannot write down, and `stateResume`
+    // refuses such a checkpoint rather than silently minting a NEW
+    // identity (engine.wit's documented seam; PERSISTENCE.md T-A).
+    const id = await a.driver.init(true);
+    step(`init(exportable): ${id.slice(0, 16)}…`);
+
+    await a.driver.userCreate({ displayName: "Bringup Bea", hue: 120 });
+    await a.driver.usMarkPut({
+      provenance: "app://bringup",
+      petname: "Bringup",
+      icon: "🌱",
+      createdAt: 1_000n,
+      needsReconfirm: false,
+    });
+    step("user-create + one mark");
+
+    const part = await a.driver.createPartition();
+    await a.driver.sealPartition(part);
+    await a.driver.usPartitionPut("tasks", part);
+    step(`partition ${hex(part).slice(0, 16)}… sealed + published`);
+
+    for (const t of RESUME_TODOS) await a.tasks.add(t);
+    const snap = await a.tasks.items();
+    await a.tasks.setCompleted(snap.items[0].id, true);
+    step(`tasks.add ×${RESUME_TODOS.length} + one toggle`);
+
+    await a.driver.stateCheckpoint();
+    step("state-checkpoint written");
+
+    // Handed to the reader half through stdout: the identity this device
+    // must still have on the other side of the kill.
+    console.log(`RESUME-WRITE-OK ${id} ${hex(part)}`);
+  } catch (e) {
+    dumpOnFail([["resume-write", a]]);
+    throw e;
+  }
+}
+
+async function resumeRead(dir: string, wantPartition: string) {
+  const artifacts = await loadArtifacts();
+  const a = await newEngine("resume-read", artifacts, probeNoNet, denoStateRoot(dir));
+  try {
+    const resumed = await a.driver.stateResume();
+    step(`state-resume: ${resumed}`);
+    if (!resumed) throw new Error("state-resume answered false over a written state root");
+
+    const bound = hex(await a.tasks.partition());
+    if (bound !== wantPartition) {
+      throw new Error(`bound ${bound.slice(0, 16)}…, expected ${wantPartition.slice(0, 16)}…`);
+    }
+    const pointers = await a.driver.usPartitions();
+    if (!pointers.some((p) => p.name === "tasks" && hex(p.id) === wantPartition)) {
+      throw new Error("the `tasks` partition pointer did not survive");
+    }
+    step("active partition + us-partition pointer intact");
+
+    const snap = await a.tasks.items();
+    if (snap.items.length !== RESUME_TODOS.length) {
+      throw new Error(`${snap.items.length} todos, expected ${RESUME_TODOS.length}`);
+    }
+    for (const title of RESUME_TODOS) {
+      if (!snap.items.some((i) => i.title === title)) throw new Error(`lost todo: ${title}`);
+    }
+    if (!snap.items.some((i) => i.completed)) throw new Error("lost the completion toggle");
+    step(`todos intact: rev=${snap.revision} ${JSON.stringify(snap.items)}`);
+
+    const marks = await a.driver.usMarksList();
+    if (marks.length !== 1 || marks[0].provenance !== "app://bringup") {
+      throw new Error(`marks did not survive: ${JSON.stringify(marks)}`);
+    }
+    const profile = await a.driver.usProfileGet();
+    if (profile.displayName !== "Bringup Bea") {
+      throw new Error(`profile did not survive: ${JSON.stringify(profile)}`);
+    }
+    step(`marks + profile intact: ${marks[0].petname} ${marks[0].icon}, ${profile.displayName}`);
+
+    // RESUME IS NOT A JOIN: everything restored was announced before the
+    // kill, so the first drain must be empty rather than replaying the
+    // whole document as remote news.
+    const events = await a.driver.usEvents();
+    if (events.length !== 0) {
+      throw new Error(`resume replayed stale events: ${JSON.stringify(events)}`);
+    }
+    step("us-events drain empty (resume is not a join)");
+
+    // Authoring proves the chunk-envelope keys survived: the engine
+    // refuses to seal on a parent whose key it does not hold, and after a
+    // resume every parent is inherited history.
+    await a.tasks.add("authored after the kill");
+    const after = await a.tasks.items();
+    if (after.items.length !== RESUME_TODOS.length + 1) {
+      throw new Error("could not author on restored history");
+    }
+    step("authored a new change on restored history (chunk keys survived)");
+  } catch (e) {
+    dumpOnFail([["resume-read", a]]);
+    throw e;
+  }
+}
+
+/** Fresh boot, unchanged: no state root, so resume is a no-op `false`. */
+async function resumeFreshBootControl() {
+  const artifacts = await loadArtifacts();
+  const a = await newEngine("resume-control", artifacts, probeNoNet);
+  const resumed = await a.driver.stateResume();
+  if (resumed) throw new Error("state-resume answered true with no state root mounted");
+  let refused = "";
+  await a.driver.stateCheckpoint().catch((e) => {
+    refused = String(e);
+  });
+  if (!refused.includes("no state root")) {
+    throw new Error(`state-checkpoint should refuse without a state root, got: ${refused || "success"}`);
+  }
+  await a.driver.init(false);
+  step("no state root: resume=false, checkpoint refused, init still works");
+}
+
+async function resume() {
+  await resumeFreshBootControl();
+
+  const dir = await Deno.makeTempDir({ prefix: "pm-bringup-state-" });
+  step(`state root: ${dir}`);
+
+  const self = new URL(import.meta.url).pathname;
+  const run = async (phase: string, args: string[]) => {
+    const cmd = new Deno.Command(Deno.execPath(), {
+      args: ["run", "-A", self, phase, dir, ...args],
+      stdout: "piped",
+      stderr: "inherit",
+    });
+    const out = await cmd.output();
+    const text = new TextDecoder().decode(out.stdout);
+    console.log(text.trimEnd());
+    if (!out.success) throw new Error(`${phase} exited ${out.code}`);
+    return text;
+  };
+
+  const written = await run("resume-write", []);
+  const line = written.split("\n").find((l) => l.startsWith("RESUME-WRITE-OK"));
+  if (!line) throw new Error("resume-write produced no identity line");
+  const [, , partition] = line.trim().split(" ");
+  step("*** kill: the writer PROCESS is gone; only the state root remains ***");
+
+  await run("resume-read", [partition]);
+
+  await Deno.remove(dir, { recursive: true });
+  console.log("\nRESUME PASS");
+}
+
 // --- main ---------------------------------------------------------------------
 
 const phase = Deno.args[0] ?? "solo";
-const phases: Record<string, () => Promise<void>> = { solo, wire, bucket };
+const phases: Record<string, () => Promise<void>> = {
+  solo,
+  wire,
+  bucket,
+  resume,
+  // The two halves `resume` re-execs; not meant to be run by hand, but
+  // harmless and useful when debugging one side in isolation.
+  "resume-write": () => resumeWrite(Deno.args[1]),
+  "resume-read": () => resumeRead(Deno.args[1], Deno.args[2]),
+};
 const run = phases[phase];
 if (!run) {
   console.error(`unknown phase ${phase}; expected: ${Object.keys(phases).join("|")}`);

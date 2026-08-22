@@ -1,0 +1,59 @@
+# The worker-host platform spike (G5 persistence round).
+#
+# Answers, empirically and in a real headless Chromium, whether a
+# SharedWorker can host the engine and whether the storage/crypto
+# primitives a device host needs behave there. See README.md for the
+# findings matrix; this file only builds and runs it.
+#
+# The engine artifacts come from the DEMO's build (module identity: the
+# same envelope+wasm the demo ships, translated by the same translator),
+# so `build` delegates to `cd ../../demo && just translate` rather than
+# keeping a second copy of that pipeline.
+
+PLAYWRIGHT := "npm:playwright@1.57.0"
+
+default: run
+
+# The demo's engine artifacts: build/engine.plan.json (translated
+# envelope) + ../engine/target/composed.wasm (the composite).
+artifacts:
+    cd ../../demo && just translate
+
+# Bundle the page and the worker for the browser and assemble serve/.
+#
+# THE WORKER IS BUNDLED SEPARATELY from the page: a SharedWorker script is
+# its own module graph with its own global scope, and it is constructed
+# with {type:"module"} (page.ts) — a classic-worker bundle would need a
+# different output format entirely.
+#
+# The --external set is the demo's, verbatim, and for the demo's reason
+# (demo/justfile's `site` recipe): the webrtc port's NODE backends must
+# stay bare specifiers or deno resolves their `node:` builtins into URLs
+# the browser then fails to fetch. The grep below is the tripwire.
+build: artifacts
+    mkdir -p serve
+    deno check --config deno.json worker.ts page.ts
+    deno bundle --config deno.json --platform browser \
+        --external node-datachannel --external "node-datachannel/polyfill" --external werift \
+        -o serve/worker.js worker.ts
+    deno bundle --config deno.json --platform browser -o serve/page.js page.ts
+    ! grep -q 'node:' serve/worker.js || { echo "serve/worker.js imports a node: builtin — check the --external set" >&2; exit 1; }
+    cp probe.html serve/
+    cp ../../demo/build/engine.plan.json serve/engine.plan.json
+    cp ../../engine/target/composed.wasm serve/engine.component.wasm
+
+# Run the matrix. Prints a verdict per question; non-zero if a REQUIRED
+# row failed (the bonus relay row never fails the run).
+run: build
+    deno run -A --config deno.json run.ts
+
+# Type-check the harness on its own (it is not in the browser graph).
+check:
+    deno check --config deno.json run.ts worker.ts page.ts
+
+# Serve the built spike for hand-driving in a real browser.
+serve: build
+    deno run --allow-net --allow-read jsr:@std/http/file-server serve --port 0
+
+clean:
+    rm -rf serve last-run.json

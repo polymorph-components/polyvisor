@@ -44,6 +44,8 @@
     "@polyengine/translator": "jsr:@polyengine/translator@0.3.1",
     "@polyengine/wasi": "jsr:@polyengine/wasi@0.3.1",
     "@polyengine/wasi/http": "jsr:@polyengine/wasi@0.3.1/http",
+    "@polyengine/wasi/filesystem-node": "jsr:@polyengine/wasi@0.3.1/filesystem-node",
+    "@polyengine/wasi/filesystem-web": "jsr:@polyengine/wasi@0.3.1/filesystem-web",
     "@polymorph/webcrypto-polyengine": "jsr:@polymorph/webcrypto@0.3.0",
     "@polymorph/websocket-polyengine": "jsr:@polymorph/websocket@0.3.0",
     "@polymorph/webrtc-polyengine": "../../polymorph-webrtc-datachannels/polyengine-impl/src/webrtc.ts",

@@ -1,0 +1,5 @@
+serve/
+node_modules/
+# The driver's own scratch record of the last run; the matrix is printed
+# on every run and the justfile is the committed record of how.
+last-run.json

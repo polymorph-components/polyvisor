@@ -8,14 +8,14 @@
 //! with two parents exists); collaborator edits propagate; revocation cuts
 //! Bob off from new epochs while laptop and phone ride the rotation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use polymorph_webcrypto_wasmtime::{WasiWebcryptoCtx, WasiWebcryptoCtxView, WasiWebcryptoView};
 use wasmtime::component::{Accessor, Component, HasData, Linker, ResourceTable};
 use wasmtime::error::Context as _;
 use wasmtime::{bail, format_err, Config, Engine, Result, Store};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_webrtc_datachannels::{self as webrtc_host, WebrtcCtx, WebrtcCtxView, WebrtcView};
 use wasmtime_websocket::{WasiWebsocketCtx, WasiWebsocketCtxView, WasiWebsocketView};
 
@@ -33,6 +33,7 @@ mod bindings {
 }
 
 mod pairing_acts;
+mod resume_acts;
 
 use bindings::exports::polyvisor::engine::driver::{Guest as Driver, S3Config, StoreConfig};
 use bindings::polyvisor::engine::store_fetch_types::Response as FetchResponse;
@@ -411,11 +412,26 @@ async fn main() -> Result<()> {
     // verification hooks, and WASI environment is per-store, so isolating
     // them in their own store is what keeps those hooks from touching the
     // positive acts.
-    let make_store = |env: &[(&str, &str)]| {
+    // THE STATE ROOT, when one is asked for (#20 G5). `None` — every
+    // existing act set — builds a WasiCtx with NO preopened directory at
+    // all, which is the fresh-boot shape the guest's persistence treats
+    // as "no state to resume": `wasi:filesystem/preopens.get-directories`
+    // answers an empty list and `std::fs` fails at the first call. That
+    // is deliberately the DEFAULT here, so nothing that existed before
+    // this feature can accidentally acquire host filesystem access.
+    let make_store_in = |env: &[(&str, &str)], state_root: Option<&Path>| {
         let mut wasi = WasiCtxBuilder::new();
         wasi.inherit_stdout().inherit_stderr();
         for (k, v) in env {
             wasi.env(k, v);
+        }
+        if let Some(root) = state_root {
+            // Mounted at `/`: the ONE preopen the engine treats as its
+            // state root (guest/src/persist.rs). Writable, because the
+            // whole point is checkpointing — the browser side needs the
+            // same grant spelled `writable: true` (the spike's trap).
+            wasi.preopened_dir(root, "/", DirPerms::all(), FilePerms::all())
+                .expect("preopen the state root");
         }
         Store::new(
             &engine,
@@ -430,12 +446,16 @@ async fn main() -> Result<()> {
             },
         )
     };
+    let make_store = |env: &[(&str, &str)]| make_store_in(env, None);
 
+    if acts == "resume" {
+        return resume_scenarios(&component, &linker, &make_store_in, relay).await;
+    }
     if acts == "pairing" {
         return pairing_scenarios(&engine, &component, &linker, &make_store, relay).await;
     }
     if acts != "full" {
-        bail!("unknown act set {acts} (want `full` or `pairing`)");
+        bail!("unknown act set {acts} (want `full`, `pairing` or `resume`)");
     }
 
     let mut store = make_store(&[]);
@@ -457,6 +477,150 @@ async fn main() -> Result<()> {
             scenario(acc, laptop, phone, bob, tablet, laptop2, laptop3, relay, s3).await
         })
         .await?
+}
+
+/// Builds a store with the given WASI environment and, optionally, a
+/// preopened state root (see `make_store_in`).
+type StateStoreFactory<'a> = dyn Fn(&[(&str, &str)], Option<&Path>) -> Store<Ctx> + 'a;
+
+/// The kill-and-resume act set (#20 G5).
+///
+/// TWO STORES over ONE state root is the whole shape. `Store` owns the
+/// WASI context, so a second store is a second view of the same host
+/// directory with no other continuity — the closest a single process gets
+/// to "the worker died and a new one opened the same namespace". The
+/// device that checkpoints and the instance that resumes therefore share
+/// nothing but files on disk.
+async fn resume_scenarios(
+    component: &Component,
+    linker: &Linker<Ctx>,
+    make_store_in: &StateStoreFactory<'_>,
+    relay: String,
+) -> Result<()> {
+    let mut outcomes: Vec<(&str, std::result::Result<(), String>)> = Vec::new();
+
+    // The state root: a real directory, created fresh so a rerun never
+    // resumes the previous run's device.
+    let root = std::env::temp_dir().join(format!("pm-engine-state-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+    println!("state root: {}", root.display());
+
+    // Fresh-boot compatibility, in a store with NO preopen.
+    let mut store = make_store_in(&[], None);
+    let fresh = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    outcomes.push((
+        "no state root: resume answers false, init still works",
+        store
+            .run_concurrent(async move |acc| resume_acts::no_state_root_act(acc, fresh).await)
+            .await?
+            .map_err(|e| e.to_string()),
+    ));
+
+    let mut store = make_store_in(&[], Some(&root));
+    let device = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    let resumed = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    let peer = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    outcomes.push((
+        "kill and resume: state survives, identity holds, the peer still syncs",
+        store
+            .run_concurrent(async move |acc| {
+                resume_acts::resume_act(acc, device, resumed, peer, relay).await
+            })
+            .await?
+            .map_err(|e| e.to_string()),
+    ));
+
+    // Crash consistency, staged rather than asserted (resume_acts.rs).
+    let torn = std::env::temp_dir().join(format!("pm-engine-torn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&torn);
+    std::fs::create_dir_all(&torn).with_context(|| format!("creating {}", torn.display()))?;
+    let torn_outcome = (async {
+        let mut store = make_store_in(&[], Some(&torn));
+        let device = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+        store
+            .run_concurrent(async move |acc| resume_acts::torn_write_act(acc, device).await)
+            .await??;
+
+        // THE KILL, mid-manifest-write. Truncating the newest generation's
+        // MANIFEST to a prefix is precisely what a process death during
+        // that one file write leaves on disk: the bytes that made it, and
+        // no trailing digest. The engine must notice and step back a
+        // generation.
+        let mut gens: Vec<u64> = std::fs::read_dir(&torn)?
+            .filter_map(std::result::Result::ok)
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_prefix("gen-"))
+                    .and_then(|n| n.parse::<u64>().ok())
+            })
+            .collect();
+        gens.sort_unstable();
+        let newest = *gens
+            .last()
+            .ok_or_else(|| format_err!("the device wrote no generations at all"))?;
+        if gens.len() < 2 {
+            bail!("expected two generations to fall back between, got {gens:?}");
+        }
+        let manifest = torn.join(format!("gen-{newest}")).join("MANIFEST");
+        let whole = std::fs::read(&manifest)?;
+        std::fs::write(&manifest, &whole[..whole.len() / 2])?;
+        println!(
+            "[   torn  ] truncated gen-{newest}/MANIFEST: {} B -> {} B (a kill mid-write)",
+            whole.len(),
+            whole.len() / 2
+        );
+
+        let mut store = make_store_in(&[], Some(&torn));
+        let resumed = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+        store
+            .run_concurrent(async move |acc| resume_acts::torn_resume_act(acc, resumed).await)
+            .await??;
+        Ok::<(), wasmtime::Error>(())
+    })
+    .await;
+    outcomes.push((
+        "a kill mid-checkpoint resumes from the previous generation",
+        torn_outcome.map_err(|e| e.to_string()),
+    ));
+
+    // What the engine actually left on disk — evidence for the report,
+    // and a cheap tripwire on the layout.
+    println!("\n=== STATE ROOT CONTENTS ===");
+    let mut gens: Vec<_> = std::fs::read_dir(&root)?
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    gens.sort();
+    for g in &gens {
+        let mut files: Vec<String> = std::fs::read_dir(root.join(g))?
+            .filter_map(std::result::Result::ok)
+            .map(|e| {
+                let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                format!("{} ({len} B)", e.file_name().to_string_lossy())
+            })
+            .collect();
+        files.sort();
+        println!("  {g}/  {}", files.join("  "));
+    }
+
+    println!("\n=== RESUME ACT SETS ===");
+    let mut failed = 0;
+    for (name, outcome) in &outcomes {
+        match outcome {
+            Ok(()) => println!("  PASS  {name}"),
+            Err(e) => {
+                failed += 1;
+                println!("  FAIL  {name}: {e}");
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} resume act set(s) failed");
+    }
+    println!("\nRESUME ACTS PASSED");
+    Ok(())
 }
 
 /// The PAIRING.md §6 act sets, each in its own store.

@@ -1,0 +1,42 @@
+{
+  "//": [
+    "PINS COPIED VERBATIM FROM demo/deno.json (module identity): this spike",
+    "reuses ../../runtime/engine.ts, so the @polyengine/runtime specifier must",
+    "resolve to the SAME module here as it does for the demo — otherwise",
+    "`instanceof ComponentException` stops holding across the boundary and the",
+    "engine's err arms turn into unbranded throws. Any bump in demo/deno.json",
+    "must be mirrored here or this spike stops measuring the demo's engine.",
+    "",
+    "@polymorph/webrtc-datachannels stays on the sibling checkout for the same",
+    "reason demo/deno.json documents at length (the JSR copy defeats",
+    "`deno bundle --external`, leaving eager `node:` imports the browser cannot",
+    "fetch). One path segment deeper than demo's, since we are spikes/worker-host."
+  ],
+  "nodeModulesDir": "auto",
+  "//minimumDependencyAge": [
+    "demo/deno.json's value, copied for the same reason it exists there:",
+    "0.3.1 was published inside the default 24h window, and the default",
+    "policy would resolve the pin to 'no matching version' outright."
+  ],
+  "minimumDependencyAge": "PT1M",
+  "imports": {
+    "@polyengine/runtime/embedder": "jsr:@polyengine/runtime@0.3.1/embedder",
+    "@polyengine/wasi": "jsr:@polyengine/wasi@0.3.1",
+    "@polyengine/wasi/http": "jsr:@polyengine/wasi@0.3.1/http",
+    "@polyengine/wasi/filesystem-web": "jsr:@polyengine/wasi@0.3.1/filesystem-web",
+    "@polymorph/webcrypto-polyengine": "jsr:@polymorph/webcrypto@0.3.0",
+    "@polymorph/websocket-polyengine": "jsr:@polymorph/websocket@0.3.0",
+    "@polymorph/webrtc-polyengine": "../../../polymorph-webrtc-datachannels/polyengine-impl/src/webrtc.ts",
+    "node-datachannel": "npm:node-datachannel@0.32.3",
+    "node-datachannel/polyfill": "npm:node-datachannel@0.32.3/polyfill",
+    "werift": "npm:werift@0.22.2"
+  },
+  "compilerOptions": {
+    "lib": [
+      "deno.ns",
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ]
+  }
+}

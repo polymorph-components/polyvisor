@@ -155,6 +155,76 @@ interface driver {
     /// the bundled partition. Returns the identity id, hex.
     identity-import: async func(bundle: list<u8>, passphrase: option<string>, secret: option<list<u8>>) -> result<string, string>;
 
+    // --- state persistence (#20 G5; runtime/PERSISTENCE.md "Engine
+    // --- contract additions") ---
+    //
+    // The engine treats ONE preopened directory as its state root: the
+    // per-device OPFS directory in the browser, a real directory under
+    // wasmtime/Deno. If the embedder mounted no directory (the fresh-boot
+    // default — `@polyengine/wasi`'s batteries `wasi()` ships an
+    // empty-preopens filesystem stub), both calls below are inert:
+    // `state-resume` answers `false` and `state-checkpoint` reports that
+    // there is no state root. Nothing about an engine that is never
+    // checkpointed changes.
+    //
+    // THE MOUNT IS THE SEALED BOUNDARY. The engine writes PLAINTEXT into
+    // its state root — keyhive archive, chunk-envelope keys, and (in
+    // `seed` posture) the identity seed itself. Encryption at rest is the
+    // embedder's job: PERSISTENCE.md's per-device DEK wraps the directory
+    // the engine is handed, not the bytes the engine writes. An embedder
+    // that mounts an unsealed directory has chosen an unsealed device.
+
+    /// Write a crash-consistent snapshot of everything needed to resume:
+    /// the keyhive archive, the sedimentree chunk store (signatures
+    /// preserved — commits are re-stored, never re-signed), every held
+    /// partition's automerge state, the chunk-envelope keys, the active
+    /// partition binding and the user-system doc/group binding.
+    ///
+    /// ATOMICITY: generation directories plus a manifest written LAST.
+    /// Each checkpoint writes `gen-<n>/` fresh and only then writes
+    /// `gen-<n>/MANIFEST` (magic + payload + trailing digest, one file
+    /// write). `state-resume` takes the HIGHEST generation whose manifest
+    /// parses AND whose every member file matches its recorded digest, so
+    /// a kill at any instant leaves the previous generation intact and
+    /// selected. No rename is relied on: OPFS `rename-at` is emulated by
+    /// copy+delete and is not atomic.
+    ///
+    /// Cadence is the EMBEDDER's: there is no timer in the guest.
+    ///
+    /// Deliberately NOT captured: a partition created but not yet
+    /// sealed (it was never committed — losing it is the correct crash
+    /// semantics), the bucket/store configuration (embedder-supplied
+    /// addressing, re-applied on resume), and live wire state.
+    ///
+    /// In `platform` posture the snapshot is written WITHOUT identity
+    /// material — the private half is a non-extractable host handle the
+    /// guest cannot see. Such a checkpoint is complete in every other
+    /// respect and `state-resume` refuses it with an explicit message
+    /// until the platform-posture resume lands: an app-owned
+    /// device-identity import on this world, implemented by the embedder
+    /// over the port's `SigningKey.fromCryptoKey` seam (webcrypto#392;
+    /// PERSISTENCE.md "Engine contract additions").
+    state-checkpoint: async func() -> result<_, string>;
+
+    /// Resume from the state root INSTEAD of `init` — the embedder calls
+    /// this first and only calls `init` if it answers `false`.
+    ///
+    /// `true`: a valid checkpoint was found and this instance is now the
+    /// device it describes — same identity, same keyhive, same chunk
+    /// store, partitions re-bound and their content intact. `false`: the
+    /// state root is absent or holds no valid generation, so the caller
+    /// should `init` a fresh device. Errors are real faults (a corrupt
+    /// state root, an unsupported posture), never "nothing there".
+    ///
+    /// v1 restores the SEED-posture identity from the persisted material.
+    /// THE SEAM: `platform` posture rests as a non-extractable WebCrypto
+    /// handle the guest cannot see, so its resume arrives from OUTSIDE the
+    /// checkpoint: an app-owned device-identity import (embedder-implemented
+    /// via the port's fromCryptoKey seam — webcrypto#392, PERSISTENCE.md). Until
+    /// that lands, a platform-posture checkpoint is refused here rather
+    /// than silently downgraded to a fresh identity.
+    state-resume: async func() -> result<bool, string>;
+
     // --- the iroh wire + subduction sync (from the skeleton) ---
 
     iroh-bind: async func(relay-url: string) -> result<string, string>;
