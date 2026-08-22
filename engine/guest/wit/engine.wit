@@ -202,7 +202,7 @@ interface driver {
     /// respect and `state-resume` refuses it with an explicit message
     /// until the platform-posture resume lands: an app-owned
     /// device-identity import on this world, implemented by the embedder
-    /// over `webcryptoHost().inject.signingKey` (webcrypto#391;
+    /// over the port's `SigningKey.fromCryptoKey` seam (webcrypto#392;
     /// PERSISTENCE.md "Engine contract additions").
     state-checkpoint: async func() -> result<_, string>;
 
@@ -220,7 +220,7 @@ interface driver {
     /// THE SEAM: `platform` posture rests as a non-extractable WebCrypto
     /// handle the guest cannot see, so its resume arrives from OUTSIDE the
     /// checkpoint: an app-owned device-identity import (embedder-implemented
-    /// via the port's inject API — webcrypto#391, PERSISTENCE.md). Until
+    /// via the port's fromCryptoKey seam — webcrypto#392, PERSISTENCE.md). Until
     /// that lands, a platform-posture checkpoint is refused here rather
     /// than silently downgraded to a fresh identity.
     state-resume: async func() -> result<bool, string>;

@@ -187,8 +187,9 @@ blocker.
   optional signing-key; the embedder implements it by loading the
   persisted non-extractable handle from the device namespace (the
   device store's identity library — the wosh pattern) and turning it
-  into the port's typed handle via `webcryptoHost().inject.signingKey`
-  (polymorph-webcrypto PR #390). The checkpoint records posture only;
+  into the port's typed handle via `SigningKey.fromCryptoKey` (the
+  merged webcrypto#392 seams — by-value, structured-clone laundered).
+  The checkpoint records posture only;
   no key reference travels in engine state.
 - **State persistence**: the engine world gains wasi:filesystem
   imports; chunk store / keyhive archive / us state persist into the
@@ -223,12 +224,13 @@ account UX beyond the picker.
 
 ## Tracks and gates
 
-- **T-A (polymorph-webcrypto)**: DONE as webcrypto#390 per the #391
-  pivot — `webcryptoHost() → { imports, inject }`: embedder-held
-  CryptoKeys as typed handles (signing-key, derivation-key), kind
-  validated at the wrap, policy reported by the existing getters. The
-  IndexedDB persistence library moved OUT of the port and into T-C
-  (this repo owns it; honestly browser-only).
+- **T-A (polymorph-webcrypto)**: DONE as webcrypto#392 (merged;
+  superseding this round's #390 draft) — `fromCryptoKey`/`toCryptoKey`
+  seams on SigningKey/VerifyingKey/Ikm: by-value crossing with
+  structured-clone laundering, token-gated constructors, kind validated
+  at the wrap, policy read off the platform key. The IndexedDB
+  persistence library moved OUT of the port and into T-C (this repo
+  owns it; honestly browser-only).
 - **T-B (engine)**: wasi:filesystem persistence + kill-and-resume act
   (landed); platform-posture resume via the app-owned device-identity
   import + injection, once #390 releases. Gates: native acts with a

@@ -108,8 +108,9 @@ export interface Driver {
    * `false` means "nothing to resume" (no state root, or none valid) and
    * is the fresh-boot path, never an error. A rejection is a real fault —
    * a corrupt root, or a checkpoint in `platform` posture, whose resume
-   * awaits the app-owned device-identity import over the port's inject
-   * API (webcrypto#391; PERSISTENCE.md "Engine contract additions"). */
+   * awaits the app-owned device-identity import over the port's
+   * seam (webcrypto#392's fromCryptoKey; PERSISTENCE.md "Engine contract
+   * additions"). */
   stateResume(): Promise<boolean>;
 
   // --- device pairing (#10) + user-system (#36) --- (engine.wit ~214-280)
