@@ -46,14 +46,47 @@ relative path.
   browser capability, not a WebCrypto one), `sealed-fs.ts` (an OPFS
   directory proxy that seals the engine's state root while the guest
   sees plaintext), `locks.ts` (the device lock, the lease, and the T0
-  sweep) and `anchor.ts` (the tab's sessionStorage pointer). The worker
-  host and its RPC envelope are the NEXT track; everything here is
-  callable from a page or a worker and holds no long-lived connection.
+  sweep) and `anchor.ts` (the tab's sessionStorage pointer).
+
+  **The worker host** sits on top of all of it and changes none of it:
+  `worker.ts` is a SharedWorker ENTRY POINT — one worker per device, the
+  device id in its name — owning the device lock and its lease, the
+  namespace, the unseal state machine, the unwrapped DEK, and one engine
+  instance mounted on the sealed state root. `client.ts` is the tab's
+  half (`connectDevice()` → a typed remote `driver`/`tasks` pair plus
+  `unseal`/`reseal`/`checkpoint`/`status`), and `rpc.ts` is the wire
+  between them. Three things are worth knowing before reading it:
+
+  - **`worker.ts` is not exported from `mod.ts`, deliberately.** It
+    imports `../engine.ts`, whose bare `@polyengine`/`@polymorph`
+    specifiers only an embedder can map; re-exporting it would put those
+    pins in front of every consumer of the index. `client.ts` and
+    `rpc.ts` import no package at all, so a picker stays package-free.
+  - **The error envelope, not the exception.** `ComponentException` does
+    not survive structured clone — clone carries an `Error`'s `name`,
+    `message` and `stack` and drops every own property, which is the
+    entire content of a WIT err. So a rejection crosses as
+    `{message, name, isWitError, witPayload?, code?}` and the client
+    re-throws a `DeviceHostError` exposing them. **Branch on those
+    fields, never on the `ComponentException` brand and never on
+    `instanceof`**: module identity does not cross a worker boundary.
+    The client does mint the brand locally from the envelope's
+    `isWitError` bit, so an adapter written against the in-process
+    driver (`pairing-engine.ts`) works over the remote one unmodified —
+    a bridge for existing consumers, not the contract.
+  - **Checkpoint cadence is the embedder's**, and it is three triggers:
+    a 500 ms trailing debounce after any mutating call, an explicit
+    `checkpoint()` RPC, and a best-effort one when the last client
+    detaches. "Best-effort" is meant literally — a killed tab never says
+    goodbye and the worker has no unload hook of its own, so the
+    debounce is what actually protects the data.
 
   Its gate is `just test` in this directory: a browser-driven probe
   matrix (Playwright over a bundled page, spike-style — none of
   IndexedDB, OPFS, Web Locks, CryptoKey persistence or sessionStorage
-  can be asserted in Deno).
+  can be asserted in Deno). Rows 11-18 drive the host end to end
+  against the REAL engine artifacts: a killed worker, two genuine page
+  reloads, two tabs sharing one worker, and the T0 sweep.
 
 - **`tools/translate.ts`** — build-time translation from a component
   binary to an envelope (plan + FACT adapters). This runs at build
@@ -71,10 +104,19 @@ for what should be the same module). `demo/deno.json` is the only
 example of that mapping so far.
 
 `device-store/` imports NO package at all — only the platform and its
-own siblings — so it type-checks under any embedder's config and cannot
-be mis-pinned. `sealed-fs.ts` declares the OPFS handle interfaces
+own siblings — with ONE exception, and the exception is the reason the
+rule is worth stating. The core modules (index, namespace, seal,
+sealed-fs, identity-keys, locks, anchor, plus the host's `client.ts` and
+`rpc.ts`) type-check under any embedder's config and cannot be
+mis-pinned; `sealed-fs.ts` declares the OPFS handle interfaces
 `@polyengine/wasi/filesystem-web` consumes rather than importing them,
-which is what buys that. The one place a pin is needed is the probe
-harness, which mounts the REAL published fragment; it carries its own
-`tests/devstore/deno.json` with the pins copied from `demo/deno.json`,
-exactly as each spike does.
+which is what buys that. `device-store/worker.ts` is the exception: it
+imports `../engine.ts` because hosting a device means instantiating the
+engine, so it needs the embedder's pins like any other consumer — which
+is exactly why it is an entry point the embedder bundles rather than
+something `mod.ts` re-exports.
+
+The other place a pin is needed is the probe harness, which mounts the
+REAL published filesystem fragment and bundles the real worker; it
+carries its own `tests/devstore/deno.json` with the pins copied from
+`demo/deno.json`, exactly as each spike does.

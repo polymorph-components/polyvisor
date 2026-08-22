@@ -6,24 +6,36 @@
 // records a verdict. Nothing here decides pass/fail — the driver does,
 // so that the assertions live beside the reasoning about what they mean.
 //
-// WHY A PAGE AND NOT A WORKER. This track is the device store, not the
-// device HOST: every module under test is callable from either, holds no
-// long-lived connection, and the worker is the next track. The one
-// question that genuinely needs two contexts (does a second context see
-// the lock held?) is answered with a second PAGE, which the lock manager
-// treats exactly as it would a worker.
+// WHY A PAGE AND NOT A WORKER, for rows 1-10. Those rows are the device
+// STORE, not the device HOST: every module under test is callable from
+// either, holds no long-lived connection, and the worker was the next
+// track. The one question that genuinely needs two contexts (does a
+// second context see the lock held?) is answered with a second PAGE,
+// which the lock manager treats exactly as it would a worker.
+//
+// ROWS 11+ ARE THE HOST, and there the page is only a client: every
+// engine call, every DEK and every checkpoint happens inside
+// device-store/worker.ts, reached through `connectDevice`. So a PASS
+// there is a claim about the worker, not about the page's ambient
+// capabilities — the spike's discipline, kept.
 //
 // TEST DATA IS OBVIOUSLY SYNTHETIC AND LABELLED. Passphrases here are
 // literal strings like "correct-horse-battery-staple-TEST"; no value in
 // this file is, or resembles, real key material.
 
 import { filesystemWeb } from "@polyengine/wasi/filesystem-web";
+// The one import here that is NOT the device store: the visor's
+// PairingDriver adapter, pulled in so row 18 can prove it is
+// constructible over the REMOTE driver without a line changed.
+import { createEnginePairingDriver } from "../../pairing-engine.ts";
 import {
   adoptAnchor,
   anchorIsLive,
   clearAnchor,
+  connectDevice,
   createDevice,
   createSealedDek,
+  type DeviceConnection,
   deviceLockIsHeld,
   type DeviceLock,
   type DeviceNamespace,
@@ -35,6 +47,7 @@ import {
   listDevices,
   loadIdentity,
   loadOrMintIdentity,
+  namespaceExists,
   newDeviceId,
   openNamespace,
   persistIdentity,
@@ -52,6 +65,7 @@ import {
   sweepT0,
   touchDevice,
   touchLease,
+  type UnsealPolicy,
   unsealFromPlatform,
   unsealWithPassphrase,
 } from "../../device-store/mod.ts";
@@ -595,7 +609,257 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
       unknownIsNotLive: unknown === false,
     };
   },
+
+  // --- the worker host (rows 11+) -------------------------------------------
+  //
+  // From here down the page owns nothing but a MessagePort. The device
+  // id, the anchor and the index are resolved on this side (the index is
+  // unsealed and sessionStorage does not exist in a worker); the DEK,
+  // the engine, the lock, the lease and the checkpoints all live in
+  // device-store/worker.ts and are only ever observed through
+  // `connectDevice`'s surface.
+
+  /** Make a T1 device the way the promotion moment does: create, then
+   * promote WITH the seal choices. Returns the id for the driver to
+   * carry across a reload. */
+  "hc-make": async (arg: { petname: string; policy: UnsealPolicy; promote: boolean }) => {
+    const d = await createDevice({ petname: arg.petname, unsealPolicy: arg.policy });
+    if (arg.promote) await promoteDevice(d.id, { unsealPolicy: arg.policy });
+    const row = await getDevice(d.id);
+    return { id: d.id, tier: row?.tier, policy: row?.unsealPolicy };
+  },
+
+  /**
+   * Attach to a device's host. `unseal` present ⇒ also run the ceremony
+   * and report what it did; absent ⇒ report the SEALED status, which is
+   * how the every-session row proves no auto-unseal happened.
+   */
+  "hc-open": async (arg: {
+    id?: string;
+    anchorPetname?: string;
+    unseal?: { passphrase?: string; untilReseal?: boolean };
+  }) => {
+    const conn = await connect(arg);
+    const opened = arg.unseal ? await refuses(() => conn.unseal(arg.unseal)) : null;
+    return {
+      deviceId: conn.deviceId,
+      hello: conn.hello,
+      // `refuses` swallows the value, so status is asked for separately —
+      // which also proves the two agree.
+      unseal: opened,
+      status: await conn.status(),
+    };
+  },
+
+  /** The ceremony on its own, so a row can attempt it more than once
+   * (wrong passphrase, then right). */
+  "hc-unseal": async (arg: { id: string; opts: { passphrase?: string } }) => {
+    const conn = conns.get(arg.id)!;
+    const attempt = await refuses(() => conn.unseal(arg.opts));
+    return { attempt, status: await conn.status() };
+  },
+
+  "hc-reseal": async (arg: { id: string }) => ({
+    status: await conns.get(arg.id)!.reseal(),
+  }),
+
+  /** Drive the remote `tasks` surface: this is the structured-clone
+   * claim, made by moving real strings and real bigint revisions. */
+  "hc-add": async (arg: { id: string; titles: string[] }) => {
+    const conn = conns.get(arg.id)!;
+    const ids: string[] = [];
+    for (const t of arg.titles) ids.push(await conn.tasks.add(t));
+    return { ids };
+  },
+
+  "hc-items": async (arg: { id: string }) => {
+    const snap = await conns.get(arg.id)!.tasks.items();
+    return {
+      // `revision` is a WIT u64 and therefore a bigint over the port —
+      // structured clone carries it, JSON does not, so it is stringified
+      // HERE (at the Playwright boundary) and not before.
+      revision: String(snap.revision),
+      titles: snap.items.map((i) => i.title).sort(),
+      n: snap.items.length,
+    };
+  },
+
+  "hc-checkpoint": async (arg: { id: string }) => ({
+    at: await conns.get(arg.id)!.checkpoint(),
+  }),
+
+  "hc-status": async (arg: { id: string }) => await conns.get(arg.id)!.status(),
+
+  /** A refusal that must be a WIT error rather than a host bug: calling
+   * the engine through a SEALED host. Proves the envelope's `code` and
+   * `isWitError` bits are populated and distinguishable. */
+  "hc-call-sealed": async (arg: { id: string }) =>
+    await refuses(() => conns.get(arg.id)!.tasks.items()),
+
+  /**
+   * The kill. `__die` makes the worker `close()` its own global, which
+   * is a crash on demand: the lock and the lease go with it exactly as
+   * they would if the process had died. Closing every tab would also
+   * work and would take the observers with it.
+   */
+  "hc-die": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    await conn.__die();
+    conns.delete(arg.id);
+    // Locks are released asynchronously by the platform; give it a beat
+    // before anyone asks.
+    await new Promise((r) => setTimeout(r, 300));
+    return { lockHeld: await deviceLockIsHeld(arg.id) };
+  },
+
+  "hc-close": async (arg: { id: string }) => {
+    await conns.get(arg.id)?.close();
+    conns.delete(arg.id);
+    await new Promise((r) => setTimeout(r, 200));
+    return { lockHeld: await deviceLockIsHeld(arg.id) };
+  },
+
+  /** The C1 sweep rule, re-asked with a LIVE WORKER holding the lock:
+   * a T0 device whose host is alive is never garbage, whatever its lease
+   * says. The lease is backdated deliberately so the ONLY thing keeping
+   * the device is the worker's lock. */
+  "hc-sweep-live": async (arg: { id: string }) => {
+    await openNamespace(arg.id).put("meta", "lease", { at: Date.now() - 10 * 60_000 });
+    const result = await sweepT0();
+    return {
+      lockHeld: await deviceLockIsHeld(arg.id),
+      kept: result.kept.some((k) => k.id === arg.id && k.because === "lock-held"),
+      swept: result.swept.includes(arg.id),
+      stillIndexed: (await getDevice(arg.id)) !== undefined,
+    };
+  },
+
+  /** …and the other half: with the worker dead the same device IS
+   * collected, storage and all. */
+  "hc-sweep-dead": async (arg: { id: string }) => {
+    await openNamespace(arg.id).put("meta", "lease", { at: Date.now() - 10 * 60_000 });
+    const lockBefore = await deviceLockIsHeld(arg.id);
+    const result = await sweepT0();
+    return {
+      lockBefore,
+      swept: result.swept.includes(arg.id),
+      indexRowGone: (await getDevice(arg.id)) === undefined,
+      namespaceGone: !(await namespaceExists(arg.id)),
+      anchorNotLive: !(await anchorIsLive(arg.id)),
+    };
+  },
+
+  "hc-forget": async (arg: { ids: string[] }) => ({ cleanup: await cleanup(arg.ids) }),
+
+  /**
+   * THE DEBOUNCE, with no explicit checkpoint anywhere: write, wait out
+   * the 500 ms trailing window, and report what `status()` says about
+   * `lastCheckpoint`. The driver then kills the worker and reads the
+   * state back — which is the only assertion that actually matters, and
+   * the reason this op returns the two timestamps rather than judging.
+   */
+  "hc-debounce": async (arg: { id: string; title: string }) => {
+    const conn = conns.get(arg.id)!;
+    const before = (await conn.status()).lastCheckpoint;
+    await conn.tasks.add(arg.title);
+    const immediately = (await conn.status()).lastCheckpoint;
+    // Comfortably past the 500 ms trailing edge, and long enough that a
+    // slow IndexedDB commit does not make this flaky.
+    await new Promise((r) => setTimeout(r, 1_500));
+    const settled = (await conn.status()).lastCheckpoint;
+    return { before, immediately, settled };
+  },
+
+  /**
+   * THE PAIRING ADAPTER, CONSTRUCTED OVER THE REMOTE DRIVER — the
+   * serialization-discipline claim, made by the one consumer that would
+   * notice if it were false.
+   *
+   * `createEnginePairingDriver` (runtime/pairing-engine.ts) is written
+   * against the IN-PROCESS `Driver` and reads a WIT err payload out of
+   * every rejection via `isComponentException(e)` then `e.payload`. If
+   * the port dropped either the branding or the payload, this adapter
+   * would silently degrade every engine refusal to a stringified stack
+   * — a change nothing else here would catch, because it still "works".
+   *
+   * `usProfileGet()` on a device with no user-system is the cheapest
+   * genuine err arm the engine offers: no network, no pairing, no
+   * ceremony.
+   */
+  "hc-pairing": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const pairing = createEnginePairingDriver(conn.driver);
+    const profile = await pairing.usProfileGet();
+    // The RAW rejection underneath, reported field by field — because
+    // the interesting failure mode of this row is passing for the wrong
+    // reason. A refusal raised by the HOST (a sealed device, a bad
+    // method name) is also a `DeviceHostError`, and it carries no WIT
+    // payload at all; only a rejection the ENGINE produced sets
+    // `isWitError`. The driver asserts on that bit, so a host refusal
+    // can no longer masquerade as the thing under test.
+    let wire: { isWitError: boolean; witPayload: unknown; name: string; message: string } | null =
+      null;
+    try {
+      await conn.driver.usProfileGet();
+    } catch (e) {
+      const d = e as {
+        name: string;
+        message: string;
+        isWitError: boolean;
+        witPayload?: unknown;
+      };
+      wire = {
+        name: d.name,
+        message: String(d.message).slice(0, 120),
+        isWitError: d.isWitError,
+        witPayload: typeof d.witPayload === "string" ? d.witPayload.slice(0, 120) : d.witPayload,
+      };
+    }
+    return {
+      constructed: typeof pairing.pairJoinStart === "function" &&
+        typeof pairing.usEvents === "function",
+      adapterOk: profile.ok,
+      adapterError: profile.ok ? "" : String(profile.error).slice(0, 120),
+      /** The adapter's error string IS the WIT payload, not a message —
+       * which is only true if the brand and the payload both survived. */
+      adapterUsedPayload: !profile.ok && wire !== null && profile.error === wire.witPayload,
+      wire,
+    };
+  },
 };
+
+// --- the host client, per page ----------------------------------------------
+
+/** Where the harness's build put the engine. Resolved against the
+ * WORKER's URL inside the worker, which is why they are bare relative
+ * names rather than page-relative ones. */
+const ARTIFACTS = {
+  envelopeUrl: "./engine.plan.json",
+  wasmUrl: "./engine.component.wasm",
+} as const;
+
+/** One connection per device per page — the shape a real embedder has.
+ * Keyed by device id so a reload starts empty and every row has to
+ * re-attach, which is the point of the reload rows. */
+const conns = new Map<string, DeviceConnection>();
+
+function connect(arg: { id?: string; anchorPetname?: string }): Promise<DeviceConnection> {
+  const existing = arg.id ? conns.get(arg.id) : undefined;
+  if (existing) return Promise.resolve(existing);
+  return connectDevice({
+    device: arg.id
+      ? { kind: "id", id: arg.id }
+      // The T0 boot: whatever this TAB was looking at, or a fresh
+      // device. sessionStorage survives the reload; the worker does not.
+      : { kind: "anchor", petname: arg.anchorPetname ?? "ephemeral" },
+    workerUrl: "./worker.js",
+    artifacts: ARTIFACTS,
+    label: "probe",
+  }).then((c) => {
+    conns.set(c.deviceId, c);
+    return c;
+  });
+}
 
 const held = new Map<string, DeviceLock>();
 

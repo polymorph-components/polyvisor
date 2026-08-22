@@ -46,6 +46,14 @@ function record(n: string, title: string, ok: boolean | "info", evidence: string
 
 const j = (v: unknown) => JSON.stringify(v);
 
+// The host rows' synthetic test values, spelled the same way page.ts
+// spells them (page.ts's PASS/PASS_WRONG). Obviously not key material.
+const PASS = "correct-horse-battery-staple-TEST";
+const PASS_WRONG = "definitely-not-the-passphrase-TEST";
+const TODOS = ["buy milk", "write the worker host"];
+/** Row 17 writes exactly this and never asks for a checkpoint. */
+const DEBOUNCED = "never explicitly checkpointed";
+
 function serveSite(): { server: Deno.HttpServer; port: number } {
   let port = 0;
   const server = Deno.serve({
@@ -369,6 +377,351 @@ async function main() {
           `(${r.unknownIsNotLive}). The consumer's degrade rule — that is a fresh device, ` +
           `silently — is the caller's; this is the question it asks.`,
       );
+    });
+
+    // --- 11-16: THE WORKER HOST -------------------------------------------
+    //
+    // One browser context for all of them, deliberately: a fresh
+    // Playwright context is a fresh storage partition, so "close the
+    // page to kill the worker" would also throw away the IndexedDB and
+    // OPFS the claims are about (the spike hit exactly this —
+    // README.md's Q3 note on the persistent-profile block).
+    //
+    // From here on the page is only an RPC client. Every engine call,
+    // every DEK and every checkpoint happens inside the SharedWorker.
+
+    /** Row 11 carries its device into rows 12 and 16. */
+    let t1Device = "";
+    /** Row 13 carries its device into row 14. */
+    let sessionDevice = "";
+
+    // --- 11: the T1 lifecycle, killed and resumed -------------------------
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "host-t1",
+        policy: "until-reseal",
+        promote: true,
+      });
+      t1Device = made.id;
+
+      // The promotion ceremony's worker half: the DEK is minted INSIDE
+      // the worker, sealed under the passphrase, and the until-reseal
+      // wrap is armed in the same call.
+      const open = await probe(page, "hc-open", {
+        id: made.id,
+        unseal: { passphrase: PASS, untilReseal: true },
+      });
+      await probe(page, "hc-add", { id: made.id, titles: TODOS });
+      const before = await probe(page, "hc-items", { id: made.id });
+      const cp = await probe(page, "hc-checkpoint", { id: made.id });
+      const died = await probe(page, "hc-die", { id: made.id });
+
+      // RECONNECT: a brand-new SharedWorker under the same name, which
+      // is what a respawn is. No passphrase this time — the until-reseal
+      // rung is the whole point.
+      const back = await probe(page, "hc-open", { id: made.id, unseal: {} });
+      const after = await probe(page, "hc-items", { id: made.id });
+
+      const ok = made.tier === "t1" && open.unseal.refused === false &&
+        open.status.resumed === false && open.status.sealed === false &&
+        before.n === 2 && cp.at > 0 && died.lockHeld === false &&
+        back.unseal.refused === false && back.status.resumed === true &&
+        back.hello.bootSeq > open.hello.bootSeq &&
+        back.hello.instanceNonce !== open.hello.instanceNonce &&
+        j(after.titles) === j(before.titles) && after.n === 2;
+      record(
+        "11 host",
+        "T1: promote → unseal → fresh engine → tasks → checkpoint → KILL the worker → resume",
+        ok,
+        `promote(until-reseal) gives tier=${made.tier}; the first unseal mints the DEK in the ` +
+          `worker and the engine comes up FRESH (stateResume()=${open.status.resumed}); ` +
+          `tasks.add ×2 over the port → rev=${before.revision} n=${before.n} ${j(before.titles)}; ` +
+          `explicit checkpoint at ${cp.at}; then the probe-only die RPC closes the worker's own ` +
+          `global and the device lock is released with no cooperation (lockHeld=${died.lockHeld}); ` +
+          `a reconnect gets a NEW worker (boot ${open.hello.bootSeq}→${back.hello.bootSeq}, new ` +
+          `nonce: ${back.hello.instanceNonce !== open.hello.instanceNonce}), auto-unseals from the ` +
+          `platform wrap with NO passphrase, and stateResume() answers ` +
+          `${back.status.resumed} — the todos are ${j(after.titles)}`,
+      );
+    });
+
+    // --- 12: the same, across a REAL page reload --------------------------
+    await guard(async () => {
+      const before = await probe(page, "hc-items", { id: t1Device });
+      const wasBoot = (await probe(page, "hc-status", { id: t1Device })).bootSeq;
+
+      // THE RESPAWN PATH. The spike measured this Chromium replacing the
+      // worker on EVERY single-tab reload (Q4) — the zero-client window
+      // at navigation — so this row is not a repeat of row 11 by another
+      // route: it is the case the T0 design was rewritten for, and the
+      // only one a user actually performs.
+      await page.reload({ waitUntil: "load" });
+      await ready(page);
+
+      const back = await probe(page, "hc-open", { id: t1Device, unseal: {} });
+      const after = await probe(page, "hc-items", { id: t1Device });
+      const ok = back.unseal.refused === false && back.status.resumed === true &&
+        back.status.sealed === false && back.hello.bootSeq > wasBoot &&
+        j(after.titles) === j(before.titles);
+      record(
+        "12 host",
+        "a REAL page reload respawns the worker; the device auto-unseals and resumes",
+        ok,
+        `boot ${wasBoot} → ${back.hello.bootSeq} across the navigation (the worker really was ` +
+          `replaced — spike Q4's zero-client window, measured again here); the fresh worker ` +
+          `auto-unseals from the persisted wrap (sealed=${back.status.sealed}) and ` +
+          `stateResume() answers ${back.status.resumed}; the todos survive: ${j(after.titles)}`,
+      );
+    });
+
+    // --- 13: the every-session rung DEMANDS the passphrase ----------------
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "host-every",
+        policy: "every-session",
+        promote: true,
+      });
+      sessionDevice = made.id;
+      const open = await probe(page, "hc-open", {
+        id: made.id,
+        unseal: { passphrase: PASS },
+      });
+      await probe(page, "hc-add", { id: made.id, titles: TODOS });
+      const before = await probe(page, "hc-items", { id: made.id });
+      await probe(page, "hc-checkpoint", { id: made.id });
+      await probe(page, "hc-close", { id: made.id });
+
+      await page.reload({ waitUntil: "load" });
+      await ready(page);
+
+      // NO UNSEAL ARGUMENT AT ALL: this is the claim. A device on the
+      // real tier must not open itself, and the worker must not quietly
+      // try the platform wrap on its behalf.
+      const sealed = await probe(page, "hc-open", { id: made.id });
+      const engineRefused = await probe(page, "hc-call-sealed", { id: made.id });
+      const wrong = await probe(page, "hc-unseal", {
+        id: made.id,
+        opts: { passphrase: PASS_WRONG },
+      });
+      const right = await probe(page, "hc-unseal", { id: made.id, opts: { passphrase: PASS } });
+      const after = await probe(page, "hc-items", { id: made.id });
+
+      const ok = open.status.resumed === false && before.n === 2 &&
+        sealed.status.sealed === true && sealed.status.needsPassphrase === true &&
+        sealed.status.resumed === null &&
+        sealed.status.rungs.passphrase === true && sealed.status.rungs.untilReseal === false &&
+        engineRefused.refused && engineRefused.error.code === "no-rung" &&
+        wrong.attempt.refused && wrong.attempt.error.code === "wrong-passphrase" &&
+        wrong.status.sealed === true &&
+        right.attempt.refused === false && right.status.resumed === true &&
+        j(after.titles) === j(before.titles);
+      record(
+        "13 host",
+        "every-session: after a reload the unseal DEMANDS the passphrase, refuses the wrong one cleanly",
+        ok,
+        `the device rests with rungs=${j(sealed.status.rungs)} — a passphrase and NO platform ` +
+          `wrap; after the reload it comes back sealed=${sealed.status.sealed} ` +
+          `needsPassphrase=${sealed.status.needsPassphrase} and no engine at all ` +
+          `(resumed=${sealed.status.resumed}); a driver call through the sealed host is refused ` +
+          `as ${j(engineRefused.error.code)}; the WRONG passphrase is refused with ` +
+          `${wrong.attempt.error.name} code=${j(wrong.attempt.error.code)} and the device stays ` +
+          `sealed (${wrong.status.sealed}); the right one resumes ` +
+          `(stateResume()=${right.status.resumed}) and the todos are ${j(after.titles)}`,
+      );
+    });
+
+    // --- 14: two pages, one context, one device, ONE worker ---------------
+    await guard(async () => {
+      const second = await openPage(ctx, port);
+      const a = await probe(page, "hc-status", { id: sessionDevice });
+      // The second tab attaches with NO ceremony: the device is already
+      // open, and "unsealed while the app is open ANYWHERE" is exactly
+      // the worker's lifetime.
+      const b = await probe(second, "hc-open", { id: sessionDevice });
+      const itemsA = await probe(page, "hc-items", { id: sessionDevice });
+      const itemsB = await probe(second, "hc-items", { id: sessionDevice });
+
+      // A write from one tab is visible to the other because there is
+      // only one engine — the dangerous case (two tabs, one device) made
+      // structural rather than policed.
+      await probe(second, "hc-add", { id: sessionDevice, titles: ["from the second tab"] });
+      const afterA = await probe(page, "hc-items", { id: sessionDevice });
+      const afterB = await probe(second, "hc-items", { id: sessionDevice });
+      const statusB = await probe(second, "hc-status", { id: sessionDevice });
+      await probe(second, "hc-close", { id: sessionDevice });
+      await second.close();
+
+      const ok = b.hello.bootSeq === a.bootSeq &&
+        b.hello.instanceNonce === a.instanceNonce && b.hello.attached === true &&
+        b.status.sealed === false && itemsA.revision === itemsB.revision &&
+        afterA.revision === afterB.revision && afterA.revision !== itemsA.revision &&
+        afterA.n === 3 && afterB.n === 3 && statusB.clients === 2;
+      record(
+        "14 host",
+        "two pages, one device: the SAME worker, one engine, one revision",
+        ok,
+        `the second tab's hello carries boot=${b.hello.bootSeq} nonce=${b.hello.instanceNonce ===
+          a.instanceNonce
+          ? "identical"
+          : "DIFFERENT"} and attached=${b.hello.attached} — it joined the running host rather ` +
+          `than spawning one (a SharedWorker is keyed by origin+url+NAME, and the name is the ` +
+          `device); it needs no ceremony (sealed=${b.status.sealed}); both tabs read revision ` +
+          `${itemsA.revision}; a tasks.add from the second tab moves BOTH to ${afterA.revision} ` +
+          `with n=${afterA.n}; the host counts ${statusB.clients} clients`,
+      );
+    });
+
+    // --- 15: T0 — the anchor, the reload, and the sweep --------------------
+    await guard(async () => {
+      // ITS OWN PAGE, because the anchor is per-TAB sessionStorage and
+      // because this row has to CLOSE the tab to kill the host — which
+      // is what makes the sweep's precondition (lock free) true.
+      const t0 = await openPage(ctx, port);
+      const first = await probe(t0, "hc-open", { anchorPetname: "ephemeral", unseal: {} });
+      const id = first.deviceId;
+      await probe(t0, "hc-add", { id, titles: TODOS });
+      const before = await probe(t0, "hc-items", { id });
+      await probe(t0, "hc-checkpoint", { id });
+
+      // C1's sweep rule, re-asked with a LIVE WORKER: the lease is
+      // backdated on purpose, so the lock is the only thing keeping this
+      // device — which is precisely the claim.
+      const live = await probe(t0, "hc-sweep-live", { id });
+
+      await t0.reload({ waitUntil: "load" });
+      await ready(t0);
+      // No id: the tab rehydrates from its OWN sessionStorage pointer,
+      // which is the entire T0 reload story.
+      const back = await probe(t0, "hc-open", { anchorPetname: "ephemeral", unseal: {} });
+      const after = await probe(t0, "hc-items", { id: back.deviceId });
+
+      await probe(t0, "hc-close", { id });
+      await t0.close();
+      await new Promise((r) => setTimeout(r, 600));
+      const dead = await probe(page, "hc-sweep-dead", { id });
+
+      const ok = first.status.tier === "t0" && first.status.resumed === false &&
+        first.status.sealed === false && before.n === 2 &&
+        live.lockHeld && live.kept && !live.swept && live.stillIndexed &&
+        back.deviceId === id && back.status.resumed === true &&
+        j(after.titles) === j(before.titles) &&
+        dead.lockBefore === false && dead.swept && dead.indexRowGone &&
+        dead.namespaceGone && dead.anchorNotLive;
+      record(
+        "15 host",
+        "T0: no ceremony, survives a REAL reload through the anchor, and is swept when the host dies",
+        ok,
+        `a T0 device is created and opened with NO ceremony at all (tier=${first.status.tier}, ` +
+          `sealed=${first.status.sealed}) — its DEK rests under the namespace's non-extractable ` +
+          `platform key, and its ephemerality is the SWEEP, not key volatility (worker.ts's ` +
+          `sealT0); two todos, a checkpoint; with the worker alive and the lease deliberately ` +
+          `backdated 10 minutes the sweep KEEPS it because the lock is held ` +
+          `(kept=${live.kept} swept=${live.swept}); after a REAL reload the tab rehydrates the ` +
+          `SAME device from sessionStorage (${back.deviceId === id}) and stateResume() answers ` +
+          `${back.status.resumed} with ${j(after.titles)} intact; then the tab is CLOSED, the ` +
+          `lock is free (${dead.lockBefore === false}) and the sweep collects it — index row ` +
+          `gone: ${dead.indexRowGone}, namespace gone: ${dead.namespaceGone}, the anchor's ` +
+          `liveness question now answers no: ${dead.anchorNotLive}`,
+      );
+    });
+
+    // --- 16: reseal puts the ceremony back --------------------------------
+    await guard(async () => {
+      const open = await probe(page, "hc-open", { id: t1Device, unseal: {} });
+      const before = await probe(page, "hc-items", { id: t1Device });
+      const resealed = await probe(page, "hc-reseal", { id: t1Device });
+      const refused = await probe(page, "hc-unseal", { id: t1Device, opts: {} });
+      const engineRefused = await probe(page, "hc-call-sealed", { id: t1Device });
+      const back = await probe(page, "hc-unseal", { id: t1Device, opts: { passphrase: PASS } });
+      const after = await probe(page, "hc-items", { id: t1Device });
+
+      const ok = open.status.sealed === false && resealed.status.sealed === true &&
+        resealed.status.rungs.untilReseal === false &&
+        resealed.status.rungs.passphrase === true &&
+        resealed.status.needsPassphrase === true && resealed.status.resumed === null &&
+        refused.attempt.refused && refused.attempt.error.code === "no-rung" &&
+        engineRefused.refused &&
+        back.attempt.refused === false && back.status.resumed === true &&
+        j(after.titles) === j(before.titles);
+      record(
+        "16 host",
+        "reseal(): the persisted wrap goes, the worker drops the DEK, the next unseal is a ceremony again",
+        ok,
+        `the device was open (sealed=${open.status.sealed}); after reseal() the status says ` +
+          `sealed=${resealed.status.sealed} rungs=${j(resealed.status.rungs)} ` +
+          `needsPassphrase=${resealed.status.needsPassphrase}, and the engine is gone with the ` +
+          `key (resumed=${resealed.status.resumed}); an unseal with no passphrase is refused ` +
+          `(${j(refused.attempt.error.code)}) and so is a driver call; the PASSPHRASE still ` +
+          `opens the device — the rung reseal deliberately leaves standing — and it resumes ` +
+          `(${back.status.resumed}) with ${j(after.titles)} intact`,
+      );
+    });
+
+    // --- 17: the checkpoint cadence, with nobody asking ------------------
+    await guard(async () => {
+      // WITH THE PASSPHRASE, because row 16 resealed this device and the
+      // platform wrap really is gone — the ceremony is the point of that
+      // row and this row must not quietly undo it.
+      const open = await probe(page, "hc-open", { id: t1Device, unseal: { passphrase: PASS } });
+      const beat = await probe(page, "hc-debounce", { id: t1Device, title: DEBOUNCED });
+      // THE ASSERTION THAT MATTERS: kill the host without ever calling
+      // `checkpoint()`, and see whether the write is still there. A
+      // `lastCheckpoint` that merely moved could be a timer that wrote
+      // nothing.
+      await probe(page, "hc-die", { id: t1Device });
+      const back = await probe(page, "hc-open", { id: t1Device, unseal: { passphrase: PASS } });
+      const after = await probe(page, "hc-items", { id: t1Device });
+
+      const ok = open.status.sealed === false &&
+        beat.settled !== null && beat.settled !== beat.before &&
+        back.status.resumed === true && after.titles.includes(DEBOUNCED);
+      record(
+        "17 host",
+        "the trailing 500ms debounce checkpoints a mutation nobody checkpointed",
+        ok,
+        `one tasks.add and then NOTHING — no explicit checkpoint call anywhere in this row. ` +
+          `lastCheckpoint was ${j(beat.before)} before the write, ${j(beat.immediately)} ` +
+          `immediately after it (the trailing edge has not fired yet — a LEADING-edge debounce ` +
+          `would have recorded the state from before the write, which is the one moment nobody ` +
+          `wants), and ${j(beat.settled)} once the window closed. Then the worker is killed ` +
+          `outright and a new one resumes (${back.status.resumed}) with the write present: ` +
+          `${after.titles.includes(DEBOUNCED)} — ${j(after.titles)}`,
+      );
+    });
+
+    // --- 18: the PairingDriver adapter over the REMOTE driver -------------
+    await guard(async () => {
+      const r = await probe(page, "hc-pairing", { id: t1Device });
+      // THE WIT BIT IS THE ASSERTION. A host-side refusal (sealed
+      // device, unknown method) is also a DeviceHostError and would have
+      // made a looser version of this row green while proving nothing —
+      // it did, on the first run of this matrix, because row 16 had
+      // resealed the device out from under it.
+      const ok = r.constructed && r.adapterOk === false &&
+        r.wire !== null && r.wire.isWitError === true &&
+        typeof r.wire.witPayload === "string" && r.wire.witPayload.length > 0 &&
+        r.adapterUsedPayload;
+      record(
+        "18 host",
+        "runtime/pairing-engine.ts's adapter is constructible over the remote driver, payload and all",
+        ok,
+        `createEnginePairingDriver(remote.driver) builds a complete PairingDriver ` +
+          `(${r.constructed}) with not one line changed — every method it needs moves only ` +
+          `structured-clone-safe values (Uint8Array ids, strings, plain records, {kind,value} ` +
+          `variants, u64 bigints), so nothing had to be excluded from the proxy. Its error path ` +
+          `is the half that could have rotted silently: the adapter reads a WIT err payload out ` +
+          `of every rejection via isComponentException(e) then e.payload, and over the port it ` +
+          `still gets one — the raw rejection is a ${r.wire?.name} with ` +
+          `isWitError=${r.wire?.isWitError} carrying witPayload=${j(r.wire?.witPayload)}, and ` +
+          `the adapter's own error string IS that payload rather than a message ` +
+          `(${r.adapterUsedPayload}). Module identity does NOT cross a worker boundary; what ` +
+          `makes this work is that DeviceHostError mints the ComponentException brand LOCALLY ` +
+          `from the envelope's isWitError bit (rpc.ts), never by cloning anything branded — ` +
+          `symbols do not clone, and Symbol.for's registry is per-agent.`,
+      );
+
+      await probe(page, "hc-close", { id: t1Device });
+      await probe(page, "hc-forget", { ids: [t1Device, sessionDevice] });
     });
 
     await ctx.close();

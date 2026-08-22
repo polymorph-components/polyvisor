@@ -7,10 +7,17 @@
 // root, the device LOCK and the T0 sweep, and the sessionStorage
 // ANCHOR a tab uses to find its ephemeral device again after a reload.
 //
-// What is NOT here, deliberately: the worker host and its RPC envelope
-// (the next track). Everything in this family is callable from a page
-// or a worker and holds no long-lived connection, so the host can sit
-// on top of it without any of it having to change.
+// Everything in this family is callable from a page or a worker and
+// holds no long-lived connection, so the WORKER HOST sits on top of it
+// without any of it having to change.
+//
+// THE HOST IS TWO FILES AND ONLY ONE OF THEM IS HERE. `client.ts` (the
+// tab's half) and `rpc.ts` (the wire) are exported below; `worker.ts` is
+// NOT, and must not be — it is a SharedWorker ENTRY POINT the embedder
+// bundles as its own module graph, and it imports ../engine.ts, whose
+// bare `@polyengine`/`@polymorph` specifiers only the embedder can map
+// (runtime/README.md's resolution model). Re-exporting it would put
+// those pins in front of every consumer of the index.
 
 export {
   createDevice,
@@ -87,3 +94,23 @@ export {
 } from "./locks.ts";
 
 export { adoptAnchor, anchorIsLive, clearAnchor, getAnchor, setAnchor } from "./anchor.ts";
+
+export {
+  type ConnectSpec,
+  connectDevice,
+  type DeviceChoice,
+  type DeviceConnection,
+} from "./client.ts";
+
+export {
+  type AttachSpec,
+  DeviceHostError,
+  type DeviceStatus,
+  DRIVER_METHODS,
+  type Hello,
+  type HostMethod,
+  READONLY_METHODS,
+  TASKS_METHODS,
+  type UnsealOptions,
+  type WireError,
+} from "./rpc.ts";
