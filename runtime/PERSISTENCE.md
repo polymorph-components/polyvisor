@@ -45,10 +45,14 @@ picker needs and nothing personal:
   enforces that it is not even ambient in the DOM), the user's name,
   the user's icon, any account identifier, any key material.
 
-Pre-unseal chrome is therefore generic. The user's colour, name and
-icon appear at the moment of unseal — which gives unseal-as-login a
-real anti-spoofing property: a page imitating the picker cannot paint
-your colour. Render nothing personal until the seal opens.
+Pre-unseal chrome is therefore generic, and the visor itself is part of
+what "generic" has to cover: it boots UNCLAIMED — the strip and drawer
+in a zero-chroma grey dress, the identity cluster empty — so that the
+picker can be a visor drawer sheet without any of this becoming
+renderable early. The user's colour, name and icon appear at the moment
+of unseal, which gives unseal-as-login a real anti-spoofing property: a
+page imitating the picker cannot paint your colour. Render nothing
+personal until the seal opens.
 
 ## Namespaces: strict partitioning
 
@@ -166,10 +170,28 @@ blocker.
 
 ## Unseal UX
 
-- Boot: index read → picker (generic chrome; device petnames only).
+- Boot: index read → picker. The picker is a VISOR DRAWER SHEET in the
+  UNCLAIMED dress: generic grey (no anchor colour has been read, let
+  alone painted), an empty identity cluster, and index content only —
+  device petnames and times. It is in the drawer rather than in page
+  flow because the drawer's mechanics are the part a page-flow card
+  could not offer: the sheet hangs off the pinned strip and the page is
+  dimmed around it, neither of which a component confined to its own
+  rectangle can reproduce. So the surface where the passphrase is typed
+  is spatially distinguishable from anything an app can draw, even
+  before there is a colour to compare.
   One device in the index and a policy that permits it: auto-unseal
-  straight to the app.
+  straight to the app, with no sheet at all (a picker that flickered
+  open and shut for the fraction of a second an unseal takes would teach
+  the user that visor motion is noise). A failed auto-unseal mounts the
+  picker carrying the refusal.
 - Unseal success is when the visor becomes yours: colour, name, icon.
+  All three arrive together, at the claim.
+- After the seal opens, an account-less device gets the same treatment:
+  the fork ("new account" / "join another device") and the join
+  ceremony's code + SAS are drawer sheets too. Identity, account and
+  ceremony UI appears only in visor territory, without exception —
+  that is the one boundary a user can be taught once.
 - **Device-name display rule** (ruled): the strip shows the device
   petname whenever this browser's index holds MORE THAN ONE device —
   pickable, not merely active. One device: no label, it is noise.
