@@ -1997,6 +1997,62 @@ webcrypto#395). The mismatch row surfaced and fixed an unseal
 atomicity bug: key AND engine, or neither. 26 matrix rows, e2e 16/16
 throughout.
 
+**The passkey rung: WebAuthn PRF unseal** (2026-08-22, the PRF-unseal
+round — the KEK ladder's parked passphrase-free rung, recorded in the
+G5 close-out; design record: the "The PRF rung: passkey unseal"
+section of [runtime/PERSISTENCE.md](runtime/PERSISTENCE.md); platform
+facts [spikes/prf-unseal/](spikes/prf-unseal/)). The round opened with
+the spike that gated it: Playwright's CDP virtual authenticator serves
+hmac-secret/PRF (`hasPrf`), outputs are deterministic per
+(credential, input) and separated per input, this Chromium evaluates
+PRF at `create()` time (optional elsewhere — the rung keeps the
+one-assertion fallback), and a derived non-extractable KEK
+structured-clones through `postMessage` — so the whole browser gate
+story existed before any design writing. The rung itself: enroll a
+passkey for the device (resident key, ES256, uv REQUIRED and pinned at
+both ceremonies — hmac-secret keeps two per-credential secrets, so a
+drifting effective-UV state would derive a wrong key on a real
+authenticator); unseal asserts it with `prf.eval` over a stored
+32-byte input; the output feeds HKDF-SHA-256 (stored salt, info bound
+to the device id so a wrap copied between namespaces refuses as a
+typed `wrong-passkey` instead of unwrapping a foreign DEK); the
+derived KEK wraps the DEK with AES-KW exactly as the passphrase rung
+does. `PrfWrap` is `PassphraseWrap`'s sibling (`wrap:prf`, no `origin`
+field — a PRF rung is always a walkable door, by construction), and
+the window/worker split is stated honestly: `navigator.credentials` is
+window-only, so the assertion runs on the PAGE and what crosses the
+port is the non-extractable KEK handle — the raw PRF output transits
+page JS exactly as a typed passphrase does; what the rung removes is
+the human secret and the wrap's offline guessability, and unlike
+`until-reseal`, profile possession alone does not open it. Enrollment
+is a third promotion choice (authorized by the platform rung, which is
+then DELETED — asked-to-be-asked, the every-session arm's rule) plus a
+kept-device switch (authorized by the passphrase when no platform wrap
+exists); the wosh ceremonies were the validated scaffolding
+(transports capture/replay, resident-key discipline), the PRF
+extension the new construction. Reseal leaves the PRF wrap standing
+(an assertion per unseal is the point) and the reseal-upgrade guard
+generalized: any reachable rung — user passphrase OR passkey — means
+no upgrade question. Rungs stay additive: a switched device's
+passphrase remains an explicit picker fallback. Recovery is a recorded
+seam, not built: a synced passkey makes the credential portable, never
+the wrap; #11's direction (an account bundle in bucket storage under a
+domain-separated second PRF input — the dual-eval seam) is written
+down in the record. The round crossed #88 mid-flight (the entry
+ceremonies became visor drawer sheets), so the picker's passkey surface
+was re-expressed in visor/ui/entry.ts's drawer picker behind an
+optional host seam — `openWithPasskey` beside `open` — keeping the
+visor free of any device-store import: the visor renders the door, the
+embedder walks it. Gates: the devstore matrix grew to 28 rows —
+passkey promotion/login across a worker kill, wrong-key as one clean
+AES-KW bit, reseal survival with both doors, and a planted platform
+wrap NEVER walked silently by a passkey device; e2e 17/17 with a
+solo-passkey scenario (real enrollment and login ceremonies against
+the CDP authenticator on a localhost RP — WebAuthn refuses IP
+origins); invariants green, the entry-markup check extended to the
+passkey ids; the e2e round caught a real picker busy-guard collision
+before it shipped.
+
 **Storage egress from the worker host: G4's browser leg meets the
 device store** (2026-08-22, the round after G5 — the seam the G5
 close-out named: a worker-hosted device had no bucket path, because the
@@ -2037,7 +2093,8 @@ with the reason recorded (a bearer is a disclosed string with no
 platform escrow — handing one over the port is exactly the banned
 cleartext crossing; the recorded v2 shape runs the token exchange in
 the worker so the bearer never exists in page memory). Gates: the
-devstore matrix grew 26→29 rows (seams refuse before any binding even
+devstore matrix grew by six rows (renumbered 28–33 on integration, the
+PRF round having taken 24–27 in parallel; seams refuse before any binding even
 when a client sneaks `initStore` past the ceremony; a bind's
 `ensureBucket` egress observed by an in-harness recorder carrying
 `AWS4-HMAC-SHA256 Credential=<synthetic key>` — the page escrowed, the

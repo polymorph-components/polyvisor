@@ -164,8 +164,15 @@ serve: site
 # ?relay=&s3= overrides — Pages hosts the artifact, not the network.
 pages: translate app panels check
     mkdir -p ../docs/demo
-    deno check host/demo.ts ../visor/frame/frame.ts ../visor/frame/frame-backend.ts
+    deno check host/demo.ts host/solo.ts host/solo-worker.ts ../visor/frame/frame.ts ../visor/frame/frame-backend.ts
     deno bundle --platform browser --minify --external node-datachannel --external "node-datachannel/polyfill" --external werift -o ../docs/demo/demo.js host/demo.ts
+    # THE SOLO PAGE (see `site` above for why the --external set must
+    # match demo.js): same two bundles, same node: tripwire.
+    deno bundle --platform browser --minify --external node-datachannel --external "node-datachannel/polyfill" --external werift -o ../docs/demo/solo.js host/solo.ts
+    deno bundle --platform browser --minify --external node-datachannel --external "node-datachannel/polyfill" --external werift -o ../docs/demo/solo-worker.js host/solo-worker.ts
+    ! grep -q 'node:' ../docs/demo/solo.js || { echo "docs/demo/solo.js imports a node: builtin — check the --external set" >&2; exit 1; }
+    ! grep -q 'node:' ../docs/demo/solo-worker.js || { echo "docs/demo/solo-worker.js imports a node: builtin — check the --external set" >&2; exit 1; }
+    ! grep -q 'node:' ../docs/demo/demo.js || { echo "docs/demo/demo.js imports a node: builtin — check the --external set" >&2; exit 1; }
     deno bundle --platform browser --minify -o ../docs/demo/frame.js ../visor/frame/frame.ts
     cp ../visor/frame/frame.html ../docs/demo/
     cp build/app.component.wasm build/app.plan.json ../docs/demo/
@@ -174,6 +181,7 @@ pages: translate app panels check
     cp ../engine/target/composed.wasm ../docs/demo/engine.component.wasm
     cp build/engine.plan.json ../docs/demo/
     sed "s/__BUILD__/$(git rev-parse --short HEAD)-$(date +%s)/g" web/index.html > ../docs/demo/index.html
+    sed "s/__BUILD__/$(git rev-parse --short HEAD)-$(date +%s)/g" web/solo.html > ../docs/demo/solo.html
     cp ../examples/todomvc/todomvc-app.css ../docs/demo/
     cp ../visor/ui/visor.css ../docs/demo/
 

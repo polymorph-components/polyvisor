@@ -25,7 +25,7 @@ bad() {
 # that could read it could impersonate the user's trust in itself; a
 # component that could influence it could put attacker-chosen words into
 # the visor's own voice. So it must not appear anywhere on the seam.
-echo "[1/8] petname never crosses the frame seam"
+echo "[1/9] petname never crosses the frame seam"
 echo "      (the visor's word for a component is never readable or influenceable by it)"
 hits=$(grep -n "petname" ../visor/frame/frame-backend.ts ../visor/frame/frame.ts ../visor/frame/frame.html 2>/dev/null)
 if [ -n "$hits" ]; then
@@ -42,7 +42,7 @@ fi
 # borrowed the visor's authority. The ONLY admissible occurrence is the
 # bare token "password" as an input-masking type — never inside a sentence.
 # Comments are exempt: they explain the rule rather than render it.
-echo "[2/8] the visor never renders the word \"password\""
+echo "[2/9] the visor never renders the word \"password\""
 echo "      (the visor's labels are the visor's own; a panel must never borrow them)"
 # BOTH halves of the visor render strings now: the system-UI core
 # (visor/ui/*.ts — visor.ts's strip/drawer host, sheets.ts's naming and
@@ -79,7 +79,7 @@ fi
 # that ever gained a style attribute (or a class resolving the variable)
 # could paint the visor's exact colour without reading it. Scope keeps the
 # secrecy structural instead of a property of the allowlist.
-echo "[3/8] the anchor colour is never made ambient"
+echo "[3/9] the anchor colour is never made ambient"
 echo "      (--visor-bg is scoped to the visor's own elements; inheriting it would disclose it)"
 # `applyVisorHue` lives in the framework core now, so the scan follows
 # it there; host/*.ts stays in the list because a consumer painting the
@@ -117,7 +117,7 @@ done
 # Banning the verb outright from host and runtime code keeps the property
 # one grep wide instead of a review argument. Comments are exempt: they
 # explain the rule rather than perform it.
-echo "[4/8] the visor never exports a key"
+echo "[4/9] the visor never exports a key"
 echo "      (escrowed signing keys are non-extractable; nothing reads them back)"
 exported=$(grep -n "exportKey" host/*.ts ../runtime/*.ts ../runtime/device-store/*.ts 2>/dev/null |
   grep -vE "^[^:]+:[0-9]+:[[:space:]]*(//|\*|/\*)")
@@ -138,7 +138,7 @@ fi
 # that could INFLUENCE them would be putting attacker-chosen words into
 # the visor's own voice on the anchor. So neither the storage key nor the
 # cluster's id may appear anywhere on the seam.
-echo "[5/8] the user's identity never crosses the frame seam"
+echo "[5/9] the user's identity never crosses the frame seam"
 echo "      (name, device and icon are visor pixels; no component may read or steer them)"
 idhits=$(grep -n "pm-demo-identity\|visor-identity" \
   ../visor/frame/frame.ts ../visor/frame/frame-backend.ts ../visor/frame/frame.html 2>/dev/null)
@@ -167,7 +167,7 @@ fi
 # framework layer rather than of one demo file, so the definer scan
 # covers BOTH the visor's own UI modules and every demo host file —
 # a rogue definition anywhere on either side fails here.
-echo "[6/8] pairing code and SAS render only in visor-owned surfaces"
+echo "[6/9] pairing code and SAS render only in visor-owned surfaces"
 echo "      (renderPairingCode()/renderSas() are defined and called only in ../visor/ui/pairing.ts)"
 outside=$(grep -rln "renderPairingCode(\|renderSas(" \
   ../visor/frame/frame.ts ../visor/frame/frame-backend.ts ../visor/frame/frame.html web/frame.js \
@@ -224,7 +224,7 @@ fi
 #        it is called where the value ENTERS. So the check pins the
 #        ADJACENCY: the call must appear in the same file, within a few
 #        lines of the read.
-echo "[7/8] the pet-icon vocabulary is curated, and a nomination is validated at the seam"
+echo "[7/9] the pet-icon vocabulary is curated, and a nomination is validated at the seam"
 echo "      (no security-semantic glyph in APP_MARK_ICONS; isAppMarkIcon guards the mark-nomination read)"
 ICONS_FILE=../visor/ui/visor.ts
 # The literal set, from the opening bracket to the closing one. Read as
@@ -313,7 +313,7 @@ fi
 # code. Part 2: exactly one inside visor.ts — the constructor itself.
 # CODE ONLY, both halves: the comments here and there DESCRIBE the class,
 # and a check that counted prose would be a check on the prose.
-echo "[8/8] app-voice text is built by the constructor, never class-assigned by hand"
+echo "[8/9] app-voice text is built by the constructor, never class-assigned by hand"
 echo "      (foreignToken() in ../visor/ui/visor.ts is the only door to the \"foreign\" class)"
 # A class ASSIGNMENT mentioning foreign, in any of the shapes the DOM
 # offers: className =, classList.add(...), setAttribute("class", ...).
@@ -340,6 +340,63 @@ if [ "$doors" -ne 1 ]; then
   bad "../visor/ui/visor.ts has $doors \"foreign\" class assignments, expected exactly 1 (foreignToken is the only door: app-influenced strings must only be renderable through the app-voice constructor)"
 else
   ok "../visor/ui/visor.ts assigns the \"foreign\" class in exactly 1 place (foreignToken)"
+fi
+
+# --- (i) the entry ceremonies live in the visor's drawer, and only there ----
+# The user-training rule, made grep-able: identity, account and CEREMONY
+# UI appears ONLY in visor territory. A user cannot audit provenance by
+# reading source, so the one boundary they CAN perceive is spatial — the
+# visor's own pixels, and above all the drawer, whose mechanics a framed
+# component structurally cannot reproduce (a sheet attached to the pinned
+# strip, the page dimmed around its own rect). A device picker or a
+# first-run fork sitting in page flow is indistinguishable in kind from
+# anything an app could paint inside its rectangle, which is why those
+# surfaces moved into ../visor/ui/entry.ts.
+#
+#   (i1) THE SAME MARKER PATTERN AS CHECK (f). Both surfaces are built
+#        exclusively by two named functions, `mountDevicePicker(` and
+#        `offerFirstRun(`, defined once in ../visor/ui/entry.ts. Pinning
+#        the CALL SITE is stronger and cheaper than grepping for "picker":
+#        a component frame has no path to a host-side function call at
+#        all, so a hit in the frame seam or in a guest would mean the
+#        architecture had grown a new seam-crossing path.
+#
+#   (i2) NO EMBEDDER PAGE CARRIES ACCOUNT-LIFECYCLE MARKUP. The negative
+#        half, on the side the first half cannot see: a page could
+#        re-grow these surfaces as plain HTML below the strip without
+#        ever calling anything. So the ids and classes themselves are
+#        banned from the embedder pages.
+echo "[9/9] the entry ceremonies render only in the visor's drawer"
+echo "      (mountDevicePicker()/offerFirstRun() live in ../visor/ui/entry.ts; no page markup below the strip)"
+outside=$(grep -rln "mountDevicePicker(\|offerFirstRun(" \
+  ../visor/frame/frame.ts ../visor/frame/frame-backend.ts ../visor/frame/frame.html web/frame.js \
+  ../examples/todomvc/guest ../providers/s3/panel ../providers/dropbox/panel \
+  2>/dev/null)
+if [ -n "$outside" ]; then
+  bad "mountDevicePicker()/offerFirstRun() referenced in the frame seam or a guest:"
+  printf '%s\n' "$outside" | sed 's/^/       /'
+else
+  ok "no reference to mountDevicePicker()/offerFirstRun() in the frame seam or any guest/panel"
+fi
+# shellcheck disable=SC2086
+definers=$(grep -rl "^export function mountDevicePicker(\|^export function offerFirstRun(" \
+  host/*.ts ../runtime/*.ts ../runtime/device-store/*.ts ../visor/ui/*.ts 2>/dev/null | grep -v '/visor/ui/entry.ts$')
+if [ -n "$definers" ]; then
+  bad "mountDevicePicker()/offerFirstRun() defined somewhere other than ../visor/ui/entry.ts:"
+  printf '%s\n' "$definers" | sed 's/^/       /'
+else
+  ok "mountDevicePicker()/offerFirstRun() are defined only in ../visor/ui/entry.ts"
+fi
+# The markup half. These ids/classes ARE the entry ceremonies; a page
+# that spells one is a page that has grown an account-lifecycle surface
+# of its own, below the strip, where nothing vouches for it.
+ENTRY_MARKUP='first-run|device-picker|solo-join|solo-new-account|solo-join-account|device-pick|device-passkey'
+pagemarkup=$(grep -nE "$ENTRY_MARKUP" web/index.html web/solo.html 2>/dev/null)
+if [ -n "$pagemarkup" ]; then
+  bad "an embedder page carries account-lifecycle markup (these are the visor's drawer sheets — ../visor/ui/entry.ts):"
+  printf '%s\n' "$pagemarkup" | sed 's/^/       /'
+else
+  ok "neither web/index.html nor web/solo.html spells an entry-ceremony id or class"
 fi
 
 echo

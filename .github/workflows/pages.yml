@@ -113,6 +113,8 @@ jobs:
         run: |
           test -f docs/demo/engine.component.wasm
           test -f docs/demo/panel-dropbox.component.wasm
+          test -f docs/demo/solo.html
+          test -f docs/demo/solo-worker.js
           test -f docs/index.html
           du -sh docs
 

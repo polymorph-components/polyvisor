@@ -52,6 +52,21 @@ Three layers, one trust story:
   twice (a mock, an engine adapter); the announcement sink and the
   storage keys are the consumer's, as everywhere else here.
 
+  The ENTRY ceremonies are here too (`entry.ts`): the device picker and
+  the first-run fork — how a browser becomes a device with an account.
+  They live here for the same reason the pairing UI does, one step
+  earlier in the boot: identity, account and ceremony UI appears only in
+  visor territory, and the drawer is where that claim is spatially real
+  (a sheet attached to the pinned strip, the page dimmed around it —
+  neither reproducible from inside a component frame). The picker is the
+  one sheet that opens before the visor has been claimed, so it renders
+  on the unclaimed grey dress with index content only (petnames and
+  times); `initVisor({ deferClaim: true })` and `visor.claim()` are the
+  two halves that let a shell exist without anything personal in it.
+  One definition, drawer-only, pinned by check (i) of
+  `demo/scripts/check-invariants.sh` — the same marker pattern check (f)
+  uses for the pairing renderers.
+
 Consumers: `demo` (full flows: petnames, credentials, storage
 dialog, pairing) and `spikes/todomvc` (consent/kill tenants, frame
 backend by default). Source-level invariants for all of it are

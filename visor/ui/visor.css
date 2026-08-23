@@ -89,8 +89,25 @@
    assembly above the dim layer and all page content — nothing an app
    draws can ever be painted over it. */
 #visor-zone { position: sticky; top: 0; z-index: 30; }
+/* THE UNCLAIMED DRESS. The fallback is EXPLICITLY grey — zero chroma —
+   and that is a decision, not a placeholder. Every member of the anchor
+   palette carries chroma .07 (visor/ui/visor.ts's VISOR_HUES), so a
+   fallback with chroma would be indistinguishable from somebody's real
+   anchor colour; at zero chroma it is a colour the visor can never
+   commit to, which makes the claim (visor.ts's `claim()`) legible as
+   THE ARRIVAL OF COLOUR rather than as a shade changing.
+
+   The pre-unseal device picker rides this dress deliberately: it is a
+   drawer sheet, so it needs the drawer's own background, and it may
+   carry nothing personal (runtime/PERSISTENCE.md, "Unseal UX" and "The
+   index: what may exist before unseal"). Generic IS the feature — a page
+   imitating the picker cannot paint your colour, because at that moment
+   neither has the real one.
+
+   Lightness and the text pairing are unchanged, so contrast is the same
+   on the grey as on any hue. */
 #visor-strip { padding: .45em 0; font-size: 12px;
-                background: var(--visor-bg, oklch(38% .07 260));
+                background: var(--visor-bg, oklch(38% 0 0));
                 color: var(--visor-fg, #f2f4fb);
                 border-bottom: 1px solid rgba(0,0,0,.35); }
 /* TWO CLUSTERS, AND A GUARANTEED GAP BETWEEN THEM. The strip carries
@@ -438,7 +455,10 @@
    content's descent together, rigidly glued (the todomvc visor
    spike settled on this after fr-interpolation proved nonlinear and
    engine-varied — spikes/todomvc/host/visor.ts:82-90, pre-C3). */
-#visor-drawer { background: var(--visor-bg, oklch(38% .07 260));
+/* The same zero-chroma UNCLAIMED dress as the strip above, and the
+   drawer needs it more: the device picker is a drawer sheet that opens
+   BEFORE the claim, so this fallback is the surface a user meets first. */
+#visor-drawer { background: var(--visor-bg, oklch(38% 0 0));
                  color: var(--visor-fg, #f2f4fb); }
 #visor-drawer[hidden] { display: none; }
 /* Only while the sheet is up does the assembly cast onto the page and
@@ -902,6 +922,102 @@
    when the sheet is already `.armed` and the row's opacity rule has
    stopped dimming anything. */
 .reset-sheet .cred-row button:disabled { opacity: .45; cursor: default; }
+
+/* --- the ENTRY sheets: the device picker and the first-run fork ------
+   visor/ui/entry.ts's two surfaces. They wear the shared `.cred-sheet`
+   shape like every other tenant and add only their own furniture — a
+   device row, a choice block, a problem line.
+
+   THE PICKER RENDERS UNCLAIMED, on the grey fallback dress at the top
+   of this file, so nothing below may reach for a hue: everything here
+   is the sheet vocabulary's own alpha-on-anchor idiom (recessed
+   backgrounds, --visor-fg text, hints at reduced opacity), which reads
+   identically on the grey and on all ten anchor colours. That is also
+   why the page-side rules these replace are NOT the model: they were
+   light-theme page chrome, and these surfaces are drawer pixels now. */
+.cred-sheet #device-list { display: flex; flex-direction: column; gap: .5em;
+                           margin: .5em 0 .2em; }
+.device-row { display: flex; flex-direction: column; gap: .15em; }
+/* A row IS a button, so it wears a border — the same honesty rule the
+   picker sheet's entries state: a border belongs on a control. */
+.device-pick { align-self: flex-start; font: inherit; font-size: 13px;
+               cursor: pointer; padding: .45em .9em; border-radius: 5px;
+               border: 1px solid rgba(255,255,255,.4);
+               background: transparent; color: inherit; }
+.device-pick:focus-visible { outline: 2px solid rgba(255,255,255,.7);
+                             outline-offset: 2px; }
+/* THE USER'S OWN WORD, in the visor's voice: plain, weight 600, never
+   quoted and never plated. A petname is user voice by construction here
+   — no component-influenced string can reach this sheet at all. */
+.device-pick { font-weight: 600; }
+.device-when { font-size: 11px; opacity: .7; }
+.cred-sheet #device-pass[hidden], .cred-sheet #device-problem[hidden],
+.cred-sheet #device-passkey[hidden],
+.cred-sheet .entry-problem[hidden] { display: none; }
+.cred-sheet #device-pass { display: flex; flex-direction: column;
+                           gap: .25em; margin: .6em 0; }
+.cred-sheet #device-pass label { font-size: 11px; opacity: .85; }
+.cred-sheet #device-pass input { width: 100%; box-sizing: border-box;
+                                 font: inherit; font-size: 13px;
+                                 background: rgba(0,0,0,.32);
+                                 color: var(--visor-fg, #f2f4fb);
+                                 border: 1px solid rgba(255,255,255,.35);
+                                 border-radius: 3px; padding: .4em .5em; }
+.cred-sheet #device-pass button, .cred-sheet #device-new {
+                                 align-self: flex-start; font: inherit;
+                                 font-size: 13px; cursor: pointer;
+                                 padding: .45em .9em; border-radius: 5px;
+                                 border: 1px solid rgba(255,255,255,.4);
+                                 background: transparent; color: inherit; }
+.cred-sheet #device-new { margin-top: .7em; }
+/* THE PASSKEY CEREMONY BLOCK (entry.ts's askForPasskey): the same
+   furniture as the passphrase block — a labelled control in the sheet's
+   alpha-on-anchor idiom — with a button where the input would be,
+   because the secret lives in the authenticator and the visor's only
+   job is to offer the door. */
+.cred-sheet #device-passkey { display: flex; flex-direction: column;
+                              gap: .25em; margin: .6em 0; }
+.cred-sheet #device-passkey label { font-size: 11px; opacity: .85; }
+.cred-sheet #device-passkey button { align-self: flex-start; font: inherit;
+                                     font-size: 13px; cursor: pointer;
+                                     padding: .45em .9em; border-radius: 5px;
+                                     border: 1px solid rgba(255,255,255,.4);
+                                     background: transparent; color: inherit; }
+/* THE FALLBACK IS DELIBERATELY SECONDARY: the policy tag named the
+   passkey ceremony, so the other door is quieter — a link-weight
+   control, not a rival button. Still a control, so it keeps a visible
+   focus ring; the underline is what carries "this is the other way in". */
+.cred-sheet .entry-secondary { align-self: flex-start; font: inherit;
+                               font-size: 11px; cursor: pointer;
+                               padding: .1em 0; margin-top: .1em;
+                               border: none; background: transparent;
+                               color: inherit; opacity: .75;
+                               text-decoration: underline; }
+.cred-sheet .entry-secondary:focus-visible {
+                               outline: 2px solid rgba(255,255,255,.7);
+                               outline-offset: 2px; }
+/* THE REFUSAL LINE. Warm, not alarming, and the same colour the sheets
+   already use for a consequence the user has to read (.cred-warning) —
+   a picker refusal is a fact about a device, not an error state. */
+.entry-problem { font-size: 12px; color: #ffd79a; margin: .5em 0 0;
+                 line-height: 1.4; }
+
+/* THE FORK'S TWO CHOICES, weighted the SAME. Neither "new account" nor
+   "join another device" is dressed as the recommended one, because
+   which is right depends on a fact only the user has (whether they
+   already hold this account somewhere else). A visually preferred
+   default here would be the visor guessing — in the visor's own voice,
+   in the visor's own pixels. */
+.entry-choice { display: flex; flex-direction: column; gap: .3em;
+                margin: .7em 0; }
+.entry-choice button { align-self: flex-start; font: inherit; font-size: 13px;
+                       cursor: pointer; padding: .45em .9em; border-radius: 5px;
+                       border: 1px solid rgba(255,255,255,.4);
+                       background: transparent; color: inherit; }
+.entry-choice button:focus-visible { outline: 2px solid rgba(255,255,255,.7);
+                                     outline-offset: 2px; }
+.entry-choice button:disabled { opacity: .45; cursor: default; }
+.entry-note { font-size: 11px; opacity: .8; line-height: 1.4; margin: 0; }
 
 /* --- Mobile geometry (<=480px) for the sheets, moved with them. */
 @media (max-width: 480px) {

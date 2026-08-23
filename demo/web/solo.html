@@ -20,46 +20,6 @@
             box-sizing: border-box; padding: 12px; }
     #solo-status { font-size: 11px; color: #777; margin: 4px 0; min-height: 1.4em;
                    font-family: ui-monospace, monospace; word-break: break-all; }
-    /* THE FIRST-RUN FORK. Two affordances, stated plainly and weighted
-       the same: neither "new account" nor "join another device" is the
-       recommended one, because which is right depends on a fact only the
-       user has (whether they already have this account somewhere else).
-       A visually preferred default here would be the page guessing. */
-    #first-run { display: flex; flex-direction: column; gap: 1em;
-                 padding: 1.2em; background: #fff; border: 1px solid #ddd;
-                 border-radius: 4px; }
-    /* An explicit `display` beats the [hidden] attribute's UA default —
-       without this rule the fork card can never actually leave. */
-    #first-run[hidden] { display: none; }
-    #first-run h2 { margin: 0; font-size: 15px; font-weight: 600; color: #333; }
-    #first-run .choice { display: flex; flex-direction: column; gap: .3em; }
-    #first-run .choice button { align-self: flex-start; padding: .4em 1em; font-size: 14px; }
-    #first-run .note { font-size: 12px; color: #666; line-height: 1.4; }
-    /* THE DEVICE PICKER. Deliberately the SAME plain page chrome as the
-       first-run fork and nothing more: this screen renders before
-       anything is unsealed, so it may carry no anchor colour, no name
-       and no icon (PERSISTENCE.md, "The index: what may exist before
-       unseal"). Generic is the feature — a page imitating this one
-       cannot paint your colour, because at this moment neither has the
-       real one. */
-    #device-picker { display: flex; flex-direction: column; gap: 1em;
-                     padding: 1.2em; background: #fff; border: 1px solid #ddd;
-                     border-radius: 4px; }
-    /* The same [hidden] trap the fork above hit: an explicit `display`
-       beats the UA default, or the card can never leave. */
-    #device-picker[hidden] { display: none; }
-    #device-picker h2 { margin: 0; font-size: 15px; font-weight: 600; color: #333; }
-    #device-picker .note { font-size: 12px; color: #666; line-height: 1.4; margin: 0; }
-    #device-list { display: flex; flex-direction: column; gap: .5em; }
-    .device-row { display: flex; flex-direction: column; gap: .15em; }
-    .device-row .device-pick { align-self: flex-start; padding: .4em 1em; font-size: 14px; }
-    .device-when { font-size: 11px; color: #888; }
-    #device-pass { display: flex; flex-direction: column; gap: .3em; }
-    #device-pass[hidden] { display: none; }
-    #device-pass label { font-size: 12px; color: #444; }
-    #device-pass input { padding: .35em; font-size: 14px; max-width: 22em; }
-    #device-problem { font-size: 12px; color: #a33; }
-    #device-problem[hidden] { display: none; }
     #solo-app { margin-top: 8px; }
   </style>
 </head>
@@ -82,52 +42,29 @@
   </div>
   <div id="visor-dim" hidden></div>
   <div id="banner"><div class="bar-inner">booting…</div></div>
+  <!-- WHAT IS NOT HERE ANY MORE, and why it left. The device picker, the
+       fork an account-less device offers, and the join pane used to be
+       markup right here, below the strip, in this page's own light
+       chrome. They are the visor's own drawer sheets now
+       (visor/ui/entry.ts), built in TS and mounted above the pinned bar
+       over a dimmed page.
+
+       The rule they were breaking is the one a user can actually learn:
+       identity, account and ceremony UI appears ONLY in visor territory.
+       A card sitting in page flow is indistinguishable in kind from
+       anything a component could paint inside its own rectangle — while
+       a sheet attached to the pinned strip, with the page dimmed around
+       it, is something a framed component structurally cannot produce.
+       The picker in particular gains nothing personal by moving: it
+       still renders before the seal opens, on the visor's UNCLAIMED grey
+       dress (visor.css's zero-chroma fallback), carrying index content
+       and nothing else (runtime/PERSISTENCE.md, "The index: what may
+       exist before unseal").
+
+       So this page keeps only its OWN furniture: the boot banner, the
+       status line, and the frame the app mounts into. -->
   <div id="page">
     <div class="status" id="solo-status">…</div>
-    <!-- THE DEVICE PICKER. Page furniture, like the fork below it, and
-         for a stronger reason: it renders BEFORE the seal opens, and the
-         visor is not constructed until it does. Everything on it comes
-         from the unsealed index — device petnames and last-used times —
-         because that is the whole of what the index is allowed to hold
-         (PERSISTENCE.md, "The index: what may exist before unseal").
-         host/solo.ts fills #device-list and unhides this. -->
-    <div id="device-picker" hidden>
-      <h2>Which device is this?</h2>
-      <p class="note">This browser holds more than one. Pick the one you want to open;
-        nothing of yours is shown until it is.</p>
-      <div id="device-list"></div>
-      <div id="device-pass" hidden>
-        <label for="device-pass-input">The passphrase for <span id="device-pass-for"></span></label>
-        <input id="device-pass-input" autocomplete="off">
-        <button type="button" id="device-pass-open">Open this device</button>
-      </div>
-      <div id="device-problem" hidden></div>
-      <button type="button" id="device-new">Set up a new device here</button>
-    </div>
-    <!-- THE FIRST-RUN FORK. Page furniture, so it is markup — the same
-         division index.html keeps (the page's own chrome is HTML; only
-         the visor's ceremonies are built in TS). Two affordances,
-         weighted the same: neither is the recommended one, because which
-         is right depends on a fact only the user has. host/solo.ts
-         unhides this when the device holds no account, and hides it once
-         one exists. -->
-    <div id="first-run" hidden>
-      <h2>This device has no account yet</h2>
-      <div class="choice">
-        <button type="button" id="solo-new-account">New account</button>
-        <p class="note">Start fresh here. This device becomes the first device of a
-          new account, and you can add more devices to it later.</p>
-      </div>
-      <div class="choice">
-        <button type="button" id="solo-join-account">Join another device</button>
-        <p class="note">You already have this account on another device. This one shows
-          a code; you enter it there, and both of you check the same six digits.</p>
-      </div>
-    </div>
-    <!-- The join pane is the VISOR's UI (visor/ui/pairing.ts) and is
-         mounted into here: this page never draws a pairing code or a
-         SAS itself. -->
-    <div id="solo-join"></div>
     <div id="solo-app"></div>
   </div>
   <meta name="pm-build" content="__BUILD__">
