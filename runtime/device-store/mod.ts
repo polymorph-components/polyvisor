@@ -115,5 +115,6 @@ export {
   READONLY_METHODS,
   TASKS_METHODS,
   type UnsealOptions,
-  type WireError,
+  type HostError,
+  type WireFailure,
 } from "./rpc.ts";

@@ -28,6 +28,11 @@ import { filesystemWeb } from "@polyengine/wasi/filesystem-web";
 // PairingDriver adapter, pulled in so row 18 can prove it is
 // constructible over the REMOTE driver without a line changed.
 import { createEnginePairingDriver } from "../../pairing-engine.ts";
+// The brand predicate, IN THE PAGE'S REALM. Row 18's central claim since
+// the 0.4.0 bump is that `fromCloneable` mints a value this copy
+// recognizes — so the predicate has to be the page's own, not the
+// worker's, and not a field the worker asserted about itself.
+import { isComponentException, isTrap } from "@polyengine/runtime/embedder";
 import {
   adoptAnchor,
   anchorIsLive,
@@ -834,41 +839,80 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
     const conn = conns.get(arg.id)!;
     const pairing = createEnginePairingDriver(conn.driver);
     const profile = await pairing.usProfileGet();
-    // The RAW rejection underneath, reported field by field — because
-    // the interesting failure mode of this row is passing for the wrong
-    // reason. A refusal raised by the HOST (a sealed device, a bad
-    // method name) is also a `DeviceHostError`, and it carries no WIT
-    // payload at all; only a rejection the ENGINE produced sets
-    // `isWitError`. The driver asserts on that bit, so a host refusal
-    // can no longer masquerade as the thing under test.
-    let wire: { isWitError: boolean; witPayload: unknown; name: string; message: string } | null =
-      null;
+
+    // THE RAW ENGINE REJECTION, inspected with the PAGE's own brand
+    // predicate. Since 0.4.0 the worker sends `toCloneable(error)` and
+    // client.ts rehydrates with `fromCloneable`, so what should arrive
+    // here is a genuine `ComponentException` minted by this copy — not a
+    // facsimile carrying a hand-rolled symbol, and not a bare Error.
+    let engine: {
+      isWit: boolean;
+      isTrapped: boolean;
+      name: string;
+      message: string;
+      payload: unknown;
+      hasStack: boolean;
+      /** A `DeviceHostError` would have one; a ComponentException must not. */
+      code: unknown;
+    } | null = null;
     try {
       await conn.driver.usProfileGet();
     } catch (e) {
       const d = e as {
         name: string;
         message: string;
-        isWitError: boolean;
-        witPayload?: unknown;
+        payload?: unknown;
+        stack?: string;
+        code?: unknown;
       };
-      wire = {
+      engine = {
+        isWit: isComponentException(e),
+        isTrapped: isTrap(e),
         name: d.name,
         message: String(d.message).slice(0, 120),
-        isWitError: d.isWitError,
-        witPayload: typeof d.witPayload === "string" ? d.witPayload.slice(0, 120) : d.witPayload,
+        payload: typeof d.payload === "string" ? d.payload.slice(0, 120) : d.payload,
+        hasStack: typeof d.stack === "string" && d.stack.length > 0,
+        code: d.code,
       };
     }
+
+    // The contrasting arm — a HOST refusal, which must NOT come back
+    // branded — is its own op (`hc-host-refusal`), because it needs the
+    // device SEALED and this one needs it open.
     return {
       constructed: typeof pairing.pairJoinStart === "function" &&
         typeof pairing.usEvents === "function",
       adapterOk: profile.ok,
       adapterError: profile.ok ? "" : String(profile.error).slice(0, 120),
       /** The adapter's error string IS the WIT payload, not a message —
-       * which is only true if the brand and the payload both survived. */
-      adapterUsedPayload: !profile.ok && wire !== null && profile.error === wire.witPayload,
-      wire,
+       * only true if the brand AND the payload both survived the port. */
+      adapterUsedPayload: !profile.ok && engine !== null && profile.error === engine.payload,
+      engine,
     };
+  },
+
+  /**
+   * A HOST refusal, inspected with the same predicate — the contrast
+   * that makes row 18's claim mean something. Calling the engine through
+   * a SEALED host is a `SealError` in the worker: not a WIT error, and
+   * it must arrive with its `code` intact and its brand absent.
+   */
+  "hc-host-refusal": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    try {
+      await conn.tasks.items();
+      return { refused: false };
+    } catch (e) {
+      const d = e as { name: string; message: string; code?: unknown; hostName?: unknown };
+      return {
+        refused: true,
+        isWit: isComponentException(e),
+        name: d.name,
+        hostName: d.hostName,
+        code: d.code,
+        message: String(d.message).slice(0, 120),
+      };
+    }
   },
 };
 

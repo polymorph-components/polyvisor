@@ -45,6 +45,8 @@
 import {
   ComponentException,
   isComponentException,
+  isTrap,
+  toCloneable,
 } from "@polyengine/runtime/embedder";
 import { type Engine, newEngine, type PersistDir } from "../engine.ts";
 import { getDevice } from "./index.ts";
@@ -69,11 +71,13 @@ import {
   type PromoteOptions,
   READONLY_METHODS,
   type ResealOptions,
+  hostCodeOf,
+  hostErrorOf,
   type Req,
   type Res,
   TASKS_METHODS,
-  toWire,
   type UnsealOptions,
+  type WireFailure,
 } from "./rpc.ts";
 
 // --- who am I ---------------------------------------------------------------
@@ -705,6 +709,39 @@ async function call(target: string, method: string, args: unknown[]): Promise<un
   return value;
 }
 
+/**
+ * Choose how one rejection crosses (rpc.ts's "how a rejection crosses").
+ *
+ * ORDER MATTERS. The branded taxonomy is tested FIRST and unconditionally:
+ * a `ComponentException` is the engine's err arm and belongs in the
+ * cloneable form whatever else it happens to carry. Only then does a
+ * typed host `code` claim the value, because the cloneable form's
+ * unbranded-`Error` row would drop that code silently. Everything left
+ * over — a `TypeError` from a host bug, a plain `Error` — takes the
+ * cloneable form too, which is a strict upgrade on the old flattening:
+ * it keeps the cause chain and the worker-side stack, and the
+ * worker-side stack is the diagnostically useful one.
+ */
+function toFailure(e: unknown): WireFailure {
+  const branded = isComponentException(e) || isTrap(e);
+  if (!branded) {
+    const code = hostCodeOf(e);
+    if (code !== undefined) return { form: "host", error: hostErrorOf(e, code) };
+  }
+  try {
+    return { form: "cloneable", value: toCloneable(e) };
+  } catch (refusal) {
+    // `toCloneable` REFUSES rather than degrades: an `InvalidHandleError`
+    // naming the path to a realm-local leaf, or a `TypeError` for a
+    // prototype the form does not cover. Both are findings about THIS
+    // code — something put a handle where a value belongs — and the
+    // refusal message names the path, so it is forwarded verbatim under
+    // a code the client can see instead of being swallowed into a
+    // timeout. Nothing is stripped to make the send succeed.
+    return { form: "host", error: hostErrorOf(refusal, "unclonable") };
+  }
+}
+
 function serve(port: MessagePort): void {
   ports.add(port);
   port.onmessage = (ev: MessageEvent<Req>) => {
@@ -713,13 +750,35 @@ function serve(port: MessagePort): void {
     call(target, method, args ?? []).then(
       (value) => {
         const res: Res = { id, ok: true, value };
-        port.postMessage(res);
+        try {
+          port.postMessage(res);
+        } catch (cloneFailure) {
+          // A `DataCloneError` HERE IS A FINDING, NOT A NUISANCE. Every
+          // method on the proxied surfaces is supposed to move records,
+          // strings and bytes (rpc.ts's serialization-discipline note),
+          // so this firing means a REALM-LOCAL VALUE — a stream, a
+          // future, a resource wrapper — has leaked into a result, and
+          // the honest response is to say so at the call site rather
+          // than strip it and hand back a husk. Without this catch the
+          // throw would escape into the message handler and the client
+          // would simply time out, which is the same bug with none of
+          // the evidence.
+          port.postMessage({
+            id,
+            ok: false,
+            failure: {
+              form: "host",
+              error: hostErrorOf(cloneFailure, "unclonable"),
+            },
+          } satisfies Res);
+          return;
+        }
         // Reply FIRST, die after: a client whose kill request never
         // resolved could not tell "killed" from "hung".
         if (dying) setTimeout(() => (self as unknown as { close(): void }).close(), 0);
       },
       (e) => {
-        const res: Res = { id, ok: false, error: toWire(e, isComponentException(e)) };
+        const res: Res = { id, ok: false, failure: toFailure(e) };
         port.postMessage(res);
       },
     );

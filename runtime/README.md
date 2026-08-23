@@ -60,20 +60,25 @@ relative path.
   - **`worker.ts` is not exported from `mod.ts`, deliberately.** It
     imports `../engine.ts`, whose bare `@polyengine`/`@polymorph`
     specifiers only an embedder can map; re-exporting it would put those
-    pins in front of every consumer of the index. `client.ts` and
-    `rpc.ts` import no package at all, so a picker stays package-free.
-  - **The error envelope, not the exception.** `ComponentException` does
-    not survive structured clone — clone carries an `Error`'s `name`,
-    `message` and `stack` and drops every own property, which is the
-    entire content of a WIT err. So a rejection crosses as
-    `{message, name, isWitError, witPayload?, code?}` and the client
-    re-throws a `DeviceHostError` exposing them. **Branch on those
-    fields, never on the `ComponentException` brand and never on
-    `instanceof`**: module identity does not cross a worker boundary.
-    The client does mint the brand locally from the envelope's
-    `isWitError` bit, so an adapter written against the in-process
-    driver (`pairing-engine.ts`) works over the remote one unmodified —
-    a bridge for existing consumers, not the contract.
+    pins in front of every consumer of the index.
+  - **Two kinds of rejection, two paths** (since the 0.4.0 bump —
+    polyengine amendments A19/A20). *The engine's* errors cross as the
+    embedder's **sanctioned cloneable form**: the worker sends
+    `toCloneable(error)`, the client rehydrates with `fromCloneable`,
+    and what an app catches is a REAL `ComponentException` minted by its
+    own copy — `isComponentException(e)` true, `payload` intact, cause
+    chain to full depth, the worker's stack carried verbatim. *The
+    host's own* conditions keep a typed envelope and arrive as a
+    `DeviceHostError` with a `code` (`wrong-passphrase`, `no-rung`,
+    `timeout`, …). The split is not decoration: the cloneable form
+    encodes any unbranded `Error` through a row carrying only
+    `name`/`message`/`stack`/`cause`, so a `SealError`'s `code` — the
+    thing the unseal ceremony branches on — would be dropped silently.
+    Branch on the brand predicate for the first and on `code` for the
+    second; never on `instanceof` across a bundle boundary.
+    The cloneable form is **version-internal and never persisted**: it
+    lives for one `postMessage` between two realms of one page load, and
+    nothing in the device store writes one to storage.
   - **Checkpoint cadence is the embedder's**, and it is three triggers:
     a 500 ms trailing debounce after any mutating call, an explicit
     `checkpoint()` RPC, and a best-effort one when the last client
@@ -103,18 +108,32 @@ embedders in the same process tree could get two different identities
 for what should be the same module). `demo/deno.json` is the only
 example of that mapping so far.
 
-`device-store/` imports NO package at all — only the platform and its
-own siblings — with ONE exception, and the exception is the reason the
-rule is worth stating. The core modules (index, namespace, seal,
-sealed-fs, identity-keys, locks, anchor, plus the host's `client.ts` and
-`rpc.ts`) type-check under any embedder's config and cannot be
-mis-pinned; `sealed-fs.ts` declares the OPFS handle interfaces
-`@polyengine/wasi/filesystem-web` consumes rather than importing them,
-which is what buys that. `device-store/worker.ts` is the exception: it
-imports `../engine.ts` because hosting a device means instantiating the
-engine, so it needs the embedder's pins like any other consumer — which
-is exactly why it is an entry point the embedder bundles rather than
-something `mod.ts` re-exports.
+`device-store/` is MOSTLY package-free, and the boundary moved at the
+0.4.0 bump, so it is worth stating exactly where it now runs.
+
+**Package-free** (only the platform and their own siblings, so they
+type-check under any embedder's config and cannot be mis-pinned):
+`index.ts`, `namespace.ts`, `names.ts`, `idb.ts`, `seal.ts`,
+`sealed-fs.ts`, `identity-keys.ts`, `locks.ts`, `anchor.ts` — and
+`rpc.ts`, whose only imports are types, which erase. `sealed-fs.ts`
+declares the OPFS handle interfaces `@polyengine/wasi/filesystem-web`
+consumes rather than importing them, which is what buys its place here.
+
+**Needs the embedder pin**: `worker.ts` always did — hosting a device
+means instantiating the engine, which is exactly why it is an entry
+point the embedder bundles rather than something `mod.ts` re-exports.
+`client.ts` joined it at 0.4.0, for one import: `fromCloneable`, which
+is what turns the worker's engine rejection back into a real branded
+`ComponentException` in the tab's realm. That was a deliberate trade —
+the alternative was keeping a hand-rolled brand key in sync with a wire
+constant that has now been renamed twice (A18, A19), silently both
+times.
+
+**The consequence for a picker.** Rendering the device list needs only
+the index, and that path is still pin-free — but it must import
+`index.ts` (and `anchor.ts`) DIRECTLY. Reaching them through `mod.ts`
+pulls `client.ts` and therefore the pin, because a barrel re-exports
+everything it names.
 
 The other place a pin is needed is the probe harness, which mounts the
 REAL published filesystem fragment and bundles the real worker; it

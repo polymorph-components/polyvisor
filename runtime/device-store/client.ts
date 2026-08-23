@@ -18,10 +18,18 @@
 // header), so THE TAB resolves the pointer and hands the worker a
 // concrete id.
 //
-// IT IMPORTS NO PACKAGE, only siblings — so a page can take this module
-// with no pins (runtime/README.md's resolution model). The engine types
-// it re-exports are type-only imports, which erase.
+// ONE PACKAGE IMPORT, AND IT IS NEW AT 0.4.0. This module used to be
+// package-free; `fromCloneable` (@polyengine/runtime/embedder) changed
+// that, deliberately. It is what turns the worker's engine rejection
+// back into a REAL branded `ComponentException` in this realm — payload,
+// cause chain, sender's stack — instead of the facsimile the old
+// hand-rolled brand produced. The trade is stated rather than hidden:
+// a picker that only reads the index still needs no pins, but it must
+// import index.ts directly rather than reach this module through mod.ts
+// (runtime/README.md's resolution model). The engine TYPES below are
+// type-only and still erase.
 
+import { fromCloneable } from "@polyengine/runtime/embedder";
 import type { Driver, Tasks } from "../engine.ts";
 import { adoptAnchor, setAnchor } from "./anchor.ts";
 import { createDevice, getDevice, touchDevice, type UnsealPolicy } from "./index.ts";
@@ -33,12 +41,12 @@ import {
   DRIVER_METHODS,
   type Hello,
   type PromoteOptions,
-  rehydrate,
   type ResealOptions,
   type Req,
   type Res,
   TASKS_METHODS,
   type UnsealOptions,
+  type WireFailure,
 } from "./rpc.ts";
 
 export { DeviceHostError };
@@ -84,12 +92,23 @@ export interface ConnectSpec {
  * proxied method-for-method (rpc.ts's tables, which are type-checked
  * exhaustive against `Driver` and `Tasks`).
  *
- * EVERY REJECTION IS A `DeviceHostError`. Branch on `isWitError` /
- * `witPayload` / `code`, never on `instanceof ComponentException`: the
- * worker and the page are separate module graphs in separate agents, so
- * class identity — and the very concept of "the same module" — does not
- * cross the port. See rpc.ts's `DeviceHostError` for the full argument
- * and for what it does carry.
+ * A REJECTION IS ONE OF TWO THINGS, and telling them apart is the
+ * point of the split (rpc.ts, "how a rejection crosses"):
+ *
+ *   * THE ENGINE REFUSED — a real `ComponentException`, rehydrated by
+ *     `fromCloneable` in this realm. `isComponentException(e)` answers
+ *     true, `e.payload` is the WIT err arm, the cause chain is whole.
+ *     This is an EXPECTED outcome an app handles.
+ *   * THE HOST REFUSED — a `DeviceHostError` carrying a typed `code`
+ *     ("wrong-passphrase", "no-rung", "timeout", …). Nothing in the
+ *     guest produced it; the unseal ceremony is its main audience.
+ *
+ * Branch on `e.code` for the second and on the embedder's brand
+ * predicate for the first. Do not branch on `instanceof DeviceHostError`
+ * across a bundle boundary — class identity is per module graph — and
+ * note the corollary: an engine error is no longer a `DeviceHostError`
+ * at all, which is a deliberate 0.4.0 change from the facsimile this
+ * class used to present.
  */
 export interface DeviceConnection {
   readonly deviceId: string;
@@ -182,6 +201,31 @@ async function resolveDevice(choice: DeviceChoice): Promise<string> {
   return made.id;
 }
 
+/**
+ * Turn one wire failure into the thing to reject with.
+ *
+ * THE ENGINE ARM GOES THROUGH `fromCloneable`, which mints a value
+ * branded by THIS copy (A20's round-trip law): what comes back out is a
+ * genuine `ComponentException` — `isComponentException()` true,
+ * `payload` intact, `cause` chain to full depth, the worker's stack
+ * carried verbatim because the sender's stack is the useful one.
+ *
+ * A THROW OUT OF `fromCloneable` IS REPORTED, NOT SMOOTHED. It raises a
+ * `TypeError` for an unknown envelope tag, and the only way to get one
+ * is two realms running different engine versions — outside the
+ * supported matrix. Its own message says exactly that, so it is
+ * rejected with verbatim rather than wrapped: a version-skew diagnosis
+ * is worth more than a tidy `DeviceHostError`.
+ */
+function thrown(failure: WireFailure): unknown {
+  if (failure.form === "host") return new DeviceHostError(failure.error);
+  try {
+    return fromCloneable(failure.value);
+  } catch (skew) {
+    return skew;
+  }
+}
+
 export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection> {
   const deviceId = await resolveDevice(spec.device);
   const timeoutMs = spec.timeoutMs ?? 120_000;
@@ -222,7 +266,7 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
     pending.delete(res.id);
     clearTimeout(entry.timer);
     if (res.ok) entry.resolve(res.value);
-    else entry.reject(rehydrate(res.error));
+    else entry.reject(thrown(res.failure));
   };
   worker.port.start();
 
@@ -231,8 +275,8 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
       return Promise.reject(
         new DeviceHostError({
           message: "device-store: this connection was closed",
-          name: "DeviceHostError",
-          isWitError: false,
+          hostName: "DeviceHostError",
+          code: "closed",
         }),
       );
     }
@@ -240,15 +284,14 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (pending.delete(id)) {
-          // A TIMEOUT IS NOT A WIT ERROR. It says nothing about what the
-          // guest did or did not do — the call may still be running in
-          // the worker — so it must never present itself as an err arm
-          // the app can handle. `isWitError: false` is the whole
-          // distinction the envelope exists to keep.
+          // A TIMEOUT IS NOT AN ENGINE ERROR. It says nothing about what
+          // the guest did or did not do — the call may still be running
+          // in the worker — so it must never arrive as a
+          // `ComponentException` an app would handle as an err arm. It
+          // is a host condition, and it says so.
           reject(new DeviceHostError({
             message: `device-store: ${target}.${method} timed out after ${timeoutMs}ms`,
-            name: "TimeoutError",
-            isWitError: false,
+            hostName: "TimeoutError",
             code: "timeout",
           }));
         }

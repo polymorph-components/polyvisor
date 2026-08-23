@@ -248,23 +248,39 @@ account UX beyond the picker.
 - **T-E (e2e)**: reload-survival, promote-then-restart, reseal, two-
   device index, swept-pointer degrade. Suite stays green throughout.
 
-## The next-release bump checklist (recorded 2026-08-22, pre-release)
+## The next-release bump checklist — EXECUTED 2026-08-22
 
-When @polyengine 0.3.2 and @polymorph/webcrypto 0.3.1 roll:
+The releases rolled as **0.4.0 across the board**, not the 0.3.x patches
+this checklist guessed when it was written: a breaking minor, because
+A19 breaks the brand key and webcrypto#392 gates the constructors. Every
+item below is recorded as executed, at the versions that actually
+shipped.
 
-- Pins: demo/deno.json runtime/translator/wasi 0.3.1 → 0.3.2;
-  webcrypto 0.3.0 → 0.3.1 (the #392 fromCryptoKey/toCryptoKey seams).
-- rpc.ts: replace the error-envelope walk and the hand-rolled brand
-  with the embedder's `toCloneable`/`fromCloneable` (A19 — built with
-  this seam as its named consumer; the brand key also renamed again,
-  `polyengine.componentException/1`, which adopting the forms makes
-  irrelevant). Row 18 arbitrates.
-- Watch #147's may_leave tightening through the full battery: a guest
-  realloc that lowers an import now traps where it was silently
-  tolerated (expected transparent for this engine's plain cabi_realloc).
-- sealed-fs assumptions unaffected (no wasi/ changes in the window).
-- Then the platform-posture slice unblocks: the engine's app-owned
+- **Pins** (done): demo/deno.json and runtime/tests/devstore/deno.json —
+  @polyengine runtime/translator/wasi 0.3.1 → **0.4.0**;
+  @polymorph webcrypto/websocket 0.3.0 → **0.4.0** (webcrypto carries
+  the #392 fromCryptoKey/toCryptoKey seams). The webrtc sibling checkout
+  was already on its 0.4.0 main with an internal `^0.4.0`, so the graph
+  is one @polyengine/runtime@0.4.0 with no 0.3.x residue.
+- **rpc.ts** (done): the error-envelope walk and the hand-rolled brand
+  are gone, replaced by the embedder's `toCloneable`/`fromCloneable`.
+  Note the amendment split the checklist ran together: **A19** is the
+  brand rename (`witError` → `componentException`), **A20** ships the
+  forms — with this seam as their named consumer driver. The swap is
+  NOT total, and the part that stayed is the point: only the ENGINE's
+  errors take the forms. Host-surface conditions keep a typed envelope,
+  because the cloneable form's unbranded-`Error` row carries
+  name/message/stack/cause and would silently drop `SealError.code` —
+  which is what every unseal ceremony branches on. Rows 18 (engine arm +
+  host arm contrast), 13, 16, 19 and 20 arbitrate.
+- **#147's may_leave tightening** (watched): the full battery ran green
+  — devstore matrix, demo check/site/e2e, pairing-bringup,
+  resume-bringup, engine check/pair/resume. No new guest trap anywhere,
+  as expected for this engine's plain cabi_realloc.
+- sealed-fs assumptions unaffected (no wasi/ changes in the window) —
+  confirmed by the sealed-fs and host rows staying green.
+- Now unblocked: the platform-posture slice — the engine's app-owned
   device-identity import + identity-keys.ts + `SigningKey.fromCryptoKey`
   (and `toCryptoKey` at mint time to persist).
 - POLYVISOR-1 (#83): the docs spike's vendored deltic-0.1.0 bundle —
-  its own turn, not the bump's.
+  still its own turn, untouched by this bump.

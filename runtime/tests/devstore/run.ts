@@ -692,32 +692,42 @@ async function main() {
     // --- 18: the PairingDriver adapter over the REMOTE driver -------------
     await guard(async () => {
       const r = await probe(page, "hc-pairing", { id: t1Device });
-      // THE WIT BIT IS THE ASSERTION. A host-side refusal (sealed
-      // device, unknown method) is also a DeviceHostError and would have
-      // made a looser version of this row green while proving nothing —
-      // it did, on the first run of this matrix, because row 16 had
-      // resealed the device out from under it.
+      // THE CONTRAST ARM: seal the device and call the engine through
+      // it, so the same predicate is asked about a HOST refusal. If both
+      // arms answered alike, the two-path split would be decorative.
+      await probe(page, "hc-reseal", { id: t1Device });
+      const h = await probe(page, "hc-host-refusal", { id: t1Device });
+      await probe(page, "hc-unseal", { id: t1Device, opts: { passphrase: PASS } });
+
       const ok = r.constructed && r.adapterOk === false &&
-        r.wire !== null && r.wire.isWitError === true &&
-        typeof r.wire.witPayload === "string" && r.wire.witPayload.length > 0 &&
-        r.adapterUsedPayload;
+        // A REAL ComponentException, minted by the PAGE's copy.
+        r.engine !== null && r.engine.isWit === true && r.engine.isTrapped === false &&
+        r.engine.name === "ComponentException" &&
+        typeof r.engine.payload === "string" && r.engine.payload.length > 0 &&
+        r.engine.hasStack === true && r.engine.code === undefined &&
+        r.adapterUsedPayload &&
+        // …and the host arm is emphatically NOT one.
+        h.refused === true && h.isWit === false && h.name === "DeviceHostError" &&
+        h.code === "no-rung" && h.hostName === "SealError";
       record(
         "18 host",
-        "runtime/pairing-engine.ts's adapter is constructible over the remote driver, payload and all",
+        "the engine's errors cross as the SANCTIONED cloneable form; the host's keep their typed code",
         ok,
         `createEnginePairingDriver(remote.driver) builds a complete PairingDriver ` +
           `(${r.constructed}) with not one line changed — every method it needs moves only ` +
-          `structured-clone-safe values (Uint8Array ids, strings, plain records, {kind,value} ` +
-          `variants, u64 bigints), so nothing had to be excluded from the proxy. Its error path ` +
-          `is the half that could have rotted silently: the adapter reads a WIT err payload out ` +
-          `of every rejection via isComponentException(e) then e.payload, and over the port it ` +
-          `still gets one — the raw rejection is a ${r.wire?.name} with ` +
-          `isWitError=${r.wire?.isWitError} carrying witPayload=${j(r.wire?.witPayload)}, and ` +
-          `the adapter's own error string IS that payload rather than a message ` +
-          `(${r.adapterUsedPayload}). Module identity does NOT cross a worker boundary; what ` +
-          `makes this work is that DeviceHostError mints the ComponentException brand LOCALLY ` +
-          `from the envelope's isWitError bit (rpc.ts), never by cloning anything branded — ` +
-          `symbols do not clone, and Symbol.for's registry is per-agent.`,
+          `structured-clone-safe values, so nothing had to be excluded from the proxy. ` +
+          `ENGINE ARM: the worker sends toCloneable(error) and client.ts rehydrates with ` +
+          `fromCloneable, so what the PAGE catches is a real ${r.engine?.name} — ` +
+          `isComponentException(e)=${r.engine?.isWit} asked with the PAGE's own copy of the ` +
+          `predicate (not a bit the worker asserted about itself), isTrap=${r.engine?.isTrapped}, ` +
+          `payload=${j(r.engine?.payload)}, the worker's stack carried verbatim ` +
+          `(${r.engine?.hasStack}), and no host \`code\` (${j(r.engine?.code)}) because it is not ` +
+          `a host condition. The adapter's own error string IS that payload rather than a ` +
+          `message (${r.adapterUsedPayload}). HOST ARM: with the device resealed, a tasks call ` +
+          `comes back ${h.name} isComponentException=${h.isWit} code=${j(h.code)} from a ` +
+          `${j(h.hostName)} — the typed code survives, which the cloneable form's unbranded-Error ` +
+          `row would have dropped silently. The hand-rolled brand is GONE: A19 renamed the key a ` +
+          `second time and A20 shipped the forms this seam was the named consumer for.`,
       );
 
       await probe(page, "hc-close", { id: t1Device });
