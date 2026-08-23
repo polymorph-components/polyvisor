@@ -57,6 +57,7 @@ import devicePairingMock from "./scenarios/device-pairing-mock.ts";
 import soloPairing from "./scenarios/solo-pairing.ts";
 import soloPersistence from "./scenarios/solo-persistence.ts";
 import soloEphemeral from "./scenarios/solo-ephemeral.ts";
+import soloPasskey from "./scenarios/solo-passkey.ts";
 import visorReset from "./scenarios/visor-reset.ts";
 
 // Re-exported so a scenario imports its whole contract from one place:
@@ -121,6 +122,18 @@ const SCENARIOS: Scenario[] = [
   // negative space around it.
   soloPersistence,
   soloEphemeral,
+  // THE PRF RUNG (passkey unseal, PERSISTENCE.md). Follows the device
+  // store's other two for the same reason they follow solo-pairing: a
+  // failure here with those two green says the fault is in the passkey
+  // rung specifically (its own ceremony, its own never-auto-unseal
+  // rule) rather than in the device store's persistence machinery in
+  // general. It is the one solo scenario that has to leave the
+  // harness's usual 127.0.0.1 origin — WebAuthn refuses an IP-address
+  // origin outright — so it runs last among the solo trio, in case a
+  // page left on a different origin has any surprise for whatever
+  // follows (nothing in this suite currently depends on that, but nor
+  // did the observation cost anything to write down).
+  soloPasskey,
   // The erase ceremony: seeds a name, a petname and a storage sentinel,
   // then reloads the page (twice) as part of its own claim. It runs
   // after the other identity/naming scenarios and before the one that
@@ -147,7 +160,15 @@ async function freePort(): Promise<number> {
 function serveSite(root: string, port: number): Deno.HttpServer {
   return Deno.serve({
     port,
-    hostname: "127.0.0.1",
+    // BOUND TO ALL INTERFACES, not just 127.0.0.1 — solo-passkey.ts
+    // needs this site reachable on `localhost` too: WebAuthn refuses an
+    // IP-address origin with a synchronous SecurityError before the
+    // authenticator is even consulted (wosh's browser-passkey.mjs
+    // finding #1, cited in spikes/prf-unseal/run.ts, which binds its own
+    // throwaway server the same way — "some resolvers prefer ::1").
+    // Every OTHER scenario keeps using the 127.0.0.1 URL `ctx.baseUrl`
+    // hands them; this only widens what the socket ACCEPTS.
+    hostname: "0.0.0.0",
     onListen: () => {},
   }, (req) =>
     serveDir(req, {
