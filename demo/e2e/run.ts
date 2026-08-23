@@ -56,6 +56,7 @@ import devicePairing from "./scenarios/device-pairing.ts";
 import devicePairingMock from "./scenarios/device-pairing-mock.ts";
 import soloPairing from "./scenarios/solo-pairing.ts";
 import soloPersistence from "./scenarios/solo-persistence.ts";
+import soloErase from "./scenarios/solo-erase.ts";
 import soloEphemeral from "./scenarios/solo-ephemeral.ts";
 import soloStorage from "./scenarios/solo-storage.ts";
 import soloGdrive from "./scenarios/solo-gdrive.ts";
@@ -123,6 +124,13 @@ const SCENARIOS: Scenario[] = [
   // order (try, keep, reload, reseal), and the ephemeral one is the
   // negative space around it.
   soloPersistence,
+  // And the way a device LEAVES. It follows persistence directly
+  // because it is the same subject read backwards: persistence proves
+  // the namespace survives a reload, this proves the erase ceremony
+  // takes it away — and a failure here with persistence green says the
+  // fault is in the erasure rather than in anything the device does
+  // between ceremonies.
+  soloErase,
   soloEphemeral,
   // THE WORKER HOST'S STORAGE EGRESS (STORAGE-EGRESS.md's T-E): the same
   // sheet the two device-store scenarios above just proved a device

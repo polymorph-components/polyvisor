@@ -690,6 +690,7 @@ export type HostMethod =
   | "oauthStart"
   | "oauthComplete"
   | "forgetOauth"
+  | "destroy"
   | "__die";
 
 export interface Req {
