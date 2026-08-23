@@ -126,6 +126,7 @@ use exports::polyvisor::engine::driver::{
 };
 use exports::polyvisor::tasks::tasks::{Guest as TasksGuest, Snapshot, TodoItem};
 use polymorph::iroh::endpoint::{Endpoint, EndpointOptions, RecvStream, SendStream};
+use polymorph::iroh::identity_from_keys;
 use polymorph::iroh::identity_generate;
 use polymorph::iroh::types::{EndpointAddr, TransportAddr};
 
@@ -2380,6 +2381,18 @@ fn own_agent_id() -> Result<Vec<u8>, String> {
     with_state(|s| s.my_peer.as_bytes().to_vec())
 }
 
+/// This device's own iroh endpoint id, or EMPTY when it has not bound
+/// one yet.
+///
+/// Empty is not an error and callers must not treat it as one: `iroh-bind`
+/// is the host's call to make and the ordering against `user-create` is
+/// the host's business. The devices-map entry simply carries no endpoint
+/// until the boot-time `us-device-endpoint-put` fills it in — which is
+/// the path that keeps it current anyway.
+fn own_endpoint_id() -> Result<Vec<u8>, String> {
+    with_state(|s| s.endpoint.as_ref().map(|e| e.id()).unwrap_or_default())
+}
+
 /// Refresh the bridge's event cache and offer everything to every peer.
 async fn flush_keyhive() -> Result<(), String> {
     let proto = with_state(|s| s.proto.clone())?;
@@ -3495,9 +3508,32 @@ impl DriverGuest for Component {
     }
 
     async fn iroh_bind(relay_url: String) -> Result<String, String> {
-        let identity = identity_generate::generate()
-            .await
-            .map_err(|e| format!("identity-generate: {e:?}"))?;
+        // THE ENDPOINT IDENTITY IS THE ADDRESS (engine.wit's
+        // `device-identity.endpoint-key-pair`). Ask the embedder first:
+        // an embedding that persists a transport key gets the SAME
+        // endpoint id back on every bind, which is what lets two devices
+        // that have both been closed and reopened still dial each other.
+        // `none` — the default an embedder gets for free — mints a fresh
+        // identity, exactly as this function always did.
+        let identity = match polyvisor::engine::device_identity::endpoint_key_pair().await {
+            Some((signing, verifying)) => {
+                // Handed on UNWRAPPED, unlike `embedder_device_key`'s
+                // pair: both this import and `identity-from-keys` speak
+                // `polymorph:webcrypto/signature`, so these are already
+                // the resources the iroh component wants. The pair is
+                // validated THERE — Ed25519, `sign` permitted, halves
+                // checked against each other by a sign/verify probe
+                // (iroh.wit's `identity-from-keys.from-keys`) — so a
+                // mis-provisioned pair fails here at bind rather than as
+                // a handshake failure against every peer.
+                identity_from_keys::from_keys(signing, verifying)
+                    .await
+                    .map_err(|e| format!("identity-from-keys: {e:?}"))?
+            }
+            None => identity_generate::generate()
+                .await
+                .map_err(|e| format!("identity-generate: {e:?}"))?,
+        };
         let options = EndpointOptions::new(&identity);
         options.add_alpn(ALPN);
         // Pairing runs on its own ALPN, so a pairing dial can never be
@@ -3900,6 +3936,10 @@ impl DriverGuest for Component {
 
     async fn us_device_revoke(agent_id: Vec<u8>) -> Result<(), String> {
         usdoc::device_revoke(agent_id).await
+    }
+
+    async fn us_device_endpoint_put(endpoint: Vec<u8>) -> Result<(), String> {
+        usdoc::device_endpoint_put(endpoint).await
     }
 
     async fn us_events() -> Result<Vec<UsEvent>, String> {

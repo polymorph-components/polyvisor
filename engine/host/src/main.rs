@@ -398,6 +398,23 @@ impl bindings::polyvisor::engine::device_identity::HostWithStore<Ctx> for Ctx {
     > {
         Ok(None)
     }
+
+    /// The TRANSPORT identity, and `none` for the same reason as above:
+    /// this host cannot construct `signature` resources from Rust-held
+    /// material. The guest's `none` branch mints a fresh iroh identity
+    /// per bind — which is what this host has always done, so nothing
+    /// native regresses; what it cannot exercise is the STABLE endpoint
+    /// id across binds, and that lives in the browser act battery.
+    async fn endpoint_key_pair(
+        _accessor: &Accessor<Ctx, Self>,
+    ) -> Result<
+        Option<(
+            wasmtime::component::Resource<polymorph_webcrypto_wasmtime::SigningKey>,
+            wasmtime::component::Resource<polymorph_webcrypto_wasmtime::VerifyingKey>,
+        )>,
+    > {
+        Ok(None)
+    }
 }
 
 /// The sync half of the same interface: empty (every function here is

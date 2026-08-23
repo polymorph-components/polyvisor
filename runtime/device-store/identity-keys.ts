@@ -52,6 +52,25 @@ const STORE = "identity";
 export const DEVICE_IDENTITY_KEY = "device-signing";
 
 /**
+ * THE DEVICE'S IROH ENDPOINT IDENTITY, by name — the transport key,
+ * kept beside the signing one and deliberately NOT the same key.
+ *
+ * In iroh the key is the address: the endpoint id peers dial is this
+ * pair's public half. Persisting it is what makes a device re-findable
+ * after a reload; before it existed the engine minted a fresh identity
+ * on every bind, so an id a peer had recorded went dead with the page.
+ *
+ * WHY A SECOND PAIR AND NOT A REUSE of the signing key (engine.wit's
+ * `device-identity.endpoint-key-pair`, where the ruling is written
+ * out): no cross-protocol key reuse between keyhive's signatures and
+ * iroh's handshake, and the transport identity — WHERE the device is —
+ * stays rotatable without repudiating the account identity that says
+ * WHO it is. Same store, same validate-on-load discipline, same
+ * algorithm; a different id, which is the whole difference.
+ */
+export const DEVICE_ENDPOINT_KEY = "device-endpoint";
+
+/**
  * Ed25519, and only Ed25519. The engine's device identity is an Ed25519
  * signing key; keeping the algorithm a CONSTANT rather than a stored
  * field is what makes validate-on-load meaningful — the algorithm a

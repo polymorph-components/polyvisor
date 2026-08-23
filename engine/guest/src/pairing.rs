@@ -918,8 +918,13 @@ async fn add_session(
 
     // 6. Enrollment writes, in the order §2 pins: group membership at
     // admin FIRST, so the card exported next carries the delegation.
+    //
+    // `join_ep` rides along into the devices entry: it is the endpoint
+    // this side DIALED to get here, so the ceremony that just completed
+    // is itself the proof that the id belongs to the joiner (iroh's
+    // key-is-address). Nothing else about the ceremony changes.
     let (user_group_id, group_card, partition_id) =
-        crate::usdoc::enroll_device(&joiner, &device_name).await?;
+        crate::usdoc::enroll_device(&joiner, &device_name, &join_ep).await?;
     send_msg(
         &out_tx,
         &PairMsg::Enroll {

@@ -382,6 +382,12 @@ export class MockPairingNetwork {
       name: offer.claim.deviceName ?? "",
       enrolledAt: Date.now(),
       revoked: false,
+      // The mock has no transport at all, so it has no endpoint id to
+      // observe: "" is the record's own reading of "not recorded", and
+      // inventing a plausible-looking one would make the mock lie about
+      // a fact only a real dial can establish.
+      endpoint: "",
+      enrolledBy: "",
     };
     doc.devices.set(agentId, dev);
     broadcast(doc, offer.joinInstanceId, { tag: "device-added", name: dev.name });

@@ -285,6 +285,7 @@ export const DRIVER_METHODS = [
   "usContactPut",
   "usDevicesList",
   "usDeviceRevoke",
+  "usDeviceEndpointPut",
   "usEvents",
   "stats",
 ] as const;

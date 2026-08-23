@@ -81,6 +81,13 @@ export interface UsDevice {
   name: string;
   enrolledAt: number;
   revoked: boolean;
+  /** The device's iroh endpoint id, hex, or "" when the account has not
+   * recorded one for it (engine.wit's `us-device`: the field is
+   * additive, so older entries simply carry nothing). */
+  endpoint: string;
+  /** The agent id of the device that enrolled this one, hex; "" for the
+   * founding device and for entries older than the field. */
+  enrolledBy: string;
 }
 
 export type UsEvent =

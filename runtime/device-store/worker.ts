@@ -87,7 +87,7 @@ import { getSigningKey, makeSigner, type Signer } from "../keystore.ts";
 // existing.
 import { SigningKey, VerifyingKey } from "@polymorph/webcrypto-polyengine";
 import { getDevice } from "./index.ts";
-import { DEVICE_IDENTITY_KEY, loadOrMintIdentity } from "./identity-keys.ts";
+import { DEVICE_ENDPOINT_KEY, DEVICE_IDENTITY_KEY, loadOrMintIdentity } from "./identity-keys.ts";
 import { type DeviceNamespace, destroyNamespace, openNamespace } from "./namespace.ts";
 import {
   createSealedDek,
@@ -1452,6 +1452,15 @@ async function fetchArtifacts(spec: AttachSpec["artifacts"]) {
  */
 let identityPair: Promise<CryptoKeyPair> | undefined;
 
+/**
+ * The device's TRANSPORT key pair, cached on the same terms and for the
+ * same reasons as the signing one above — and a genuinely separate pair
+ * (identity-keys.ts's `DEVICE_ENDPOINT_KEY`, engine.wit's
+ * `endpoint-key-pair`): iroh's endpoint id is this key's public half,
+ * and no key crosses between keyhive's signatures and iroh's handshake.
+ */
+let endpointPair: Promise<CryptoKeyPair> | undefined;
+
 /** Where the fresh-init agent id is recorded, in the unsealed `meta`
  * store beside the lease and the boot counter. */
 const AGENT_KEY = "agent";
@@ -1464,6 +1473,16 @@ function devicePair(): Promise<CryptoKeyPair> {
       throw e;
     });
   return identityPair;
+}
+
+function endpointKey(): Promise<CryptoKeyPair> {
+  endpointPair ??= loadOrMintIdentity(ns, DEVICE_ENDPOINT_KEY)
+    .then((r) => r.pair)
+    .catch((e) => {
+      endpointPair = undefined;
+      throw e;
+    });
+  return endpointPair;
 }
 
 /**
@@ -1486,6 +1505,19 @@ function deviceIdentityFragment(): DeviceIdentityFragment {
   return {
     deviceKeyPair: async () => {
       const pair = await devicePair();
+      return [
+        SigningKey.fromCryptoKey(pair.privateKey),
+        VerifyingKey.fromCryptoKey(pair.publicKey),
+      ];
+    },
+    // THE ENDPOINT ID SURVIVES THE RELOAD, which is the point: this
+    // device's iroh address is derived from a key that lives in the
+    // device namespace, so a peer that recorded the id can still dial it
+    // after both sides have been closed and reopened. Fresh wrappers per
+    // instance for the registry-identity reason in this function's
+    // header; the underlying `CryptoKeyPair` is the cached one.
+    endpointKeyPair: async () => {
+      const pair = await endpointKey();
       return [
         SigningKey.fromCryptoKey(pair.privateKey),
         VerifyingKey.fromCryptoKey(pair.publicKey),
