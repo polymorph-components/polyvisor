@@ -1,0 +1,7 @@
+# Measure whether the CDP virtual authenticator can serve the PRF
+# unseal rung's browser gate. See README.md for the executed record.
+run:
+    deno run -A run.ts
+
+check:
+    deno check run.ts
