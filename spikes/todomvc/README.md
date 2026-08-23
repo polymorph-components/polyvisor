@@ -14,9 +14,9 @@ permission linker, and asset pipeline are deliberately left as seams.
 Quarantined, delete-at-will, wired into no CI. The built demo is committed
 at `docs/spike-todomvc/` (the repo's Pages root).
 
-[#16]: https://github.com/polymorph-components/polymorph-apps/issues/16
-[#15]: https://github.com/polymorph-components/polymorph-apps/issues/15
-[deltic]: https://github.com/lann/deltic
+[#16]: https://github.com/polymorph-components/polyvisor/issues/16
+[#15]: https://github.com/polymorph-components/polyvisor/issues/15
+[deltic]: https://github.com/polymorph-components/polyengine
 
 ## Architecture
 
