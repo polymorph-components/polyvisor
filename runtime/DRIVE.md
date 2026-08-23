@@ -278,6 +278,69 @@ the worker still owns the verifier and the tokens, and the secret it
 holds is the app's identity, never the user's. What changes on a public
 origin is only how much that app identity is worth protecting.
 
+### The ruling: BRING YOUR OWN CLIENT
+
+The shipping posture for a served page is the user's OWN
+web-application client, minted by them and typed into the sheet — which
+is what the sheet already asks for, so this is a ruling rather than a
+feature. It is the SAME BARGAIN THE S3 PROVIDER MAKES and should be read
+beside it: bring your own bucket, bring your own keys, the visor escrows
+them. The Google secret then protects the user's own app identity, sits
+in the user's own browser, and names the user's own app on the consent
+screen — so the confidentiality Google expects becomes a promise the
+user is making to themselves, which is the only version of it a browser
+can keep.
+
+The alternative Google offers browser apps — the TOKEN MODEL
+(implicit-style: an access token straight to the page, no secret, NO
+REFRESH TOKEN) — is recorded and rejected for v1 with its cost named:
+one-hour access and no unattended renewal means a device closed for an
+hour cannot sync until someone puts a foreground gesture in front of it,
+which is precisely the property the worker host exists to provide. It
+becomes the right answer only if zero-setup Drive ever outweighs
+background sync.
+
+Note that §3's classification is DROPBOX-SHAPED and does not
+generalize: Dropbox issues PKCE public clients, so the demo's owner seam
+refreshes with a client id and no secret at all. Google has no such
+client type for the code flow. A seam that grows a third OAuth backend
+should model "does this provider issue public clients" rather than
+assume either shape.
+
+### The broker, parked with its measurements
+
+An opt-in token-exchange broker — holding the secret, so zero-setup
+Drive becomes possible — is a direction, not a plan. What the probes
+settled about its shape:
+
+- **A broker is PERMANENT in the token path, not one-time.** Google
+  demands `client_secret` on the REFRESH grant as well as the initial
+  exchange (probed: `client_secret is missing` without it,
+  `invalid_grant` with it). There is no "use the broker once, then run
+  independently".
+- **The one shape where a broker never sees a token** is client
+  assertions (`private_key_jwt`): the broker signs a short-lived
+  assertion and the worker presents it to Google itself. Google's
+  support on USER-consent grants is UNPROVEN — a junk assertion produced
+  `internal_failure` (500) rather than the missing-secret refusal, so
+  the parameter takes some branch, which is suggestive and nothing more.
+  One experiment with a properly registered key settles it; nothing
+  should be designed on it before that.
+- **The trust at stake is smaller than it looks, and structurally so.**
+  `drive.file` confines the token to app-created files, and those files
+  are keyhive ciphertext by construction. A wholly malicious broker
+  therefore gets availability (delete, withhold) and METADATA — never
+  content. The storage credential is not a data-confidentiality
+  credential in this design, and that is the sentence any broker's
+  consent copy has to be able to say honestly.
+- **Which makes the metadata the lever.** This provider uses plain
+  derivable names (§2: `docs/<hex(doc)>`, `chunk-<hex(id)>`), mirroring
+  Dropbox — whereas the S3 provider HMACs object names under per-epoch
+  name-keys. So a broker, or the provider itself, sees doc ids, chunk
+  counts, sizes and timing. If the broker direction is taken, porting
+  the name-key scheme to Drive is the change that blinds it, and it is
+  cheapest before any account has data to migrate.
+
 ## Parked, explicitly
 
 Drive in the demo page/picker; shared/team drives; resumable uploads
