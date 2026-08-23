@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>polymorph — authorization</title>
+  <!-- THE REGISTERED OAUTH REDIRECT TARGET (DRIVE.md §3 × #7).
+       https://polymorph-components.github.io/polyvisor/demo/oauth-callback.html
+       is the exact URI registered with Google's web-application client;
+       the authorize endpoint renders a sign-in page for it (verified
+       2026-08-23). Its entire job is: read ?code&state (or ?error) off
+       its own query string, postMessage it to the opener, close.
+
+       WHY THIS IS A SEPARATE FILE FROM solo.html rather than a branch at
+       the top of that page (which still exists — see host/solo.ts's
+       first-run relay branch): landing the popup on solo.html means the
+       redirect boots the ENTIRE solo bundle — engine, worker attach,
+       visor, megabytes of module graph — purely to read one query
+       parameter, relay it, and close. That is correct for a client
+       registered against solo.html itself (a desktop-type client on a
+       loopback origin, where any path is accepted) but wasteful for the
+       web-client path, which can be registered against ANY exact URL —
+       so it is registered against a page that does nothing else.
+
+       DEPENDENCY-FREE ON PURPOSE, and this is not a style preference: it
+       is the ONE page that runs before anything else in the ceremony can
+       proceed. No <script type="module">, no bundle, no fetch of
+       visor.css — a failed or slow fetch here would strand the popup
+       with nothing able to render even the fallback text. Every rule
+       below is inline for that reason. -->
+  <style>
+    body {
+      margin: 0;
+      padding: 2em 1.4em;
+      background: #1a1a2e;
+      color: #eee;
+      font: 14px 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <div id="banner">completing authorization…</div>
+  <script>
+    // No module graph, no import — see the file-level comment above.
+    var params = new URLSearchParams(location.search);
+    var code = params.get("code");
+    var state = params.get("state");
+    var error = params.get("error");
+    var banner = document.getElementById("banner");
+
+    if (window.opener) {
+      // Targeted to THIS page's own origin, never "*" — the same rule
+      // solo.ts's first-run relay branch follows, and for the same
+      // reason: a wildcard target would hand a one-shot authorization
+      // code to whatever page happens to be listening.
+      //
+      // MESSAGE SHAPE: { pmGdriveCode, state } on success — the field
+      // names solo.ts's `message` listener already matches on. `error`
+      // is added here, MINIMALLY, for the refusal case (the provider
+      // sent ?error= instead of a code): solo.ts's listener is the one
+      // place that interprets this shape, and it is extended there to
+      // treat a present `error` as a ceremony refusal rather than
+      // silently waiting out its timeout.
+      window.opener.postMessage(
+        error ? { pmGdriveError: error, state: state } : { pmGdriveCode: code, state: state },
+        location.origin,
+      );
+      if (banner) {
+        banner.textContent = error
+          ? "authorization was refused — you can close this window"
+          : "authorization relayed — you can close this window";
+      }
+      window.close();
+      // If the browser blocked the close (some do, for a window not
+      // opened by a very recent user gesture), the banner above is what
+      // is left on screen — hence it already reads as a stable end
+      // state, not a transient one.
+    } else if (banner) {
+      // No opener at all: this page was opened directly, not as the
+      // popup half of a ceremony. Nothing to relay to.
+      banner.textContent = "no authorization in progress — you can close this window";
+    }
+  </script>
+</body>
+</html>

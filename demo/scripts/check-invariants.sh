@@ -366,6 +366,16 @@ fi
 #        re-grow these surfaces as plain HTML below the strip without
 #        ever calling anything. So the ids and classes themselves are
 #        banned from the embedder pages.
+#
+#        SCANNED AS A GLOB, for the reason check (b) spells out at its
+#        own: the property is about EVERY page this origin serves, so
+#        the scan should follow the next page rather than need this list
+#        edited — which is precisely the miss it would otherwise have
+#        had when the OAuth callback page arrived. That page is the
+#        sharpest case for the rule, not an incidental one: it appears
+#        mid-ceremony, at the moment a user is primed to expect a
+#        prompt, which is exactly where a counterfeit account surface
+#        would be believed.
 echo "[9/9] the entry ceremonies render only in the visor's drawer"
 echo "      (mountDevicePicker()/offerFirstRun() live in ../visor/ui/entry.ts; no page markup below the strip)"
 outside=$(grep -rln "mountDevicePicker(\|offerFirstRun(" \
@@ -391,12 +401,19 @@ fi
 # that spells one is a page that has grown an account-lifecycle surface
 # of its own, below the strip, where nothing vouches for it.
 ENTRY_MARKUP='first-run|device-picker|solo-join|solo-new-account|solo-join-account|device-pick|device-passkey'
-pagemarkup=$(grep -nE "$ENTRY_MARKUP" web/index.html web/solo.html 2>/dev/null)
+# MATCHED AS AN ATTRIBUTE, not as a substring, which is what the rule
+# above actually says: "the ids and classes THEMSELVES are banned". A
+# page whose PROSE names one of these surfaces is describing the
+# ceremony, not growing one — and the callback page does exactly that,
+# explaining in a comment which relay branch it replaces. Scanning bare
+# substrings would have made a page unable to document its own relation
+# to the visor's ceremonies, which is a check punishing the wrong thing.
+pagemarkup=$(grep -nEi "(id|class)[[:space:]]*=[[:space:]]*[\"']?[^\"'>]*($ENTRY_MARKUP)" web/*.html 2>/dev/null)
 if [ -n "$pagemarkup" ]; then
   bad "an embedder page carries account-lifecycle markup (these are the visor's drawer sheets — ../visor/ui/entry.ts):"
   printf '%s\n' "$pagemarkup" | sed 's/^/       /'
 else
-  ok "neither web/index.html nor web/solo.html spells an entry-ceremony id or class"
+  ok "no page in web/*.html spells an entry-ceremony id or class"
 fi
 
 echo

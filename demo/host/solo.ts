@@ -124,6 +124,14 @@ const RELAY = params.get("relay") ?? "https://use1-1.relay.n0.iroh.link";
 // redirect handling are visor capabilities; the popup's ONLY job is to
 // relay the one-shot code (DRIVE.md §3) — the worker holds the verifier
 // and does the exchange, so this window never sees a token.
+// THE FALLBACK PATH, demoted (web/oauth-callback.html is now the
+// REGISTERED path for a web-application client). This branch stays,
+// unchanged in shape, because it is still the ONLY path a desktop-type
+// client accepts: those clients are registered against a loopback
+// origin WITH A PATH (DRIVE.md §3's probe — `http://127.0.0.1:8600/
+// solo.html`), and any path is accepted at that origin, so landing here
+// works for them too. Both are cheap to keep and they cover different
+// client types — this one is not deleted, only no longer the only door.
 const relayedCode = params.get("code");
 const isAuthPopup = !!relayedCode && !!window.opener;
 if (isAuthPopup) {
@@ -1700,7 +1708,14 @@ async function startApp(
                 provider: "gdrive",
                 clientId: client,
                 clientSecret: gdSecret || undefined,
-                redirectUri: location.origin + location.pathname,
+                // web/oauth-callback.html is the REGISTERED redirect for
+                // a web-application client (DRIVE.md §3) — resolved
+                // relative to the current page, never a hardcoded
+                // origin, so this is correct on localhost, on 127.0.0.1
+                // and on the Pages path alike. The `?code` branch above
+                // stays as the fallback for a desktop-type client
+                // registered against solo.html itself.
+                redirectUri: new URL("./oauth-callback.html", location.href).toString(),
                 authUrl: gdriveEndpoints.authUrl,
                 tokenUrl: gdriveEndpoints.tokenUrl,
               });
@@ -1724,9 +1739,21 @@ async function startApp(
                   };
                   const onMessage = (e: MessageEvent) => {
                     if (e.origin !== location.origin) return;
-                    const d = e.data as { pmGdriveCode?: unknown; state?: unknown } | null;
-                    if (!d || typeof d.pmGdriveCode !== "string") return;
+                    const d = e.data as
+                      | { pmGdriveCode?: unknown; pmGdriveError?: unknown; state?: unknown }
+                      | null;
+                    if (!d) return;
                     if (expectedState !== null && d.state !== expectedState) return;
+                    // THE ERROR CASE (oauth-callback.html): the provider
+                    // sent ?error= instead of a code. Rejecting here
+                    // turns that into a prompt refusal the sheet can
+                    // render, rather than a silent wait for the timeout
+                    // this listener would otherwise hit.
+                    if (typeof d.pmGdriveError === "string") {
+                      done(() => reject(new Error(`authorization was refused: ${d.pmGdriveError}`)));
+                      return;
+                    }
+                    if (typeof d.pmGdriveCode !== "string") return;
                     done(() =>
                       resolve({
                         code: d.pmGdriveCode as string,

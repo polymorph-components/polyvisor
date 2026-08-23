@@ -151,6 +151,10 @@ site: translate app panels check
     cp build/engine.plan.json serve/engine.plan.json
     sed "s/__BUILD__/$(git rev-parse --short HEAD)-$(date +%s)/g" web/index.html > serve/index.html
     sed "s/__BUILD__/$(git rev-parse --short HEAD)-$(date +%s)/g" web/solo.html > serve/solo.html
+    # THE OAUTH CALLBACK PAGE (DRIVE.md §3): the registered Drive
+    # redirect target, dependency-free and carrying no __BUILD__ stamp —
+    # it never uses one, so a plain copy is the whole job.
+    cp web/oauth-callback.html serve/
     cp ../examples/todomvc/todomvc-app.css serve/
     cp ../visor/ui/visor.css serve/
 
@@ -182,6 +186,9 @@ pages: translate app panels check
     cp build/engine.plan.json ../docs/demo/
     sed "s/__BUILD__/$(git rev-parse --short HEAD)-$(date +%s)/g" web/index.html > ../docs/demo/index.html
     sed "s/__BUILD__/$(git rev-parse --short HEAD)-$(date +%s)/g" web/solo.html > ../docs/demo/solo.html
+    # THE OAUTH CALLBACK PAGE (DRIVE.md §3) — see `site` above; same
+    # plain copy, same reason (no __BUILD__ stamp in this file).
+    cp web/oauth-callback.html ../docs/demo/
     cp ../examples/todomvc/todomvc-app.css ../docs/demo/
     cp ../visor/ui/visor.css ../docs/demo/
 
