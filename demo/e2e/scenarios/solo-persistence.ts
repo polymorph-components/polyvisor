@@ -169,6 +169,14 @@ const scenario: Scenario = {
       assert(trace.includes("promoted:until-reseal"), `trace: ${JSON.stringify(trace)}`);
     });
 
+    // THE TRANSPORT ADDRESS, READ BEFORE THE RELOAD. Bind happens at
+    // boot and off the critical path, so it is polled rather than
+    // assumed present (solo.ts's `myEndpoint`).
+    const endpointBefore = await until([page], "the bound endpoint", async () => {
+      const id = (await solo(page, "endpointId")) as string;
+      return id !== "" ? id : false;
+    }, WAITS.converge);
+
     // A CHECKPOINT ON PURPOSE, so the reload below is a claim about
     // persistence rather than a race with the worker's 500 ms debounce.
     // (The debounce would almost always win; "almost always" is how a
@@ -205,6 +213,30 @@ const scenario: Scenario = {
       }, WAITS.converge);
       assert(titles.includes("buy milk"), `resumed todos: ${JSON.stringify(titles)}`);
       assert(titles.includes("call the bank"), `resumed todos: ${JSON.stringify(titles)}`);
+    });
+
+    await act("the iroh endpoint id is the SAME device address as before", async () => {
+      // THE SIXTH CLAIM, and the one the account's other devices depend
+      // on. In iroh the key IS the address, so before the endpoint key
+      // was persisted every bind minted a fresh id and a peer that had
+      // recorded this device's address could never reach it again —
+      // which made "both devices reloaded, then re-found each other"
+      // impossible by construction, not by bug.
+      //
+      // What makes this a real assertion rather than a tautology: the
+      // reload above tore the page AND the SharedWorker down, so the
+      // endpoint here was bound by a new worker global from a key it
+      // loaded out of the device namespace, through the engine's
+      // `device-identity.endpoint-key-pair` import.
+      const endpointAfter = await until([page], "the rebound endpoint", async () => {
+        const id = (await solo(page, "endpointId")) as string;
+        return id !== "" ? id : false;
+      }, WAITS.converge);
+      assertEquals(
+        endpointAfter,
+        endpointBefore,
+        "the device's transport address must survive a real reload",
+      );
     });
 
     await act("the reseal control asks what should unseal this device", async () => {

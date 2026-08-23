@@ -57,6 +57,7 @@ import devicePairingMock from "./scenarios/device-pairing-mock.ts";
 import soloPairing from "./scenarios/solo-pairing.ts";
 import soloPersistence from "./scenarios/solo-persistence.ts";
 import soloErase from "./scenarios/solo-erase.ts";
+import soloResumeSync from "./scenarios/solo-resume-sync.ts";
 import soloEphemeral from "./scenarios/solo-ephemeral.ts";
 import soloStorage from "./scenarios/solo-storage.ts";
 import soloGdrive from "./scenarios/solo-gdrive.ts";
@@ -132,6 +133,16 @@ const SCENARIOS: Scenario[] = [
   // fault is in the erasure rather than in anything the device does
   // between ceremonies.
   soloErase,
+  // AND THE STATE BETWEEN CEREMONIES, which is where the account lives
+  // most of the time: both devices of a paired account close and reopen,
+  // and sync has to come back WITHOUT a ceremony. It runs after
+  // solo-pairing (which proves the ceremony) and after solo-persistence
+  // (which proves a device survives a reload with the same transport
+  // address) because it depends on both: a failure here with those two
+  // green says the fault is in the resume wiring — the device directory,
+  // the role read out of it, the acceptor and the dial — rather than in
+  // anything either of them covers.
+  soloResumeSync,
   soloEphemeral,
   // THE WORKER HOST'S STORAGE EGRESS (STORAGE-EGRESS.md's T-E): the same
   // sheet the two device-store scenarios above just proved a device

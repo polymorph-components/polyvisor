@@ -208,6 +208,12 @@ export interface Driver {
   usDevicesList(): Promise<UsDevice[]>;
   usDeviceRevoke(agentId: Uint8Array): Promise<void>;
 
+  /** Record THIS device's own iroh endpoint id in the account's device
+   * map, so the account's other devices can dial it after a reload.
+   * Called every boot: the engine compares before it writes and authors
+   * nothing when the stored value already matches. */
+  usDeviceEndpointPut(endpoint: Uint8Array): Promise<void>;
+
   /** Drain remotely-caused changes the visor must announce (#22).
    * Local-echo suppression is engine-side: a device never receives
    * events for its own writes. */
@@ -300,6 +306,13 @@ export interface UsDevice {
   name: string;
   enrolledAt: bigint;
   revoked: boolean;
+  /** The device's iroh endpoint id, or EMPTY when none is recorded —
+   * additive, so entries written before the key existed read back empty
+   * rather than failing (engine.wit's `us-device`). */
+  endpoint: Uint8Array;
+  /** The agent id of the device that enrolled this one; empty for the
+   * founding device, and empty additively for older entries. */
+  enrolledBy: Uint8Array;
 }
 
 export type UsEvent =
@@ -522,6 +535,23 @@ async function persistImports(dir: PersistDir): Promise<Record<string, unknown>>
  */
 export interface DeviceIdentityFragment {
   deviceKeyPair(): Promise<[unknown, unknown] | undefined>;
+  /**
+   * The embedder-held TRANSPORT identity — the iroh endpoint key
+   * (engine.wit's `device-identity.endpoint-key-pair`, where the ruling
+   * is written out in full).
+   *
+   * Consulted at `irohBind()`. `undefined` mints a fresh iroh identity
+   * per bind, which is what every embedding did before this existed —
+   * and which means the endpoint id, being the key's public half, died
+   * with the page session. A persisted pair makes the id stable, so a
+   * peer that recorded it can still dial after both sides reloaded.
+   *
+   * A SECOND PAIR, never the signing one: no key crosses between
+   * keyhive's signatures and iroh's handshake, and the transport
+   * identity stays rotatable independently of the account identity.
+   * Same handle convention as `deviceKeyPair` above.
+   */
+  endpointKeyPair(): Promise<[unknown, unknown] | undefined>;
 }
 
 /** The import key for {@link DeviceIdentityFragment}. */
@@ -536,6 +566,7 @@ export const DEVICE_IDENTITY = "polyvisor:engine/device-identity@0.1.0";
  * handle; that fragment is the device-store track's. */
 const noDeviceIdentity: DeviceIdentityFragment = {
   deviceKeyPair: () => Promise.resolve(undefined),
+  endpointKeyPair: () => Promise.resolve(undefined),
 };
 
 export async function newEngine(

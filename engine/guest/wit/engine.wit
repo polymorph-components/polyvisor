@@ -434,6 +434,26 @@ interface driver {
         name: string,
         enrolled-at: u64,
         revoked: bool,
+        /// THE DEVICE'S IROH ENDPOINT ID — how the account's other
+        /// devices dial this one after everybody has been closed and
+        /// reopened. Empty when this device has not recorded one yet.
+        ///
+        /// ADDITIVE: entries written before this key existed read back
+        /// EMPTY, never as an error. A document is not migrated; it
+        /// simply fills in, because every device upserts its own entry
+        /// at boot (`us-device-endpoint-put`).
+        ///
+        /// Two writers, and the difference is worth keeping straight.
+        /// The ADDER writes the joiner's endpoint at enrollment from an
+        /// id it OBSERVED on a connection it dialed — key-is-address, so
+        /// the observation is transport-authenticated. Every device also
+        /// writes its OWN entry at boot, which is the path that keeps
+        /// this current when a transport identity changes.
+        endpoint: list<u8>,
+        /// The agent id of the device that enrolled this one. Empty for
+        /// the FOUNDING device, which nobody enrolled — and, ADDITIVELY,
+        /// for every entry written before this key existed.
+        enrolled-by: list<u8>,
     }
 
     variant us-event {
@@ -582,6 +602,24 @@ interface driver {
     us-devices-list:  async func() -> result<list<us-device>, string>;
     us-device-revoke: async func(agent-id: list<u8>) -> result<_, string>;
 
+    /// Record THIS device's own iroh endpoint id in the account's device
+    /// map, so the account's other devices can find it again after a
+    /// reload. Requires an existing user system — same error convention
+    /// as `us-profile-set` when there is none.
+    ///
+    /// CALLED EVERY BOOT, which is what pins the second half of the
+    /// contract: when the stored value already EQUALS `endpoint` this is
+    /// a no-op and authors NO chunk. A boot-time write that produced a
+    /// change every time would add one chunk per page load per device to
+    /// a document every device syncs, forever, for information that did
+    /// not change.
+    ///
+    /// Only ever this device's own entry: an endpoint is a claim about
+    /// where a device is, and the only unimpeachable source for that
+    /// claim is the device itself — or a peer that dialed it (the adder
+    /// at enrollment, see `us-device.endpoint`).
+    us-device-endpoint-put: async func(endpoint: list<u8>) -> result<_, string>;
+
     /// Drain remotely-caused changes the visor must announce (#22).
     /// Local-echo suppression is engine-side: a device never receives
     /// events for its own writes.
@@ -635,6 +673,36 @@ interface device-identity {
     /// this import with a stub answering `none` is byte-for-byte the
     /// engine it was before this interface existed.
     device-key-pair: async func() -> option<tuple<signing-key, verifying-key>>;
+
+    /// The embedder-held TRANSPORT identity: the iroh endpoint key.
+    ///
+    /// Consulted at `iroh-bind`. `some(pair)` binds the endpoint under
+    /// that key through `polymorph:iroh/identity-from-keys`; `none`
+    /// mints a fresh one through `identity-generate`, which is exactly
+    /// the behavior of every embedding before this function existed.
+    ///
+    /// WHY IT MATTERS THAT IT PERSISTS. In iroh the key IS the address:
+    /// an endpoint id is the public half, and peers dial it. A freshly
+    /// minted key per bind therefore means a device's address dies with
+    /// its page session, and a peer that recorded the old one can never
+    /// reach it again. Persisting the key is what makes "both devices
+    /// reloaded, then re-found each other" possible at all.
+    ///
+    /// A SECOND PAIR, DELIBERATELY — not the signing identity above.
+    /// Two reasons, and either alone would be enough. (1) No
+    /// cross-protocol key reuse: the signing key authors keyhive
+    /// delegations and signs subduction messages, and iroh's handshake
+    /// signs its own transcripts; one key over two protocols' message
+    /// spaces is the classic way a signature minted for one becomes
+    /// meaningful in the other. (2) Separability: the transport identity
+    /// is WHERE a device is and the signing identity is WHO it is, and
+    /// an embedder must be able to rotate one without repudiating the
+    /// account built on the other.
+    ///
+    /// Same pair convention and the same free default as
+    /// `device-key-pair`: a host that answers `none` here is
+    /// byte-for-byte the engine it was before this function existed.
+    endpoint-key-pair: async func() -> option<tuple<signing-key, verifying-key>>;
 }
 
 /// The shared shape of the storage egress imports below. Named as its
@@ -651,6 +719,10 @@ interface store-fetch-types {
 world engine {
     import polymorph:iroh/endpoint@0.1.0;
     import polymorph:iroh/identity-generate@0.1.0;
+    /// The other half of the endpoint-identity story: minting an iroh
+    /// identity from the embedder's persisted key handles, for when
+    /// `device-identity.endpoint-key-pair` answers `some`.
+    import polymorph:iroh/identity-from-keys@0.1.0;
 
     /// The embedder-held device identity (see the interface above). The
     /// world import MUST be filled at instantiation, so every embedder

@@ -64,6 +64,7 @@ export {
 
 export {
   deleteIdentity,
+  DEVICE_ENDPOINT_KEY,
   DEVICE_IDENTITY_KEY,
   IdentityKeyError,
   loadIdentity,

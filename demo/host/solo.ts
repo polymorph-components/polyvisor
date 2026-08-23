@@ -65,7 +65,13 @@ import {
 import { createRunner, type Runner } from "../../visor/surface/runner.ts";
 import { createFrameBackend } from "../../visor/frame/frame-backend.ts";
 import { createSurface } from "../../visor/surface/surface.ts";
-import { initVisor, type SurfaceIdentity, type Visor, VISOR_HUES } from "../../visor/ui/visor.ts";
+import {
+  initVisor,
+  type SurfaceIdentity,
+  type Visor,
+  VISOR_HUES,
+  VISOR_ICONS,
+} from "../../visor/ui/visor.ts";
 import { registerVisorSheets } from "../../visor/ui/sheets.ts";
 import {
   type DevicePickerHost,
@@ -84,7 +90,7 @@ import {
   usCacheKeys,
   visorAnnounceSink,
 } from "../../visor/ui/pairing.ts";
-import type { PairingDriver, UsProfile } from "../../visor/ui/pairing-driver.ts";
+import type { PairingDriver, UsMark, UsProfile } from "../../visor/ui/pairing-driver.ts";
 import { createEnginePairingDriver } from "../../runtime/pairing-engine.ts";
 import type { UiEvent } from "../../visor/surface/events.ts";
 import { type EngineArtifacts, hex, unhex, until, type UsStorage } from "../../runtime/engine.ts";
@@ -203,6 +209,25 @@ const ENGINE_ARTIFACTS = {
  * visor's own (demo/scripts/check-invariants.sh invariant (b)), and this
  * is the platform's masking token, spelled once, here. */
 const MASKED = { type: "password" } as const;
+
+/** THE ACCOUNT'S USER ICON, coming the other way: UTF-8 bytes of one
+ * glyph (engine.wit's `us-profile.icon` — `option<list<u8>>`, opaque to
+ * the engine) turned back into a glyph this visor is willing to draw.
+ *
+ * Returns null for every "nothing to say" answer — absent, undecodable,
+ * or a glyph outside the visor's curated vocabulary (visor.ts's
+ * VISOR_ICONS; another device may run a different build) — so a caller
+ * can tell "the account has no icon" from "the account has one" and
+ * never confuse the first with "clear the one this device wears". */
+function decodeUserIcon(bytes: Uint8Array | undefined): string | null {
+  if (!bytes || bytes.length === 0) return null;
+  try {
+    const glyph = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return VISOR_ICONS.includes(glyph) ? glyph : null;
+  } catch {
+    return null;
+  }
+}
 
 async function fetchArtifacts(name: string): Promise<EngineArtifacts> {
   const [envelope, bytes] = await Promise.all([
@@ -879,10 +904,21 @@ async function startApp(
       // WRITE-THROUGH (PAIRING.md §5): the visor has already stored and
       // painted; the partition is the source of truth catching up, so a
       // failure here is announced rather than hidden.
+      //
+      // THE GLYPH GOES WITH THE NAME, as UTF-8 bytes of the glyph
+      // itself (engine.wit's `us-profile.icon` is `option<list<u8>>`
+      // and the engine treats it as opaque). `rec.icon` was already
+      // filtered to the visor's curated vocabulary by `loadIdentity`,
+      // so what crosses is one vetted glyph and never free text. An
+      // ABSENT icon crosses as `none`, which the engine reads as
+      // "delete" — right, because absent here means the user's record
+      // genuinely has no glyph, not that this device has nothing to
+      // say (the settings sheet always commits a picked one).
       void (async () => {
         const res = await us.usProfileSet({
           displayName: rec.name ?? "",
           hue: hueIndexOf(hue),
+          icon: rec.icon ? new TextEncoder().encode(rec.icon) : undefined,
         });
         if (!res.ok) announce(`could not save your profile: ${res.error}`, true);
       })();
@@ -2379,12 +2415,92 @@ async function startApp(
 
   let usSynced = false;
 
+  /** KEEP THE ACCOUNT'S DEVICE DIRECTORY HONEST — the backstop the whole
+   * resume path stands on.
+   *
+   * The devices map is not just a roster any more: each entry carries
+   * the device's iroh ENDPOINT ID, which is the only way one device of
+   * an account can find another after both have been closed and
+   * reopened. The adder writes the joiner's endpoint at enrollment (from
+   * an id it observed on the wire, which is why it is trustworthy), and
+   * `user-create` writes the founder's own — so in the ordinary case the
+   * directory is already right and this call authors nothing.
+   *
+   * It is called anyway, on every boot that has both an endpoint and an
+   * account, because "already right" is a claim about a past that may
+   * have contained an older engine, a failed bind, or an entry written
+   * before the field existed. The engine compares before it writes
+   * (usdoc.rs's `device_endpoint_put`: "THE NO-OP IS THE CONTRACT"), so
+   * the cost of being sure is one read.
+   *
+   * IT DOES NOT CREATE A MISSING ENTRY, and that is the engine's rule
+   * rather than this page's choice: a device whose entry has not synced
+   * yet would be racing the adder's enrollment write, and the loser of
+   * that automerge conflict loses the name the write carried. The next
+   * boot finds the entry.
+   *
+   * THE RAW DRIVER: `us-device-endpoint-put` is transport bookkeeping,
+   * not something the visor's contract has any business carrying. */
+  const recordMyEndpoint = async () => {
+    if (!myEndpoint) return;
+    try {
+      await enqueue(() => driver.usDeviceEndpointPut(myEndpoint as Uint8Array));
+    } catch (e) {
+      // NOT ANNOUNCED. A directory this device could not update is a
+      // reachability problem for a FUTURE boot, not something the user
+      // can act on now, and the account still works in every other way.
+      console.warn(`[solo] could not record this device's endpoint: ${err(e)}`);
+    }
+  };
+
   /** Subscribe to `tree` with `peer`, both directions being the caller's
    * to arrange. `subscribe` is what makes a LATER write push rather than
    * wait for a poll. */
   const subscribe = async (peer: Uint8Array, tree: Uint8Array, what: string) => {
     const h = await driver.syncStart(peer, tree, true);
     await until(`subscribed to ${what}`, () => driver.syncStatus(h), 30_000);
+  };
+
+  /** READER DIALS, and this is the only place on this page that opens a
+   * connection as the initiator. Both the ceremony's joiner and a
+   * RESUMED boot's reader come through here, so the direction rule above
+   * is stated once and obeyed twice.
+   *
+   * `usPartition` is the CEREMONY path's extra. At enrollment time the
+   * joiner has the account doc's id in hand (the enrollment carries it)
+   * and subscribes it explicitly, because nothing else will: the two
+   * sides have only just met. A RESUMED boot passes nothing, and that is
+   * not an omission — the doc's id is deliberately absent from the
+   * `us-*` surface, and the engine subscribes the us doc to every known
+   * peer itself on every pump (usdoc.rs's `ensure_subscriptions`:
+   * "Engine-driven because `us-*` hides doc identity by design"). By
+   * resume time the peer is known, so the engine does it. */
+  const dialPeer = async (
+    peer: Uint8Array,
+    peerEndpoint: Uint8Array,
+    usPartition?: Uint8Array,
+  ) => {
+    await enqueue(async () => {
+      const conn2 = await driver.irohStart(true, peerEndpoint, RELAY, peer);
+      await until("the other device answers", () => driver.connStatus(conn2), 30_000);
+      if (usPartition) await subscribe(peer, usPartition, "your account");
+    });
+  };
+
+  /** The account's todo list, as the account's own pointer map names it
+   * (#36) — the only channel either side has for it.
+   *
+   * THE RAW DRIVER, and for the same reason the peer ids are read raw:
+   * `us-partitions` is not on the visor's `PairingDriver` contract and
+   * must not be added to it. Which partition an app is mounted on is the
+   * embedder's concern; the trusted surface has no use for a partition
+   * id and no business holding one. */
+  const awaitTasksPointer = async (what: string, timeoutMs: number) => {
+    const pointer = await until(what, async () => {
+      const list = await enqueue(() => driver.usPartitions());
+      return list.find((p) => p.name === TASKS_POINTER) ?? false;
+    }, timeoutMs, 250);
+    return pointer.id;
   };
 
   // --- role: the JOINER (this page is the new device) ----------------------
@@ -2420,24 +2536,10 @@ async function startApp(
         throw new Error("the enrollment carried no peer ids — cannot reach the other device");
       }
       const peer = enrollment.peerAgentId;
-      await enqueue(async () => {
-        // READER DIALS.
-        const conn2 = await driver.irohStart(true, enrollment.peerEndpointId, RELAY, peer);
-        await until("the other device answers", () => driver.connStatus(conn2), 30_000);
-        await subscribe(peer, enrollment.partitionId, "your account");
-      });
-      // The tasks partition id has no channel but the account's own
-      // pointer map — which is why the map exists (#36).
-      // THE RAW DRIVER AGAIN, and for the same reason as the peer ids:
-      // `us-partitions` is not on the visor's `PairingDriver` contract
-      // and must not be added to it. Which partition an app is mounted
-      // on is the embedder's concern; the trusted surface has no use for
-      // a partition id and no business holding one.
-      const pointer = await until("your account's todo list", async () => {
-        const list = await enqueue(() => driver.usPartitions());
-        return list.find((p) => p.name === TASKS_POINTER) ?? false;
-      }, 60_000, 250);
-      const tasksId = pointer.id;
+      // READER DIALS — and the account doc goes with the dial, because
+      // the two sides have only just met (see `dialPeer`).
+      await dialPeer(peer, enrollment.peerEndpointId, enrollment.partitionId);
+      const tasksId = await awaitTasksPointer("your account's todo list", 60_000);
       await enqueue(async () => {
         await driver.adoptPartition(tasksId);
         await subscribe(peer, tasksId, "your todo list");
@@ -2455,7 +2557,7 @@ async function startApp(
       // cache diff; on a device joining for the first time the cache is
       // empty, so it says nothing and the line below is the only one the
       // user hears. The two do not double-speak.
-      await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile);
+      await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile, applyMarks);
       const adopted = await us.usProfileGet();
       if (adopted.ok) {
         // THE ADOPTION ANNOUNCEMENT (PAIRING.md §5): a remotely-caused
@@ -2465,6 +2567,13 @@ async function startApp(
         );
       }
       await mountApp();
+      // DIRECTORY UPKEEP, at the first moment this device has an account
+      // to keep it in — see `recordMyEndpoint`. The adder already wrote
+      // this device's endpoint from the id it observed on the wire, so
+      // this call is almost always the engine's own no-op; it is here so
+      // that "every device with an endpoint and an account has said so"
+      // holds without a case analysis.
+      await recordMyEndpoint();
     } catch (e) {
       if (joinAttempts < WIRE_ATTEMPTS) joinWired = false;
       else announce(`could not sync this device with your account: ${err(e)}`, true);
@@ -2495,8 +2604,71 @@ async function startApp(
     const angle = VISOR_HUES[profile.hue] ?? VISOR_HUES[0];
     visor.commitHue(angle);
     const rec = visor.identity();
-    if (profile.displayName) visor.saveIdentity({ ...rec, name: profile.displayName });
+    const next = { ...rec };
+    if (profile.displayName) next.name = profile.displayName;
+    // THE GLYPH, decoded from the account's bytes and then VETTED. It
+    // was written by another device — possibly a different visor build,
+    // with a vocabulary this one does not have — so it passes the same
+    // membership test `loadIdentity` applies to hand-editable storage
+    // (visor.ts's VISOR_ICONS: the bidi/ZWJ/confusable firewall) before
+    // it can reach the one position on the strip that is supposed to be
+    // unspoofable. `saveIdentity` would refuse an outsider anyway; the
+    // check is here so a refusal does not silently DROP the glyph this
+    // device already wears.
+    //
+    // ABSENT OR INVALID MEANS "NOTHING TO SAY", never "clear it": an
+    // account that has never carried an icon must not undress a device
+    // whose user picked one locally.
+    const glyph = decodeUserIcon(profile.icon);
+    if (glyph) next.icon = glyph;
+    visor.saveIdentity(next);
     visor.renderIdentity();
+  };
+
+  /** THE ACCOUNT'S MARKS, adopted into THIS device's trust table — the
+   * inbound half of `onNamed`'s write-through, at the same three moments
+   * `applyProfile` runs at (the join beat, a resumed boot, a mark event
+   * drained off the account).
+   *
+   * WHAT MAY BE ADOPTED, and why it is narrower than the list
+   * (PAIRING.md §5 and its repaired-view rule): `us-marks-list` returns
+   * the REPAIRED view, not the raw records — the engine has already run
+   * petname- and icon-uniqueness repair over the doc, and a record that
+   * LOST is handed out with `needs-reconfirm` set and, for an icon
+   * collision, with its icon cleared to "". Such a record is not a name
+   * this device may start speaking in the visor's own voice: the
+   * contract is that it renders NEW-with-explanation and the USER
+   * re-confirms it through the naming ceremony (which is also where a
+   * cleared icon gets re-picked, since the vocabulary is the visor's and
+   * the engine cannot choose a replacement). So only WHOLE marks are
+   * seeded — petname and icon both non-empty, `needsReconfirm` false —
+   * and everything else is left for the ceremony. Note that "" icon
+   * implies `needs-reconfirm` engine-side anyway; both are tested
+   * because the contract states both, not because either is redundant.
+   *
+   * DELETIONS ARE OUT OF SCOPE. There is no mark-forgotten event to
+   * drain, so a mark forgotten on another device stays in this device's
+   * table until it is forgotten here too. That is a gap, not a decision
+   * hidden in an omission — it needs an event before it can be closed.
+   *
+   * SILENT, like `applyProfile`: the drain has already announced the
+   * event, and the join beat has its own sentence. */
+  const applyMarks = (marks: UsMark[]) => {
+    for (const m of marks) {
+      if (m.needsReconfirm) continue;
+      const petname = m.petname.trim();
+      if (petname === "" || m.icon === "") continue;
+      // `setPetname` is the same call the ceremony makes, and it applies
+      // its own write-side vocabulary gate to the glyph.
+      sheets.marks.setPetname(m.provenance, petname, m.icon);
+      // AND THE LIVE SURFACE, exactly as `onNamed` refreshes it locally:
+      // a table seeded under a mounted app would otherwise leave the
+      // strip calling the surface NEW while the record says otherwise.
+      if (appSlot.surface && appSlot.surface.name === m.provenance) {
+        appSlot.surface = { ...appSlot.surface, petname, icon: m.icon, isNew: false };
+        visor.renderContext();
+      }
+    }
   };
 
   // --- role: the ADDER (this page already has the account) -----------------
@@ -2506,6 +2678,59 @@ async function startApp(
   let acceptorConn: number | null = null;
   let adderWired = false;
   let adderAttempts = 0;
+
+  /** WRITER ACCEPTS: no peer, no expectation — this side answers
+   * whoever it granted, or whoever it once granted and is now coming
+   * back. Idempotent, because both the add ceremony and a resumed boot
+   * want it up and a second listener on one endpoint would be a second
+   * answer to the same dial. */
+  const postAcceptor = async () => {
+    if (acceptorPosted) return;
+    acceptorPosted = true;
+    try {
+      acceptorConn = await enqueue(() =>
+        driver.irohStart(false, new Uint8Array(), RELAY, new Uint8Array())
+      );
+    } catch (e) {
+      // The flag goes back down so the next caller can try again: a
+      // posted-but-failed acceptor is the silent failure this whole
+      // section exists to avoid.
+      acceptorPosted = false;
+      throw e;
+    }
+  };
+
+  /** THIS PAGE'S OWN ENDPOINT DIED — which is what a `Closed` error out
+   * of a dial or an acceptor means, and it is sticky by design: iroh's
+   * home relay does not come back on its own, so every later call
+   * against that endpoint fails the same way. There is nothing to do but
+   * bind again.
+   *
+   * IT IS SAFE TO REBIND ONLY BECAUSE THE IDENTITY IS STABLE. The
+   * endpoint key pair is held by the device
+   * (engine.wit's `device-identity.endpoint-key-pair`), so a rebind
+   * mints the SAME endpoint id — the address the account's directory
+   * records, and the one the other device is dialling. Before that key
+   * was persisted this recovery would have silently moved this device,
+   * which is worse than staying broken.
+   *
+   * CONTRACT: `Closed` is matched capitalised, on the word. The
+   * lower-case "the peer closed the pairing stream" is a DIFFERENT
+   * fact — the far end going away, which is a thing to retry, not a
+   * reason to tear down this device's transport. */
+  const isEndpointClosed = (e: unknown) => /\bClosed\b/.test(err(e));
+
+  const rebindEndpoint = async () => {
+    const id = unhex(await enqueue(() => driver.irohBind(RELAY)));
+    myEndpoint = id;
+    console.warn(`[solo] endpoint was closed; rebound the same address ${hex(id).slice(0, 8)}…`);
+    // The old acceptor went down with the endpoint, so the flag has to
+    // as well — otherwise this device would look like it was listening
+    // while nothing was.
+    acceptorPosted = false;
+    acceptorConn = null;
+    await postAcceptor();
+  };
 
   /** Everything after the GRANT, on the adding side.
    *
@@ -2521,14 +2746,7 @@ async function startApp(
     adderWired = true;
     adderAttempts++;
     try {
-      if (!acceptorPosted) {
-        acceptorPosted = true;
-        // WRITER ACCEPTS: no peer, no expectation — this side answers
-        // whoever it granted.
-        acceptorConn = await enqueue(() =>
-          driver.irohStart(false, new Uint8Array(), RELAY, new Uint8Array())
-        );
-      }
+      await postAcceptor();
       const joiner = await until("the joined device", async () => {
         const res = await us.usDevicesList();
         if (!res.ok) return false;
@@ -2568,6 +2786,276 @@ async function startApp(
       else announce(`could not sync the new device with your account: ${err(e)}`, true);
       console.warn(`[solo] post-grant wiring failed (attempt ${adderAttempts}): ${err(e)}`);
     }
+  };
+
+  // --- role: a RESUMED BOOT (the account is already here) ------------------
+  //
+  // THE GAP THIS CLOSES, stated plainly: the two roles above are
+  // CEREMONY roles. They run once, on the edge of an enrollment, and
+  // everything they know — who the peer is, where to dial it — came out
+  // of a ceremony that is over. So a page that reloads afterwards wires
+  // nothing, and once BOTH devices have reloaded there is no connection
+  // between them at all: edits stop crossing, and neither page has any
+  // symptom to show for it. Silence again, which is the failure mode
+  // this whole file keeps writing down.
+  //
+  // WHAT REPLACES THE CEREMONY'S KNOWLEDGE is the account's own device
+  // directory. Each entry now carries an ENDPOINT (where that device
+  // can be dialled) and an ENROLLED-BY (which device let it in), so the
+  // enrollment tree survives in the one place both devices already
+  // agree about — and a resumed boot can read its own role out of it
+  // instead of remembering one.
+  //
+  // THE ROLE IS THE SAME ROLE, and it must be: reversing the direction
+  // is the healthy-looking silence #78 is about. So this side re-enacts
+  // exactly what it did at ceremony time —
+  //
+  //   * MY ENROLLER, if I have one, is who I DIALLED then; I dial it
+  //     again. (READER DIALS.)
+  //   * MY CHILDREN — the devices whose `enrolled-by` is me — dialled
+  //     ME; I ACCEPT again, and subscribe them once their dial lands.
+  //     (WRITER ACCEPTS.)
+  //
+  // The acceptor goes up UNCONDITIONALLY and first, for the same reason
+  // adderWire posts it before it waits for anything: a listener that
+  // arrives after the dial is a dial into nothing. Every device may have
+  // enrolled someone, and posting it costs one call.
+  //
+  // AND IT IS PATIENT RATHER THAN PERSISTENT-UNTIL-IT-GIVES-UP. The
+  // ceremony's bounded three attempts are right for a ceremony: the user
+  // is watching, the other device is on the desk, and a failure is
+  // something to report while they can still act on it. Here the other
+  // device may be shut, on a train, or opened tomorrow — so the retry
+  // runs for as long as the page lives, and says so ONCE. A line per
+  // attempt would be a page shouting a fact that has not changed.
+
+  // AND WHAT THIS DOES NOT RECOVER, written down because the shape of
+  // the gap is not obvious and the workaround for it would be worse.
+  //
+  // Only ONE side reloading is NOT recovered, when the side that
+  // reloaded is the one that ACCEPTS. Its own resume posts an acceptor
+  // and waits, correctly; but its peer — the reader — still holds a
+  // connection handle from before, and has no way to learn that the
+  // thing on the other end of it is gone. `conn-status` reports the
+  // outcome of the HANDSHAKE and is never invalidated afterwards
+  // (engine/guest/src/lib.rs:3700 writes it once; :3706-3713 reads it
+  // back forever), and `sync-status` is one-shot per round rather than a
+  // subscription's health. So the reader has no evidence of staleness at
+  // all, and the only "fix" available to this file would be to re-dial
+  // on a timer — a second connection and a second set of subductions for
+  // the same pair, which is precisely the double-dialling the direction
+  // discipline exists to prevent.
+  //
+  // The both-sides case, which is the ordinary one (a user closes their
+  // laptop, then their phone), IS recovered: both readers come back with
+  // no handle to be misled by, and dial.
+  //
+  // The honest fix belongs in the engine — a `conn-status` that goes
+  // false when the connection drops — and until it exists this page
+  // cannot tell the difference between a healthy peer and a departed
+  // one.
+
+  /** Slow on purpose: the thing being waited for is another human
+   * opening a browser. */
+  const RESUME_TICK_MS = 5_000;
+  /** Ten minutes, and it is a wait for a PERSON, not for a wire. */
+  const RESUME_POINTER_MS = 600_000;
+
+  let resumeWired = false;
+
+  /** Wire a device that already holds the account.
+   *
+   * `needsTasks` is the un-dead-end: an account whose todo-list pointer
+   * has not reached this device yet. That used to park the page on "this
+   * account has no todo list yet" — a sentence that describes a
+   * PERMANENT state and was being said about a temporary one. The
+   * pointer is us-doc content, so it arrives exactly when the wire below
+   * comes up; the page waits for it instead of concluding from it. */
+  const resumeWire = async (needsTasks: boolean) => {
+    if (resumeWired) return;
+    resumeWired = true;
+
+    const st = await conn.status();
+    // Hex both ways, lower-cased at the boundary: the worker's `meta`
+    // copy and the directory's keys are both written by `hex()`
+    // (runtime/engine.ts), so this is belt-and-braces rather than a
+    // known mismatch — and a silent no-match here would be the page
+    // deciding it has no role in its own account.
+    const me = (st.agentId ?? "").toLowerCase();
+    if (!me) {
+      console.warn("[solo] resume wiring: this device has no recorded agent id");
+      return;
+    }
+
+    let announced = false;
+    const sayWaiting = () => {
+      if (announced) return;
+      announced = true;
+      status("waiting for your other device…");
+    };
+
+    /** Dialled at most once — a second dial to the same peer is a second
+     * connection carrying the same subscriptions. */
+    let dialled = false;
+    /** Which peers this device has already subscribed the todo list to.
+     * Keyed by agent id, hex. */
+    const tasksWired = new Set<string>();
+    /** Whether the tasks partition is this device's to read. False only
+     * on the `needsTasks` path, until the pointer arrives and the
+     * adoption below runs. */
+    let tasksHeld = !needsTasks;
+
+    /** Subscribe the account's todo list to one peer.
+     *
+     * ONLY THE TASKS PARTITION, because only it needs asking: the engine
+     * subscribes the us doc to every known peer itself on every pump
+     * (usdoc.rs's `ensure_subscriptions`), and it has no name for this
+     * one. Same division of labour as adderWire's. */
+    const wireTasks = async (peerHex: string) => {
+      if (!tasksHeld || tasksWired.has(peerHex)) return;
+      const list = await enqueue(() => driver.usPartitions());
+      const part = list.find((p) => p.name === TASKS_POINTER);
+      if (!part) return;
+      tasksWired.add(peerHex);
+      try {
+        await enqueue(() => subscribe(unhex(peerHex), part.id, "your todo list"));
+        usSynced = true;
+        console.log(`[solo] subduction re-wired: this device ⇄ ${peerHex.slice(0, 8)}…`);
+      } catch (e) {
+        // Back out of the set: a subscription that did not take must be
+        // retried, or this device is silently unsubscribed for ever.
+        tasksWired.delete(peerHex);
+        throw e;
+      }
+    };
+
+    // THE POINTER ARM, when this device has no todo list yet. It runs
+    // alongside the retry loop rather than inside it: the loop's job is
+    // the wire, and this is what the wire is FOR.
+    if (needsTasks) {
+      sayWaiting();
+      say("waiting for your other device…");
+      void (async () => {
+        try {
+          const tasksId = await awaitTasksPointer(
+            "your account's todo list",
+            RESUME_POINTER_MS,
+          );
+          // CONTRACT: `adopt-partition` REPLACES whatever this device
+          // held for that id with an empty document
+          // (engine/guest/src/lib.rs:3804), so it is called only on the
+          // path where this device demonstrably held nothing — the
+          // pointer was absent at boot and has only just arrived. A
+          // resumed device that already had the partition gets it back
+          // from its checkpoint and must never be re-adopted.
+          await enqueue(() => driver.adoptPartition(tasksId));
+          tasksHeld = true;
+          await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile, applyMarks);
+          await mountApp();
+        } catch (e) {
+          announce(`could not open your account's todo list: ${err(e)}`, true);
+          console.warn(`[solo] resume: the tasks pointer never arrived: ${err(e)}`);
+        }
+      })();
+    }
+
+    /** One attempt at everything, run again every `RESUME_TICK_MS`. Each
+     * step guards itself, so a tick that achieves half the wiring keeps
+     * the half it got. */
+    const tick = async () => {
+      // AT MOST ONE REBIND PER TICK. `Closed` is sticky, so an
+      // unguarded rebind-on-error would be a rebind storm: every failing
+      // call in this function would mint a fresh endpoint for the next
+      // one to fail against.
+      let rebound = false;
+      const onError = async (e: unknown, what: string) => {
+        console.warn(`[solo] resume ${what}: ${err(e)}`);
+        if (rebound || !isEndpointClosed(e)) return;
+        rebound = true;
+        try {
+          await rebindEndpoint();
+        } catch (e2) {
+          console.warn(`[solo] resume: rebinding the endpoint failed: ${err(e2)}`);
+        }
+      };
+
+      // WRITER ACCEPTS, first and always — see the section note.
+      try {
+        await postAcceptor();
+      } catch (e) {
+        await onError(e, "acceptor");
+      }
+
+      const res = await us.usDevicesList();
+      if (!res.ok) return;
+      const devices = res.value;
+      const mine = devices.find((d) => d.agentId.toLowerCase() === me);
+
+      // READER DIALS: my enroller is the device I dialled at ceremony
+      // time, and an empty `enrolled-by` means I am the founding device
+      // and never dialled anyone.
+      if (!dialled && mine && mine.enrolledBy !== "") {
+        const enroller = devices.find(
+          (d) => d.agentId.toLowerCase() === mine.enrolledBy.toLowerCase(),
+        );
+        // An entry with no endpoint is the directory saying "not
+        // observed" (engine.wit's `us-device`), and there is nothing
+        // honest to dial with. It may be filled in by that device's own
+        // boot-time upkeep, so this keeps looking rather than failing.
+        if (enroller && !enroller.revoked && enroller.endpoint !== "") {
+          sayWaiting();
+          try {
+            await dialPeer(unhex(enroller.agentId), unhex(enroller.endpoint));
+            dialled = true;
+          } catch (e) {
+            await onError(e, "dial");
+          }
+        }
+      }
+      if (dialled && mine) {
+        try {
+          await wireTasks(mine.enrolledBy.toLowerCase());
+        } catch (e) {
+          await onError(e, "subscribe (enroller)");
+        }
+      }
+
+      // MY CHILDREN dialled me, so this side waits for the dial to LAND
+      // before subscribing. adderWire's reasoning applies unchanged: a
+      // `sync-start` against a peer this side has no connection to
+      // reports a healthy handle and delivers nothing — the same silent
+      // shape as the reversed-direction bug (#78). The difference from
+      // adderWire is only that this is a POLL rather than an `until`:
+      // the tick is already the waiting loop.
+      const children = devices.filter(
+        (d) => !d.revoked && d.enrolledBy !== "" && d.enrolledBy.toLowerCase() === me,
+      );
+      if (children.length > 0 && acceptorConn !== null) {
+        sayWaiting();
+        let connected = false;
+        try {
+          connected = Boolean(await driver.connStatus(acceptorConn));
+        } catch (e) {
+          await onError(e, "acceptor status");
+        }
+        if (connected) {
+          for (const child of children) {
+            try {
+              await wireTasks(child.agentId.toLowerCase());
+            } catch (e) {
+              await onError(e, "subscribe (child)");
+            }
+          }
+        }
+      }
+    };
+
+    // NOT `until`, and not a bounded count. `poll` skips a tick whose
+    // predecessor is still running, which is exactly right here: a dial
+    // has its own 30s deadline inside it, and overlapping attempts would
+    // be several endpoints racing to reach one peer.
+    void tick();
+    poll(RESUME_TICK_MS, tick);
   };
 
   const addTenant = visor.drawer.tenant<{ container: HTMLElement }>({
@@ -2704,17 +3192,30 @@ async function startApp(
     // announces any diff it finds, which is the announcement this moment
     // owes; there is no adoption fanfare on a device that already
     // belongs to the account.
-    await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile);
+    await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile, applyMarks);
+    // THE DIRECTORY, BEFORE ANYTHING WAITS ON IT. This device's own
+    // entry is what the account's OTHER devices dial, so it is refreshed
+    // at the top of the resumed boot rather than after the wiring that
+    // depends on the symmetric fact being true over there.
+    await recordMyEndpoint();
     const parts = await enqueue(() => driver.usPartitions());
     const tasksPart = parts.find((p) => p.name === TASKS_POINTER);
     if (tasksPart) {
+      // THE APP FIRST, THE WIRE IN THE BACKGROUND. Everything this
+      // device needs to show the user is already on disk; making them
+      // watch a spinner while a peer that may be switched off is dialled
+      // would be the page confusing "not yet in sync" with "not yet
+      // usable".
       await mountApp();
+      void resumeWire(false);
     } else {
-      // An account with no todo list is not a first run — offering to
-      // create a SECOND account here would be the page guessing at a
-      // state it does not understand.
-      status("this account has no todo list yet");
-      say("ready — no todo list on this account");
+      // NOT A DEAD END ANY MORE. An account with no todo list is still
+      // not a first run — offering to create a SECOND account here would
+      // be the page guessing at a state it does not understand — but nor
+      // is it a state to park in. The pointer lives in the account's own
+      // document, so it arrives when the wire does; `resumeWire` says so
+      // on screen, waits, adopts, and mounts.
+      void resumeWire(true);
     }
   } else {
     note("account:none");
@@ -2739,12 +3240,35 @@ async function startApp(
   // or colour moved under this device, so the strip is repainted from
   // the account rather than left stale behind a sentence describing a
   // change the user cannot see.
-  poll(1000, async () => {
+  //
+  // ONE FUNCTION, TWO CALLERS, and that is not tidiness. `usEvents` is a
+  // DRAIN: it hands each event out exactly once, so whoever calls it
+  // owns what the event meant. The driving hook below used to call it on
+  // its own and then throw the batch away — which meant a scenario
+  // ticking the page faster than this timer could swallow the one
+  // `profile-changed` the timer existed to act on, and the strip would
+  // stay stale for a reason nothing on the page could report. Any future
+  // caller of the drain must come through here.
+  const drainAndAdopt = async () => {
     const events = await drainAnnouncements(us, announce);
-    if (events.some((ev) => ev.tag === "profile-changed")) {
-      await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile);
+    // THE ADOPTION HALF, for both families of remotely-caused change the
+    // account can hand this device. `profile-changed` moves the strip's
+    // identity; the three MARK tags move the trust table — including
+    // `mark-conflict-repaired`, which is the one that most needs
+    // adopting rather than merely announcing, since after a repair the
+    // account's view of a record and this device's may genuinely differ.
+    // One reconcile covers all of them: it re-reads both halves anyway,
+    // and a batch mentioning several is still one round trip.
+    if (
+      events.some((ev) =>
+        ev.tag === "profile-changed" || ev.tag === "mark-added" ||
+        ev.tag === "mark-changed" || ev.tag === "mark-conflict-repaired"
+      )
+    ) {
+      await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile, applyMarks);
     }
-  });
+  };
+  poll(1000, drainAndAdopt);
 
   // --- driving hooks --------------------------------------------------------
   //
@@ -2759,6 +3283,13 @@ async function startApp(
     /** THE DEVICE, as the store holds it. Nothing personal: an opaque
      * id, the tier, the policy and the rungs the picker reasons about. */
     deviceId: () => conn.deviceId,
+    /** THE TRANSPORT ADDRESS this page bound, hex, or "" when the bind
+     * failed. Read-only and deliberately narrow: it exists so a scenario
+     * can assert that the id is the SAME one across a real reload —
+     * which is the whole claim of the persisted endpoint key
+     * (engine.wit's `device-identity.endpoint-key-pair`). Nothing here
+     * lets a test set it. */
+    endpointId: () => (myEndpoint ? hex(myEndpoint) : ""),
     deviceStatus: () => conn.status(),
     /** The strip's device line — "" when the rule says there is none. */
     deviceLabel: () =>
@@ -2920,10 +3451,12 @@ async function startApp(
       });
       return res.ok;
     },
-    /** Drain both timers once, without waiting on them. */
+    /** Drain both timers once, without waiting on them. The drain goes
+     * through `drainAndAdopt` for the reason written there: an event
+     * handed out once must be ACTED on once, by whoever took it. */
     tick: async () => {
       if (await entry?.joinHandle.tick()) void joinerWire();
-      await drainAnnouncements(us, announce);
+      await drainAndAdopt();
     },
     appRunner: () => appRunner !== null,
     /** The storage sheet, entered the way a user enters it. */

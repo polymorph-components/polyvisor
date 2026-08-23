@@ -214,7 +214,23 @@ fn read_profile(am: &AutoCommit) -> (String, u16, Option<Vec<u8>>) {
     )
 }
 
-fn read_devices(am: &AutoCommit) -> BTreeMap<String, (String, u64, bool)> {
+/// One entry of the devices map, as the document holds it.
+///
+/// A named record rather than a tuple because it grew past the point
+/// where positional reads stayed honest — and because two of its fields
+/// are ADDITIVE (engine.wit's `us-device`): `endpoint` and `enrolled_by`
+/// are empty on every entry written before those keys existed, and the
+/// read path must treat that as ordinary rather than as damage.
+#[derive(Clone, PartialEq)]
+struct DeviceRow {
+    name: String,
+    enrolled_at: u64,
+    revoked: bool,
+    endpoint: Vec<u8>,
+    enrolled_by: Vec<u8>,
+}
+
+fn read_devices(am: &AutoCommit) -> BTreeMap<String, DeviceRow> {
     let mut out = BTreeMap::new();
     let Some(devices) = map_at(am, DEVICES) else {
         return out;
@@ -225,11 +241,16 @@ fn read_devices(am: &AutoCommit) -> BTreeMap<String, (String, u64, bool)> {
         };
         out.insert(
             key.to_string(),
-            (
-                get_str(am, &d, "name").unwrap_or_default(),
-                get_u64(am, &d, "enrolled-at").unwrap_or(0),
-                get_bool(am, &d, "revoked"),
-            ),
+            DeviceRow {
+                name: get_str(am, &d, "name").unwrap_or_default(),
+                enrolled_at: get_u64(am, &d, "enrolled-at").unwrap_or(0),
+                revoked: get_bool(am, &d, "revoked"),
+                // ADDITIVE (engine.wit's `us-device`): an entry written
+                // before these keys existed reads back empty, which is
+                // the documented value for "not recorded", not an error.
+                endpoint: get_bytes(am, &d, "endpoint").unwrap_or_default(),
+                enrolled_by: get_bytes(am, &d, "enrolled-by").unwrap_or_default(),
+            },
         );
     }
     out
@@ -478,7 +499,7 @@ struct Snap {
     /// what keeps a repair write from announcing itself twice.
     marks: BTreeMap<String, (String, String, Option<String>, u64, bool)>,
     repairs: BTreeSet<(String, String)>,
-    devices: BTreeMap<String, (String, u64, bool)>,
+    devices: BTreeMap<String, DeviceRow>,
     /// The account's storage record. `None` until an account binds one;
     /// compared WHOLE, so a change of any field (not just of provider)
     /// is a change worth announcing.
@@ -531,11 +552,15 @@ fn diff(pre: &Snap, post: &Snap) -> Vec<UsEvent> {
     for (prov, kind) in new_repairs {
         out.push(UsEvent::MarkConflictRepaired((prov.clone(), kind.clone())));
     }
-    for (id, (name, _, revoked)) in &post.devices {
+    // Devices announce APPEARANCE and REVOCATION, and nothing else: an
+    // endpoint that moved is not news to a user, and every device
+    // rewrites its own endpoint at boot, so an event on that field would
+    // be a notification storm about plumbing.
+    for (id, row) in &post.devices {
         match pre.devices.get(id) {
-            None => out.push(UsEvent::DeviceAdded(name.clone())),
-            Some((_, _, was_revoked)) if !*was_revoked && *revoked => {
-                out.push(UsEvent::DeviceRevoked(name.clone()))
+            None => out.push(UsEvent::DeviceAdded(row.name.clone())),
+            Some(before) if !before.revoked && row.revoked => {
+                out.push(UsEvent::DeviceRevoked(row.name.clone()))
             }
             Some(_) => {}
         }
@@ -786,7 +811,13 @@ pub(crate) async fn create(profile: UsProfile) -> Result<Vec<u8>, String> {
     // with an empty name keeps `us-devices-list` complete (a missing
     // first device would be worse than an unnamed one) and leaves the
     // naming to the visor. Flagged to the dispatcher.
-    device_entry(&crate::own_agent_id()?, "").await?;
+    // The founding device: `enrolled-by` is EMPTY because nobody
+    // enrolled it, which is the record's documented reading of empty
+    // rather than a gap. Its endpoint is recorded if the transport
+    // happens to be bound already — the host's ordering, not ours — and
+    // the boot-time `us_device_endpoint_put` covers the case where it is
+    // not.
+    device_entry(&crate::own_agent_id()?, "", &crate::own_endpoint_id()?, &[]).await?;
     set_baseline()?;
     Ok(group)
 }
@@ -881,9 +912,16 @@ async fn anchor_data_partitions(agent: &[u8]) -> Result<(), String> {
 }
 
 /// The adder's enrollment writes, in the order PAIRING.md §2 pins.
+///
+/// `join_ep` is the joiner's iroh endpoint id AS THIS DEVICE OBSERVED
+/// IT: the adder dialed that endpoint to run the ceremony, and in iroh
+/// the key is the address, so the connection itself authenticates the
+/// id. Recording it here is what lets the account re-find the new device
+/// after both sides have been closed and reopened.
 pub(crate) async fn enroll_device(
     joiner: &[u8],
     name: &str,
+    join_ep: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
     let group = with_state(|s| s.us.user_group.clone())?
         .ok_or("no user group on this device (user-create first)")?;
@@ -922,7 +960,7 @@ pub(crate) async fn enroll_device(
     // ANCHOR: it is sealed under an epoch the joiner holds, so it is
     // guaranteed to be a chunk the joiner can open directly — and from a
     // chunk it can open, the whole ancestry is reachable (§2, §4b).
-    device_entry(joiner, name).await?;
+    device_entry(joiner, name, join_ep, &crate::own_agent_id()?).await?;
     // 6. The same anchor, for the account's DATA partitions — the
     // devices entry only covers this document (see
     // `anchor_data_partitions`). AFTER the rotation in step 2, so the
@@ -933,10 +971,28 @@ pub(crate) async fn enroll_device(
     Ok((group, card, partition))
 }
 
-async fn device_entry(agent: &[u8], name: &str) -> Result<(), String> {
+/// Write (or refresh) one device's entry.
+///
+/// `endpoint` and `enrolled_by` are written ONLY when non-empty: an
+/// empty argument means "nothing to say about this", and writing an
+/// empty value would turn a silence into an assertion — a later, better
+/// informed write (the joiner's own boot-time
+/// `us_device_endpoint_put`) would then be overwriting a real key with
+/// nothing on the losing side of a merge.
+async fn device_entry(
+    agent: &[u8],
+    name: &str,
+    endpoint: &[u8],
+    enrolled_by: &[u8],
+) -> Result<(), String> {
     let key = hex::encode(agent);
     let enrolled_at = crate::now_ms_u64();
     let name = name.to_string();
+    // Raw bytes, as `us-partition`'s id and the profile icon are stored:
+    // the map KEY is hex because automerge map keys are strings, the
+    // values are not.
+    let endpoint = endpoint.to_vec();
+    let enrolled_by = enrolled_by.to_vec();
     write(move |am| {
         let devices = match map_at(am, DEVICES) {
             Some(d) => d,
@@ -956,6 +1012,14 @@ async fn device_entry(agent: &[u8], name: &str) -> Result<(), String> {
             .map_err(|e| format!("enrolled-at: {e}"))?;
         am.put(&d, "revoked", false)
             .map_err(|e| format!("revoked: {e}"))?;
+        if !endpoint.is_empty() {
+            am.put(&d, "endpoint", endpoint)
+                .map_err(|e| format!("device endpoint: {e}"))?;
+        }
+        if !enrolled_by.is_empty() {
+            am.put(&d, "enrolled-by", enrolled_by)
+                .map_err(|e| format!("enrolled-by: {e}"))?;
+        }
         Ok(())
     })
     .await
@@ -1202,13 +1266,15 @@ pub(crate) async fn devices_list() -> Result<Vec<UsDevice>, String> {
     pump().await?;
     let devices = read_us(read_devices)?;
     let mut out = Vec::new();
-    for (key, (name, enrolled_at, revoked)) in devices {
+    for (key, row) in devices {
         let Ok(raw) = hex::decode(&key) else { continue };
         out.push(UsDevice {
             agent_id: raw,
-            name,
-            enrolled_at,
-            revoked,
+            name: row.name,
+            enrolled_at: row.enrolled_at,
+            revoked: row.revoked,
+            endpoint: row.endpoint,
+            enrolled_by: row.enrolled_by,
         });
     }
     out.sort_by(|a, b| {
@@ -1217,6 +1283,47 @@ pub(crate) async fn devices_list() -> Result<Vec<UsDevice>, String> {
             .then_with(|| a.agent_id.cmp(&b.agent_id))
     });
     Ok(out)
+}
+
+/// Record THIS device's own endpoint id (engine.wit's
+/// `us-device-endpoint-put`).
+///
+/// THE NO-OP IS THE CONTRACT. The host calls this on every boot, and a
+/// write that authored a chunk every time would grow the one document
+/// every device syncs by one change per page load per device, forever,
+/// carrying nothing new. So the stored value is read and compared FIRST,
+/// and an equal value returns without touching the document at all.
+///
+/// CONTRACT: an ABSENT entry is left absent rather than created. The
+/// devices map is keyed by agent id, and two devices concurrently
+/// `put_object`-ing a fresh map under the same key is an automerge
+/// conflict whose loser's fields vanish — so a device whose entry has
+/// not synced yet would be racing the adder's enrollment write and could
+/// silently drop the name that write carried. It costs nothing to wait:
+/// the adder already recorded this device's endpoint at enrollment (from
+/// an id it observed on the wire), and the next boot finds the entry.
+pub(crate) async fn device_endpoint_put(endpoint: Vec<u8>) -> Result<(), String> {
+    if endpoint.is_empty() {
+        return Err("a device endpoint must not be empty".into());
+    }
+    pump().await?;
+    let key = hex::encode(crate::own_agent_id()?);
+    let stored = read_us(|am| read_devices(am).get(&key).map(|r| r.endpoint.clone()))?;
+    match stored {
+        // Already ours, byte for byte: nothing to author.
+        Some(ref e) if *e == endpoint => return Ok(()),
+        // No entry for this device yet — see the CONTRACT note above.
+        None => return Ok(()),
+        Some(_) => {}
+    }
+    write(move |am| {
+        let devices = map_at(am, DEVICES).ok_or("no devices map")?;
+        let d = child_map(am, &devices, &key).ok_or("no entry for this device")?;
+        am.put(&d, "endpoint", endpoint)
+            .map_err(|e| format!("device endpoint: {e}"))?;
+        Ok(())
+    })
+    .await
 }
 
 pub(crate) async fn device_revoke(agent_id: Vec<u8>) -> Result<(), String> {

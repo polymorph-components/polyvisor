@@ -129,12 +129,21 @@ function toMockDevice(d: {
   name: string;
   enrolledAt: bigint;
   revoked: boolean;
+  endpoint: Uint8Array;
+  enrolledBy: Uint8Array;
 }): MockUsDevice {
   return {
     agentId: hex(d.agentId),
     name: d.name,
     enrolledAt: Number(d.enrolledAt),
     revoked: d.revoked,
+    // EMPTY STAYS EMPTY across the hex boundary: `hex(new Uint8Array())`
+    // is "", which is exactly the visor-side spelling of "not recorded"
+    // that engine.wit's `us-device` gives these two fields. No
+    // `undefined` is invented here — an absent endpoint and an unknown
+    // one are the same fact and deserve one representation.
+    endpoint: hex(d.endpoint),
+    enrolledBy: hex(d.enrolledBy),
   };
 }
 

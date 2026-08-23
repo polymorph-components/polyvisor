@@ -409,12 +409,24 @@ function saveBootCache(keys: UsCacheKeys, cache: BootCache) {
 /** After driver init: pull the real profile + marks, compare against
  * the boot cache, ANNOUNCE any diff (a silently-changed hue/name is
  * exactly the "anchor that quietly changes" lesson from #22 the
- * visor-hue code already carries), then refresh the cache to match. */
+ * visor-hue code already carries), then refresh the cache to match.
+ *
+ * `onProfile` and `onMarks` are the two ADOPTION halves, and they are
+ * the consumer's on purpose: this function knows what the account says,
+ * and only the consumer knows what to repaint with it (the strip is the
+ * consumer's, and so is the trust table's key). Both are optional, so a
+ * caller that only wants the cache refreshed and the diff announced —
+ * every caller before marks crossed — keeps exactly its old behaviour.
+ * `onMarks` receives the list VERBATIM, repaired view and all: deciding
+ * which of those marks may be adopted is a trust judgement (PAIRING.md
+ * §5), and a framework function must not make it on the consumer's
+ * behalf. */
 export async function reconcileFromDriver(
   driver: PairingDriver,
   keys: UsCacheKeys,
   status: AnnounceSink,
   onProfile?: (profile: UsProfile) => void,
+  onMarks?: (marks: UsMark[]) => void,
 ): Promise<void> {
   const cache = loadBootCache(keys);
   const profileRes = await driver.usProfileGet();
@@ -430,7 +442,12 @@ export async function reconcileFromDriver(
     onProfile?.(p);
   }
   const marksRes = await driver.usMarksList();
-  if (marksRes.ok) saveBootCache(keys, { marks: marksRes.value });
+  if (marksRes.ok) {
+    saveBootCache(keys, { marks: marksRes.value });
+    // AFTER the cache, so a consumer that throws out of `onMarks` still
+    // leaves the cache matching what the account said.
+    onMarks?.(marksRes.value);
+  }
 }
 
 // --- join flow: new device (§5) --------------------------------------------
