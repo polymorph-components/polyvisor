@@ -30,6 +30,14 @@
 // other page's rendered rows would be testing the surface protocol's
 // repaint, which is a different scenario's job.
 //
+// AND THE ACCOUNT'S OWN FACE CROSSES TOO. The todos prove the app's
+// partition converged; they say nothing about the ACCOUNT — the name
+// and colour that make the joined device recognisably the same person's.
+// That half used to be read on the enrollment edge, before any document
+// had arrived, so a joiner adopted an empty name and hue 0 for ever.
+// It is asserted here, on B's own strip, because the strip is where a
+// user would notice its absence.
+//
 // DEADLINES ARE GENEROUS, per device-pairing-acts.ts's reasoning: every
 // step here crosses a relay, and a deadline that is merely "usually
 // enough" is a flake generator whose failure text is indistinguishable
@@ -41,7 +49,14 @@ import { act, assert, assertEquals, SOLO_KEYS } from "../util.ts";
 // The solo pages' shared driving surface — the `__solo` root, the
 // sandboxed todomvc frame, and the pacing rule for typing into it. Three
 // scenarios drive this page now; see e2e/solo-util.ts.
-import { addTodo, appFrame, solo, todoRows, until, WAITS } from "../solo-util.ts";
+import { addTodo, appFrame, solo, stripPersonal, todoRows, until, WAITS } from "../solo-util.ts";
+
+/** The account's own face: the name A commits before pairing and the
+ * anchor colour it picks. Both must be on B's strip after B joins — and
+ * the hue is deliberately not the 265 both pages are seeded with, so an
+ * unchanged strip cannot pass the assertion by accident. */
+const ACCOUNT_NAME = "Ada";
+const ACCOUNT_HUE = 175;
 
 const scenario: Scenario = {
   name: "solo-pairing",
@@ -86,6 +101,53 @@ const scenario: Scenario = {
         state: "visible",
         timeout: WAITS.converge,
       });
+    });
+
+    await act("A gives the account a name and a colour of its own", async () => {
+      // THE HONEST PATH: the visor's own settings sheet, driven as a
+      // user drives it (the sheet's ids are the visor's, shared with
+      // settings-identity.ts). The write-through in solo.ts's
+      // `onIdentityCommitted` carries the committed record into the
+      // account's profile — visor → account, the one direction that
+      // goes that way. What the JOINER later shows must come back the
+      // other way, over the wire, which is the claim below.
+      await solo(pageA, "openSettings");
+      await until(
+        [pageA],
+        "A's settings sheet",
+        async () =>
+          await pageA.evaluate(() => document.getElementById("visor-settings-name") !== null),
+        15_000,
+      );
+      await pageA.evaluate(
+        ([who, hue]) => {
+          const input = document.getElementById("visor-settings-name") as HTMLInputElement | null;
+          if (input) input.value = who as string;
+          // A hue that is certainly NOT the seeded 265 both pages boot
+          // with — otherwise B's strip would "match the account" by
+          // having never changed at all.
+          (document.querySelector(
+            `.settings-hues button[data-hue="${hue}"]`,
+          ) as HTMLButtonElement | null)?.click();
+          (document.querySelector(".settings-sheet .cred-row button:first-child") as
+            | HTMLButtonElement
+            | null)?.click();
+        },
+        [ACCOUNT_NAME, ACCOUNT_HUE] as [string, number],
+      );
+      const personal = await until(
+        [pageA],
+        "A's own strip",
+        async () => {
+          const p = await stripPersonal(pageA);
+          return p.identityText.includes(ACCOUNT_NAME) ? p : false;
+        },
+        15_000,
+      );
+      assert(
+        personal.anchorColour.includes(String(ACCOUNT_HUE)),
+        `A's anchor took the picked colour: ${JSON.stringify(personal)}`,
+      );
     });
 
     await act("two todos typed into A's real app frame reach A's engine", async () => {
@@ -228,6 +290,28 @@ const scenario: Scenario = {
       const rows = todoRows(pageB);
       await rows.first().waitFor({ state: "visible", timeout: WAITS.converge });
       assertEquals(await rows.count(), 2, "B's rendered todo rows");
+    });
+
+    await act("B's strip becomes the ACCOUNT's: A's name and A's colour", async () => {
+      // THE ORIGINAL COMPLAINT. B's todos arriving proves the account
+      // document reached B's engine; this proves the DISPLAY layer ever
+      // reads it. The read happens on the host side once B's own sync
+      // wiring has delivered the doc — not on the enrollment edge, when
+      // the freshly-adopted doc is still empty (visor/ui/pairing.ts's
+      // `mountJoinPane` doc comment).
+      const personal = await until(
+        [pageA, pageB],
+        "A's name on B's strip",
+        async () => {
+          const p = await stripPersonal(pageB);
+          return p.identityText.includes(ACCOUNT_NAME) ? p : false;
+        },
+        WAITS.converge,
+      );
+      assert(
+        personal.anchorColour.includes(String(ACCOUNT_HUE)),
+        `B's anchor took the account's colour: ${JSON.stringify(personal)}`,
+      );
     });
 
     await act("a todo added on B appears on A", async () => {

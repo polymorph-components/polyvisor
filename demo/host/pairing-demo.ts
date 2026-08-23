@@ -53,19 +53,39 @@ const addPaneEl = document.getElementById("add-pane")!;
 const joinPaneEl = document.getElementById("join-pane")!;
 
 const addHandle = mountAddPane(addPaneEl, alice, addStatus);
-const joinHandle = mountJoinPane(joinPaneEl, tablet, joinStatus, (profile) => {
-  // The hue-adoption beat (§5): repaint SOMETHING visibly on the join
-  // pane so Playwright (and a human) can see the synced colour land.
-  // The consuming page, not visor/ui/pairing.ts, owns painting its own
-  // pane — pairing.ts only reports the value (see its mountJoinPane doc
-  // comment), consistent with the anchor-colour discipline in
-  // host/demo.ts (applyVisorHue is host-page code, not shared code).
-  // `profile.hue` is a palette INDEX; `paletteAngle` is the one place
-  // that turns it into a paintable angle (PAIRING.md §4).
+const joinHandle = mountJoinPane(joinPaneEl, tablet, joinStatus);
+
+/** THE ADOPTION BEAT (§5), on the JOIN-COMPLETED EDGE — `tick()`'s
+ * `true`, which is where the pane hands the moment to its consumer.
+ * The pane no longer reads the profile itself, and rightly: on the real
+ * engine the account's document arrives over a sync path the embedder
+ * wires on this very edge, so a read inside the pane would read an
+ * empty doc. THIS page's driver is the in-page mock, where enrollment
+ * hands the whole us doc over instantly, so reading it here is both
+ * correct and immediate.
+ *
+ * Repaint SOMETHING visibly on the join pane so Playwright (and a
+ * human) can see the synced colour land. The consuming page, not
+ * visor/ui/pairing.ts, owns painting its own pane — pairing.ts only
+ * reports the value (see its mountJoinPane doc comment), consistent
+ * with the anchor-colour discipline in host/demo.ts (applyVisorHue is
+ * host-page code, not shared code). `profile.hue` is a palette INDEX;
+ * `paletteAngle` is the one place that turns it into a paintable angle
+ * (PAIRING.md §4). */
+async function adoptOnJoin() {
+  const res = await tablet.usProfileGet();
+  if (!res.ok) return;
+  const profile = res.value;
+  // Announced, never silent — the sentence the pane used to say, said
+  // where the value now comes from.
+  joinStatus(
+    `this device now follows your profile: ${profile.displayName}, your colour`,
+    true,
+  );
   const angle = paletteAngle(profile.hue);
   joinPaneEl.style.setProperty("--pm-hue", String(angle));
   joinPaneEl.style.background = `oklch(92% .03 ${angle})`;
-});
+}
 
 // Poll both panes on a shared tick. Background driver calls are
 // serialized here (one at a time) — same lesson host/demo.ts records
@@ -78,7 +98,12 @@ let stopped = { add: false, join: false };
 const POLL_MS = 150;
 async function tick() {
   if (!stopped.add) stopped.add = await addHandle.tick();
-  if (!stopped.join) stopped.join = await joinHandle.tick();
+  if (!stopped.join) {
+    // The EDGE, not the level: `stopped.join` latches, so this branch
+    // runs exactly once — the tick that first reports done.
+    stopped.join = await joinHandle.tick();
+    if (stopped.join) await adoptOnJoin();
+  }
 }
 const timer = setInterval(() => {
   tick().catch((e) => console.error(e));

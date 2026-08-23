@@ -417,23 +417,32 @@ export async function reconcileFromDriver(
 
 export interface JoinPaneHandle {
   /** Poll once; call on an interval from the host page. Returns true
-   * once enrollment completes (caller may stop polling). */
+   * once enrollment completes (caller may stop polling). That `true` is
+   * the JOIN-COMPLETED EDGE, and it is the caller's cue for everything
+   * enrollment does not do by itself: wiring the sync path, then
+   * reading and adopting the account's profile once the doc lands. */
   tick(): Promise<boolean>;
 }
 
 /** Mounts the join flow into `container`: entry button → QR + grouped
- * code → SAS screen → light confirm → adoption announcement. `onAdopt`
- * fires once with the synced profile so the host page can repaint the
- * pane's visor hue — the "hue visibly changing to the synced one"
- * beat lives in the CALLER because the caller owns the pane's actual
- * strip element; this module only reports the value. `profile.hue` is
- * a PALETTE INDEX (see `paletteAngle`) — the caller converts it to an
- * angle when painting. */
+ * code → SAS screen → light confirm → "joined."
+ *
+ * THE ADOPTION BEAT IS NOT THIS PANE'S. Enrollment only makes this
+ * device a member of the account; the account's own document arrives
+ * LATER, over the sync path the embedder wires on the strength of this
+ * pane's `tick()` returning true. Reading `us-profile-get` here would
+ * read the just-adopted, still-empty us doc — an empty name and hue 0,
+ * adopted once and never re-read. So the pane reports the
+ * JOIN-COMPLETED EDGE and nothing else; the caller reads the profile
+ * once its own wiring has delivered the doc, paints it (it owns the
+ * strip), and makes the §5 announcement then. Announced-never-silent
+ * still holds — the sentence simply belongs to the moment the value
+ * exists. `profile.hue` is a PALETTE INDEX (see `paletteAngle`) — the
+ * caller converts it to an angle when painting. */
 export function mountJoinPane(
   container: HTMLElement,
   driver: PairingDriver,
   status: AnnounceSink,
-  onAdopt: (profile: { hue: number; displayName: string }) => void,
 ): JoinPaneHandle {
   ensureStyles();
   container.classList.add("pm-pane");
@@ -508,16 +517,11 @@ export function mountJoinPane(
         status("confirmed — waiting for the other device to confirm…");
       } else if (st.tag === "enrolled") {
         phase = "done";
-        const profRes = await driver.usProfileGet();
-        if (profRes.ok) {
-          // THE ADOPTION ANNOUNCEMENT (§5): a remotely-caused identity
-          // change is always announced, never silent.
-          status(
-            `this device now follows your profile: ${profRes.value.displayName}, your colour`,
-            true,
-          );
-          onAdopt({ hue: profRes.value.hue, displayName: profRes.value.displayName });
-        }
+        // NO PROFILE READ HERE. The us doc this device just adopted is
+        // empty until the embedder's sync path delivers it; the §5
+        // adoption announcement is made by the caller, on this tick's
+        // `true`, with a profile that by then exists (see the function's
+        // doc comment).
         body.replaceChildren();
         const done = document.createElement("div");
         done.textContent = "joined.";
