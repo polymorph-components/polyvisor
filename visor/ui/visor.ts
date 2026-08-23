@@ -1563,42 +1563,107 @@ export function initVisor(config: VisorConfig): Visor {
     setContext(null);
   };
 
+  /** THE STRIP OF APP THAT ALWAYS SHOWS. The visor's whole claim is that
+   * its pixels are somewhere else than the page's — and a drawer allowed
+   * to grow until it covers the last of the app surface makes that claim
+   * uncheckable: a full-screen sheet is indistinguishable from a page
+   * that has drawn one, which is the exact confusion the visor exists to
+   * prevent. So the budget keeps a band of (dimmed) app visible under
+   * the assembly at every size, and the boundary between the two
+   * surfaces stays perceivable. A sheet that wants more scrolls
+   * internally; it does not get the last 48px. */
+  const APP_REVEAL = 48;
+
   /** The height budget every sheet shares. The sheet grows ABOVE the
    * strip inside one sticky assembly, so a sheet taller than the viewport
    * would push the strip off the bottom of the screen — losing the anchor
    * at the exact moment a secret is on screen. The sheet is therefore
-   * capped at viewport-minus-strip and scrolls internally past that (see
-   * .cred-sheet's --visor-sheet-max). Measured rather than hardcoded
-   * because the strip wraps to two rows on a phone, and re-measured on
-   * resize/rotation.
+   * capped at viewport-minus-strip-minus-APP_REVEAL and scrolls
+   * internally past that (see .cred-sheet's --visor-sheet-max). Measured
+   * rather than hardcoded because the strip wraps to two rows on a phone,
+   * and re-measured on resize/rotation.
    *
    * ceil: a fractional strip height would otherwise leave the bar hanging
    * a subpixel off the bottom. */
-  const fit = () => {
+  const budget = () => {
     const stripH = Math.ceil(strip?.getBoundingClientRect().height ?? 0);
-    const budget = Math.max(0, globalThis.innerHeight - stripH);
-    drawer.style.setProperty("--visor-sheet-max", `${budget}px`);
+    return Math.max(0, globalThis.innerHeight - stripH - APP_REVEAL);
   };
+
+  const fit = () => {
+    drawer.style.setProperty("--visor-sheet-max", `${budget()}px`);
+  };
+
+  /** THE GESTURE STOPS AT THE VISOR'S EDGE — the JS half of the
+   * containment `.cred-sheet`/`#visor-drawer-inner`/`#visor-dim` declare
+   * in CSS, and the half that is actually load-bearing.
+   *
+   * `overscroll-behavior` only ends a chain at an element that HAS
+   * SCROLL RANGE, and most sheets have none: they fit. Measured in
+   * Chromium at 390×664 — a wheel over a short open sheet, and a wheel
+   * over the dim, both scrolled the DOCUMENT by 117px with `contain`
+   * declared the whole way up. That is the reported surprise: a drag
+   * inside the visor moving the app underneath it, the two surfaces
+   * answering one gesture, which is the distinction the drawer exists to
+   * make. So the chain is refused here instead.
+   *
+   * What is allowed through is exactly what the sheet itself can
+   * consume: a sheet with room left in the direction of travel scrolls
+   * normally (and the CSS `contain` ends the chain at its edges for
+   * touch, smoothly, without a cancelled gesture). Everything else —
+   * the drawer's own chrome, a sheet already at its end, the dim in its
+   * entirety — is refused. Non-passive by necessity: a passive listener
+   * may not preventDefault. */
+  const consumable = (target: EventTarget | null, dy: number): boolean => {
+    const el = (target as Element | null)?.closest?.(".cred-sheet") as HTMLElement | null;
+    if (!el) return false;
+    const room = el.scrollHeight - el.clientHeight;
+    if (room <= 1) return false;
+    if (dy < 0) return el.scrollTop > 0;
+    if (dy > 0) return el.scrollTop < room - 1;
+    return false;
+  };
+  drawer.addEventListener("wheel", (e) => {
+    if (!consumable(e.target, (e as WheelEvent).deltaY)) e.preventDefault();
+  }, { passive: false });
+  dim.addEventListener("wheel", (e) => e.preventDefault(), { passive: false });
+  // TOUCH: the dim is already refused wholesale by its `touch-action:
+  // none`, and a scrolling sheet is handled natively by `contain`. What
+  // is left is a drag that starts on the drawer's own chrome rather than
+  // in a sheet, which no CSS declaration covers.
+  drawer.addEventListener("touchmove", (e) => {
+    const el = (e.target as Element | null)?.closest?.(".cred-sheet") as HTMLElement | null;
+    if (el === null || el.scrollHeight - el.clientHeight <= 1) e.preventDefault();
+  }, { passive: false });
 
   /** Animate 0 → the measured content height. One property drives the
    * whole assembly: the sheet's growth pushes the strip down and the
    * page content with it, on one curve (spikes/todomvc/host/visor.ts:82-90
-   * — scrollHeight misses the flex-end top-overflow, so measure at auto). */
+   * — scrollHeight misses the flex-end top-overflow, so measure at auto).
+   *
+   * CLAMPED STRUCTURALLY, not only by the sheet's own max-height: the
+   * cap has to hold for whatever is in the drawer, and the sheet is not
+   * guaranteed to be the only child of the inner (a swap puts two there
+   * for the length of a travel) nor to have finished resolving its
+   * max-height at the moment we measure. */
   const reveal = () => {
     drawerInner.style.height = "auto";
-    const target = drawerInner.offsetHeight;
+    const target = Math.min(drawerInner.offsetHeight, budget());
     drawerInner.style.height = "0px";
     void drawerInner.offsetHeight;
     drawerInner.style.height = `${target}px`;
   };
 
   /** Animate the CURRENT height to a newly measured one, for a drawer
-   * that is already open (a rebuilt sheet, an occupant swap, a resize).
-   * Same single-property curve as `reveal`; the momentary `auto` is
-   * never rendered, since style is only resolved at frame time. */
+   * that is already open (a rebuilt sheet, an occupant swap, a resize,
+   * or a sheet whose content arrived late — see `contentWatch`). Same
+   * single-property curve as `reveal`, same structural clamp; the
+   * momentary `auto` is never rendered, since style is only resolved at
+   * frame time. Which is also why this is safe to call DURING a reveal:
+   * the transition simply re-aims from wherever it currently is. */
   const retarget = () => {
     drawerInner.style.height = "auto";
-    drawerInner.style.height = `${drawerInner.offsetHeight}px`;
+    drawerInner.style.height = `${Math.min(drawerInner.offsetHeight, budget())}px`;
   };
 
   /** THE SWAP: how one occupant replaces another INSIDE the drawer.
@@ -1622,6 +1687,8 @@ export function initVisor(config: VisorConfig): Visor {
   function makeTenant<S>(spec: DrawerTenantSpec<S>): TenantImpl<S> {
     let session: S | null = null;
     let anchor: (() => void) | null = null;
+    /** Watches the mounted sheet for LATE CONTENT — see `present`. */
+    let contentWatch: ResizeObserver | null = null;
     let armTimer = 0;
     /** Kept so the sheet can be rebuilt (a shape change) or re-presented
      * (a resume) for the SAME session. */
@@ -1633,8 +1700,13 @@ export function initVisor(config: VisorConfig): Visor {
     let dimmedNow = false;
 
     const detach = () => {
-      if (anchor) globalThis.removeEventListener("resize", anchor);
+      if (anchor) {
+        globalThis.removeEventListener("resize", anchor);
+        globalThis.visualViewport?.removeEventListener("resize", anchor);
+      }
       anchor = null;
+      contentWatch?.disconnect();
+      contentWatch = null;
     };
 
     /** PUT THIS TENANT'S SHEET ON SCREEN, from its builder, and animate
@@ -1695,6 +1767,32 @@ export function initVisor(config: VisorConfig): Visor {
       fit();
       anchor = refit;
       globalThis.addEventListener("resize", refit);
+      // ALSO the visual viewport where there is one. On a phone the
+      // window's `resize` is the unreliable half of this pair: a URL bar
+      // sliding away or a keyboard coming up changes the space the sheet
+      // actually has and both engines report it here first, sometimes
+      // only here. Feature-detected, same handler — a second delivery of
+      // the same news costs one re-measure.
+      globalThis.visualViewport?.addEventListener("resize", refit);
+      // THE SHEET THAT FILLS IN LATER. The revealed height is a pixel
+      // target measured ONCE, at present-time — and a sheet whose fields
+      // arrive from an async round-trip is measured as its own skeleton
+      // and never told it grew. The inner clips from the TOP (flex-end),
+      // so what a user gets is a drawer hanging half out of view with
+      // its heading cut off: the visor apparently half-closed, which is
+      // exactly the state the anchor is supposed to make unambiguous.
+      // Watching the mounted sheet's box closes the whole class — async
+      // sheets, adopt/manual re-renders, a field appearing under a
+      // radio — not just the one that was reported. `retarget` re-aims a
+      // reveal already in flight rather than fighting it, so this is
+      // safe during the 700ms curve.
+      if (typeof ResizeObserver !== "undefined") {
+        contentWatch = new ResizeObserver(() => {
+          if (session !== s || suspended) return;
+          retarget();
+        });
+        contentWatch.observe(sheet.root);
+      }
 
       const controls = sheet.controls ?? [];
       if (spec.armed) {

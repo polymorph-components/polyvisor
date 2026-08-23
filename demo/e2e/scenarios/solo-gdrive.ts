@@ -180,16 +180,12 @@ const scenario: Scenario = {
           );
           await solo(page, "openStorageSheet");
           await page.waitForSelector("#storage-kind-gdrive", { timeout: 15_000 });
-          // A real click, but through evaluate: the drawer sheet renders
-          // taller than the viewport at this point (the S3 fields are
-          // still in the DOM, merely hidden), which Playwright's own
-          // actionability check reads as "outside the viewport" even
-          // though the element is visible and clickable to a user who
-          // has scrolled. `.click()` on the element itself is the same
-          // DOM event a user's click dispatches.
-          await page.evaluate(() => {
-            (document.getElementById("storage-kind-gdrive") as HTMLInputElement).click();
-          });
+          // A REAL click. This used to go through `evaluate`, blamed on
+          // a "Playwright actionability quirk"; it was the drawer bug
+          // that drawer-overflow.ts now guards — the sheet's content
+          // grew after it was measured and the drawer clipped it out of
+          // view, so the radio genuinely was unreachable.
+          await page.click("#storage-kind-gdrive");
           await page.waitForSelector("#storage-gd-root", { state: "visible", timeout: 15_000 });
           // THE DEFAULT IS ASSERTED, NOT SET (DRIVE.md §5): the sheet
           // must arrive with hidden app data already chosen, so a

@@ -480,6 +480,17 @@
 #visor-drawer-inner { height: 0; overflow: hidden;
                        display: flex; flex-direction: column;
                        justify-content: flex-end;
+                       /* THE BACKSTOP FOR THE SHEET'S OWN CONTAINMENT.
+                          `overscroll-behavior` only ends a chain at an
+                          element that SCROLLS, and a sheet short enough
+                          to fit does not scroll at all — so a wheel or a
+                          drag on a small sheet chained straight past it
+                          into the document (measured: the page moved
+                          under an open drawer). The inner is a scroll
+                          container by virtue of `overflow: hidden`, and
+                          containing here catches the gesture whether the
+                          sheet scrolls or not. */
+                       overscroll-behavior: contain;
                        transition: height 700ms cubic-bezier(.2,.8,.2,1); }
 @media (prefers-reduced-motion: reduce) {
   #visor-drawer-inner { transition: none; }
@@ -535,9 +546,20 @@
 }
 
 /* The dim layer sits BETWEEN the page and the visor assembly: the
-   zone (30) above, every app surface below. */
+   zone (30) above, every app surface below.
+
+   IT ABSORBS THE GESTURE. The dim is the visor saying "the page is not
+   what you are talking to right now", and a drag on it that scrolled
+   the page underneath would contradict that in the most literal way
+   available — the surface the user was told is out of play moving under
+   their thumb. `touch-action: none` refuses the pan outright, and
+   `overflow: hidden` is what makes the dim a scroll container in the
+   first place — without it `overscroll-behavior` has nothing to end,
+   and a wheel over the dim chains to the document (measured). */
 #visor-dim { position: fixed; inset: 0; z-index: 20;
-              background: rgba(6,8,16,.62); }
+              background: rgba(6,8,16,.62);
+              overflow: hidden;
+              overscroll-behavior: none; touch-action: none; }
 #visor-dim[hidden] { display: none; }
 
 /* --- Mobile geometry fixes (<=480px), visor cluster half only. Each
@@ -619,9 +641,17 @@
    `width:100%` is load-bearing now that the container is a flex
    column: `margin:0 auto` is an AUTO cross-axis margin, which
    suppresses the default stretch and would size the sheet to its
-   content instead of to the page's centered column. */
+   content instead of to the page's centered column.
+
+   THE SCROLL STOPS HERE. A drag inside the sheet that ran the sheet to
+   its end and then carried on into the PAGE would move the app surface
+   under a sheet the user is reading a secret out of — the two surfaces
+   answering one gesture, which is precisely the distinction the drawer
+   is built to keep. `overscroll-behavior: contain` ends the chain at
+   the sheet for wheel and touch alike. */
 .cred-sheet { box-sizing: border-box; width: 100%; max-width: 34em; margin: 0 auto;
               max-height: var(--visor-sheet-max, 80dvh); overflow-y: auto;
+              overscroll-behavior: contain;
               flex-shrink: 0;
               padding: .8em 1.1em 1.1em; font-size: 13px; line-height: 1.45; }
 .cred-sheet h2 { margin: 0 0 .35em; font-size: 15px; font-weight: 600; }
