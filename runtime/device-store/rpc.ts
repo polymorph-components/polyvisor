@@ -16,8 +16,9 @@
 // say so plainly rather than let a reader infer it. Since 0.4.0 the
 // engine-error path crosses as the embedder's SANCTIONED CLONEABLE FORM
 // (A20), so worker.ts calls `toCloneable` and client.ts calls
-// `fromCloneable` — both real value imports from
-// @polyengine/runtime/embedder. worker.ts always needed the pin (it
+// `fromCloneable` — both real value imports from @polyengine/protocol
+// (they lived in @polyengine/runtime/embedder until A22 made that module
+// application-only). worker.ts always needed the pin (it
 // instantiates the engine); client.ts did not, and now does. What is
 // still package-free is everything BELOW the host: the index, the
 // namespace, the seal ladder, the locks, the anchor and this file — so a

@@ -2599,6 +2599,57 @@ async function main() {
       await probe(page, "hc-forget", { ids: [id] });
     });
 
+    // --- 47b: the MINIMAL driver-gate storm (no egress, no latency) -------
+    //
+    // THE REGRESSION GATE for polyengine#239, and the reason this repo
+    // moved to @polyengine/runtime 0.5.1.
+    //
+    // Two of the device's OWN periodic drivers, run back to back on one
+    // store — no network, no egress, nothing slow. 0.4.0's `driveAsync`
+    // took its speculative pending-resumption entry unconditionally
+    // (0.4.0 src/exec/boundary.ts:1064) and that entry is a store-wide
+    // gate, so the second driver could only hop at the top of its loop;
+    // 10,000 hops later the internal-bug assert fires. af97c13 bounds the
+    // entry to the sole driver and adds a driver-arrival wake.
+    //
+    // THE DRAIN COUNT IS THE INTERESTING NUMBER, not just the trap: it
+    // measures the starvation directly. Measured 21 checkpoints / 1 drain
+    // / trap on stock 0.4.0; 107 / 108 / no trap on 0.5.1. A fix that
+    // merely deleted the entry would clear the trap; the drain count
+    // recovering is what shows the shipped driver-arrival wake working.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "gate storm",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const id = made.id as string;
+      await probe(page, "hc-open", { id, unseal: { passphrase: PASS, untilReseal: true } });
+      await probe(page, "hc-add", { id, titles: ["gate-storm"] });
+      const r = await probe(page, "hc-driver-gate-storm", { id, ms: 12_000 });
+      record(
+        "47b store-egress",
+        "two of the device's own periodic drivers do not trip the speculative resume gate",
+        r.trap === "" && r.checkpoints > 0 && r.drains > 0,
+        `12 s of back-to-back \`state-checkpoint\` and \`us-events\` calls on ONE store: ` +
+          `${r.checkpoints} checkpoints and ${r.drains} drains completed, trap=${j(r.trap)}, ` +
+          `and the device still answers afterwards (refused=${r.alive.refused}). Both callers ` +
+          `are drivers this device runs on its OWN timers — the worker's 500 ms debounced ` +
+          `non-blocking checkpoint (worker.ts) and the solo page's 1 s us-events drain ` +
+          `(solo.ts) — so this collision is the ordinary case, not an exotic one. THE TRIGGER ` +
+          `IS CONCURRENCY, NOT LATENCY: no slow network, no egress and no Drive round trip is ` +
+          `involved anywhere in this row, and there is no Gecko differential; mobile Firefox ` +
+          `merely reported it first because slow OPFS widens the window. On 0.4.0 this row ` +
+          `FAILS — the us-events driver is starved to a single drain and then dies on ` +
+          `"driveAsync: a resumed-activation claim was never released" (polyengine#239, the ` +
+          `store-wide speculative resume gate). af97c13 in v0.5.1 bounds that entry to the ` +
+          `sole driver and wakes the incumbent on driver arrival, which is what the drain ` +
+          `count recovering measures.`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
     await ctx.close();
   } finally {
     await browser.close();

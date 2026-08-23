@@ -18,9 +18,11 @@
 // header), so THE TAB resolves the pointer and hands the worker a
 // concrete id.
 //
-// ONE PACKAGE IMPORT, AND IT IS NEW AT 0.4.0. This module used to be
-// package-free; `fromCloneable` (@polyengine/runtime/embedder) changed
-// that, deliberately. It is what turns the worker's engine rejection
+// ONE PACKAGE IMPORT, NEW AT 0.4.0 AND RE-HOMED AT 0.5.1. This module
+// used to be package-free; `fromCloneable` changed that, deliberately. It
+// came from `@polyengine/runtime/embedder` until polyengine A22 made that
+// module application-only and moved the vocabulary to
+// `@polyengine/protocol`, which is where it is imported from now. It is what turns the worker's engine rejection
 // back into a REAL branded `ComponentException` in this realm — payload,
 // cause chain, sender's stack — instead of the facsimile the old
 // hand-rolled brand produced. The trade is stated rather than hidden:
@@ -29,7 +31,7 @@
 // (runtime/README.md's resolution model). The engine TYPES below are
 // type-only and still erase.
 
-import { fromCloneable } from "@polyengine/runtime/embedder";
+import { fromCloneable } from "@polyengine/protocol";
 import type { Driver, Tasks } from "../engine.ts";
 import { adoptAnchor, setAnchor } from "./anchor.ts";
 import {

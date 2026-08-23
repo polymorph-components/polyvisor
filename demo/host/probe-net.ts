@@ -10,7 +10,7 @@
 // the SHAPE under test is which import a call site travels through and
 // what each seam will refuse, not per-user authority.
 
-import { ComponentException } from "@polyengine/runtime/embedder";
+import { ComponentException } from "@polyengine/protocol";
 import type { EngineNet, StoreFetch, StoreSign } from "../../runtime/engine.ts";
 
 function refuse(message: string): never {

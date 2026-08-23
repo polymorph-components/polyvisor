@@ -505,8 +505,21 @@ async function main() {
   // absent on OPFS files in this build. The device store never asks for
   // one — it writes through `createWritable` — so the boot is green
   // regardless. Worth knowing before someone reaches for the sync API.)
-  const FIREFOX_PREFS: Record<string, boolean> = {
+  // THE SECOND PREF, and it is a HARNESS fact rather than a lag in
+  // Playwright's build. `navigator.storage.persist()` under headless
+  // Playwright Firefox NEVER SETTLES — the promise neither resolves nor
+  // rejects — because the persistent-storage permission prompt has no UI
+  // to answer it and headless has nobody to click. Every kept-device
+  // ceremony awaits that call, so without this pref the whole
+  // keep-this-device family wedges on a promise that will not settle,
+  // which reads as a deadline failure in whatever act happened to be
+  // first. Setting the permission to 1 (ALLOW) answers the prompt the way
+  // a user who chose to keep the device already answered it. Measured
+  // 2026-08-23: with it, solo-persistence, solo-storage, solo-gdrive and
+  // solo-account-storage all pass under Gecko; without it, all four hang.
+  const FIREFOX_PREFS: Record<string, boolean | number> = {
     "javascript.options.wasm_js_promise_integration": true,
+    "permissions.default.persistent-storage": 1,
   };
   let firefoxBrowser: Browser | null = null;
   const launchFirefox = () =>
@@ -514,7 +527,26 @@ async function main() {
   /** Which engine the scenario now running asked for. `ctx.browser` and
    * `fresh` both read it through `current()` rather than closing over a
    * browser, for the same reason the chromium handle is a getter: the
-   * runner replaces a wedged browser underneath a scenario. */
+   * runner replaces a wedged browser underneath a scenario.
+   *
+   * THE JUGGLER HAZARD, and it constrains how a Firefox-lane scenario may
+   * be WRITTEN, not just which browser it gets. Calling a
+   * `WebAssembly.promising` export from inside a `page.evaluate` frame
+   * SIGSEGVs the Firefox content process — measured 2026-08-23, 4 of 4
+   * minimal cases, with the identical code in a PAGE SCRIPT running clean
+   * every time. The fault is in the Juggler protocol's evaluate frame
+   * meeting a JSPI stack switch, not in the engine: nothing in the wasm
+   * or the embedder differs between the two paths. Playwright reports it
+   * as a bare "Target crashed", which names nothing and sends the reader
+   * looking at the engine.
+   *
+   * So: a scenario on the firefox lane must reach engine work through
+   * page scripts, exposed bindings or event hooks — anything the page
+   * itself drives — and must never sit in an evaluate frame that reaches
+   * a promising export. `firefox-smoke` is written to that rule: it
+   * evaluates only FEATURE PROBES (typeof checks, constructor presence),
+   * which touch no promising export, and leaves engine instantiation to
+   * the page's own boot. */
   let engine: "chromium" | "firefox" = "chromium";
   const current = (): Browser => engine === "firefox" ? firefoxBrowser! : browser;
 

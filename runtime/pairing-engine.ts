@@ -55,7 +55,7 @@
 
 import type { Driver, PairAddState, PairJoinState, UsEvent, UsMark, UsProfile } from "./engine.ts";
 import { hex, unhex } from "./engine.ts";
-import { isComponentException } from "@polyengine/runtime/embedder";
+import { isComponentException } from "@polyengine/protocol";
 import type {
   PairAddState as MockPairAddState,
   PairEnrollment as MockPairEnrollment,

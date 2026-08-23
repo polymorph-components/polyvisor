@@ -46,7 +46,7 @@ import type { OauthStartSpec, StoreBinding } from "../../device-store/rpc.ts";
 // the 0.4.0 bump is that `fromCloneable` mints a value this copy
 // recognizes — so the predicate has to be the page's own, not the
 // worker's, and not a field the worker asserted about itself.
-import { isComponentException, isTrap } from "@polyengine/runtime/embedder";
+import { isComponentException, isTrap } from "@polyengine/protocol";
 import {
   adoptAnchor,
   anchorIsLive,
@@ -1320,6 +1320,62 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
   "hc-ensure-bucket": async (arg: { id: string }) => {
     const conn = conns.get(arg.id)!;
     return { attempt: await refuses(() => conn.driver.ensureBucket()) };
+  },
+
+  /** RECONCILIATION ROUND — the MINIMAL flip for polyengine#239.
+   *
+   * No slow network, no egress at all. Two of this device's OWN periodic
+   * drivers, run back to back on one store:
+   *
+   *   * `state-checkpoint` — the worker's non-blocking, debounced
+   *     checkpoint (device-store/worker.ts ~1737: "Ordinary driver/tasks
+   *     calls are NOT blocked behind a checkpoint"). While it is parked in
+   *     `driveAsync`'s awaiting-race it holds the SPECULATIVE
+   *     pending-resumption entry, which 0.4.0 takes unconditionally
+   *     (0.4.0 src/exec/boundary.ts:1064).
+   *   * `us-events` — the account event drain the solo page runs every
+   *     second forever (demo/host/solo.ts:3271, `poll(1000,
+   *     drainAndAdopt)`).
+   *
+   * The entry is a STORE-WIDE gate, so the us-events driver can only hop
+   * at the top of its own loop until the checkpoint's host calls answer.
+   * Past 10,000 hops that is an assert — a TRAP, not a refusal.
+   * af97c13 (#239) bounds the entry to the sole driver.
+   *
+   * Measured: the trigger is CONCURRENCY, not latency — it fires with the
+   * recorder answering instantly. */
+  "hc-driver-gate-storm": async (arg: { id: string; ms?: number }) => {
+    const conn = conns.get(arg.id)!;
+    const until = Date.now() + (arg.ms ?? 12_000);
+    let checkpoints = 0;
+    let drains = 0;
+    let trap = "";
+    const note = (e: unknown) => {
+      const m = String((e as Error)?.message ?? e);
+      if (trap === "" && /resumed-activation claim|driveAsync/.test(m)) trap = m.slice(0, 240);
+    };
+    const checkpointLoop = (async () => {
+      while (Date.now() < until && trap === "") {
+        try {
+          await conn.checkpoint();
+          checkpoints++;
+        } catch (e) {
+          note(e);
+        }
+      }
+    })();
+    const drainLoop = (async () => {
+      while (Date.now() < until && trap === "") {
+        try {
+          await conn.driver.usEvents();
+          drains++;
+        } catch (e) {
+          note(e);
+        }
+      }
+    })();
+    await Promise.all([checkpointLoop, drainLoop]);
+    return { checkpoints, drains, trap, alive: await refuses(() => conn.status()) };
   },
 
   /** ROW 32's other half: `unbindStore` refuses at the seam, never
