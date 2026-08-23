@@ -279,8 +279,20 @@ shipped.
   as expected for this engine's plain cabi_realloc.
 - sealed-fs assumptions unaffected (no wasi/ changes in the window) —
   confirmed by the sealed-fs and host rows staying green.
-- Now unblocked: the platform-posture slice — the engine's app-owned
-  device-identity import + identity-keys.ts + `SigningKey.fromCryptoKey`
-  (and `toCryptoKey` at mint time to persist).
+- The platform-posture slice: **LANDED**, both halves. The engine's
+  app-owned `device-identity` import (commit addbca8) and the worker
+  host's fragment over it — `loadOrMintIdentity` out of the device
+  namespace, laundered through `SigningKey.fromCryptoKey` /
+  `VerifyingKey.fromCryptoKey` (the merged webcrypto#392 seams) and
+  handed to `newEngine`. The worker now inits `platform` posture, so a
+  new device's private key never enters its checkpoint at all; existing
+  `seed` checkpoints still resume through the unchanged seed path,
+  because the engine forks on the manifest's recorded posture rather
+  than on the embedder's current preference. Gate rows 21 (identity
+  stable across a kill, confirmed from the restored archive), 22 (a
+  rival key in the namespace refused by name, never a silent fresh
+  device) and 23 (seed back-compat). `toCryptoKey` — the extraction
+  half — is still unused here: nothing needs to hand a device key back
+  out yet.
 - POLYVISOR-1 (#83): the docs spike's vendored deltic-0.1.0 bundle —
   still its own turn, untouched by this bump.

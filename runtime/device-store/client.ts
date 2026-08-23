@@ -32,7 +32,13 @@
 import { fromCloneable } from "@polyengine/runtime/embedder";
 import type { Driver, Tasks } from "../engine.ts";
 import { adoptAnchor, setAnchor } from "./anchor.ts";
-import { createDevice, getDevice, touchDevice, type UnsealPolicy } from "./index.ts";
+import {
+  createDevice,
+  getDevice,
+  type Posture,
+  touchDevice,
+  type UnsealPolicy,
+} from "./index.ts";
 import { nsDbName } from "./names.ts";
 import {
   type AttachSpec,
@@ -65,7 +71,14 @@ export type DeviceChoice =
    */
   | { kind: "anchor"; petname: string }
   /** A brand-new device, anchored to this tab. */
-  | { kind: "new"; petname: string; unsealPolicy?: UnsealPolicy };
+  | {
+    kind: "new";
+    petname: string;
+    unsealPolicy?: UnsealPolicy;
+    /** Overrides the `platform` default. The one caller that wants
+     * `seed` is the gate row proving old checkpoints still resume. */
+    posture?: Posture;
+  };
 
 export interface ConnectSpec {
   device: DeviceChoice;
@@ -81,6 +94,8 @@ export interface ConnectSpec {
   artifacts: AttachSpec["artifacts"];
   /** `wasi:cli` args label; diagnostics only. */
   label?: string;
+  /** PROBE ONLY — see `AttachSpec.__seedPosture` in rpc.ts. */
+  __seedPosture?: boolean;
   /** How long a single RPC may take before the client gives up.
    * Instantiating the composite is ~100 ms, but a first unseal also runs
    * 600k PBKDF2 iterations and a resume reads the whole state root. */
@@ -180,6 +195,12 @@ async function resolveDevice(choice: DeviceChoice): Promise<string> {
     }
     const made = await createDevice({
       petname: choice.petname,
+      // PLATFORM POSTURE, from the first moment. The worker always hands
+      // the engine the namespace's non-extractable key through the
+      // `device-identity` import, so `seed` (createDevice's default,
+      // which predates that seam) would make the index row say something
+      // untrue about every device this library creates.
+      posture: "platform",
       // WHILE-OPEN IS THE T0 RUNG, and naming it here is what makes the
       // reload path work: the worker climbs the rung the DEVICE RECORD
       // names, and `every-session` (createDevice's default, right for a
@@ -196,6 +217,9 @@ async function resolveDevice(choice: DeviceChoice): Promise<string> {
   const made = await createDevice({
     petname: choice.petname,
     unsealPolicy: choice.unsealPolicy,
+    // See the anchor arm above: the worker runs platform posture, so the
+    // row says so.
+    posture: choice.posture ?? "platform",
   });
   setAnchor(made.id);
   return made.id;
@@ -311,7 +335,12 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
 
   const hello = await helloPromise;
   await send("host", "attach", [
-    { deviceId, artifacts: spec.artifacts, label: spec.label } satisfies AttachSpec,
+    {
+      deviceId,
+      artifacts: spec.artifacts,
+      label: spec.label,
+      __seedPosture: spec.__seedPosture,
+    } satisfies AttachSpec,
   ]);
 
   const close = async (): Promise<void> => {

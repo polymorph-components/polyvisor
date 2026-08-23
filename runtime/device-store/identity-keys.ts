@@ -39,6 +39,19 @@ import { NS_STORES } from "./namespace.ts";
 const STORE = "identity";
 
 /**
+ * THE DEVICE'S OWN SIGNING IDENTITY, by name.
+ *
+ * One well-known id, because there is exactly one of these per device
+ * and three places need to agree on the spelling: the worker host (which
+ * loads it and hands it to the engine through the `device-identity`
+ * import), any tool that wants to inspect it, and the probe matrix that
+ * plants a rival pair to prove the engine refuses it. The store itself
+ * stays keyed — `persistIdentity(ns, id, pair)` — because nothing here
+ * should assume this is the only key a device will ever hold.
+ */
+export const DEVICE_IDENTITY_KEY = "device-signing";
+
+/**
  * Ed25519, and only Ed25519. The engine's device identity is an Ed25519
  * signing key; keeping the algorithm a CONSTANT rather than a stored
  * field is what makes validate-on-load meaningful — the algorithm a

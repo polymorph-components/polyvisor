@@ -377,13 +377,39 @@ export interface AttachSpec {
   artifacts: { envelopeUrl: string; wasmUrl: string };
   /** For `newEngine`'s `wasi:cli` args and nothing else. */
   label?: string;
+  /**
+   * PROBE ONLY — boot a FRESH device in seed posture (`init(true)`)
+   * instead of the platform posture every real device now uses.
+   *
+   * It exists for exactly one gate row: proving that a seed-posture
+   * checkpoint written before this switch still resumes through the
+   * unchanged seed path with the `device-identity` fragment present and
+   * ignored. The engine forks on the MANIFEST's recorded posture, not on
+   * what the embedder currently prefers (engine/guest/src/persist.rs's
+   * "THE POSTURE FORK"), so back-compat is a property to verify rather
+   * than assume — and the smallest honest way to verify it is to be able
+   * to write one.
+   *
+   * Named with the leading underscores that `__die` uses, for the same
+   * reason: nothing in an application should ever set it.
+   */
+  __seedPosture?: boolean;
 }
 
 /** Everything a picker or a strip needs to know, and nothing secret. */
 export interface DeviceStatus {
   deviceId: string;
   tier: Tier;
+  /** The index row's claim about how this device's identity RESTS.
+   * Every device the worker inits is `platform`; a namespace carrying an
+   * older seed-posture checkpoint resumes through the seed path
+   * regardless, because the engine forks on the manifest, not on this. */
   posture: Posture;
+  /** The agent id (a public key, hex) the engine reported when this
+   * device was FRESHLY INITED, or null before that has happened. A
+   * resume must still be this agent — the engine enforces it against the
+   * checkpoint manifest and refuses a mismatch by name. */
+  agentId: string | null;
   policy: UnsealPolicy;
   /** True until an unseal succeeds, true again after `reseal()`. The
    * headline fact. */

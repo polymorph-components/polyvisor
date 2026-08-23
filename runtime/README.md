@@ -79,6 +79,18 @@ relative path.
     The cloneable form is **version-internal and never persisted**: it
     lives for one `postMessage` between two realms of one page load, and
     nothing in the device store writes one to storage.
+  - **Platform posture is the default.** At attach the worker loads (or
+    mints) the device's non-extractable Ed25519 pair from the namespace
+    (`identity-keys.ts`) and hands it to the engine through the
+    app-owned `polyvisor:engine/device-identity@0.1.0` import, built
+    with `SigningKey.fromCryptoKey`/`VerifyingKey.fromCryptoKey` off the
+    SAME `@polymorph/webcrypto` module `newEngine` builds the port's own
+    fragment from — module identity matters here, because a wrapper from
+    a second copy of the package is not one the port recognizes. So the
+    device's private key is never written into a checkpoint; a resumed
+    device is the same device because the platform still holds its key.
+    A checkpoint written in the older `seed` posture still resumes: the
+    engine forks on the manifest, not on what the embedder prefers now.
   - **Checkpoint cadence is the embedder's**, and it is three triggers:
     a 500 ms trailing debounce after any mutating call, an explicit
     `checkpoint()` RPC, and a best-effort one when the last client
