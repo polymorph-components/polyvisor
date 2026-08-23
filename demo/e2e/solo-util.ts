@@ -125,3 +125,127 @@ export function stripPersonal(
     };
   });
 }
+
+// --- driving the two ceremonies a multi-device scenario needs -------------
+//
+// WHY THESE LIVE HERE AND WHAT THEY ARE NOT. `solo-pairing` drives the
+// add ceremony STEP BY STEP, in four acts, because each of those steps
+// IS one of its claims: that the code is 79 characters, that the same
+// six digits appear on two documents that share only a relay, that the
+// grant is armed rather than instant. A scenario whose claim is about
+// something AFTER pairing does not want to re-make those claims — it
+// wants a paired pair — and copying thirty lines of ceremony driving
+// into it would put solo-pairing's assertions somewhere they cannot be
+// read as assertions.
+//
+// So these are DRIVERS, not claims: they assert nothing, and every
+// value a caller might want to assert on comes back out. solo-pairing
+// deliberately does NOT use them; its inline version is its subject.
+
+/** Create the account this page is the first device of, and wait for the
+ * app to be up — the fork's "new account" button, clicked as a user
+ * clicks it. */
+export async function createAccount(page: Page) {
+  await solo(page, "newAccount");
+  await until([page], "the new account", async () => await solo(page, "hasAccount"), 60_000);
+  await appFrame(page).locator("input.new-todo").waitFor({
+    state: "visible",
+    timeout: WAITS.converge,
+  });
+}
+
+/** Give the account a name (and optionally a colour) through the VISOR'S
+ * OWN SETTINGS SHEET, driven as a user drives it. This is the one
+ * direction that goes visor → account: solo.ts's `onIdentityCommitted`
+ * write-through carries the committed record into the account's profile.
+ *
+ * Returns once THIS page's strip shows the name — the local commit, not
+ * the remote arrival. What the other device does with it is the
+ * caller's claim. */
+export async function setAccountName(page: Page, name: string, hue?: number) {
+  await solo(page, "openSettings");
+  await until(
+    [page],
+    "the settings sheet",
+    async () => await page.evaluate(() => document.getElementById("visor-settings-name") !== null),
+    15_000,
+  );
+  await page.evaluate(
+    ([who, h]) => {
+      const input = document.getElementById("visor-settings-name") as HTMLInputElement | null;
+      if (input) input.value = who as string;
+      if (h !== undefined) {
+        (document.querySelector(
+          `.settings-hues button[data-hue="${h}"]`,
+        ) as HTMLButtonElement | null)?.click();
+      }
+      (document.querySelector(".settings-sheet .cred-row button:first-child") as
+        | HTMLButtonElement
+        | null)?.click();
+    },
+    [name, hue] as [string, number | undefined],
+  );
+  await until(
+    [page],
+    `${name} on this page's own strip`,
+    async () => (await stripPersonal(page)).identityText.includes(name),
+    15_000,
+  );
+}
+
+/** THE WHOLE ADD CEREMONY, end to end, between two independent pages —
+ * `joiner` shows a code, `adder` takes it, both read the same six
+ * digits, the grant arms, and the joiner confirms.
+ *
+ * The SAS pair comes back so a caller that wants to assert on it can;
+ * this function only waits for the two strings to be non-empty, which is
+ * a precondition of driving the next control rather than a claim about
+ * them. */
+export async function pairPages(
+  adder: Page,
+  joiner: Page,
+  deviceName: string,
+): Promise<{ code: string; sasAdder: string; sasJoiner: string }> {
+  const both = [adder, joiner];
+  await solo(joiner, "joinAccount");
+  const code = await until([joiner], "the joiner's pairing code", async () => {
+    const c = (await solo(joiner, "code")) as string;
+    return c.length > 0 ? c : false;
+  }, WAITS.code);
+
+  await solo(adder, "openAdd");
+  await until([adder], "the adder's sheet", async () => await solo(adder, "addOpen"), 15_000);
+  if (!(await solo(adder, "pasteCode", code))) {
+    throw new Error("the pairing code never reached the adder's sheet");
+  }
+  await solo(adder, "connect");
+
+  const sasAdder = await until(both, "the adder's SAS", async () => {
+    const s = ((await solo(adder, "sasAdd")) as string).trim();
+    return s.length > 0 ? s : false;
+  }, WAITS.sas);
+  const sasJoiner = await until(both, "the joiner's SAS", async () => {
+    const s = ((await solo(joiner, "sasJoin")) as string).trim();
+    return s.length > 0 ? s : false;
+  }, WAITS.sas);
+
+  await solo(adder, "sasContinue");
+  await until(
+    both,
+    "the grant control",
+    async () => (await solo(adder, "grantArmed")) !== null,
+    WAITS.sas,
+  );
+  await solo(adder, "typeDeviceName", deviceName);
+  // ARMED, NOT INSTANT — a click before the delay elapses lands on a
+  // disabled button, so the driver waits exactly as a user must.
+  await until(
+    both,
+    "the grant to arm",
+    async () => (await solo(adder, "grantArmed")) === true,
+    15_000,
+  );
+  await solo(adder, "grant");
+  await solo(joiner, "joinConfirm");
+  return { code, sasAdder, sasJoiner };
+}
