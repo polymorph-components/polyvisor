@@ -579,7 +579,9 @@ async function promote(opts: PromoteOptions): Promise<DeviceStatus> {
  *
  * ORDER IS LOAD-BEARING: the re-wrap lands before the deletion, so a
  * failed ceremony leaves the device exactly as it was — still openable
- * by the platform wrap, still upgradable.
+ * by the platform wrap, still upgradable. A FINAL CHECKPOINT sits
+ * between them, and it can refuse the whole ceremony: see the note at
+ * the call site.
  *
  * The engine goes with the key, and it has to: the mounted state root
  * closes over the DEK, so an engine left running would keep writing
@@ -614,6 +616,41 @@ async function reseal(opts: ResealOptions = {}): Promise<DeviceStatus> {
     }
     await rekeyFromPlatform(ns, opts.passphrase);
   }
+  // THE FINAL CHECKPOINT, and it is the FALLIBLE HALF, taken first.
+  //
+  // Sealing drops the engine (see this function's header), and a
+  // mutation inside the 500 ms debounce window has a checkpoint armed
+  // that will never fire — so without this, every seal silently threw
+  // away up to half a second of work. `destroy` already drains the
+  // chain for the sharper version of the same reason ("a checkpoint
+  // already RUNNING is mid-write into the state root"); reseal only
+  // grew the asymmetry because for a long time nothing in that window
+  // was expensive to lose. #93 ended that: bucket state — the per-doc
+  // name-key chain and the flushed-chunk map — is checkpointed now, and
+  // losing it does not merely rewind a keystroke, it re-mints the
+  // keychain and makes the next flush upload a complete duplicate of
+  // the store under all-new names.
+  //
+  // A FAILURE PROPAGATES and the device STAYS OPEN. This is the erase
+  // ceremony's discipline (keystore.ts's `eraseKeystore`: report the
+  // refusal, let the user retry, never report success over a partial
+  // act) applied to the other end of the lifecycle — sealing over work
+  // we just failed to save is exactly "reporting success over a partial
+  // act", and the user can always try again on a device that is still
+  // open. Nothing has been dropped at this point: `rekeyFromPlatform`
+  // above is additive and leaves the device openable either way.
+  //
+  // AN UNTOUCHED ENGINE IS NOT A FAILURE PATH: `stateCheckpoint()` on an
+  // engine that has done nothing since it resumed simply writes another
+  // generation. The only case with nothing to checkpoint is having no
+  // engine at all — an already-sealed device — which is why the guard
+  // is `engine !== null` rather than a "was anything mutated" flag we
+  // would have to keep honest.
+  if (debounceTimer !== undefined) {
+    clearTimeout(debounceTimer);
+    debounceTimer = undefined;
+  }
+  if (engine !== null) await checkpoint();
   await resealNamespace(ns);
   dek = null;
   engine = null;

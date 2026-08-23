@@ -56,7 +56,13 @@ story, and this provider's point is that there is none).
   pull that can list the folder and learn nothing from it. Note the
   keychain is a SECRET but still not a CAPABILITY: knowing a name lets
   you derive where an object sits, never read it, because every read on
-  this provider goes through the owner seam's OAuth.)
+  this provider goes through the owner seam's OAuth. AMENDED 2026-08-23
+  (#93): the keychain is also CHECKPOINTED state now — it is minted
+  inside the engine and no embedder can hand it back, so it rides the
+  sealed state root with the keyhive archive. Until that change a page
+  reload was enough to lose it and write a second complete copy of the
+  store under a fresh doc-folder name; devstore row 41 asserts exactly
+  one doc folder across a kill.)
 - `store-revoke` deletes the pickup and returns the honest note: this
   store never minted a capability, so there is nothing server-side to
   revoke; a party holding the user's own Drive credential is outside
@@ -91,7 +97,14 @@ story, and this provider's point is that there is none).
   name→id with `files.list` queries scoped to a parent folder, caches
   folder ids in instance memory, and never creates duplicates itself
   (upload is list-then-create-or-update: multipart create when absent,
-  media PATCH when present).
+  media PATCH when present). The folder-id CACHE is still instance
+  memory and deliberately so — ids are public addressing, re-resolvable
+  from any instance in one `files.list`. (WAS TRUE UNTIL 2026-08-23:
+  the name-KEY that decides what those names ARE was instance memory
+  too, which meant a respawned worker resolved nothing and created a
+  whole duplicate tree under fresh names. Bucket state is checkpointed
+  since #93; the caveat now applies to the id cache alone, where it
+  costs a re-listing and nothing else.)
 - Layout mirrors Dropbox's SHAPE with S3's NAMES: root folder (the
   binding's `root`) → a `docs` folder holding one folder per document,
   and a flat `pickup` folder holding per-member bootstrap objects. Doc
@@ -476,7 +489,12 @@ settled about its shape:
   and byte sizes; write and read TIMING; and the GROUPING itself — which
   objects belong together, since the folder still gathers one document's
   objects even though it is not labelled with which. Name-keys blind
-  labels, not traffic shape. Two further honest limits: a member who
+  labels, not traffic shape. (One of those counts was WRONG rather than
+  merely visible until 2026-08-23: the keychain was instance memory, so
+  every respawn added another doc folder for the SAME document and the
+  "number of documents" an observer saw was really a count of respawns.
+  Bucket state is checkpointed since #93 and the folder count is now the
+  document count.) Two further honest limits: a member who
   once held the keychain can go on deriving names (harmless here — a
   name is not a read, since every read needs the user's own OAuth), and
   an observer who already knows a (doc, owner, member) triple can

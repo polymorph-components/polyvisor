@@ -513,7 +513,18 @@ async fn main() -> Result<()> {
     let make_store = |env: &[(&str, &str)]| make_store_in(env, None);
 
     if acts == "resume" {
-        return resume_scenarios(&component, &linker, &make_store_in, relay).await;
+        // The bucket-state act (#93) needs a real store. A bucket of its
+        // OWN, named for this process: the counts it asserts are over
+        // the whole bucket, so anything another run left behind would be
+        // counted as this run's.
+        let probe = resume_acts::S3Probe {
+            endpoint: s3.endpoint.clone(),
+            bucket: format!("pm-resume-{}", std::process::id()),
+            access: s3.access.clone(),
+            secret: (*egress.secret).clone(),
+            http: reqwest::Client::new(),
+        };
+        return resume_scenarios(&component, &linker, &make_store_in, relay, &probe).await;
     }
     if acts == "pairing" {
         return pairing_scenarios(&engine, &component, &linker, &make_store, relay).await;
@@ -560,6 +571,7 @@ async fn resume_scenarios(
     linker: &Linker<Ctx>,
     make_store_in: &StateStoreFactory<'_>,
     relay: String,
+    probe: &resume_acts::S3Probe,
 ) -> Result<()> {
     let mut outcomes: Vec<(&str, std::result::Result<(), String>)> = Vec::new();
 
@@ -610,6 +622,70 @@ async fn resume_scenarios(
         store
             .run_concurrent(async move |acc| {
                 resume_acts::platform_no_identity_act(acc, device, resumed).await
+            })
+            .await?
+            .map_err(|e| e.to_string()),
+    ));
+
+    // BACK-COMPAT, STRUCTURALLY. `resume_act`'s device never configured
+    // a store, so `State.buckets` stayed empty and the checkpoint wrote
+    // NO `buckets.bin` member — a generation shaped exactly like every
+    // pre-#93 one. It resumed a moment ago (the act above passed), which
+    // is the absence path taken end to end. Asserted rather than left to
+    // the eye, because it is the only proof this build can give that an
+    // old checkpoint still resumes: the rig has no old build to write
+    // one with.
+    let absent = (|| -> Result<String> {
+        let mut carriers = Vec::new();
+        let mut gens = Vec::new();
+        for entry in std::fs::read_dir(&root)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("gen-") {
+                continue;
+            }
+            gens.push(name.clone());
+            if entry.path().join("buckets.bin").exists() {
+                carriers.push(name);
+            }
+        }
+        if gens.is_empty() {
+            bail!("the resumed device wrote no generations at all");
+        }
+        if !carriers.is_empty() {
+            bail!(
+                "generations {carriers:?} carry a buckets member, but that device never \
+                 configured a store — the absence path was not exercised"
+            );
+        }
+        Ok(format!(
+            "{} generation(s), none with a buckets member",
+            gens.len()
+        ))
+    })();
+    match &absent {
+        Ok(what) => println!("[  buckets ] pre-#93 generation shape: {what}"),
+        Err(e) => println!("[  buckets ] pre-#93 generation shape: FAILED: {e}"),
+    }
+    outcomes.push((
+        "a generation with no buckets member resumes (the pre-#93 shape)",
+        absent.map(|_| ()).map_err(|e| e.to_string()),
+    ));
+
+    // Bucket state across a kill (#93). Its own state root and its own
+    // bucket — the counts are over the whole bucket.
+    let bucket_root = std::env::temp_dir().join(format!("pm-engine-buckets-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&bucket_root);
+    std::fs::create_dir_all(&bucket_root)
+        .with_context(|| format!("creating {}", bucket_root.display()))?;
+    let mut store = make_store_in(&[], Some(&bucket_root));
+    let device = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    let resumed = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    outcomes.push((
+        "bucket state survives the kill: a re-flush uploads nothing, a change uploads the delta",
+        store
+            .run_concurrent(async move |acc| {
+                resume_acts::bucket_state_act(acc, device, resumed, probe).await
             })
             .await?
             .map_err(|e| e.to_string()),

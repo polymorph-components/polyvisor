@@ -505,6 +505,17 @@ enum StoreCfg {
 }
 
 /// One partition's bucket-side state (the #19 pull layer).
+///
+/// SERIALIZABLE BECAUSE IT IS CHECKPOINTED (#93). Every field here is
+/// GENERATED INSIDE THE ENGINE and cannot be re-supplied by an embedder
+/// — unlike `State::store`, which is pure addressing the embedder
+/// re-applies at every bring-up. Losing this map across a respawn
+/// re-mints the keychain (every derived name changes, so a flush writes
+/// a complete duplicate store) and forgets the upload dedup map and the
+/// standing Dropbox links. It rides the checkpoint's sealed state root
+/// with the keyhive archive: `name_keys` is secret material of the same
+/// kind. See persist.rs's `BUCKETS_FILE`.
+#[derive(Serialize, Deserialize)]
 struct BucketState {
     /// Per-epoch name-keys; index = epoch. Rotated on store-revoke.
     name_keys: Vec<[u8; 32]>,

@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 use wasmtime::component::Accessor;
 use wasmtime::{bail, format_err, Result};
 
-use crate::bindings::exports::polyvisor::engine::driver::{Guest as Driver, UsMark, UsProfile};
+use crate::bindings::exports::polyvisor::engine::driver::{
+    Guest as Driver, S3Config, StoreConfig, UsMark, UsProfile,
+};
 use crate::bindings::exports::polyvisor::tasks::tasks::Guest as Tasks;
 use crate::Ctx;
 
@@ -507,5 +509,364 @@ pub(crate) async fn torn_resume_act(
         );
     }
     ok("torn: fell back to the last intact generation (1 todo, not 2)", Instant::now());
+    Ok(())
+}
+
+// --- the bucket-state act (#93) ----------------------------------------------
+
+/// Host-side, read-only S3 access, used ONLY to count what the engine
+/// left in the bucket.
+///
+/// Deliberately not routed through the guest's egress seams: the claim
+/// under test is about what is IN the store, and asking the engine would
+/// be asking the component under test to grade itself. This is the same
+/// SigV4 the escrowed signer performs (`store_signer::sign` in main.rs),
+/// assembled here over the rig's synthetic MinIO credential.
+pub(crate) struct S3Probe {
+    pub endpoint: String,
+    pub bucket: String,
+    pub access: String,
+    pub secret: String,
+    pub http: reqwest::Client,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+fn hmac256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    use hmac::Mac as _;
+    let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(key)
+        .expect("HMAC accepts keys of any length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+impl S3Probe {
+    /// Every object key in the bucket, sorted.
+    ///
+    /// The rig's buckets hold at most a handful of objects, so the
+    /// single (unpaginated) ListObjectsV2 page is the whole truth; a
+    /// truncated response would be a rig failure and is reported as one.
+    pub(crate) async fn keys(&self) -> Result<Vec<String>> {
+        let host = self
+            .endpoint
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_end_matches('/');
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        // The same civil-from-days shape provider-s3 uses; the host has
+        // no date crate and needs exactly this one format.
+        let days = (now / 86_400) as i64;
+        let (y, mo, d) = {
+            let z = days + 719_468;
+            let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+            let doe = (z - era * 146_097) as u64;
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let y = yoe as i64 + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+            let m = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 })?;
+            (if m <= 2 { y + 1 } else { y }, m, d)
+        };
+        let rem = now % 86_400;
+        let date = format!("{y:04}{mo:02}{d:02}");
+        let amz = format!(
+            "{date}T{:02}{:02}{:02}Z",
+            rem / 3600,
+            (rem % 3600) / 60,
+            rem % 60
+        );
+        let path = format!("/{}", self.bucket);
+        let query = "list-type=2";
+        let payload_hash = sha256_hex(b"");
+        let canonical_headers =
+            format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz}\n");
+        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+        let canonical = format!(
+            "GET\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+        );
+        let scope = format!("{date}/us-east-1/s3/aws4_request");
+        let sts = format!(
+            "AWS4-HMAC-SHA256\n{amz}\n{scope}\n{}",
+            sha256_hex(canonical.as_bytes())
+        );
+        let mut key = format!("AWS4{}", self.secret).into_bytes();
+        for part in [date.as_str(), "us-east-1", "s3", "aws4_request"] {
+            key = hmac256(&key, part.as_bytes());
+        }
+        let signature = hex::encode(hmac256(&key, sts.as_bytes()));
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            self.access
+        );
+        let resp = self
+            .http
+            .get(format!("{}{path}?{query}", self.endpoint))
+            .header("x-amz-date", amz)
+            .header("x-amz-content-sha256", payload_hash)
+            .header("authorization", authorization)
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await?;
+        if status != 200 {
+            bail!("list {}: {status} {body}", self.bucket);
+        }
+        if body.contains("<IsTruncated>true</IsTruncated>") {
+            bail!("list {}: truncated — the act's counts would be wrong", self.bucket);
+        }
+        let mut out: Vec<String> = body
+            .split("<Key>")
+            .skip(1)
+            .filter_map(|s| s.split("</Key>").next())
+            .map(str::to_string)
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+}
+
+/// How many chunks a `bucket-flush` decided to upload, out of the
+/// summary string the engine returns.
+///
+/// The summary is the engine's own account of the work it chose to do
+/// (`flush_to`: `"flushed chunks={n} oplog={n}B epoch={n}"`), and it is
+/// the only window onto the dedup decision — the bucket cannot show it,
+/// because a re-upload of an already-stored chunk lands on the SAME
+/// name. Parsed strictly: an unrecognised summary is a failure, never a
+/// silently-zero assertion.
+fn flushed_chunks(summary: &str) -> Result<u32> {
+    summary
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("chunks="))
+        .ok_or_else(|| format_err!("flush summary has no `chunks=` field: {summary:?}"))?
+        .parse::<u32>()
+        .map_err(|e| format_err!("unparseable chunk count in {summary:?}: {e}"))
+}
+
+/// BUCKET STATE SURVIVES THE KILL — the act #93 asked for.
+///
+/// The defect: `State.buckets` (per-doc name-key chains, the flushed
+/// dedup map, manifest entries, grantees, the Dropbox links) lived only
+/// in instance memory. persist.rs classified it with `store` as
+/// "embedder-supplied addressing, re-applied by the embedder", which is
+/// true of the ADDRESSING and false of the STATE: no embedder can
+/// re-supply a keychain the engine minted. So every respawn minted a
+/// fresh one, every derived object name changed, and the next flush
+/// wrote a complete second copy of the store — and even at equal names,
+/// a lost `flushed` map re-uploads every chunk.
+///
+/// The assertion is therefore an OBJECT COUNT, taken host-side out of
+/// the bucket itself:
+///
+///  1. device flushes, checkpoints, and is abandoned;
+///  2. a fresh instance resumes and RE-APPLIES ONLY THE ADDRESSING
+///     (`init-store` — that half of the note was right) and flushes
+///     again: the key set must be UNCHANGED, byte for byte, AND the
+///     engine must report ZERO chunks sent. The two are different
+///     claims — a lost dedup map with a surviving keychain re-uploads
+///     everything to the same names, which the key set cannot see —
+///     so the keychain and the `flushed` map are pinned separately.
+///     Pre-fix the key set roughly doubles.
+///  3. one real mutation, then a third flush: the delta must be the new
+///     chunk and nothing else — the dedup map survived too, so the
+///     device uploads what changed rather than the world.
+///
+/// Name-keys are secret material and never appear here: the evidence is
+/// counts and set equality over opaque object names.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn bucket_state_act(
+    acc: &Accessor<Ctx>,
+    device: crate::bindings::Engine,
+    resumed: crate::bindings::Engine,
+    probe: &S3Probe,
+) -> Result<()> {
+    let d: &Driver = device.polyvisor_engine_driver();
+    let dt: &Tasks = device.polyvisor_tasks_tasks();
+
+    let store_cfg = || {
+        StoreConfig::S3(S3Config {
+            endpoint: probe.endpoint.clone(),
+            bucket: probe.bucket.clone(),
+            access_key: probe.access.clone(),
+        })
+    };
+
+    // --- before the kill ---------------------------------------------------
+    let dev_id_hex = step!("buckets: device.init(exportable)", d.call_init(acc, true));
+    let dev_id = hex::decode(&dev_id_hex).map_err(|e| format_err!("{e}"))?;
+    step!(
+        "buckets: device.init-store(s3)",
+        d.call_init_store(acc, store_cfg())
+    );
+    step!("buckets: device.ensure-bucket", d.call_ensure_bucket(acc));
+
+    step!(
+        "buckets: device.user-create",
+        d.call_user_create(
+            acc,
+            UsProfile {
+                display_name: "Bucketed Bella".to_string(),
+                hue: 40,
+                icon: None,
+            },
+        )
+    );
+    let part = step!("buckets: device.create-partition", d.call_create_partition(acc));
+    step!(
+        "buckets: device.seal-partition",
+        d.call_seal_partition(acc, part.clone())
+    );
+    step!(
+        "buckets: device.us-partition-put(tasks)",
+        d.call_us_partition_put(acc, "tasks".to_string(), part.clone())
+    );
+    for title in ["buy milk", "write the act", "count the objects"] {
+        step!(
+            format!("buckets: device.tasks.add({title})"),
+            dt.call_add(acc, title.to_string())
+        );
+    }
+
+    // The grant is in the act because it is now a CHECKPOINTED mutation:
+    // it appends to this doc's `grantees` and republishes K_p under the
+    // current name-key epoch (hence rpc.ts dropping `storeGrant` from
+    // READONLY_METHODS in the same change).
+    let _ = step!(
+        "buckets: device.store-grant(self)",
+        d.call_store_grant(acc, part.clone(), dev_id.clone())
+    );
+    let summary = step!(
+        "buckets: device.bucket-flush",
+        d.call_bucket_flush(acc, part.clone())
+    );
+    println!("            {summary}");
+    step!("buckets: device.state-checkpoint", d.call_state_checkpoint(acc));
+
+    let before = probe.keys().await?;
+    if before.len() < 4 {
+        bail!(
+            "the pre-kill flush left only {} object(s) — too few for the count to mean anything",
+            before.len()
+        );
+    }
+    println!(
+        "[  buckets ] pre-kill bucket holds {} object(s) (3 chunks + oplog + manifest + K_p, names elided)",
+        before.len()
+    );
+
+    // --- THE KILL ----------------------------------------------------------
+    // Same idiom as `resume_act`: a distinct component instance, so the
+    // borrow checker enforces that nothing below touches `device`.
+    let _abandoned = device;
+    ok("*** kill: the device instance is abandoned ***", Instant::now());
+
+    let r: &Driver = resumed.polyvisor_engine_driver();
+    let rt: &Tasks = resumed.polyvisor_tasks_tasks();
+    let did = step!("buckets: resumed.state-resume", r.call_state_resume(acc));
+    if !did {
+        bail!("state-resume answered false over a state root that was just checkpointed");
+    }
+    // THE ADDRESSING, AND ONLY THE ADDRESSING. This is the embedder's
+    // half of the config/state split, re-applied exactly as the worker
+    // host re-applies it at every bring-up. Nothing here hands back a
+    // name-key, a flushed set, or a grantee — if the count below holds,
+    // it holds because the CHECKPOINT carried them.
+    step!(
+        "buckets: resumed.init-store(s3) [addressing re-applied by the embedder]",
+        r.call_init_store(acc, store_cfg())
+    );
+
+    let summary = step!(
+        "buckets: resumed.bucket-flush [no mutation since the checkpoint]",
+        r.call_bucket_flush(acc, part.clone())
+    );
+    println!("            {summary}");
+    // THE DEDUP HALF, PINNED SEPARATELY — the key set alone cannot see
+    // it. `flushed` (cref -> epoch) is the upload dedup map, and losing
+    // it while KEEPING the keychain re-uploads every chunk to the SAME
+    // names: same key set, same count, a full re-upload. Set equality
+    // below would pass straight through that, so the engine's own count
+    // of what it decided to send is the observable that catches it.
+    let chunks = flushed_chunks(&summary)?;
+    if chunks != 0 {
+        bail!(
+            "a re-flush with no mutation since the checkpoint re-uploaded {chunks} chunk(s): the \
+             keychain survived but the flushed-chunk map did not, so the device re-sent history \
+             it had already stored — over the same names, which is why the object count cannot \
+             see it (#93)"
+        );
+    }
+    ok(
+        "buckets: the no-change re-flush sent ZERO chunks (the dedup map survived, not just the keychain)",
+        Instant::now(),
+    );
+    let after = probe.keys().await?;
+    if after != before {
+        let added = after.iter().filter(|k| !before.contains(k)).count();
+        bail!(
+            "a re-flush after resume changed the store: {} object(s) before, {} after, {added} new \
+             — the resumed instance minted a fresh keychain (or lost the flushed map) and \
+             re-uploaded the world (#93)",
+            before.len(),
+            after.len()
+        );
+    }
+    ok(
+        &format!(
+            "buckets: re-flush after the kill uploaded nothing new — the bucket still holds \
+             exactly {} object(s), the SAME key set (the keychain and the dedup map survived)",
+            after.len()
+        ),
+        Instant::now(),
+    );
+
+    // --- and a real mutation moves exactly the delta ------------------------
+    step!(
+        "buckets: resumed.tasks.add(after the kill)",
+        rt.call_add(acc, "after the kill".to_string())
+    );
+    let summary = step!(
+        "buckets: resumed.bucket-flush [one new change]",
+        r.call_bucket_flush(acc, part.clone())
+    );
+    println!("            {summary}");
+    // The mirror of the zero above: the delta flush must send the ONE
+    // new chunk, not the whole history again. Together the two counts
+    // say the dedup map is being consulted, not merely present.
+    let chunks = flushed_chunks(&summary)?;
+    if chunks != 1 {
+        bail!(
+            "one new todo should flush exactly one chunk; the engine sent {chunks} — the dedup \
+             map was not consulted (#93)"
+        );
+    }
+    let delta = probe.keys().await?;
+    let new: Vec<&String> = delta.iter().filter(|k| !after.contains(k)).collect();
+    let gone: Vec<&String> = after.iter().filter(|k| !delta.contains(k)).collect();
+    if !gone.is_empty() {
+        bail!("the delta flush ORPHANED {} object(s)", gone.len());
+    }
+    if new.len() != 1 {
+        bail!(
+            "a single new todo should add exactly one object (its chunk; the oplog and manifest \
+             are rewritten under their existing names) — it added {}: the store was re-uploaded \
+             rather than extended",
+            new.len()
+        );
+    }
+    ok(
+        &format!(
+            "buckets: one new change added exactly 1 object ({} -> {}), not another whole copy",
+            after.len(),
+            delta.len()
+        ),
+        Instant::now(),
+    );
     Ok(())
 }

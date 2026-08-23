@@ -158,6 +158,13 @@ export interface DeviceConnection {
    * Forget the persisted wrap and drop the worker's key material. The
    * engine goes down with it; the next `unseal` runs the ceremony.
    *
+   * IT SAVES FIRST, AND IT CAN REFUSE. The ceremony takes a final
+   * checkpoint before dropping anything — the debounce window would
+   * otherwise lose every mutation of the last half second at each seal —
+   * and if that checkpoint fails the whole call REJECTS with the device
+   * still open, rather than sealing over work it could not save. A
+   * caller retries; it does not get a success it cannot trust.
+   *
    * SOMETIMES AN UPGRADE: on a device whose only usable rung is the
    * platform wrap, this REQUIRES `passphrase` and the device comes back
    * as an `every-session` one — see the worker's `reseal` for why

@@ -126,21 +126,50 @@ run: compose minio relay-bin
 
 # The #20 G5 kill-and-resume acts: the engine checkpoints into a mounted
 # state root and a FRESH instance resumes from it, then proves it is still
-# the same device by syncing with a live peer. Relay only — no bucket.
+# the same device by syncing with a live peer.
+#
+# MinIO joins the recipe for the #93 bucket-state act, which asserts an
+# OBJECT COUNT out of a real store across a kill. It takes a bucket of its
+# own (named for the host process), so it cannot collide with `just run`.
+#
+# THE FIXED PORT, AND WHAT IS AND IS NOT TOLERATED. 9000 is what the rig's
+# `--endpoint` default and `just run` both use. If another MinIO already
+# holds it, OUR spawn dies and the act would quietly probe the stranger —
+# passing for the wrong reason. Two things keep that honest: the guard
+# below FAILS THE RECIPE when our own server is not the one that came up,
+# and the act's bucket is named for the host pid, so nothing it counts is
+# ever shared with a co-tenant. An ephemeral port would need MinIO to
+# report the port it chose, which `--quiet` plus `--address :0` do not
+# give us reliably; the guard is the smaller honest change.
 #
 # The state root is a real temp directory, so this is the native-parity
 # half of the browser's OPFS path: same guest `std::fs` code, real files.
-resume: compose relay-bin
+resume: compose relay-bin minio
     #!/usr/bin/env bash
     set -euo pipefail
     relay=".deps/relay/bin/iroh-relay"
     [ -x "$relay" ] || { echo "iroh-relay not installed at $relay (run: just relay-bin)" >&2; exit 1; }
     "$relay" --dev &
     relay_pid=$!
-    trap 'kill $relay_pid 2>/dev/null || true' EXIT
+    data="$(mktemp -d /tmp/pm-resume-minio.XXXXXX)"
+    MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+        .deps/minio server "$data" --address 127.0.0.1:9000 --quiet &
+    minio_pid=$!
+    trap 'kill $relay_pid $minio_pid 2>/dev/null || true; rm -rf "$data"' EXIT
+    for _ in $(seq 1 50); do
+        if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then break; fi
+        sleep 0.2
+    done
+    if ! kill -0 "$minio_pid" 2>/dev/null; then
+        echo "minio did not survive startup on 127.0.0.1:9000 (port already in use?)" >&2
+        echo "the bucket-state act would have probed someone else's server; refusing" >&2
+        exit 1
+    fi
     sleep 0.5
     cargo run --release -p engine-host -- target/composed.wasm \
-        --acts resume --relay http://127.0.0.1:3340
+        --acts resume --relay http://127.0.0.1:3340 \
+        --endpoint http://127.0.0.1:9000 \
+        --access minioadmin --secret minioadmin
 
 check:
     cargo clippy --target wasm32-wasip2 \

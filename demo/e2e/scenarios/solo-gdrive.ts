@@ -306,6 +306,24 @@ const scenario: Scenario = {
         "a REAL reload: binding and consent come back with nothing re-entered",
         async () => {
           const authCallsBefore = authCallCount(fake);
+          // Pin the state before the navigation. The flush above armed
+          // the worker's 500 ms trailing checkpoint, and this beat is
+          // faster than that — the reload would race a timer, which is
+          // the one thing an assertion must not do. Other scenarios take
+          // the same explicit checkpoint before their reload for the
+          // same reason (solo-persistence, solo-passkey).
+          //
+          // AND THIS IS NOT THE RESEAL CASE. A navigation is death by
+          // crash: nobody gets to say goodbye, and the crash-consistency
+          // contract accepts that window by design (PERSISTENCE.md,
+          // "Checkpoint semantics") — so a test that wants determinism
+          // across a reload has to close it itself. `reseal` is the
+          // opposite: an orderly CEREMONY the worker runs, which saves
+          // first and refuses if it cannot (worker.ts's `reseal`). A
+          // checkpoint taken on a test's behalf before a reseal would
+          // hide a regression of that behaviour, which is why devstore
+          // row 40 takes none.
+          await solo(page, "checkpoint");
           await page.reload({ waitUntil: "domcontentloaded" });
           await waitForBoot(page, "__solo");
           const trace = (await solo(page, "bootTrace")) as string[];
@@ -370,6 +388,22 @@ const scenario: Scenario = {
             authCallsAfter,
             authCallsBefore,
             "a fresh /auth request means a re-consent ran where it must not have",
+          );
+          // ONE DOC FOLDER, STILL (#93). A reload is a worker respawn,
+          // and bucket state — the doc's name-key chain — used to live
+          // only in that worker's memory: the post-reload sync above
+          // would mint a fresh keychain, derive all-new names, and write
+          // a COMPLETE SECOND COPY of the store under a second keyed
+          // doc-folder name. Invisible to the user on appdata, which is
+          // exactly why it is asserted here. It is checkpointed state
+          // now, so the count is the document count.
+          const docFolders = fake.childNames(`${ROOT}/docs`, "appDataFolder");
+          assertEquals(
+            docFolders.length,
+            1,
+            `after a reload + Sync now the store must still hold exactly one doc folder; ` +
+              `${docFolders.length} means the respawned engine re-minted its name-key and ` +
+              `duplicated the whole store (#93)`,
           );
           await page.evaluate(() => {
             (Array.from(document.querySelectorAll("#storage-sheet button")) as HTMLButtonElement[])

@@ -2067,9 +2067,16 @@ async function main() {
     //
     // `__die`, reconnect, unseal with NO ceremony — the sealed oauth row
     // AND the sealed binding both come back re-applied at bring-up, not
-    // re-entered (persist.rs's "embedder-supplied addressing, re-applied
-    // by the embedder", engine/guest/src/persist.rs — the same claim
-    // STORAGE-EGRESS.md's row 31 pins for S3, now for the OAuth row too).
+    // re-entered (persist.rs's "the embedder's `init-store` ADDRESSING,
+    // re-applied by the embedder", engine/guest/src/persist.rs — the
+    // same claim STORAGE-EGRESS.md's row 31 pins for S3, now for the
+    // OAuth row too).
+    //
+    // ADDRESSING is what this row is about, and only addressing. The
+    // per-doc bucket STATE that used to be lumped in with it — the
+    // name-key chain, the flushed map — is checkpointed since #93 and
+    // is row 41's subject. This device has flushed nothing yet, so
+    // there is no bucket state here to lose either way.
     await guard(async () => {
       const id = gdriveDevice;
       await probe(page, "hc-die", { id });
@@ -2191,6 +2198,17 @@ async function main() {
     // Reseal drops the in-worker egress authority with everything else
     // (STORAGE-EGRESS.md §6, DRIVE.md §4): the same upgrade-ceremony
     // shape row 32 pins for S3, now checked for the oauth row too.
+    //
+    // IT ALSO TAKES A FINAL CHECKPOINT (worker.ts's `reseal`: sealing
+    // drops the engine, so the ceremony saves first and REFUSES if it
+    // cannot), and this row is where that is load-bearing rather than
+    // merely tidy: row 39 flushed a moment ago, which minted the doc's
+    // name-key chain, and row 41 downstream asserts an exact doc-folder
+    // count over it. NO TEST MAY PRE-CHECKPOINT BEFORE A RESEAL — an
+    // `hc-checkpoint` anywhere between that flush and this ceremony
+    // would save the work on the test's behalf and hide a regression of
+    // exactly the behaviour under test, leaving row 41 green over a
+    // reseal that had thrown the keychain away.
     await guard(async () => {
       const id = gdriveDevice;
       const resealed = await probe(page, "hc-reseal", { id, passphrase: PASS, upgrade: true });
@@ -2218,7 +2236,7 @@ async function main() {
       );
     });
 
-    // --- 41: names disclose no doc id — the keyed-name regression -----------
+    // --- 41: names disclose no doc id, and they are STABLE across a kill ---
     //
     // WHAT AN OBSERVER OF THE STORE IS PREVENTED FROM LEARNING, made
     // falsifiable. Object contents on this provider are keyhive
@@ -2230,15 +2248,26 @@ async function main() {
     // forever). Object AND FOLDER names are now keyed hashes under the
     // doc's name-key, ported from the S3 provider (DRIVE.md §2).
     //
-    // This row is the regression test for that whole change and it
-    // asserts both halves: STRUCTURE still resolves (the fixed
-    // container words `docs`/`pickup`, one doc folder, objects inside
-    // it — so the store is still navigable), and the doc id's hex
-    // appears in NO stored name anywhere in the fake's tree. The second
-    // half is the one that would have failed before the change and the
-    // one that fails again if any call site is ever reverted to a plain
-    // name — including the doc FOLDER, which is why the scan covers
-    // folders and not just leaves.
+    // THREE CLAIMS, and the third one is new with #93:
+    //
+    //  1. STRUCTURE still resolves — the fixed container words
+    //     `docs`/`pickup`, a doc folder, objects inside it — so a device
+    //     holding the name-key can still find everything.
+    //  2. The doc id's hex appears in NO stored name anywhere in the
+    //     fake's tree, folders included. This is the half that would
+    //     have failed before names were keyed and fails again if any
+    //     call site is reverted to a plain name.
+    //  3. EXACTLY ONE DOC FOLDER, and the same names before and after a
+    //     kill. This row used to assert `>= 1` and its evidence text
+    //     explained the duplicates as expected: `BucketState.name_keys`
+    //     was instance memory, so every respawned worker minted a fresh
+    //     keychain and flushed a complete second copy of the store under
+    //     a fresh folder name. That was the defect, not the design
+    //     (#93): bucket STATE now rides the checkpoint beside the
+    //     keyhive archive, so a kill + unseal + flush is a NO-OP on the
+    //     tree. The row therefore checkpoints, kills the worker,
+    //     re-unseals with no ceremony and flushes again, then asserts
+    //     SET EQUALITY of every name in the tree across that cycle.
     await guard(async () => {
       const id = gdriveDevice;
       const flushed = await probe(page, "gd-flush", { id });
@@ -2250,16 +2279,37 @@ async function main() {
       // Every name the provider has written anywhere — folders included.
       const allNames = fake.files().map((f) => f.name);
       const leaking = allNames.filter((n) => n.includes(docHex));
+      const namesBefore = [...allNames].sort();
+
+      // THE RESPAWN. An explicit checkpoint (the flush's debounced one
+      // would usually have landed, but this row asserts an exact set and
+      // will not race a timer), then `__die` — a genuine crash, no
+      // goodbye — then an unseal, which brings the engine back up
+      // through `stateResume()`. The passphrase is here because row 40's
+      // upgrade ceremony moved this device onto `every-session`; which
+      // rung reopens it is not what this row is about.
+      await probe(page, "hc-checkpoint", { id });
+      await probe(page, "hc-die", { id });
+      const back = await probe(page, "hc-open", { id, unseal: { passphrase: PASS } });
+      const reflushed = await probe(page, "gd-flush", { id });
+
+      const namesAfter = fake.files().map((f) => f.name).sort();
+      const docFoldersAfter = fake.childNames("pm-devstore/docs");
+      const stable = j(namesBefore) === j(namesAfter);
 
       const ok = flushed.attempt.refused === false &&
         rootChildren.includes("docs") && rootChildren.includes("pickup") &&
-        docFolders.length >= 1 &&
-        perFolder.some((n) => n > 0) &&
+        docFolders.length === 1 &&
+        perFolder.every((n) => n > 0) &&
         !docFolders.includes(docHex) &&
-        leaking.length === 0;
+        leaking.length === 0 &&
+        back.unseal.refused === false &&
+        reflushed.attempt.refused === false &&
+        docFoldersAfter.length === 1 &&
+        stable;
       record(
         "41 gdrive",
-        "stored names disclose no doc id (keyed names, ported from S3)",
+        "stored names disclose no doc id, and survive a respawn unchanged",
         ok,
         `after a flush, the structure still resolves — ${j(rootChildren)} under the root, ` +
           `${docFolders.length} doc folder(s) holding ${j(perFolder)} object(s) — so a device ` +
@@ -2268,12 +2318,16 @@ async function main() {
           `provider has written (folders included) for the doc id's hex finds ${leaking.length} ` +
           `— an untrusted observer of this tree learns object counts, sizes and timing, and ` +
           `nothing about WHICH document any of it belongs to. Name-keys blind labels, not ` +
-          `traffic shape, and this row asserts exactly the labels half. (More than one doc ` +
-          `folder is EXPECTED here and is not a naming bug: \`BucketState.name_keys\` is ` +
-          `instance memory, so each respawned worker in rows 37/38/40 minted a fresh keychain ` +
-          `and flushed a complete copy under a fresh folder name. The S3 arm orphans objects ` +
-          `the same way for the same reason — the flush re-uploads everything it does not ` +
-          `remember, so the newest folder is always whole.)`,
+          `traffic shape. Then the STABILITY half (#93): checkpoint, \`__die\`, unseal ` +
+          `(refused=${back.unseal.refused}), flush again ` +
+          `(refused=${reflushed.attempt.refused}) — the tree still holds ` +
+          `${docFoldersAfter.length} doc folder and the full set of ${namesAfter.length} names ` +
+          `is IDENTICAL to the ${namesBefore.length} before the kill (${stable}). The keychain ` +
+          `and the flushed-chunk map are checkpointed state now, so a respawn re-addresses the ` +
+          `store and re-uses it; it no longer re-mints a keychain and writes a complete ` +
+          `duplicate copy under a fresh folder name, which is what this row used to record as ` +
+          `expected. The S3 arm orphaned objects the same way for the same reason and is fixed ` +
+          `by the same change.`,
       );
       await probe(page, "hc-close", { id });
       await probe(page, "hc-forget", { ids: [id] });
