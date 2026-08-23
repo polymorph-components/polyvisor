@@ -29,6 +29,19 @@ import { filesystemWeb } from "@polyengine/wasi/filesystem-web";
 // constructible over the REMOTE driver without a line changed.
 import { createEnginePairingDriver } from "../../pairing-engine.ts";
 import { unhex } from "../../engine.ts";
+// The storage-egress rows (24+): the page-side half of the credential
+// ceremony (`putSigningKey`, exactly as the visor's real sheet would
+// call it) and the moved factories under direct unit test (row 29,
+// no worker involved at all — STORAGE-EGRESS.md §7, "verbatim in
+// semantics").
+import { putSigningKey } from "../../keystore.ts";
+import {
+  emptyGrant,
+  makeOwnerFetch,
+  makePublicFetch,
+  makeSharedFetch,
+} from "../../store-egress.ts";
+import type { StoreBinding } from "../../device-store/rpc.ts";
 // The brand predicate, IN THE PAGE'S REALM. Row 18's central claim since
 // the 0.4.0 bump is that `fromCloneable` mints a value this copy
 // recognizes — so the predicate has to be the page's own, not the
@@ -1038,6 +1051,114 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
         message: String(d.message).slice(0, 120),
       };
     }
+  },
+
+  // --- storage egress (rows 24+) ---------------------------------------
+
+  /**
+   * ROW 24. A client that reaches for `conn.driver.initStore(...)`
+   * DIRECTLY — sneaking addressing past the `bindStore` ceremony,
+   * since `initStore` is a plain `Driver` method and every `Driver`
+   * method is on the remote proxy — must still find every seam
+   * refusing. `initStore` only arms the GUEST's own notion of where to
+   * write; the worker's module-scoped `storeGrant`/`storeSigner` (what
+   * the factories actually close over) are untouched by it, so
+   * `ensureBucket()` reaches `store-owner-fetch` with `grant.provider
+   * === null` and refuses by name before a single byte leaves the
+   * worker.
+   */
+  "sx-sneak": async (arg: { id: string; recorderOrigin: string }) => {
+    const conn = conns.get(arg.id)!;
+    const initAttempt = await refuses(() =>
+      conn.driver.initStore({
+        kind: "s3",
+        value: {
+          endpoint: arg.recorderOrigin,
+          bucket: "pm-devstore",
+          accessKey: "SYNTHETIC-TEST-KEY",
+        },
+      })
+    );
+    const ensureAttempt = await refuses(() => conn.driver.ensureBucket());
+    return { initAttempt, ensureAttempt };
+  },
+
+  /** ROW 25. `bindStore`'s own refusals, asked by CODE. */
+  "hc-bind": async (arg: { id: string; binding: StoreBinding }) => {
+    const conn = conns.get(arg.id)!;
+    const attempt = await refuses(() => conn.bindStore(arg.binding));
+    return { attempt, status: await conn.status() };
+  },
+
+  /**
+   * ROW 26+. The page half of the ceremony: escrow a SYNTHETIC LABELED
+   * credential exactly as the credential sheet would
+   * (`putSigningKey(origin, accessKey, secret)`), non-extractable, and
+   * out of scope the instant this call returns.
+   */
+  "sx-escrow": async (arg: { origin: string; accessKey: string; secret: string }) => {
+    await putSigningKey(arg.origin, arg.accessKey, arg.secret);
+    return { ok: true };
+  },
+
+  /** `ensureBucket()` on its own, so a row can call it more than once
+   * (bound, then after a die+reunseal, then after unbind). */
+  "hc-ensure-bucket": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    return { attempt: await refuses(() => conn.driver.ensureBucket()) };
+  },
+
+  /** ROW 28's other half: `unbindStore` refuses at the seam, never
+   * silently. */
+  "hc-unbind": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const attempt = await refuses(() => conn.unbindStore());
+    return { attempt, status: await conn.status() };
+  },
+
+  /**
+   * ROW 29. The moved factories, gated DIRECTLY — no worker, no wire,
+   * one `EgressGrant` built by hand exactly as `applyBinding` would
+   * build it for an s3 destination (STORAGE-EGRESS.md §4: owner and
+   * public both the one origin, shared empty because S3 has no app
+   * tier).
+   */
+  "sx-unit": async (arg: { recorderOrigin: string }) => {
+    const grant = emptyGrant();
+    grant.provider = "s3";
+    grant.origins = new Set([arg.recorderOrigin]);
+    grant.publicOrigins = new Set([arg.recorderOrigin]);
+    grant.sharedOrigins = new Set();
+
+    // (1) CONFINEMENT: a destination outside the grant is refused
+    // structurally, by the platform URL parser, never a prefix test.
+    const owner = makeOwnerFetch(grant);
+    const notGranted = await refuses(() =>
+      owner("GET", "https://synthetic-other.invalid/x", [], new Uint8Array())
+    );
+
+    // (2) STRIPPING: the public tier holds no identity, so it ACTIVELY
+    // strips whatever the guest set. The recorder's log entry (read by
+    // the driver right after this call) is the actual assertion; this
+    // call just has to reach the recorder with a header attached so
+    // there is something to strip.
+    const pub = makePublicFetch(grant);
+    await pub(
+      "PUT",
+      `${arg.recorderOrigin}/pm-devstore/unit-test-key`,
+      [["authorization", "Bearer synthetic-not-a-real-token"]],
+      new Uint8Array(),
+    );
+
+    // (3) NO APP TIER ON S3: the shared seam is a Dropbox-only import;
+    // asking for it on an s3 grant is a call site wanting an identity
+    // this provider cannot mint.
+    const shared = makeSharedFetch(grant);
+    const sharedRefused = await refuses(() =>
+      shared("GET", `${arg.recorderOrigin}/x`, [], new Uint8Array())
+    );
+
+    return { notGranted, sharedRefused };
   },
 };
 

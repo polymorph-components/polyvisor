@@ -123,6 +123,12 @@ engine, and same-browser multi-device is just two workers.
   2026-05); Samsung Internet and the long tail still lack it. A
   no-worker degraded mode (per-tab engine + Web Locks single-owner) is
   PARKED, not built — recorded so nobody designs it in by accident.
+- **Storage egress** — the bucket path from a worker-hosted device,
+  which this record's round left refusing — landed in the following
+  round and is governed by its own sibling record,
+  [STORAGE-EGRESS.md](./STORAGE-EGRESS.md): the store closures live in
+  the worker, the binding crosses as sealed device state, the escrow
+  stays the page-side keystore.
 
 ## Sealing
 

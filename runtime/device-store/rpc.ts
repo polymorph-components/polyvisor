@@ -80,8 +80,10 @@ import type { Posture, Tier, UnsealPolicy } from "./index.ts";
  * them: `SealError.code` ("wrong-passphrase", "no-rung",
  * "already-sealed", "tampered", "unsupported"),
  * `SealedFsError.fsCode` ("io"), `IdentityKeyError.code`
- * ("extractable", "algorithm", "unavailable"), plus this module's own
- * "timeout", "closed" and "unclonable".
+ * ("extractable", "algorithm", "unavailable"), the worker's own storage
+ * binding refusals ("bad-destination", "no-credential" — worker.ts's
+ * `StoreError`), plus this module's own "timeout", "closed" and
+ * "unclonable".
  */
 export interface HostError {
   message: string;
@@ -396,6 +398,34 @@ export interface AttachSpec {
   __seedPosture?: boolean;
 }
 
+/**
+ * WHERE THIS DEVICE'S BUCKET IS — the whole of what `bindStore` moves
+ * across the port (runtime/STORAGE-EGRESS.md §2, "Nothing crosses the
+ * RPC but addressing").
+ *
+ * ADDRESSING PLUS ONE PUBLIC IDENTIFIER, AND NEVER A CREDENTIAL. The
+ * access key is an identifier that already travels to the destination in
+ * clear inside the Authorization header; the SECRET behind it never
+ * appears on this type, in this file, or anywhere on this wire. The
+ * ceremony that takes it runs on the PAGE, escrows it into the origin
+ * keystore (runtime/keystore.ts) as a non-extractable handle, and the
+ * worker reads that handle back BY DESTINATION ORIGIN out of the same
+ * IndexedDB database — so the secret has no path across the port and
+ * needs none. A future field carrying one (a bearer, a session token, a
+ * password) is not an extension of this type: it is the thing this
+ * design forbids, and Dropbox is parked for the worker precisely because
+ * it would require it (§5).
+ *
+ * It is also the shape the engine's `StoreConfig` "s3" arm carries, on
+ * purpose: the worker re-applies it as `initStore` at every bring-up.
+ */
+export interface StoreBinding {
+  kind: "s3";
+  endpoint: string;
+  bucket: string;
+  accessKey: string;
+}
+
 /** Everything a picker or a strip needs to know, and nothing secret. */
 export interface DeviceStatus {
   deviceId: string;
@@ -443,6 +473,19 @@ export interface DeviceStatus {
   instanceNonce: string;
   /** How many client ports are currently attached. */
   clients: number;
+  /**
+   * Where this device syncs, or null.
+   *
+   * NULL MEANS TWO DIFFERENT THINGS AND THE FIELD CANNOT DISTINGUISH
+   * THEM, deliberately: the device is SEALED, or it is unsealed and
+   * nothing is bound. The sealed case is structural rather than a
+   * simplification — the binding rests DEK-sealed in the namespace
+   * (STORAGE-EGRESS.md §3), so a sealed host genuinely cannot read it,
+   * and a status that named the destination anyway would be pretending
+   * to a knowledge it does not have. Read it together with `sealed`: a
+   * sealed device's storage is unknown, not absent.
+   */
+  storage: StoreBinding | null;
 }
 
 export type HostMethod =
@@ -453,6 +496,8 @@ export type HostMethod =
   | "reseal"
   | "checkpoint"
   | "status"
+  | "bindStore"
+  | "unbindStore"
   | "__die";
 
 export interface Req {

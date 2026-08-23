@@ -66,6 +66,93 @@ function serveSite(): { server: Deno.HttpServer; port: number } {
   return { server, port };
 }
 
+// --- the S3-shaped RECORDER (rows 24+) ---------------------------------
+//
+// AN OBSERVER, NOT A FAKE. This does not implement S3 — it never checks
+// a signature, never stores a byte — it only notes that a request
+// LEFT THE WORKER through the owner seam and what it looked like
+// (method, path, whether an Authorization header rode along and its
+// public prefix, whether an x-amz-date rode along). The rows that use
+// it assert egress and SigV4 signing over the escrowed synthetic
+// credential; MinIO-backed end-to-end verification (the object actually
+// landing, a real reload, reseal reported through the real sheet) lives
+// in the demo e2e suite's `solo-storage` scenario per
+// STORAGE-EGRESS.md's gates, not here.
+interface S3LogEntry {
+  method: string;
+  path: string;
+  hasAuthorization: boolean;
+  /** First ~40 chars only — the scheme, algorithm and the PUBLIC access
+   * key identifier plus scope, which already travels to the destination
+   * in clear (rpc.ts's `StoreBinding` doc comment). Never the signature,
+   * never anything secret. */
+  authorizationPrefix: string;
+  hasAmzDate: boolean;
+}
+
+function serveRecorder(): { server: Deno.HttpServer; port: number } {
+  const log: S3LogEntry[] = [];
+  let port = 0;
+  const cors = {
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET, PUT, POST, OPTIONS",
+    "access-control-allow-headers": "*",
+  };
+  const server = Deno.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    onListen: (addr) => {
+      port = addr.port;
+    },
+  }, async (req) => {
+    const url = new URL(req.url);
+    if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+    if (url.pathname === "/__s3log" && req.method === "GET") {
+      return new Response(JSON.stringify(log), {
+        status: 200,
+        headers: { ...cors, "content-type": "application/json" },
+      });
+    }
+    if (url.pathname === "/__s3log/clear" && req.method === "POST") {
+      log.length = 0;
+      return new Response(null, { status: 200, headers: cors });
+    }
+    // Every OTHER request is the thing under observation: drain the
+    // body (a PUT's object bytes) before answering, then log the
+    // request's own public metadata.
+    if (req.body) {
+      try {
+        await req.arrayBuffer();
+      } catch { /* a cut-short body is not this harness's concern */ }
+    }
+    const auth = req.headers.get("authorization") ?? "";
+    log.push({
+      method: req.method,
+      path: url.pathname,
+      hasAuthorization: auth !== "",
+      authorizationPrefix: auth.slice(0, 64),
+      hasAmzDate: req.headers.has("x-amz-date"),
+    });
+    // ANY PUT → 200 empty body; ANY GET → 404. That is the whole of
+    // what an ensureBucket/bucketFlush call needs to see to either
+    // succeed or fail cleanly — the rows tolerate either outcome (the
+    // CLAIM is the signed egress, not a working bucket).
+    if (req.method === "PUT") return new Response(null, { status: 200, headers: cors });
+    return new Response(null, { status: 404, headers: cors });
+  });
+  return { server, port };
+}
+
+const s3LogGet = (port: number): Promise<S3LogEntry[]> =>
+  fetch(`http://127.0.0.1:${port}/__s3log`).then((r) => r.json());
+const s3LogClear = (port: number): Promise<void> =>
+  fetch(`http://127.0.0.1:${port}/__s3log/clear`, { method: "POST" }).then(() => {});
+
+// Synthetic labeled S3 credentials — never realistic-looking material,
+// spelled the same way across every row that uses them.
+const S3_ACCESS_KEY = "SYNTHETIC-TEST-KEY";
+const S3_SECRET = "synthetic-test-secret-0000";
+
 async function openPage(ctx: BrowserContext, port: number): Promise<Page> {
   const page = await ctx.newPage();
   page.on("pageerror", (e) => console.log(`      · pageerror: ${e.message}`));
@@ -115,6 +202,11 @@ async function main() {
   const { server, port } = serveSite();
   await new Promise((r) => setTimeout(r, 50));
   console.log(`probe: http://127.0.0.1:${port}/probe.html`);
+
+  const { server: s3Server, port: s3Port } = serveRecorder();
+  await new Promise((r) => setTimeout(r, 50));
+  const s3Origin = `http://127.0.0.1:${s3Port}`;
+  console.log(`s3 recorder: ${s3Origin}`);
 
   const browser: Browser = await chromium.launch({
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
@@ -1084,10 +1176,321 @@ async function main() {
       await probe(page, "hc-forget", { ids: [id] });
     });
 
+    // --- 24: THE SEAMS ARE REAL, AND REFUSE BEFORE ANY BINDING -------------
+    //
+    // A client that reaches PAST `bindStore` and calls
+    // `conn.driver.initStore(...)` directly — every `Driver` method is
+    // on the remote proxy, so nothing stops the call from being made —
+    // must still find every storage seam refusing. `initStore` only
+    // arms the GUEST's own notion of an address; the worker's
+    // module-scoped grant and signer (what the factories actually close
+    // over) are untouched by it, so the first byte still cannot leave.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "unbound",
+        policy: "while-open",
+        promote: false,
+      });
+      const id = made.id as string;
+      await probe(page, "hc-open", { id, unseal: {} });
+      await s3LogClear(s3Port);
+
+      const r = await probe(page, "sx-sneak", { id, recorderOrigin: s3Origin });
+      const logAfter = await s3LogGet(s3Port);
+
+      const ensureMsg = String(r.ensureAttempt.error?.message ?? "");
+      const named = ensureMsg.includes("store-owner-fetch: no storage grant configured yet") ||
+        ensureMsg.includes("store-signer: no signing credential wired");
+      const ok = r.ensureAttempt.refused === true && named && logAfter.length === 0;
+      const initNote = r.initAttempt.refused
+        ? "also refused"
+        : "accepted (it only arms the guest's own address, not the worker's grant)";
+      record(
+        "24 store-egress",
+        "the worker's seams are real and refuse before any binding",
+        ok,
+        `\`conn.driver.initStore(...)\` called DIRECTLY (a client sneaking addressing past the ` +
+          `bind ceremony) then \`ensureBucket()\` → refused: ${r.ensureAttempt.refused}, naming ` +
+          `the refusing seam: ${j(ensureMsg)} — one of the factories' own strings, never the ` +
+          `old NO_STORE text. The recorder saw NOTHING: ${logAfter.length} requests logged. ` +
+          `initStore itself: ${initNote}`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
+    // --- 25: bindStore REFUSES BY NAME -------------------------------------
+    //
+    // Three distinct destinations that must never be accepted, each
+    // refused with its OWN code rather than a shared message a caller
+    // would have to parse (worker.ts's `StoreError`/`SealError`).
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "bind-refusals",
+        policy: "while-open",
+        promote: false,
+      });
+      const id = made.id as string;
+      await probe(page, "hc-open", { id, unseal: {} });
+
+      // (1) bad-destination: an unparseable endpoint.
+      const bad = await probe(page, "hc-bind", {
+        id,
+        binding: { kind: "s3", endpoint: "not a url at all", bucket: "pm-devstore", accessKey: S3_ACCESS_KEY },
+      });
+
+      // (2) no-credential: a good endpoint, nothing escrowed for it.
+      // A FRESH origin (a port nothing else in this run ever escrows
+      // for), so an earlier row's escrow cannot leak into this one.
+      const uncredited = await probe(page, "hc-bind", {
+        id,
+        binding: {
+          kind: "s3",
+          endpoint: "http://127.0.0.1:1/never-escrowed",
+          bucket: "pm-devstore",
+          accessKey: S3_ACCESS_KEY,
+        },
+      });
+
+      // (4) no-credential, the MISMATCH shape: escrow a synthetic
+      // credential for the recorder origin under S3_ACCESS_KEY, then
+      // bind that SAME origin with a DIFFERENT access key and no
+      // re-escrow. The worker compares the escrowed record's own
+      // `accessKey` field (STORAGE-EGRESS.md §4) — a caller cannot bind
+      // under an identifier the escrow was never keyed for, and this
+      // fails at bind rather than as a provider 403 later. Escrowed
+      // AFTER sub-case (2) ran, so (2)'s "nothing escrowed" origin
+      // (a distinct port) stays genuinely uncredited.
+      await probe(page, "sx-escrow", {
+        origin: s3Origin,
+        accessKey: S3_ACCESS_KEY,
+        secret: S3_SECRET,
+      });
+      const mismatched = await probe(page, "hc-bind", {
+        id,
+        binding: {
+          kind: "s3",
+          endpoint: s3Origin,
+          bucket: "pm-devstore",
+          accessKey: "SYNTHETIC-OTHER-KEY",
+        },
+      });
+
+      // (3) no-rung: sealed. A T1 device sealed under a REAL passphrase
+      // (row 16's shape): reseal() drops the platform wrap and leaves
+      // the passphrase rung standing, sealed=true, and this time there
+      // IS no auto-unseal to undo it. Bind while it rests sealed.
+      const sealDevice = await probe(page, "hc-make", {
+        petname: "bind-refusals-sealed",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const sealId = sealDevice.id as string;
+      await probe(page, "hc-open", { id: sealId, unseal: { passphrase: PASS, untilReseal: true } });
+      const resealed = await probe(page, "hc-reseal", { id: sealId });
+      const sealed = await probe(page, "hc-bind", {
+        id: sealId,
+        binding: { kind: "s3", endpoint: s3Origin, bucket: "pm-devstore", accessKey: S3_ACCESS_KEY },
+      });
+
+      const ok = bad.attempt.refused && bad.attempt.error.code === "bad-destination" &&
+        uncredited.attempt.refused && uncredited.attempt.error.code === "no-credential" &&
+        mismatched.attempt.refused && mismatched.attempt.error.code === "no-credential" &&
+        sealed.attempt.refused && sealed.attempt.error.code === "no-rung";
+      record(
+        "25 store-egress",
+        "bindStore refuses by NAME, not by message prose",
+        ok,
+        `an unparseable endpoint → ${j(bad.attempt.error.code)}; a usable endpoint with nothing ` +
+          `escrowed for its origin → ${j(uncredited.attempt.error.code)} (fail at bind, not as a ` +
+          `403 twenty provider calls later); a MISMATCHED access key — escrowed under ` +
+          `${j(S3_ACCESS_KEY)}, bound with a different one and no re-escrow — → ` +
+          `${j(mismatched.attempt.error.code)} (the escrowed record's own accessKey is compared, ` +
+          `never accepted as an allowlist of one); and on a SEALED device → ` +
+          `${j(sealed.attempt.error.code)}, the same code every other sealed-host refusal in ` +
+          `this matrix carries`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+      // sealId is sealed and never re-opened — hc-forget only removes
+      // the index row, which is all cleanup needs here.
+      await probe(page, "hc-forget", { ids: [sealId] });
+    });
+
+    /** Row 26 carries its device into rows 27 and 28. */
+    let storeDevice = "";
+
+    // --- 26: bind wires the derived grant and the escrowed signer ---------
+    //
+    // The page half of the ceremony (`putSigningKey`) and the worker
+    // half (`bindStore`) in the order a real embedder must run them.
+    // The claim is the EGRESS and its SIGNATURE: nothing crossed the
+    // port but addressing, and what the worker signed with is a
+    // credential the PAGE escrowed and the worker read back BY
+    // DESTINATION ORIGIN — never a secret string on this wire.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "bound device",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const id = made.id as string;
+      storeDevice = id;
+      await probe(page, "hc-open", { id, unseal: { passphrase: PASS, untilReseal: true } });
+
+      const escrow = await probe(page, "sx-escrow", {
+        origin: s3Origin,
+        accessKey: S3_ACCESS_KEY,
+        secret: S3_SECRET,
+      });
+
+      const binding = { kind: "s3", endpoint: s3Origin, bucket: "pm-devstore", accessKey: S3_ACCESS_KEY };
+      const bound = await probe(page, "hc-bind", { id, binding });
+
+      await s3LogClear(s3Port);
+      const ensure = await probe(page, "hc-ensure-bucket", { id });
+      const log = await s3LogGet(s3Port);
+      const signed = log.find((e: S3LogEntry) =>
+        e.authorizationPrefix.startsWith(`AWS4-HMAC-SHA256 Credential=${S3_ACCESS_KEY}/`)
+      );
+
+      const ok = escrow.ok && bound.attempt.refused === false &&
+        j(bound.status.storage) === j(binding) &&
+        log.length >= 1 && signed !== undefined;
+      record(
+        "26 store-egress",
+        "bind wires the derived grant and the escrowed signer",
+        ok,
+        `escrow landed for ${s3Origin} (${escrow.ok}); bindStore accepted ` +
+          `(refused=${bound.attempt.refused}) and status().storage echoes the addressing: ` +
+          `${j(bound.status.storage)}; ensureBucket() then produced ${log.length} recorded ` +
+          `request(s), one signed with \`Authorization: ` +
+          `${signed?.authorizationPrefix ?? "(none found)"}…\` — the worker signed with a ` +
+          `credential the PAGE escrowed and the worker read back, and nothing crossed the port ` +
+          `but addressing. ensureBucket() itself came back ` +
+          `${ensure.attempt.refused ? "REFUSED (the recorder is not a real S3, so this is fine — the claim is the signed egress)" : "accepted"}`,
+      );
+    });
+
+    // --- 27: the binding survives the host's death -------------------------
+    //
+    // `__die`, reconnect, `unseal` with NO passphrase (the platform
+    // wrap from row 26's `untilReseal: true`) — and the sealed row must
+    // have been RE-APPLIED by the worker at bring-up with no page-side
+    // state at all (persist.rs's "embedder-supplied addressing,
+    // re-applied by the embedder", engine/guest/src/persist.rs:611-614
+    // — the round's central claim).
+    await guard(async () => {
+      const id = storeDevice;
+      await probe(page, "hc-die", { id });
+      const back = await probe(page, "hc-open", { id, unseal: {} });
+
+      await s3LogClear(s3Port);
+      const ensure = await probe(page, "hc-ensure-bucket", { id });
+      const log = await s3LogGet(s3Port);
+      const signed = log.find((e: S3LogEntry) =>
+        e.authorizationPrefix.startsWith(`AWS4-HMAC-SHA256 Credential=${S3_ACCESS_KEY}/`)
+      );
+
+      const ok = back.unseal.refused === false &&
+        back.status.storage !== null &&
+        back.status.storage.endpoint === s3Origin &&
+        log.length >= 1 && signed !== undefined;
+      record(
+        "27 store-egress",
+        "the binding survives the host's death: re-applied at bring-up, no re-bind",
+        ok,
+        `after a KILL and a fresh worker, an unseal with NO passphrase auto-unseals from the ` +
+          `platform wrap and status().storage still reports the addressing ` +
+          `(${j(back.status.storage)}) — the sealed row survived and \`bringUpEngine\` ` +
+          `re-applied it. With NO \`bindStore\` call anywhere in this row, \`ensureBucket()\` ` +
+          `still produced a SIGNED request (${log.length} recorded, prefix ` +
+          `${j(signed?.authorizationPrefix)}…) — the worker re-ran \`initStore\` and re-minted ` +
+          `the signer from the escrow at bring-up, exactly as persist.rs's comment describes.`,
+      );
+    });
+
+    // --- 28: reseal seals it, unseal restores it, unbind refuses at the seam
+    //
+    // Reseal drops the IN-WORKER egress authority with everything else
+    // (STORAGE-EGRESS.md §6): a fresh status() on the sealed device
+    // must report storage null (unreadable, not absent — read together
+    // with `sealed`), unseal brings it back, and `unbindStore` clears
+    // the sealed binding and empties the grant so every subsequent
+    // egress refuses at the seam with the recorder log staying empty.
+    await guard(async () => {
+      const id = storeDevice;
+      // THE UPGRADE CEREMONY (row 20's idiom): this device's only
+      // usable rung is the platform wrap from row 26, so reseal REQUIRES
+      // the passphrase and it becomes the device's new every-session
+      // rung.
+      const resealed = await probe(page, "hc-reseal", { id, passphrase: PASS, upgrade: true });
+      const sealedStatus = await probe(page, "hc-status", { id });
+
+      const back = await probe(page, "hc-unseal", { id, opts: { passphrase: PASS } });
+
+      const unbound = await probe(page, "hc-unbind", { id });
+
+      await s3LogClear(s3Port);
+      const ensureAfterUnbind = await probe(page, "hc-ensure-bucket", { id });
+      const logAfterUnbind = await s3LogGet(s3Port);
+
+      const ok = resealed.attempt.refused === false && resealed.status.sealed === true &&
+        sealedStatus.storage === null && sealedStatus.sealed === true &&
+        back.attempt.refused === false && back.status.storage !== null &&
+        unbound.attempt.refused === false && unbound.status.storage === null &&
+        ensureAfterUnbind.attempt.refused === true &&
+        logAfterUnbind.length === 0;
+      record(
+        "28 store-egress",
+        "reseal seals the binding; unseal restores it; unbind refuses at the seam",
+        ok,
+        `reseal() (an upgrade ceremony, refused=${resealed.attempt.refused}) leaves the device ` +
+          `sealed (${resealed.status.sealed}); a FRESH status() on the sealed device reports ` +
+          `storage=${j(sealedStatus.storage)} — unreadable, read together with ` +
+          `sealed=${sealedStatus.sealed}, never a false "absent"; unseal brings it back ` +
+          `(storage=${j(back.status.storage)}); unbindStore() then clears the sealed row ` +
+          `(storage=${j(unbound.status.storage)}) and \`ensureBucket()\` is refused ` +
+          `(${ensureAfterUnbind.attempt.refused}: ${j(ensureAfterUnbind.attempt.error?.message)}) ` +
+          `with the recorder seeing NOTHING (${logAfterUnbind.length} requests) — the owner/signer ` +
+          `seam, not a 403 twenty calls later.`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
+    // --- 29: the egress factories confine by origin and strip identity ----
+    //
+    // A PAGE-SIDE UNIT ROW: no worker, no wire, `store-egress.ts`'s
+    // factories called directly over a hand-built `EgressGrant` — the
+    // same shape `applyBinding` builds for an s3 destination (§4).
+    await guard(async () => {
+      await s3LogClear(s3Port);
+      const r = await probe(page, "sx-unit", { recorderOrigin: s3Origin });
+      const log = await s3LogGet(s3Port);
+      const stripped = log.find((e: S3LogEntry) => e.path === "/pm-devstore/unit-test-key");
+
+      const ok = r.notGranted.refused && r.notGranted.error.message.includes("origin not granted") &&
+        stripped !== undefined && stripped.hasAuthorization === false &&
+        r.sharedRefused.refused && r.sharedRefused.error.message.includes("no app tier on this provider");
+      record(
+        "29 store-egress",
+        "the egress factories confine by origin and strip identity",
+        ok,
+        `makeOwnerFetch(grant) to an UNGRANTED origin → refused: ` +
+          `${j(r.notGranted.error.message)} (structural, the platform URL parser — never a ` +
+          `prefix test); makePublicFetch(grant) carrying a guest-supplied Authorization header ` +
+          `reached the recorder with it STRIPPED — hasAuthorization=${stripped?.hasAuthorization} ` +
+          `on the logged request; makeSharedFetch(grant) on an s3 provider (no app tier at all) ` +
+          `→ ${j(r.sharedRefused.error.message)}`,
+      );
+    });
+
     await ctx.close();
   } finally {
     await browser.close();
     await server.shutdown();
+    await s3Server.shutdown();
   }
 
   console.log(`\n=== DEVICE STORE MATRIX ===`);
