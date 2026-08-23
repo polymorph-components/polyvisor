@@ -3,7 +3,7 @@
 Tooling for running wasm-bindgen-contaminated Rust crate graphs as pure
 WebAssembly components, with "the JS boundary is never reached" enforced as
 a runtime trap instead of assumed. Incubating here per the placement ruling
-on [#13](https://github.com/polymorph-components/polymorph-apps/issues/13#issuecomment-5310732507);
+on [#13](https://github.com/polymorph-components/polyvisor/issues/13#issuecomment-5310732507);
 graduates to a standalone repo once proven (its audience is any Rust
 component author, not just polymorph).
 
