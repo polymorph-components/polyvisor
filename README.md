@@ -94,20 +94,39 @@ flowchart TB
     Relay -.->|"ciphertext at most"| Revoked
     Store -.->|"rotated names — nothing fetchable"| Revoked
 
-    classDef trusted fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20
+    classDef trustedPlan fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20,stroke-dasharray: 6 4
     classDef tcb fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
     classDef confinedC fill:#fff3e0,stroke:#ef6c00,color:#e65100
     classDef untrusted fill:#ffebee,stroke:#c62828,color:#b71c1c
+    classDef untrustedPlan fill:#ffebee,stroke:#c62828,color:#b71c1c,stroke-dasharray: 6 4
     classDef peer fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c
     classDef actor fill:#fffde7,stroke:#f9a825,color:#f57f17
 
-    class Pub,AppPub,Origin,SandboxO,Wit trusted
+    class Pub,AppPub,Origin,SandboxO,Wit trustedPlan
     class Visor,Runtime,Engine tcb
     class Frame,Apps,Services,Providers confinedC
-    class Relay,Store,Broker,Push,OAuth untrusted
+    class Relay,Store,OAuth untrusted
+    class Broker,Push untrustedPlan
     class Own,Contacts,Revoked peer
     class User actor
 ```
+
+**Solid borders are built** — in-tree and gated (the engine's native
+batteries, the device-store matrix, the demo e2e suite). **Dashed
+borders are planned** — designed in NOTES.md, no code yet: the entire
+release-integrity story
+([#3](https://github.com/polymorph-components/polyvisor/issues/3) —
+publisher keys, signed manifests, the verifying bootstrap service
+worker; the demo today is served as plain static files with none of
+it), app-publisher sigchains and witnessing
+([#52](https://github.com/polymorph-components/polyvisor/issues/52)),
+the dedicated sandbox origin (an open decision — frames today are
+opaque-origin `srcdoc`), and the notification broker + Web Push wake
+path. Solid does not mean finished, either: the permission machinery
+behind "imports = grants" exists as fragments (host-scoped fetch
+imports, the egress-grant factories) while the general grant table and
+consent surface are still design, and exactly one data service exists
+(`polyvisor:tasks`).
 
 Reading the diagram:
 
