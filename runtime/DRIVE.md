@@ -110,16 +110,40 @@ The v2 shape from the egress record's §5, now built:
   may cross the port as data and rest sealed beside the tokens.
 - THE TEST PAIR IS PICKED UP, NEVER SHIPPED: rclone's published desktop
   client (id `202264815644.apps.googleusercontent.com`; secret published
-  in their source under their own reversible obscure scheme —
-  `rclone reveal` emits it) is the candidate, with the recorded caveat
-  that rclone's own docs say the shared id is being retired during 2026.
-  If it has lapsed, any installed-app pair the operator registers slots
-  into the same two sheet fields. Nothing is baked into source, bundles,
-  or defaults; the fields are typed (or URL-param prefilled) at test
-  time. Loopback redirect URIs (`http://127.0.0.1:<port>/…`) are what
-  make a desktop-client pair usable by a locally-served page; the
-  deployed site would need a registered web client, which is the
-  shipping story, not this one.
+  in their source under their own reversible obscure scheme — AES-CTR
+  under a fixed committed key, which `rclone reveal` emits) is the
+  candidate. PROBED LIVE 2026-08-23 AND ALIVE, by a method worth
+  recording because the pair is expected to lapse: the token endpoint
+  answers `invalid_grant` (400) for this pair with a deliberately bogus
+  code — meaning the client authenticated and only the code failed —
+  against `invalid_client` (401) for a wrong secret or an unknown id,
+  which is the control that makes the probe non-vacuous. The authorize
+  endpoint separately renders a sign-in page rather than an error,
+  which is where Google validates the REDIRECT URI: a loopback URI WITH
+  A PATH (`http://127.0.0.1:8600/solo.html`) is accepted for a desktop
+  client. Neither probe can say whether consent completes and issues
+  tokens — that needs a real account and is the operator's live beat.
+  rclone's own docs say the shared id is being retired DURING 2026, so
+  it is expiring rather than stable; re-run the probe before trusting
+  it.
+- WHEN IT LAPSES, MINT ONE — do not hunt for another published pair.
+  `googleworkspace/cli` (`gws`) was examined for one and deliberately
+  ships none (its `oauth_config.rs` hits are a format doc-comment and
+  test fixtures): its model is bring-your-own, and `gws auth setup`
+  automates exactly the console ceremony this fallback needs — it
+  creates a Cloud project, mints a Desktop-app OAuth client and enables
+  APIs, leaving the pair in `~/.config/gws/client_secret.json`. Either
+  path lands in the same two sheet fields. Testing-mode clients carry
+  three operator obligations that are not our bugs: add yourself as a
+  test user (else "Access blocked"), enable the Drive API on the
+  project (else `accessNotConfigured` 403s), and click through
+  "Google hasn't verified this app". If a Desktop client ever refuses
+  our redirect, a Web-application client with the page URL registered
+  verbatim is the shape to use.
+- Nothing is baked into source, bundles, or defaults; the fields are
+  typed (or URL-param prefilled) at test time. The deployed site would
+  need a registered web client, which is the shipping story, not this
+  one.
 
 ### 4. Tokens rest sealed, device-scoped; refresh writes back
 
@@ -203,10 +227,11 @@ Recorded, not forgotten.
 - Existing batteries stay green throughout: devstore matrix, e2e suite,
   invariants (nothing widens), pairing-bringup, resume-bringup, S3 acts.
 - **The live beat is manual and the operator's**: serve locally, solo →
-  storage → Google Drive, the picked-up pair (or a registered one), real
-  consent, real flush; verify in drive.google.com that the app's folder
-  exists and holds ciphertext objects. Documented here, not automated —
-  a real Google account cannot and should not sit in CI.
+  storage → Google Drive, the picked-up pair (or a minted one — see §3
+  for both paths and the freshness probe), real consent, real flush;
+  verify in drive.google.com that the app's folder exists and holds
+  ciphertext objects. Documented here, not automated — a real Google
+  account cannot and should not sit in CI.
 
 ## Parked, explicitly
 
