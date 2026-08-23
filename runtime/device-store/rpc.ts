@@ -560,6 +560,7 @@ export type HostMethod =
   | "status"
   | "bindStore"
   | "unbindStore"
+  | "destroy"
   | "__die";
 
 export interface Req {

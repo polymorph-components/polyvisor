@@ -88,7 +88,7 @@ import type { PairingDriver } from "../../visor/ui/pairing-driver.ts";
 import { createEnginePairingDriver } from "../../runtime/pairing-engine.ts";
 import type { UiEvent } from "../../visor/surface/events.ts";
 import { type EngineArtifacts, hex, unhex, until } from "../../runtime/engine.ts";
-import { adoptAnchor } from "../../runtime/device-store/anchor.ts";
+import { adoptAnchor, clearAnchor } from "../../runtime/device-store/anchor.ts";
 import {
   connectDevice,
   type DeviceConnection,
@@ -865,12 +865,36 @@ async function startApp(
         if (!res.ok) announce(`could not forget it in your account: ${res.error}`, true);
       })();
     },
-    onReset: () => {
+    onReset: async () => {
+      // THE DEVICE ITSELF GOES, and that is the point of this handler on
+      // this page. Before G5 an erase here wiped three localStorage
+      // caches and reloaded onto the SAME device — the account came
+      // straight back, which is not what the ceremony promised.
+      //
+      // FIRST, AND FALLIBLE ON PURPOSE. `conn.destroy()` is the one step
+      // that can fail, and the sheet's contract is that a throw out of
+      // `onReset` REFUSES the whole ceremony with everything still held
+      // (visor/ui/sheets.ts's "the fallible half first"). So it runs
+      // before anything else is forgotten: if the namespace cannot be
+      // destroyed, the user is told, and nothing below has already
+      // thrown away the way back to it.
+      await conn.destroy();
+      // The T0 pointer, which now names storage that does not exist.
+      // `adoptAnchor` would clear it on the next boot anyway (a stale
+      // pointer is a fresh device, silently — PERSISTENCE.md's degrade
+      // rule), but leaving it would make the reload's first act a
+      // recovery from something we did on purpose.
+      clearAnchor();
+      // And the boot caches, which are this page's copies of what the
+      // account said about the user.
       for (const k of [US_CACHE_KEYS.hue, US_CACHE_KEYS.name, US_CACHE_KEYS.marks]) {
         localStorage.removeItem(k);
       }
     },
-    resetConsequences: ["the devices you paired with this one"],
+    resetConsequences: [
+      "this device's copy of your account",
+      "the devices you paired with this one",
+    ],
     extraActions: [
       {
         label: "this device…",
@@ -2155,6 +2179,64 @@ async function startApp(
     /** The device's own claim about where it syncs — `null` sealed or
      * unbound (`DeviceStatus.storage`'s own ambiguity; see rpc.ts). */
     storageStatus: async () => (await conn.status()).storage,
+    /** The strip's settings button. `openDevice`/`openAdd` above press
+     * it on their way to an extra action; the erase ceremony's own way
+     * in is a button on the settings sheet itself, so it needs the first
+     * half on its own. */
+    openSettings: () =>
+      (document.getElementById("visor-settings") as HTMLButtonElement | null)?.click(),
+    /** THE ERASE CEREMONY, for driving — the same conventions as the
+     * device hooks above and as the demo's own `reset` block
+     * (host/demo.ts): every control is CLICKED, or (for the confirm
+     * field) left holding the value a user's typing would leave, so a
+     * driver meets the arming delay and the typed-confirmation gate
+     * exactly as a user does. Nothing here reaches `onReset` directly;
+     * the only way through is the sheet's own button. */
+    reset: {
+      /** The only path in (visor/ui/sheets.ts's `requestReset`): the
+       * settings sheet's own danger button. Settings must already be
+       * open for this to do anything, which is also true of the user. */
+      openFromSettings: () =>
+        (document.querySelector("#visor-drawer-inner #visor-settings-reset") as
+          | HTMLButtonElement
+          | null)?.click(),
+      open: () => sheets.resetOpen(),
+      /** Whether the erase control is still behind the arming delay,
+       * read as `disabled` — the enforcement the ceremony itself relies
+       * on — plus the `armed` class the drawer host adds once ARM_MS has
+       * elapsed. */
+      armingState: () => {
+        const btn = document.querySelector("#visor-drawer-inner .reset-sheet .erase-confirm") as
+          | HTMLButtonElement
+          | null;
+        const input = document.querySelector("#visor-drawer-inner #visor-reset-confirm") as
+          | HTMLInputElement
+          | null;
+        return {
+          btnDisabled: btn?.disabled ?? null,
+          btnText: btn?.textContent ?? "",
+          inputDisabled: input?.disabled ?? null,
+          armed: document.querySelector("#visor-drawer-inner .reset-sheet")?.classList
+            .contains("armed") ?? false,
+        };
+      },
+      type: (value: string) => {
+        const input = document.querySelector("#visor-drawer-inner #visor-reset-confirm") as
+          | HTMLInputElement
+          | null;
+        if (input) input.value = value;
+      },
+      erase: () =>
+        (document.querySelector("#visor-drawer-inner .reset-sheet .erase-confirm") as
+          | HTMLButtonElement
+          | null)?.click(),
+      /** What the sheet is telling the user right now — a refused word,
+       * or a refused erasure. */
+      reason: () =>
+        (document.querySelector("#visor-drawer-inner .reset-sheet .cred-reason") as
+          | HTMLElement
+          | null)?.textContent ?? "",
+    },
   });
 }
 
