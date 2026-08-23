@@ -692,32 +692,42 @@ async function main() {
     // --- 18: the PairingDriver adapter over the REMOTE driver -------------
     await guard(async () => {
       const r = await probe(page, "hc-pairing", { id: t1Device });
-      // THE WIT BIT IS THE ASSERTION. A host-side refusal (sealed
-      // device, unknown method) is also a DeviceHostError and would have
-      // made a looser version of this row green while proving nothing —
-      // it did, on the first run of this matrix, because row 16 had
-      // resealed the device out from under it.
+      // THE CONTRAST ARM: seal the device and call the engine through
+      // it, so the same predicate is asked about a HOST refusal. If both
+      // arms answered alike, the two-path split would be decorative.
+      await probe(page, "hc-reseal", { id: t1Device });
+      const h = await probe(page, "hc-host-refusal", { id: t1Device });
+      await probe(page, "hc-unseal", { id: t1Device, opts: { passphrase: PASS } });
+
       const ok = r.constructed && r.adapterOk === false &&
-        r.wire !== null && r.wire.isWitError === true &&
-        typeof r.wire.witPayload === "string" && r.wire.witPayload.length > 0 &&
-        r.adapterUsedPayload;
+        // A REAL ComponentException, minted by the PAGE's copy.
+        r.engine !== null && r.engine.isWit === true && r.engine.isTrapped === false &&
+        r.engine.name === "ComponentException" &&
+        typeof r.engine.payload === "string" && r.engine.payload.length > 0 &&
+        r.engine.hasStack === true && r.engine.code === undefined &&
+        r.adapterUsedPayload &&
+        // …and the host arm is emphatically NOT one.
+        h.refused === true && h.isWit === false && h.name === "DeviceHostError" &&
+        h.code === "no-rung" && h.hostName === "SealError";
       record(
         "18 host",
-        "runtime/pairing-engine.ts's adapter is constructible over the remote driver, payload and all",
+        "the engine's errors cross as the SANCTIONED cloneable form; the host's keep their typed code",
         ok,
         `createEnginePairingDriver(remote.driver) builds a complete PairingDriver ` +
           `(${r.constructed}) with not one line changed — every method it needs moves only ` +
-          `structured-clone-safe values (Uint8Array ids, strings, plain records, {kind,value} ` +
-          `variants, u64 bigints), so nothing had to be excluded from the proxy. Its error path ` +
-          `is the half that could have rotted silently: the adapter reads a WIT err payload out ` +
-          `of every rejection via isComponentException(e) then e.payload, and over the port it ` +
-          `still gets one — the raw rejection is a ${r.wire?.name} with ` +
-          `isWitError=${r.wire?.isWitError} carrying witPayload=${j(r.wire?.witPayload)}, and ` +
-          `the adapter's own error string IS that payload rather than a message ` +
-          `(${r.adapterUsedPayload}). Module identity does NOT cross a worker boundary; what ` +
-          `makes this work is that DeviceHostError mints the ComponentException brand LOCALLY ` +
-          `from the envelope's isWitError bit (rpc.ts), never by cloning anything branded — ` +
-          `symbols do not clone, and Symbol.for's registry is per-agent.`,
+          `structured-clone-safe values, so nothing had to be excluded from the proxy. ` +
+          `ENGINE ARM: the worker sends toCloneable(error) and client.ts rehydrates with ` +
+          `fromCloneable, so what the PAGE catches is a real ${r.engine?.name} — ` +
+          `isComponentException(e)=${r.engine?.isWit} asked with the PAGE's own copy of the ` +
+          `predicate (not a bit the worker asserted about itself), isTrap=${r.engine?.isTrapped}, ` +
+          `payload=${j(r.engine?.payload)}, the worker's stack carried verbatim ` +
+          `(${r.engine?.hasStack}), and no host \`code\` (${j(r.engine?.code)}) because it is not ` +
+          `a host condition. The adapter's own error string IS that payload rather than a ` +
+          `message (${r.adapterUsedPayload}). HOST ARM: with the device resealed, a tasks call ` +
+          `comes back ${h.name} isComponentException=${h.isWit} code=${j(h.code)} from a ` +
+          `${j(h.hostName)} — the typed code survives, which the cloneable form's unbranded-Error ` +
+          `row would have dropped silently. The hand-rolled brand is GONE: A19 renamed the key a ` +
+          `second time and A20 shipped the forms this seam was the named consumer for.`,
       );
 
       await probe(page, "hc-close", { id: t1Device });
@@ -884,6 +894,191 @@ async function main() {
           `clean ${j(wrong.attempt.error.code)} (AES-KW's integrity check — no partial key ever ` +
           `exists), and the right one opens it and resumes (${right.status.resumed}) with ` +
           `${j(items.titles)} intact`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
+    // --- 21: PLATFORM POSTURE — the same device across a kill -------------
+    //
+    // The posture the design always wanted (PERSISTENCE.md, "Device
+    // signing identity"), now that the engine's `device-identity` import
+    // exists (engine commit addbca8). The worker hands the engine the
+    // non-extractable handle from the device namespace; the private half
+    // never enters the checkpoint at all, so a resumed device is the same
+    // device because the PLATFORM still holds its key — not because a
+    // seed was decrypted back out of the state root.
+    //
+    // Every host row above already runs this path (platform is the
+    // default now). This one makes the identity claim explicitly, from
+    // both sides: the recorded agent id, and the restored archive's own
+    // answer to `khKnowsAgent`.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "platform device",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const id = made.id as string;
+      await probe(page, "hc-open", { id, unseal: { passphrase: PASS, untilReseal: true } });
+      const fresh = await probe(page, "hc-agent", { id });
+      const atRest = await probe(page, "hc-identity-at-rest", { id });
+      await probe(page, "hc-add", { id, titles: TODOS });
+      await probe(page, "hc-checkpoint", { id });
+
+      await probe(page, "hc-die", { id });
+      const back = await probe(page, "hc-open", { id, unseal: {} });
+      const after = await probe(page, "hc-agent", { id });
+      const items = await probe(page, "hc-items", { id });
+
+      const ok = made.posture === "platform" &&
+        typeof fresh.agentId === "string" && fresh.agentId.length > 0 &&
+        fresh.resumed === false && fresh.knows === true &&
+        atRest.present === true && atRest.privateExtractable === false &&
+        atRest.algorithm === "Ed25519" && atRest.exportRefused === true &&
+        back.status.resumed === true && back.status.sealed === false &&
+        after.agentId === fresh.agentId && after.knows === true &&
+        after.posture === "platform" && after.resumed === true &&
+        TODOS.every((t: string) => items.titles.includes(t));
+      record(
+        "21 host",
+        "platform posture: the device's key never enters the checkpoint, and the resumed device is the SAME agent",
+        ok,
+        `the index row rests as posture=${j(made.posture)} and the namespace's identity entry is ` +
+          `a real platform handle — extractable=${atRest.privateExtractable}, ` +
+          `${atRest.algorithm} usages=${j(atRest.usages)}, exportKey("pkcs8") refused: ` +
+          `${atRest.exportRefused} (row 5 pins the same property for a harness-driven device; ` +
+          `this is the namespace THE WORKER populated and the engine is now trusting). ` +
+          `init(false) adopted it rather than minting: agent ${j(String(fresh.agentId).slice(0, 16))}…, ` +
+          `resumed=${fresh.resumed}. After the worker is KILLED and a new one resumes ` +
+          `(${back.status.resumed}), the agent id is unchanged ` +
+          `(${after.agentId === fresh.agentId}) and the RESTORED ARCHIVE itself answers ` +
+          `khKnowsAgent(that id)=${after.knows} — asked of the engine, not of our own note. ` +
+          `Todos intact: ${j(items.titles)}`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
+    // --- 22: THE MISMATCH REFUSAL -----------------------------------------
+    //
+    // THE FAILURE THIS ROW IS REALLY ABOUT IS THE SILENT ONE. A resume
+    // handed the wrong device's key could plausibly answer "nothing to
+    // resume" — and `false` is the fresh-boot path, so the worker would
+    // call `init`, mint a third identity, and produce a device that WORKS
+    // and is empty, having lost every membership it held. The engine
+    // therefore errors rather than answering false (persist.rs's "NOT
+    // `Ok(false)`"), and this row asserts the whole consequence: a named
+    // refusal, and a host that comes up FAILED rather than empty.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "wrong namespace",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const id = made.id as string;
+      await probe(page, "hc-open", { id, unseal: { passphrase: PASS, untilReseal: true } });
+      const fresh = await probe(page, "hc-agent", { id });
+      await probe(page, "hc-add", { id, titles: TODOS });
+      await probe(page, "hc-checkpoint", { id });
+      await probe(page, "hc-die", { id });
+
+      // Between the checkpoint and the reconnect, a DIFFERENT valid pair.
+      const plant = await probe(page, "hc-plant-identity", { id });
+
+      const refused = await probe(page, "hc-open", { id, unseal: {} });
+      const engineCall = await probe(page, "hc-host-refusal", { id });
+      const status = await probe(page, "hc-status", { id });
+
+      const payload = String(refused.unseal?.error?.witPayload ?? "");
+      // The engine names BOTH agents. The first prefix is the
+      // CHECKPOINT's — so this is the engine confirming, from the
+      // manifest, which identity the state belongs to.
+      const prefix = String(fresh.agentId ?? "").slice(0, 8);
+      const ok = refused.unseal.refused === true &&
+        refused.unseal.error.isWit === true &&
+        payload.includes("device-identity mismatch") &&
+        payload.includes(prefix) &&
+        // NOT empty-but-working: no engine came up at all, and the
+        // device rolled back to SEALED rather than sitting half-open
+        // with key material and no engine (worker.ts's "UNSEALING IS
+        // ATOMIC" — this row is what found that).
+        refused.status.resumed === null && refused.status.sealed === true &&
+        engineCall.refused === true && engineCall.code === "no-rung" &&
+        status.agentId === fresh.agentId &&
+        plant.planted === true && plant.rivalExtractable === false && plant.different === true;
+      record(
+        "22 host",
+        "a rival identity in the namespace is REFUSED by name — never a silent fresh device",
+        ok,
+        `the device checkpointed as agent ${j(prefix)}…; a DIFFERENT but perfectly valid ` +
+          `non-extractable pair was then planted in its identity store ` +
+          `(planted=${plant.planted}, extractable=${plant.rivalExtractable}, ` +
+          `different=${plant.different}) — the wrong-device / corrupt-namespace case. The resume ` +
+          `is refused with a real WIT error (isComponentException=${refused.unseal.error.isWit}) ` +
+          `whose payload names both agents and matches the CHECKPOINT's recorded id: ` +
+          `${j(payload.slice(0, 150))}. The consequence is the point: the host comes up FAILED, ` +
+          `not empty — resumed=${refused.status.resumed}, sealed=${refused.status.sealed}, and a ` +
+          `tasks call is refused (${j(engineCall.code)}). An embedder that read the refusal as ` +
+          `"nothing to resume" would have called init, minted a third identity and silently lost ` +
+          `every membership the device held; the recorded agent id is still ` +
+          `${status.agentId === fresh.agentId ? "the original" : "CHANGED"}. This row also found ` +
+          `the half-open state it now pins: the ceremony SUCCEEDS here (the wrap opened) and only ` +
+          `the resume fails, so an unseal that was not atomic left the DEK in memory with no ` +
+          `engine — sealed=false and every call refusing "the device is sealed".`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
+    // --- 23: SEED-POSTURE BACK COMPAT --------------------------------------
+    //
+    // VERIFY, DO NOT ASSUME. The engine forks on the MANIFEST's recorded
+    // posture, not on what the embedder currently prefers
+    // (engine/guest/src/persist.rs, "THE POSTURE FORK"), so a checkpoint
+    // written before the switch should still resume through the seed
+    // path with the `device-identity` fragment present and ignored. That
+    // is a claim about someone else's code, which is exactly the kind
+    // worth a row rather than a sentence.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "an older device",
+        policy: "until-reseal",
+        promote: true,
+        posture: "seed",
+      });
+      const id = made.id as string;
+      // The probe-only knob: init(true), the pre-switch posture.
+      const fresh = await probe(page, "hc-open", {
+        id,
+        seedPosture: true,
+        unseal: { passphrase: PASS, untilReseal: true },
+      });
+      await probe(page, "hc-add", { id, titles: TODOS });
+      await probe(page, "hc-checkpoint", { id });
+      await probe(page, "hc-die", { id });
+
+      // …and back with the ORDINARY platform-posture worker: no knob, the
+      // fragment wired exactly as every other device gets it.
+      const back = await probe(page, "hc-open", { id, unseal: {} });
+      const items = await probe(page, "hc-items", { id });
+
+      const ok = made.posture === "seed" && fresh.status.resumed === false &&
+        back.unseal.refused === false && back.status.resumed === true &&
+        back.status.sealed === false &&
+        TODOS.every((t: string) => items.titles.includes(t));
+      record(
+        "23 host",
+        "a SEED-posture checkpoint still resumes under the platform-posture worker",
+        ok,
+        `the device was inited through the probe's seed knob (init(true), the posture every ` +
+          `device used before engine addbca8) and checkpointed; the worker was then killed and ` +
+          `the device reopened by the UNCHANGED platform-posture host — same fragment wiring as ` +
+          `every other row, no knob. stateResume() answered ${back.status.resumed} and the state ` +
+          `is intact (${j(items.titles)}). The engine forked on the manifest's recorded posture ` +
+          `rather than on the embedder's current preference, so the identity came back out of the ` +
+          `checkpoint and the device-identity import was never consulted — which is what makes ` +
+          `the posture switch a change to NEW devices only.`,
       );
       await probe(page, "hc-close", { id });
       await probe(page, "hc-forget", { ids: [id] });

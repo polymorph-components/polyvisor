@@ -64,6 +64,7 @@ export {
 
 export {
   deleteIdentity,
+  DEVICE_IDENTITY_KEY,
   IdentityKeyError,
   loadIdentity,
   loadOrMintIdentity,
@@ -115,5 +116,6 @@ export {
   READONLY_METHODS,
   TASKS_METHODS,
   type UnsealOptions,
-  type WireError,
+  type HostError,
+  type WireFailure,
 } from "./rpc.ts";

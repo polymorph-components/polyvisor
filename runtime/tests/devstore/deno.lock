@@ -1,13 +1,12 @@
 {
   "version": "5",
   "specifiers": {
-    "jsr:@polyengine/protocol@0.1": "0.1.0",
-    "jsr:@polyengine/runtime@0.3": "0.3.1",
-    "jsr:@polyengine/runtime@0.3.1": "0.3.1",
-    "jsr:@polyengine/runtime@~0.3.1": "0.3.1",
-    "jsr:@polyengine/wasi@0.3.1": "0.3.1",
-    "jsr:@polymorph/webcrypto@0.3.0": "0.3.0",
-    "jsr:@polymorph/websocket@0.3.0": "0.3.0",
+    "jsr:@polyengine/protocol@~0.2.1": "0.2.1",
+    "jsr:@polyengine/runtime@0.4": "0.4.0",
+    "jsr:@polyengine/runtime@0.4.0": "0.4.0",
+    "jsr:@polyengine/wasi@0.4.0": "0.4.0",
+    "jsr:@polymorph/webcrypto@0.4.0": "0.4.0",
+    "jsr:@polymorph/websocket@0.4.0": "0.4.0",
     "jsr:@std/cli@^1.0.12": "1.0.32",
     "jsr:@std/encoding@^1.0.7": "1.0.11",
     "jsr:@std/fmt@^1.0.5": "1.0.10",
@@ -23,32 +22,32 @@
     "npm:werift@0.22.2": "0.22.2"
   },
   "jsr": {
-    "@polyengine/protocol@0.1.0": {
-      "integrity": "0c97f34166f22ba55e7b084148df96e47aebe47cd9dd13930057759c9161bb1c"
+    "@polyengine/protocol@0.2.1": {
+      "integrity": "857bef84afedc414d47daedf203448f72e8803cf96301afb783b1ac975f3dcec"
     },
-    "@polyengine/runtime@0.3.1": {
-      "integrity": "1bacade5b3330fb5aba9ba3e7111010c11cd4c5e867a1848cb13342b2b1e3cbb",
+    "@polyengine/runtime@0.4.0": {
+      "integrity": "d34a59d9df58bd48541483619d1987319d8aad4d2e0f3775890177ffb0878a5a",
       "dependencies": [
         "jsr:@polyengine/protocol"
       ]
     },
-    "@polyengine/wasi@0.3.1": {
-      "integrity": "0f7c5b3cc3753ceea233df5ffb03096cdbd8df3f4a398f5345c83f8188abe8ea",
+    "@polyengine/wasi@0.4.0": {
+      "integrity": "b946443255e98cb6156237de90f051af7e483d2afdc0d721bdba64392cdbd896",
       "dependencies": [
         "jsr:@polyengine/protocol",
-        "jsr:@polyengine/runtime@~0.3.1"
+        "jsr:@polyengine/runtime@0.4"
       ]
     },
-    "@polymorph/webcrypto@0.3.0": {
-      "integrity": "0708409c1f36c091da7c60ee62db6416f8968c92acc92f8a192e9e9ee55f2569",
+    "@polymorph/webcrypto@0.4.0": {
+      "integrity": "ffedef7d0141571a81aa55c47d892d3ff95e3ca6796815e231729f81f0286d3d",
       "dependencies": [
-        "jsr:@polyengine/runtime@0.3"
+        "jsr:@polyengine/runtime@0.4"
       ]
     },
-    "@polymorph/websocket@0.3.0": {
-      "integrity": "23c92ed2ccda31ca66cad1ac9cbcf87473ccac7ae9a2b82fcb3486d5af97bbcd",
+    "@polymorph/websocket@0.4.0": {
+      "integrity": "f2b77720ca02ba95d405a51abd4ca930074a22188ce23a5731c0a6b40f9c4bf2",
       "dependencies": [
-        "jsr:@polyengine/runtime@0.3"
+        "jsr:@polyengine/runtime@0.4"
       ]
     },
     "@std/cli@1.0.32": {
@@ -669,17 +668,17 @@
   },
   "workspace": {
     "dependencies": [
-      "jsr:@polyengine/runtime@0.3.1",
-      "jsr:@polyengine/wasi@0.3.1",
-      "jsr:@polymorph/webcrypto@0.3.0",
-      "jsr:@polymorph/websocket@0.3.0",
+      "jsr:@polyengine/runtime@0.4.0",
+      "jsr:@polyengine/wasi@0.4.0",
+      "jsr:@polymorph/webcrypto@0.4.0",
+      "jsr:@polymorph/websocket@0.4.0",
       "npm:node-datachannel@0.32.3",
       "npm:werift@0.22.2"
     ],
     "links": {
-      "jsr:@polymorph/webrtc-datachannels@0.3.0": {
+      "jsr:@polymorph/webrtc-datachannels@0.4.0": {
         "dependencies": [
-          "jsr:@polyengine/runtime@0.3",
+          "jsr:@polyengine/runtime@0.4",
           "npm:node-datachannel@0.32.3",
           "npm:werift@0.22.2"
         ]

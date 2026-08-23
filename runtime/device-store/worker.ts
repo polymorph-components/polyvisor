@@ -45,9 +45,29 @@
 import {
   ComponentException,
   isComponentException,
+  isTrap,
+  toCloneable,
 } from "@polyengine/runtime/embedder";
-import { type Engine, newEngine, type PersistDir } from "../engine.ts";
+import {
+  type DeviceIdentityFragment,
+  type Engine,
+  newEngine,
+  type PersistDir,
+} from "../engine.ts";
+// THE SAME MODULE INSTANCE THE ENGINE'S OWN IMPORTS COME FROM. `newEngine`
+// builds the port's fragment with `webcryptoImports()` out of
+// `@polymorph/webcrypto-polyengine` (engine.ts:13), and these two statics
+// are exports of THAT module — so a handle minted here lands in the same
+// class family the port's own imports serve. Reaching for a second copy
+// of the package (a different specifier, an unpinned range) would mint
+// wrappers the port does not recognize, and the failure would arrive as
+// an unhelpful lowering error deep inside a call. The specifier is
+// spelled identically to engine.ts's on purpose; demo/deno.json maps it
+// once for the whole graph, which is that file's stated reason for
+// existing.
+import { SigningKey, VerifyingKey } from "@polymorph/webcrypto-polyengine";
 import { getDevice } from "./index.ts";
+import { DEVICE_IDENTITY_KEY, loadOrMintIdentity } from "./identity-keys.ts";
 import { type DeviceNamespace, openNamespace } from "./namespace.ts";
 import {
   createSealedDek,
@@ -69,11 +89,13 @@ import {
   type PromoteOptions,
   READONLY_METHODS,
   type ResealOptions,
+  hostCodeOf,
+  hostErrorOf,
   type Req,
   type Res,
   TASKS_METHODS,
-  toWire,
   type UnsealOptions,
+  type WireFailure,
 } from "./rpc.ts";
 
 // --- who am I ---------------------------------------------------------------
@@ -221,7 +243,35 @@ async function unseal(opts: UnsealOptions = {}): Promise<DeviceStatus> {
     dek = await climbRung(record.unsealPolicy, rungs, opts);
   }
 
-  await bringUpEngine();
+  // UNSEALING IS ATOMIC: KEY *AND* ENGINE, OR NEITHER.
+  //
+  // The DEK is assigned above because `bringUpEngine` needs it to mount
+  // the sealed state root — so a failure below would otherwise leave the
+  // device HALF OPEN: key material held in memory, no engine, and a
+  // `status()` reporting `sealed: false` while every driver call refused
+  // with "the device is sealed". Worse, the early return at the top of
+  // this function would then make the NEXT `unseal()` a silent no-op
+  // reporting success, on a device that still has no engine.
+  //
+  // The gate caught this on the mismatch row (row 22), which is exactly
+  // the case that makes it reachable: the ceremony genuinely succeeds —
+  // the passphrase was right, the wrap opened — and then `stateResume()`
+  // refuses because the namespace holds another device's key. So the
+  // rollback is not a tidy-up for impossible states; it is the ordinary
+  // outcome of a device whose storage has been disturbed.
+  //
+  // Rolling back to SEALED rather than inventing a third state keeps one
+  // thing true at a time. The caller is not left guessing why: the
+  // rejection it receives is the engine's own, and for a mismatch that
+  // is a `ComponentException` naming both agent ids.
+  try {
+    await bringUpEngine();
+  } catch (e) {
+    dek = null;
+    engine = null;
+    resumed = null;
+    throw e;
+  }
   return await status();
 }
 
@@ -481,6 +531,83 @@ async function fetchArtifacts(spec: AttachSpec["artifacts"]) {
   return { envelope, bytes: new Uint8Array(bytes) };
 }
 
+// --- the device identity (platform posture) ---------------------------------
+//
+// THE POSTURE THE DESIGN ALWAYS WANTED (PERSISTENCE.md, "Device signing
+// identity"): the device's signing key is a NON-EXTRACTABLE WebCrypto
+// handle living in the device namespace, and the engine is handed that
+// handle rather than a seed it could write into a checkpoint. A seed
+// posture's private material rests inside the sealed state root; a
+// platform posture's cannot leave the browser profile at all, because
+// the platform refuses to export it — which is the difference between
+// "encrypted at rest under a key someone may hold" and "not present".
+//
+// THE ENGINE SEAM is the app-owned `polyvisor:engine/device-identity@0.1.0`
+// import (engine.wit; the webcrypto#391 ruling that persistence is an
+// EMBEDDER library, not a WebCrypto capability). It is consulted twice:
+// at `init(false)`, where the handed pair is ADOPTED instead of a fresh
+// mint, and at `stateResume()` of a platform checkpoint, where it is the
+// only place the identity can come from — and where the engine verifies
+// it against the agent id the manifest recorded.
+
+/**
+ * The device's key pair, loaded ONCE per worker global.
+ *
+ * `loadOrMintIdentity` is already race-free and validate-on-load
+ * (identity-keys.ts), so the caching here is about not paying an
+ * IndexedDB round trip on every `deviceKeyPair()` call — the engine asks
+ * at least once per instantiation and the answer cannot change while
+ * this global lives.
+ *
+ * A REJECTION CLEARS THE CACHE. A poisoned promise would make one
+ * transient IndexedDB failure permanent for the worker's whole life,
+ * which for a device host means "this device never opens again until you
+ * close every tab".
+ */
+let identityPair: Promise<CryptoKeyPair> | undefined;
+
+/** Where the fresh-init agent id is recorded, in the unsealed `meta`
+ * store beside the lease and the boot counter. */
+const AGENT_KEY = "agent";
+
+function devicePair(): Promise<CryptoKeyPair> {
+  identityPair ??= loadOrMintIdentity(ns, DEVICE_IDENTITY_KEY)
+    .then((r) => r.pair)
+    .catch((e) => {
+      identityPair = undefined;
+      throw e;
+    });
+  return identityPair;
+}
+
+/**
+ * Build the `device-identity` fragment for ONE engine instance.
+ *
+ * FRESH PER INSTANCE, and that is not incidental: the port's resource
+ * classes carry per-instance registry identity (engine.ts's module
+ * header, the polymorph-iroh host-deltic finding), so a `SigningKey`
+ * wrapper minted for one instance must not be handed to another. What is
+ * cached across instances is the `CryptoKeyPair` — plain platform
+ * handles, which belong to no registry — and the wrappers are minted at
+ * the moment the engine asks.
+ *
+ * `fromCryptoKey` is the merged webcrypto#392 injection seam: it
+ * launders the key, checks the type, algorithm and usages, and mints a
+ * wrapper under the port's private token. The non-extractability rides
+ * along untouched — the port never sees material either.
+ */
+function deviceIdentityFragment(): DeviceIdentityFragment {
+  return {
+    deviceKeyPair: async () => {
+      const pair = await devicePair();
+      return [
+        SigningKey.fromCryptoKey(pair.privateKey),
+        VerifyingKey.fromCryptoKey(pair.publicKey),
+      ];
+    },
+  };
+}
+
 /**
  * Mount the state root and resume, or come up fresh.
  *
@@ -516,6 +643,7 @@ async function bringUpEngine(): Promise<void> {
     // deno-lint-ignore no-explicit-any
     NO_STORE as any,
     sealed as unknown as PersistDir,
+    deviceIdentityFragment(),
   );
 
   resumed = await e.driver.stateResume();
@@ -524,13 +652,28 @@ async function bringUpEngine(): Promise<void> {
     // device needs an identity and a partition before `tasks` has
     // anywhere to put anything.
     //
-    // `init(true)` — an EXPORTABLE (seed-posture) identity — because
-    // seed is the resting posture until the platform-posture engine path
-    // lands, and engine.ts:110-113 warns that a checkpoint taken in
-    // `platform` posture REJECTS on resume while that seam is still
-    // open. A device that could not be resumed is the one failure this
-    // whole track exists to prevent.
-    await e.driver.init(true);
+    // `init(false)` — PLATFORM POSTURE, now that the seam is open. The
+    // engine consults the `device-identity` import first and adopts the
+    // handle this worker just loaded, so the identity a fresh device
+    // starts life with is the one already persisted in its namespace
+    // rather than a fresh mint the guest would then have to write down.
+    //
+    // The old `init(true)` was a placeholder with a stated reason: a
+    // platform checkpoint used to be REFUSED on resume, so seed was the
+    // only posture that could survive a kill. That is no longer true —
+    // engine commit addbca8 — and seed's cost is real: its private
+    // material rests inside the checkpoint, so it is only as safe as the
+    // DEK, whereas a platform key is not in the checkpoint at all.
+    //
+    // `__seedPosture` is the probe's back-compat knob and nothing else;
+    // see AttachSpec.
+    const agent = await e.driver.init(attached.__seedPosture === true);
+    // RECORDED IN `meta`, unsealed, deliberately: an agent id is a public
+    // key, it is the one thing a resumed device must still be, and the
+    // sweep and the picker both read this store before anything is open.
+    // It is written on the FRESH path only — a resume must never be able
+    // to overwrite the id it is supposed to have matched.
+    await ns.put("meta", AGENT_KEY, agent);
     const partition = await e.driver.createPartition();
     await e.driver.sealPartition(partition);
   }
@@ -620,6 +763,12 @@ async function status(): Promise<DeviceStatus> {
     deviceId: DEVICE_ID,
     tier: record?.tier ?? "t0",
     posture: record?.posture ?? "seed",
+    // The id the engine reported at this device's FRESH init — a public
+    // key, so it rests unsealed like everything else in `meta`. It is
+    // what a resume has to still be, and the probe matrix compares it
+    // across a kill; `khKnowsAgent(unhex(agentId))` asks the resumed
+    // engine the same question from the other side.
+    agentId: (await ns.get<string>("meta", AGENT_KEY)) ?? null,
     policy,
     sealed: dek === null,
     rungs,
@@ -705,6 +854,39 @@ async function call(target: string, method: string, args: unknown[]): Promise<un
   return value;
 }
 
+/**
+ * Choose how one rejection crosses (rpc.ts's "how a rejection crosses").
+ *
+ * ORDER MATTERS. The branded taxonomy is tested FIRST and unconditionally:
+ * a `ComponentException` is the engine's err arm and belongs in the
+ * cloneable form whatever else it happens to carry. Only then does a
+ * typed host `code` claim the value, because the cloneable form's
+ * unbranded-`Error` row would drop that code silently. Everything left
+ * over — a `TypeError` from a host bug, a plain `Error` — takes the
+ * cloneable form too, which is a strict upgrade on the old flattening:
+ * it keeps the cause chain and the worker-side stack, and the
+ * worker-side stack is the diagnostically useful one.
+ */
+function toFailure(e: unknown): WireFailure {
+  const branded = isComponentException(e) || isTrap(e);
+  if (!branded) {
+    const code = hostCodeOf(e);
+    if (code !== undefined) return { form: "host", error: hostErrorOf(e, code) };
+  }
+  try {
+    return { form: "cloneable", value: toCloneable(e) };
+  } catch (refusal) {
+    // `toCloneable` REFUSES rather than degrades: an `InvalidHandleError`
+    // naming the path to a realm-local leaf, or a `TypeError` for a
+    // prototype the form does not cover. Both are findings about THIS
+    // code — something put a handle where a value belongs — and the
+    // refusal message names the path, so it is forwarded verbatim under
+    // a code the client can see instead of being swallowed into a
+    // timeout. Nothing is stripped to make the send succeed.
+    return { form: "host", error: hostErrorOf(refusal, "unclonable") };
+  }
+}
+
 function serve(port: MessagePort): void {
   ports.add(port);
   port.onmessage = (ev: MessageEvent<Req>) => {
@@ -713,13 +895,35 @@ function serve(port: MessagePort): void {
     call(target, method, args ?? []).then(
       (value) => {
         const res: Res = { id, ok: true, value };
-        port.postMessage(res);
+        try {
+          port.postMessage(res);
+        } catch (cloneFailure) {
+          // A `DataCloneError` HERE IS A FINDING, NOT A NUISANCE. Every
+          // method on the proxied surfaces is supposed to move records,
+          // strings and bytes (rpc.ts's serialization-discipline note),
+          // so this firing means a REALM-LOCAL VALUE — a stream, a
+          // future, a resource wrapper — has leaked into a result, and
+          // the honest response is to say so at the call site rather
+          // than strip it and hand back a husk. Without this catch the
+          // throw would escape into the message handler and the client
+          // would simply time out, which is the same bug with none of
+          // the evidence.
+          port.postMessage({
+            id,
+            ok: false,
+            failure: {
+              form: "host",
+              error: hostErrorOf(cloneFailure, "unclonable"),
+            },
+          } satisfies Res);
+          return;
+        }
         // Reply FIRST, die after: a client whose kill request never
         // resolved could not tell "killed" from "hung".
         if (dying) setTimeout(() => (self as unknown as { close(): void }).close(), 0);
       },
       (e) => {
-        const res: Res = { id, ok: false, error: toWire(e, isComponentException(e)) };
+        const res: Res = { id, ok: false, failure: toFailure(e) };
         port.postMessage(res);
       },
     );

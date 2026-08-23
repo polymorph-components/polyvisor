@@ -1956,7 +1956,8 @@ refuse import), superseded by webcrypto#391 — persistence is an
 embedder library (absorbed here as
 runtime/device-store/identity-keys.ts, the wosh-validated pattern),
 the guest-facing function is app-owned WIT per consumer, and the port
-ships only injection (`webcryptoHost().inject`, webcrypto#390).
+ships only the key seams (`fromCryptoKey`/`toCryptoKey`, webcrypto#392,
+which superseded this round's own #390 draft mid-flight).
 runtime/device-store/ is the embedder half: an unsealed index carrying
 exactly seven ruled fields (the anchor colour may never appear before
 unseal — the colour arriving IS the login's anti-spoofing tell), one
@@ -1979,7 +1980,22 @@ destroy — a zombie picker row demanding a passphrase that never existed
 is the trap the ruling closed. Gates: a 22-row browser matrix on the
 device store, e2e 16/16 (solo-persistence: reload → auto-unseal →
 todos intact; solo-ephemeral: the anchor round trip and the >1-device
-strip label), native and headless batteries unchanged.
+strip label), native and headless batteries unchanged. When the 0.4.0
+releases rolled (A19's componentException brand break; A20's
+toCloneable/fromCloneable, built with this worker seam as the named
+consumer driver), the RPC error path adopted the sanctioned forms —
+engine errors rehydrate client-side as real branded
+ComponentExceptions, host conditions keep their typed envelope because
+the cloneable error row carries no own properties — and the
+platform-posture slice closed: the engine's app-owned device-identity
+import (pairs, verified against the manifest's agent id on resume),
+the worker minting and persisting non-extractable pairs through
+identity-keys and handing them over the #392 seams, init(false) as the
+worker's resting posture, seed kept for back-compat and for the native
+acts (the wasmtime webcrypto host has no Rust-held-key seam yet —
+webcrypto#395). The mismatch row surfaced and fixed an unseal
+atomicity bug: key AND engine, or neither. 26 matrix rows, e2e 16/16
+throughout.
 
 ## Parked and candidate non-goals
 

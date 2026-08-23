@@ -8,186 +8,155 @@
 // clonable envelope and back. worker.ts and client.ts both import it,
 // which is the point — there is exactly one description of the wire.
 //
-// IT IMPORTS NO PACKAGE, only sibling types. That is deliberate and it
-// is what lets a page take `client.ts` with no pins at all
-// (runtime/README.md's resolution model). The one place a package
-// identity would have been convenient — `isComponentException` from
-// @polyengine/runtime/embedder — is handled by the brand REGISTRY KEY
-// instead; see `rehydrate` below for the whole argument.
+// IT IMPORTS NO PACKAGE — only sibling TYPES, which erase. That is
+// deliberate and it is what keeps this module checkable under any
+// embedder's config (runtime/README.md's resolution model).
+//
+// ITS TWO CONSUMERS NO LONGER SHARE THAT PROPERTY, and the header should
+// say so plainly rather than let a reader infer it. Since 0.4.0 the
+// engine-error path crosses as the embedder's SANCTIONED CLONEABLE FORM
+// (A20), so worker.ts calls `toCloneable` and client.ts calls
+// `fromCloneable` — both real value imports from
+// @polyengine/runtime/embedder. worker.ts always needed the pin (it
+// instantiates the engine); client.ts did not, and now does. What is
+// still package-free is everything BELOW the host: the index, the
+// namespace, the seal ladder, the locks, the anchor and this file — so a
+// consumer that only reads the index to render a picker still needs no
+// pins, provided it imports those modules directly rather than through
+// mod.ts (which re-exports client.ts). See runtime/README.md.
 
 import type { Driver, Tasks } from "../engine.ts";
 import type { Posture, Tier, UnsealPolicy } from "./index.ts";
 
-// --- the error envelope -----------------------------------------------------
+// --- how a rejection crosses -----------------------------------------------
+//
+// TWO PATHS, AND THE SPLIT IS THE POINT (polyengine amendments A19/A20;
+// the 0.4.0 bump). A rejection out of the worker is one of two very
+// different kinds of thing, and flattening both into one envelope — as
+// the pre-0.4.0 version of this file did — cost fidelity at both ends.
+//
+//   THE ENGINE'S ERRORS take the SANCTIONED CLONEABLE FORM. A20 ships
+//   `toCloneable`/`fromCloneable` on the embedder, built with this
+//   SharedWorker seam as its named consumer driver: the worker sends
+//   `toCloneable(error)` and the client rehydrates with `fromCloneable`,
+//   which mints a REAL branded `ComponentException` in the client's own
+//   realm — payload, cause chain to full depth, sender's stack, and
+//   `isComponentException()` answering true. That is strictly more than
+//   the hand-rolled facsimile carried: it had one payload and no cause
+//   chain, and it depended on this file spelling a brand key correctly,
+//   which it had already got wrong once (A18) and which A19 renamed
+//   again (`witError` -> `componentException`). Adopting the forms
+//   deletes the hand-roll rather than chasing the spelling a third time.
+//
+//   THE HOST'S OWN CONDITIONS KEEP THEIR TYPED ENVELOPE, below. A
+//   `SealError` is NOT a WIT error — nothing in the guest produced it,
+//   and "you typed the wrong passphrase" is a normal answer from the
+//   ceremony rather than a fault in the engine. There is also a
+//   mechanical reason, and it is decisive: `toCloneable` encodes any
+//   unbranded `Error` — subclasses included — through the contract's
+//   `error` row, which carries `name`, `message`, `stack` and `cause`
+//   AND NOTHING ELSE (@polyengine/protocol@0.2.1/src/cloneable.ts, the
+//   `o instanceof Error` branch). `SealError.code` is an own property,
+//   so it would be dropped, silently — and `code` is exactly what the
+//   unseal ceremony branches on (demo/host/solo.ts's boot path;
+//   runtime/tests/devstore rows 13, 16, 19, 20).
+//
+// THE CLONEABLE FORM IS VERSION-INTERNAL AND MUST NEVER BE PERSISTED
+// (A20: "the supported matrix is the same engine version in both realms,
+// the shape may change in any release, and nothing may be persisted on
+// it"). This use satisfies that by construction and it is worth saying
+// where the form crosses: a `WireFailure` lives for one `postMessage`
+// between two realms of ONE page load, running one bundle of one engine
+// version. Nothing here reaches IndexedDB, OPFS or the checkpoint —
+// sealed-fs.ts and seal.ts never see it. If a future change is tempted
+// to log one, cache one, or put one in a checkpoint: that is the line.
 
 /**
- * A rejection, flattened into something structured clone will carry.
+ * A HOST-SURFACE condition — the device store's own refusals, not the
+ * engine's.
  *
- * WHY IT CANNOT BE THE ERROR ITSELF. Structured clone does carry `Error`
- * objects, but it carries only `name`, `message`, `stack` and `cause` —
- * OWN PROPERTIES ARE DROPPED. `ComponentException`'s entire meaning is
- * its `payload` (the WIT `result<T, E>` err value), and `SealError`'s is
- * its `code`; both would arrive as bare `Error`s with a nice message and
- * no machine-readable content. So the envelope names the three facts a
- * caller can act on and carries them explicitly.
- *
- * WHAT `isWitError` MEANS, precisely: the worker-side rejection was
- * recognized by `isComponentException` — i.e. the guest returned the err
- * arm of a WIT `result`, and `witPayload` is that arm's value. `false`
- * covers everything else: a host bug, a `SealError`, a `TypeError` in
- * the worker. The distinction matters because a WIT err is an EXPECTED
- * outcome the app should handle, while an unbranded throw is a defect.
+ * `code` is the contract; `message` is for a human and `hostName` is a
+ * breadcrumb. The closed set of codes comes from the modules that raise
+ * them: `SealError.code` ("wrong-passphrase", "no-rung",
+ * "already-sealed", "tampered", "unsupported"),
+ * `SealedFsError.fsCode` ("io"), `IdentityKeyError.code`
+ * ("extractable", "algorithm", "unavailable"), plus this module's own
+ * "timeout", "closed" and "unclonable".
  */
-export interface WireError {
-  /** Always present, always safe to show a developer. Never assume it
-   * is stable enough to branch on — that is what the other two are for. */
+export interface HostError {
   message: string;
-  /** The original error's `name` ("ComponentException", "SealError",
-   * "TypeError"…). Diagnostic, not a contract. */
-  name: string;
-  /** True iff the worker recognized the rejection as a WIT `result` err
-   * value. See the note above. */
-  isWitError: boolean;
-  /** The WIT err arm's value when `isWitError`; absent otherwise. For
-   * this engine's `result<T, string>` methods it is a string
-   * (engine.ts:38). */
-  witPayload?: unknown;
-  /** A typed refusal code where the thrower had one — `SealError.code`
-   * ("wrong-passphrase", "no-rung", …) or `SealedFsError.fsCode`. This
-   * is what an unseal ceremony branches on. */
+  /** The thrower's class name, for diagnosis only. */
+  hostName: string;
   code?: string;
 }
 
 /**
- * The brand key for a WIT `result` err value, spelled out rather than
- * imported.
- *
- * THE AUTHORITY, and it is explicit about this being allowed:
- * `@polyengine/protocol@0.1.0/src/brands.ts` (the brands module the
- * pinned `@polyengine/runtime@0.3.1/embedder` recognizes values with) —
- * "Every brand is a `Symbol.for` REGISTRY symbol, so N copies of this
- * package (or of the runtime) agree on every brand by construction", and
- * "Brands are contract markers, NOT a security boundary: a hand-rolled
- * object carrying the right symbol is a legal value (this is what makes
- * zero-import host modules possible)."
- *
- * SO THE CLIENT CAN MINT an error that `isComponentException()` accepts
- * without importing the embedder, and `rehydrate` below does exactly
- * that — which is what keeps this module, and client.ts with it,
- * package-free (runtime/README.md's resolution model: a picker that only
- * reads the index should not have to pin the engine).
- *
- * THE COST, STATED, BECAUSE IT ALREADY BIT ONCE. The key is a wire
- * constant with a history: amendment A18 renamed every key's prefix from
- * `deltic.` to `polyengine.`, and that module's own header says
- * pre-A18 and post-A18 brands "do NOT interoperate … by design and
- * WITHOUT A DIAGNOSTIC". The first draft of this file hand-rolled the
- * older spelling (taken from a stale copy in the module cache), and the
- * result was precisely the described silence: nothing threw, nothing
- * warned, and `pairing-engine.ts` quietly reported every engine refusal
- * as a message instead of a payload. That is why row 18 of the gate
- * (runtime/tests/devstore/run.ts) asserts the adapter's error string IS
- * the WIT payload rather than merely that a rejection happened: a future
- * key change turns a silent degradation into a red row.
- *
- * What is NOT claimed: that the brand crossed the port. Symbols do not
- * clone and `Symbol.for`'s registry is per-agent, so nothing branded
- * survives a `postMessage`. The brand on the client's error is MINTED
- * FRESH from the envelope's `isWitError` bit, on this side, in this
- * realm.
- *
- * SUCCESSOR, ALREADY UPSTREAM (polyengine A19, runtime 0.3.2): the
- * embedder now exports `toCloneable`/`fromCloneable` — a sanctioned,
- * round-trip-exact crossing for the whole branded error taxonomy,
- * built with THIS seam as its named consumer. The 0.3.2 bump replaces
- * this envelope's error walk and this hand-rolled key with those forms
- * (the client then rehydrates a real branded ComponentException, cause
- * chain and all), and note the key below is renamed AGAIN by A19
- * (`polyengine.componentException/1`) — adopting the forms rather than
- * chasing the spelling is the point. Until the bump, this key matches
- * the pinned 0.3.1 and row 18 stands guard.
+ * One rejection, on the wire. A discriminated union rather than a
+ * widened record, so neither side can read the engine path's fields off
+ * a host refusal or the reverse.
  */
-const WIT_ERROR_BRAND: symbol = Symbol.for("polyengine.witError/1");
+export type WireFailure =
+  /** `toCloneable(error)` output — hand it to `fromCloneable` and throw
+   * the result. Carries the whole branded taxonomy faithfully. */
+  | { form: "cloneable"; value: unknown }
+  /** A device-store condition, with its typed code intact. */
+  | { form: "host"; error: HostError };
 
 /**
- * The client-side error every remote call rejects with.
+ * The client-side error for a HOST-SURFACE condition.
  *
- * BRANCH ON THE FIELDS, NOT ON THE CLASS AND NOT ON THE BRAND. Module
- * identity does not cross a worker boundary — the page and the worker
- * evaluate two separate module graphs in two separate agents — so
- * `instanceof` against anything the worker threw is meaningless here,
- * and even class identity of `DeviceHostError` itself only holds within
- * one bundle. `isWitError` / `witPayload` / `code` are the contract.
+ * WHAT THIS CLASS IS NOT, ANY MORE. Before 0.4.0 it was also a
+ * `ComponentException` facsimile: it carried `isWitError`, `witPayload`,
+ * a `payload` alias and a hand-minted brand, so that an adapter written
+ * against the in-process driver would keep working over the port. All of
+ * that is gone, because `fromCloneable` now produces the real thing and
+ * a facsimile beside it would be a second, worse answer to a question
+ * that has a first one. `DeviceHostError` is now exactly what its name
+ * says: the device host refusing, for a reason the device host owns.
  *
- * The `ComponentException` brand IS carried, as a compatibility
- * courtesy, so that an adapter written against the in-process driver
- * keeps working over the remote one unmodified — runtime/pairing-engine.ts's
- * `errFrom` reads `isComponentException(e)` then `e.payload`, and that
- * is precisely the shape this class presents. `payload` is an alias of
- * `witPayload` for the same reason. Consumers writing NEW code should
- * still read `isWitError`: the brand is a bridge for existing adapters,
- * not the wire contract.
+ * BRANCH ON `code`. `instanceof` is still meaningless across the port
+ * boundary in the general case — two realms are two module graphs — but
+ * `code` is a plain string and travels.
  */
 export class DeviceHostError extends Error {
-  readonly isWitError: boolean;
-  readonly witPayload?: unknown;
   readonly code?: string;
-  /** Alias of `witPayload`, for `ComponentException`-shaped consumers. */
-  readonly payload?: unknown;
+  /** The worker-side thrower's class name ("SealError", "TypeError"). */
+  readonly hostName: string;
 
-  constructor(wire: WireError) {
-    super(wire.message);
+  constructor(e: HostError) {
+    super(e.message);
     this.name = "DeviceHostError";
-    this.isWitError = wire.isWitError;
-    if (wire.isWitError) {
-      this.witPayload = wire.witPayload;
-      this.payload = wire.witPayload;
-    }
-    if (wire.code !== undefined) this.code = wire.code;
-    // Minted here, in this realm, from the envelope's bit — see the
-    // brand comment above. Only for genuine WIT err values: branding a
-    // host bug would tell an adapter that a defect was an expected
-    // outcome, which is the one lie this whole envelope exists to avoid.
-    if (wire.isWitError) {
-      Object.defineProperty(this, WIT_ERROR_BRAND, {
-        value: true,
-        enumerable: false,
-        writable: false,
-        configurable: false,
-      });
-    }
+    this.hostName = e.hostName;
+    if (e.code !== undefined) this.code = e.code;
   }
 }
 
 /**
- * Worker side: flatten a thrown thing into the envelope.
+ * Does this rejection carry a typed host code? If so it takes the host
+ * path, because the cloneable form would drop the code (see above).
  *
- * `isWit` is passed in rather than computed, because only the worker has
- * the embedder module and therefore the brand predicate — this module
- * stays package-free (see the header).
+ * Deliberately structural rather than `instanceof`: worker.ts and the
+ * modules that raise these live in one graph today, but the predicate
+ * that matters is "does it carry a code", and a hand-rolled refusal with
+ * one is as legitimate as `SealError`.
  */
-export function toWire(e: unknown, isWit: boolean): WireError {
-  const err = e as {
-    name?: string;
-    message?: string;
-    payload?: unknown;
-    code?: string;
-    fsCode?: string;
-  };
-  const wire: WireError = {
-    message: String(err?.message ?? e),
-    name: typeof err?.name === "string" ? err.name : typeof e,
-    isWitError: isWit,
-  };
-  if (isWit) wire.witPayload = err?.payload;
-  const code = err?.code ?? err?.fsCode;
-  if (typeof code === "string") wire.code = code;
-  return wire;
+export function hostCodeOf(e: unknown): string | undefined {
+  const err = e as { code?: unknown; fsCode?: unknown } | null;
+  if (err === null || typeof err !== "object") return undefined;
+  if (typeof err.code === "string") return err.code;
+  if (typeof err.fsCode === "string") return err.fsCode;
+  return undefined;
 }
 
-/** Client side: the envelope, as something to `throw`. */
-export function rehydrate(wire: WireError): DeviceHostError {
-  return new DeviceHostError(wire);
+/** Describe any thrown thing as a host condition. */
+export function hostErrorOf(e: unknown, code?: string): HostError {
+  const err = e as { name?: unknown; message?: unknown } | null;
+  const out: HostError = {
+    message: String((err as { message?: unknown })?.message ?? e),
+    hostName: typeof err?.name === "string" ? err.name : typeof e,
+  };
+  if (code !== undefined) out.code = code;
+  return out;
 }
 
 // --- the proxied surfaces ---------------------------------------------------
@@ -408,13 +377,39 @@ export interface AttachSpec {
   artifacts: { envelopeUrl: string; wasmUrl: string };
   /** For `newEngine`'s `wasi:cli` args and nothing else. */
   label?: string;
+  /**
+   * PROBE ONLY — boot a FRESH device in seed posture (`init(true)`)
+   * instead of the platform posture every real device now uses.
+   *
+   * It exists for exactly one gate row: proving that a seed-posture
+   * checkpoint written before this switch still resumes through the
+   * unchanged seed path with the `device-identity` fragment present and
+   * ignored. The engine forks on the MANIFEST's recorded posture, not on
+   * what the embedder currently prefers (engine/guest/src/persist.rs's
+   * "THE POSTURE FORK"), so back-compat is a property to verify rather
+   * than assume — and the smallest honest way to verify it is to be able
+   * to write one.
+   *
+   * Named with the leading underscores that `__die` uses, for the same
+   * reason: nothing in an application should ever set it.
+   */
+  __seedPosture?: boolean;
 }
 
 /** Everything a picker or a strip needs to know, and nothing secret. */
 export interface DeviceStatus {
   deviceId: string;
   tier: Tier;
+  /** The index row's claim about how this device's identity RESTS.
+   * Every device the worker inits is `platform`; a namespace carrying an
+   * older seed-posture checkpoint resumes through the seed path
+   * regardless, because the engine forks on the manifest, not on this. */
   posture: Posture;
+  /** The agent id (a public key, hex) the engine reported when this
+   * device was FRESHLY INITED, or null before that has happened. A
+   * resume must still be this agent — the engine enforces it against the
+   * checkpoint manifest and refuses a mismatch by name. */
+  agentId: string | null;
   policy: UnsealPolicy;
   /** True until an unseal succeeds, true again after `reseal()`. The
    * headline fact. */
@@ -469,7 +464,11 @@ export interface Req {
 
 export type Res =
   | { id: number; ok: true; value: unknown }
-  | { id: number; ok: false; error: WireError };
+  // `failure`, not `error`: the field changed SHAPE at 0.4.0 (a
+  // discriminated union, not a flat record), and renaming it makes every
+  // call site a compile error rather than letting a stale reader pick
+  // fields off the wrong arm.
+  | { id: number; ok: false; failure: WireFailure };
 
 /** The unsolicited first message on every port. Reply id 0 is reserved
  * for it so a client can recognize it without a pending entry. */

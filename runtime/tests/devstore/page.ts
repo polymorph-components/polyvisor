@@ -28,6 +28,12 @@ import { filesystemWeb } from "@polyengine/wasi/filesystem-web";
 // PairingDriver adapter, pulled in so row 18 can prove it is
 // constructible over the REMOTE driver without a line changed.
 import { createEnginePairingDriver } from "../../pairing-engine.ts";
+import { unhex } from "../../engine.ts";
+// The brand predicate, IN THE PAGE'S REALM. Row 18's central claim since
+// the 0.4.0 bump is that `fromCloneable` mints a value this copy
+// recognizes — so the predicate has to be the page's own, not the
+// worker's, and not a field the worker asserted about itself.
+import { isComponentException, isTrap } from "@polyengine/runtime/embedder";
 import {
   adoptAnchor,
   anchorIsLive,
@@ -36,6 +42,7 @@ import {
   createDevice,
   createSealedDek,
   type DeviceConnection,
+  DEVICE_IDENTITY_KEY,
   deviceLockIsHeld,
   type DeviceLock,
   type DeviceNamespace,
@@ -49,6 +56,7 @@ import {
   loadOrMintIdentity,
   namespaceExists,
   newDeviceId,
+  type Posture,
   openNamespace,
   persistIdentity,
   promoteDevice,
@@ -85,12 +93,33 @@ const dec = new TextDecoder();
 /** What the driver gets back for a failure that was SUPPOSED to happen:
  * the error's own type and code, never a stringified stack. A refusal
  * that is not typed is a refusal callers have to parse. */
-function caught(e: unknown): { name: string; code: string; message: string } {
-  const err = e as { name?: string; code?: string; message?: string; fsCode?: string };
+function caught(
+  e: unknown,
+): { name: string; code: string; message: string; isWit: boolean; witPayload: unknown } {
+  const err = e as {
+    name?: string;
+    code?: string;
+    message?: string;
+    fsCode?: string;
+    payload?: unknown;
+  };
+  // THE TWO PATHS, REPORTED SEPARATELY (device-store/rpc.ts, "how a
+  // rejection crosses"). `code` is the host arm's contract; `isWit` and
+  // `witPayload` are the engine arm's, asked with the PAGE's own brand
+  // predicate so a row can tell a device-store refusal from something
+  // the guest actually said. A row that only looked at `message` would
+  // pass for either.
+  const isWit = isComponentException(e);
   return {
     name: err?.name ?? typeof e,
     code: err?.code ?? err?.fsCode ?? "",
     message: String(err?.message ?? e).slice(0, 200),
+    isWit,
+    witPayload: isWit && typeof err?.payload === "string"
+      ? err.payload.slice(0, 200)
+      : isWit
+      ? err?.payload
+      : undefined,
   };
 }
 
@@ -622,11 +651,20 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
   /** Make a T1 device the way the promotion moment does: create, then
    * promote WITH the seal choices. Returns the id for the driver to
    * carry across a reload. */
-  "hc-make": async (arg: { petname: string; policy: UnsealPolicy; promote: boolean }) => {
-    const d = await createDevice({ petname: arg.petname, unsealPolicy: arg.policy });
+  "hc-make": async (
+    arg: { petname: string; policy: UnsealPolicy; promote: boolean; posture?: Posture },
+  ) => {
+    const d = await createDevice({
+      petname: arg.petname,
+      unsealPolicy: arg.policy,
+      // The index row states how the identity RESTS. Every device the
+      // worker inits is platform posture now; the seed-back-compat row
+      // asks for `seed` so its row is not a lie either.
+      posture: arg.posture ?? "platform",
+    });
     if (arg.promote) await promoteDevice(d.id, { unsealPolicy: arg.policy });
     const row = await getDevice(d.id);
-    return { id: d.id, tier: row?.tier, policy: row?.unsealPolicy };
+    return { id: d.id, tier: row?.tier, policy: row?.unsealPolicy, posture: row?.posture };
   },
 
   /**
@@ -637,6 +675,7 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
   "hc-open": async (arg: {
     id?: string;
     anchorPetname?: string;
+    seedPosture?: boolean;
     unseal?: { passphrase?: string; untilReseal?: boolean };
   }) => {
     const conn = await connect(arg);
@@ -793,6 +832,97 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
     };
   },
 
+  /**
+   * THE AGENT ID, ASKED FROM BOTH SIDES.
+   *
+   * `status().agentId` is the worker's note of what the engine reported
+   * at this device's fresh init. On its own that is only our own memo,
+   * so the resumed ENGINE is asked the same question directly:
+   * `khKnowsAgent(unhex(id))` goes into the restored keyhive archive. A
+   * resume that had quietly minted a new identity would not know the old
+   * agent, and a resume that refused would not be answering at all.
+   *
+   * (The engine's own enforcement is stronger than either and is what
+   * row 22 pins: the manifest records the agent id, and a handed key
+   * that does not match it is refused by name.)
+   */
+  "hc-agent": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const status = await conn.status();
+    const agentId = status.agentId;
+    const knows = agentId === null
+      ? null
+      : await conn.driver.khKnowsAgent(unhex(agentId));
+    return {
+      agentId,
+      knows,
+      posture: status.posture,
+      resumed: status.resumed,
+      sealed: status.sealed,
+    };
+  },
+
+  /**
+   * PLANT A RIVAL IDENTITY in the device's namespace — a DIFFERENT but
+   * perfectly valid non-extractable Ed25519 pair, exactly the shape
+   * `loadOrMintIdentity` would hand back.
+   *
+   * This is the wrong-device / corrupt-namespace case made reproducible.
+   * The engine records the agent id in the checkpoint manifest, so the
+   * resume must notice that the key it was handed is not the key the
+   * state belongs to. The interesting failure it guards against is not a
+   * crash but a SILENT one: an embedder that treated the refusal as
+   * "nothing to resume" would call `init` and mint a third identity,
+   * losing every membership the device held.
+   */
+  "hc-plant-identity": async (arg: { id: string }) => {
+    const ns = openNamespace(arg.id);
+    const before = await loadIdentity(ns, DEVICE_IDENTITY_KEY);
+    const rival = await crypto.subtle.generateKey("Ed25519", false, [
+      "sign",
+      "verify",
+    ]) as CryptoKeyPair;
+    await persistIdentity(ns, DEVICE_IDENTITY_KEY, rival);
+    const after = await loadIdentity(ns, DEVICE_IDENTITY_KEY);
+    return {
+      hadOne: before !== null,
+      planted: after !== null,
+      // The rival is a real one: non-extractable, like every key this
+      // store will accept.
+      rivalExtractable: rival.privateKey.extractable,
+      different: before !== null && after !== null &&
+        (await rawPublic(before)).byteLength > 0 &&
+        hexOf(await rawPublic(before)) !== hexOf(await rawPublic(after)),
+    };
+  },
+
+  /**
+   * What the identity store actually holds, read back raw — the
+   * non-extractability claim at the storage layer rather than at the
+   * mint. Row 5 already pins this for a device the harness drives
+   * directly; this asks it of a namespace THE WORKER populated, which is
+   * the one the engine is now trusting.
+   */
+  "hc-identity-at-rest": async (arg: { id: string }) => {
+    const ns = openNamespace(arg.id);
+    const stored = await ns.get<CryptoKeyPair>("identity", DEVICE_IDENTITY_KEY);
+    if (!stored) return { present: false };
+    let exportRefused = false;
+    try {
+      await crypto.subtle.exportKey("pkcs8", stored.privateKey);
+    } catch {
+      exportRefused = true;
+    }
+    return {
+      present: true,
+      privateExtractable: stored.privateKey.extractable,
+      algorithm: stored.privateKey.algorithm.name,
+      usages: stored.privateKey.usages.join(","),
+      exportRefused,
+      publicHex: hexOf(await rawPublic(stored)).slice(0, 16),
+    };
+  },
+
   "hc-forget": async (arg: { ids: string[] }) => ({ cleanup: await cleanup(arg.ids) }),
 
   /**
@@ -834,41 +964,80 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
     const conn = conns.get(arg.id)!;
     const pairing = createEnginePairingDriver(conn.driver);
     const profile = await pairing.usProfileGet();
-    // The RAW rejection underneath, reported field by field — because
-    // the interesting failure mode of this row is passing for the wrong
-    // reason. A refusal raised by the HOST (a sealed device, a bad
-    // method name) is also a `DeviceHostError`, and it carries no WIT
-    // payload at all; only a rejection the ENGINE produced sets
-    // `isWitError`. The driver asserts on that bit, so a host refusal
-    // can no longer masquerade as the thing under test.
-    let wire: { isWitError: boolean; witPayload: unknown; name: string; message: string } | null =
-      null;
+
+    // THE RAW ENGINE REJECTION, inspected with the PAGE's own brand
+    // predicate. Since 0.4.0 the worker sends `toCloneable(error)` and
+    // client.ts rehydrates with `fromCloneable`, so what should arrive
+    // here is a genuine `ComponentException` minted by this copy — not a
+    // facsimile carrying a hand-rolled symbol, and not a bare Error.
+    let engine: {
+      isWit: boolean;
+      isTrapped: boolean;
+      name: string;
+      message: string;
+      payload: unknown;
+      hasStack: boolean;
+      /** A `DeviceHostError` would have one; a ComponentException must not. */
+      code: unknown;
+    } | null = null;
     try {
       await conn.driver.usProfileGet();
     } catch (e) {
       const d = e as {
         name: string;
         message: string;
-        isWitError: boolean;
-        witPayload?: unknown;
+        payload?: unknown;
+        stack?: string;
+        code?: unknown;
       };
-      wire = {
+      engine = {
+        isWit: isComponentException(e),
+        isTrapped: isTrap(e),
         name: d.name,
         message: String(d.message).slice(0, 120),
-        isWitError: d.isWitError,
-        witPayload: typeof d.witPayload === "string" ? d.witPayload.slice(0, 120) : d.witPayload,
+        payload: typeof d.payload === "string" ? d.payload.slice(0, 120) : d.payload,
+        hasStack: typeof d.stack === "string" && d.stack.length > 0,
+        code: d.code,
       };
     }
+
+    // The contrasting arm — a HOST refusal, which must NOT come back
+    // branded — is its own op (`hc-host-refusal`), because it needs the
+    // device SEALED and this one needs it open.
     return {
       constructed: typeof pairing.pairJoinStart === "function" &&
         typeof pairing.usEvents === "function",
       adapterOk: profile.ok,
       adapterError: profile.ok ? "" : String(profile.error).slice(0, 120),
       /** The adapter's error string IS the WIT payload, not a message —
-       * which is only true if the brand and the payload both survived. */
-      adapterUsedPayload: !profile.ok && wire !== null && profile.error === wire.witPayload,
-      wire,
+       * only true if the brand AND the payload both survived the port. */
+      adapterUsedPayload: !profile.ok && engine !== null && profile.error === engine.payload,
+      engine,
     };
+  },
+
+  /**
+   * A HOST refusal, inspected with the same predicate — the contrast
+   * that makes row 18's claim mean something. Calling the engine through
+   * a SEALED host is a `SealError` in the worker: not a WIT error, and
+   * it must arrive with its `code` intact and its brand absent.
+   */
+  "hc-host-refusal": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    try {
+      await conn.tasks.items();
+      return { refused: false };
+    } catch (e) {
+      const d = e as { name: string; message: string; code?: unknown; hostName?: unknown };
+      return {
+        refused: true,
+        isWit: isComponentException(e),
+        name: d.name,
+        hostName: d.hostName,
+        code: d.code,
+        message: String(d.message).slice(0, 120),
+      };
+    }
   },
 };
 
@@ -887,7 +1056,9 @@ const ARTIFACTS = {
  * re-attach, which is the point of the reload rows. */
 const conns = new Map<string, DeviceConnection>();
 
-function connect(arg: { id?: string; anchorPetname?: string }): Promise<DeviceConnection> {
+function connect(
+  arg: { id?: string; anchorPetname?: string; seedPosture?: boolean },
+): Promise<DeviceConnection> {
   const existing = arg.id ? conns.get(arg.id) : undefined;
   if (existing) return Promise.resolve(existing);
   return connectDevice({
@@ -899,6 +1070,9 @@ function connect(arg: { id?: string; anchorPetname?: string }): Promise<DeviceCo
     workerUrl: "./worker.js",
     artifacts: ARTIFACTS,
     label: "probe",
+    // PROBE ONLY, and only the seed-back-compat row passes it: the
+    // worker inits in platform posture otherwise.
+    __seedPosture: arg.seedPosture === true,
   }).then((c) => {
     conns.set(c.deviceId, c);
     return c;

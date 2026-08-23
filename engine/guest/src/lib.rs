@@ -19,6 +19,20 @@ wit_bindgen::generate!({
     path: "wit",
     world: "engine",
     generate_all,
+    // The world now NAMES `polymorph:webcrypto` types (the
+    // `device-identity` import hands over `signing-key`/`verifying-key`),
+    // so those interfaces must be remapped onto the bindings
+    // `polymorph-webcrypto-guest` already generated. Binding them a second
+    // time here would produce distinct, unconvertible resource types — the
+    // crate's own doc says exactly this ("Do not bind the same interfaces
+    // with a second `generate!` without that remapping", rust/guest/src/lib.rs:18).
+    // `signature` is what `device-identity` uses; `types` and `wrapping`
+    // are what `signature` itself uses, so they come along.
+    with: {
+        "polymorph:webcrypto/signature@0.1.0": polymorph_webcrypto_guest::bindings::signature,
+        "polymorph:webcrypto/types@0.1.0": polymorph_webcrypto_guest::bindings::types,
+        "polymorph:webcrypto/wrapping@0.1.0": polymorph_webcrypto_guest::bindings::wrapping,
+    },
 });
 
 mod pairing;
@@ -39,7 +53,7 @@ use futures::future::{AbortHandle, Abortable, LocalBoxFuture};
 
 use polymorph_webcrypto_guest::{
     aes_gcm::{self, AesVariant},
-    ed25519, Aead, AeadKeyOptions, SigningKey, SigningKeyOptions,
+    ed25519, Aead, AeadKeyOptions, SigningKey, SigningKeyOptions, VerifyingKey,
 };
 
 // The storage providers: protocol only. They handle opaque blobs at
@@ -177,6 +191,35 @@ impl IdentityKey {
             }
         }
     }
+}
+
+/// Consult the embedder's `device-identity` import (engine.wit).
+///
+/// `Ok(None)` is "this embedding persists no device identity" — the
+/// default every host gets from a stub fragment, and the unchanged
+/// mint-a-fresh-key path. `Ok(Some(..))` is the embedder-held pair,
+/// already resolved to the agent id the rest of the engine keys off.
+///
+/// The verifying half is exported here rather than trusted as handed:
+/// `export-key-raw` on a `verifying-key` is secret-free and always
+/// permitted (webcrypto.wit's `verifying-key.export-key-raw` — "There is
+/// no extractability gate on this resource"), and the 32 raw bytes ARE
+/// the agent id, so deriving it is the same operation a minted pair goes
+/// through in `init`. CONTRACT: the pair is NOT cross-checked (that the
+/// verifying key is the signing key's public half) — the port exposes no
+/// accessor that could, which is exactly why the pair travels together.
+async fn embedder_device_key() -> Result<Option<(IdentityKey, DalekVerifyingKey)>, String> {
+    let Some((signing, verifying)) = polyvisor::engine::device_identity::device_key_pair().await
+    else {
+        return Ok(None);
+    };
+    let vk_raw = VerifyingKey::from_raw(verifying)
+        .export_key_raw()
+        .await
+        .map_err(|e| format!("device-identity: export verifying key: {e}"))?;
+    let vk = DalekVerifyingKey::from_bytes(&arr32(&vk_raw, "device-identity verifying key")?)
+        .map_err(|e| format!("device-identity: parse verifying key: {e:?}"))?;
+    Ok(Some((IdentityKey::Platform(SigningKey::from_raw(signing)), vk)))
 }
 
 struct SignerInner {
@@ -2390,12 +2433,23 @@ impl DriverGuest for Component {
     async fn init(exportable_identity: bool) -> Result<String, String> {
         let (key, verifying) = if exportable_identity {
             // G5 demo-grade posture: a soft in-guest key the identity
-            // bundle can carry.
+            // bundle can carry. UNCHANGED, in every respect: the seed
+            // posture never consults `device-identity` (engine.wit).
             let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
             let vk = sk.verifying_key();
             (IdentityKey::Soft(Box::new(sk)), vk)
+        } else if let Some(handed) = embedder_device_key().await? {
+            // Platform posture, and this embedding persists a device
+            // identity: ADOPT it rather than minting. Everything
+            // downstream is identical to the minted path — the agent id
+            // comes from the handed verifying key exactly as it would
+            // from a freshly minted one — which is what makes the second
+            // boot the SAME device (engine.wit `device-identity`).
+            handed
         } else {
-            // Default posture: platform-held, non-extractable.
+            // Platform posture, no persistence granted: mint through the
+            // port. The behavior of every embedding that predates the
+            // `device-identity` import.
             let options = SigningKeyOptions {
                 sign: true,
                 extractable: false,

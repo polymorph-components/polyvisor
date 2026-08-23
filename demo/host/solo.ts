@@ -154,9 +154,13 @@ async function fetchArtifacts(name: string): Promise<EngineArtifacts> {
 }
 
 function err(e: unknown): string {
-  // `DeviceHostError` presents `payload` as an alias of the WIT err arm
-  // (device-store/rpc.ts), so one reader covers both the in-process and
-  // the remote driver.
+  // ONE READER FOR BOTH BACKENDS. Over the port the engine's errors
+  // arrive as REAL `ComponentException`s (device-store/rpc.ts: the
+  // worker sends `toCloneable`, client.ts rehydrates with
+  // `fromCloneable`), so `payload` is the WIT err arm exactly as it is
+  // in-process. The host's own refusals are `DeviceHostError`s with no
+  // payload and a typed `code` — those fall to `message` here, and the
+  // boot path below reads their `code` where it matters.
   const p = (e as { payload?: unknown }).payload;
   return typeof p === "string" ? p : String((e as { message?: string }).message ?? e);
 }
