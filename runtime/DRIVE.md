@@ -373,11 +373,37 @@ Recorded, not forgotten.
   observed at the fake); and the naming regression row — after a flush,
   the structure still resolves (`docs`/`pickup`, a doc folder with
   objects in it) while the doc id's hex appears in NO stored name
-  anywhere in the fake's tree, folders included.
+  anywhere in the fake's tree, folders included. **The account's storage
+  record** adds two more: a fresh account's `us-storage-get` answers an
+  ABSENCE and never an error (the sheet asks it on every open and treats
+  the answer as data); and a synthetic labeled gdrive record — client
+  pair included — put through the RPC survives `__die` + unseal with no
+  second write, because `usStoragePut` is deliberately absent from
+  `READONLY_METHODS` and therefore schedules a checkpoint like any other
+  mutation.
 - **e2e** `solo-gdrive`: the full ceremony headless through the real
   popup path (the fake's `/auth` redirect), tokens appearing NOWHERE in
   page storage, objects landing in the fake's store, reload → sync with
   nothing re-entered, reseal seals it, forget revokes.
+- **e2e** `solo-account-storage`: TWO independent solo devices in ONE
+  account, against the same fake — the headline of "The account syncs
+  its storage config; devices keep their credentials". B enrolls FIRST
+  (so A's bind is a change to an account B already belongs to), A binds
+  Drive through the full sheet ceremony and writes the record through,
+  B ANNOUNCES the change on the visor's rule line while its own store
+  is still unbound, B's sheet then leads with the account's destination
+  and offers NO field for folder, client id or client secret — only a
+  Connect button and the `#storage-diverge` escape hatch — and B binds
+  with a consent click and nothing typed. Both devices' flushes land in
+  ONE store: one root folder in the hidden space, and B's doc folders a
+  superset of A's, never a disjoint fork.
+- **Known coverage gap**: the S3 ADOPT path — a second device meeting an
+  account whose record is the s3 arm, with the addressing prefilled and
+  settled and the secret-key escrow as the only input — has NO e2e
+  scenario yet. The gdrive adopt path is the covered one
+  (`solo-account-storage`); the s3 half is exercised only by the sheet's
+  own code being shared between the two arms, which is a weaker claim
+  and is recorded here rather than implied to be tested.
 - Existing batteries stay green throughout: devstore matrix, e2e suite,
   invariants (nothing widens), pairing-bringup, resume-bringup, S3 acts.
 - **The live beat is manual and the operator's**: serve locally, solo →
@@ -455,6 +481,59 @@ refreshes with a client id and no secret at all. Google has no such
 client type for the code flow. A seam that grows a third OAuth backend
 should model "does this provider issue public clients" rather than
 assume either shape.
+
+### The account syncs its storage config; devices keep their credentials
+
+Ruled 2026-08-23 (owner's call, on the question "should BYO client
+credentials sync?"). The answer splits three ways, and the split is the
+bright line worth keeping legible:
+
+- **The DESTINATION and the CLIENT PAIR sync, through the account.**
+  They are account-level configuration BY NATURE: `drive.file` confines
+  visibility per client id (§2), and the layout hangs off root + space,
+  so every device MUST agree on all of them or the store forks —
+  invisibly, in the appdata space. Config that all devices are required
+  to agree on but each device types independently is a silent-fork
+  failure mode with a UI: a second device typing a
+  different-but-valid client id consents fine and then sees an EMPTY
+  store. So the account's user-system doc carries ONE storage-config
+  record (`us-storage-put`/`us-storage-get`, beside the partition
+  pointer map and for the same reason it exists), written through when
+  a device binds, announced on the others when it changes. The sync
+  channel is keyhive E2E — the record is ciphertext on the wire, in
+  the bucket, and in every checkpoint — and the client secret is APP
+  identity that every device legitimately holds in cleartext anyway,
+  so syncing it crosses no line that per-device sealing had not
+  already crossed. This does not contradict the never-in-URLs rule:
+  that is about UNTRUSTED channels (synced browser history, request
+  logs); this is the trusted E2E channel. Different question, opposite
+  answers, both right.
+- **TOKENS AND CONSENT stay per-device**, and not only on principle
+  (standing user credentials never cross even trusted channels): Google
+  treats a refresh token as one client session's, and concurrent use
+  of one refresh token from several devices risks token-family
+  invalidation — one device's refresh killing its siblings'. The
+  consent popup is also the moment the user authorizes THIS device,
+  and it costs one click.
+- **The SigV4 secret structurally cannot sync** — it exists only as a
+  non-extractable handle; there are no bytes to put in a document. The
+  S3 arm of the synced record therefore carries addressing and the
+  public access-key identifier only, and each device still escrows the
+  secret itself. The hierarchy is the honest one: what CAN be a handle
+  must be one (per-profile); what must be a string and is APP identity
+  may ride the account's E2E state; what must be a string and is USER
+  credential stays sealed per-device.
+
+The sheet's consequence: on a device whose account already carries a
+storage record, the storage sheet leads with "your account syncs
+through …" and the remaining ceremony is exactly the per-device part —
+the consent click (gdrive) or the secret-key escrow (s3). A bind that
+changes the destination writes the record through, which is a change
+the OTHER devices announce (`us-events`), never silently adopt.
+Recovery inherits the right property for free: the user-system doc
+rides the account, so a restored account knows where its bucket is —
+and holds the client pair to reach it, lacking only this device's own
+consent.
 
 ### The broker, parked with its measurements
 

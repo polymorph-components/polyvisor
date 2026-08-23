@@ -173,6 +173,35 @@ export interface Driver {
   usPartitionPut(name: string, id: Uint8Array): Promise<void>;
   usPartitions(): Promise<UsPartition[]>;
 
+  /** Write the account's storage record through (engine.wit's
+   * `us-storage-put`; DRIVE.md, "The account syncs its storage config;
+   * devices keep their credentials"). Overwrite semantics, one record
+   * per account — an account has one store.
+   *
+   * What rides it: the DESTINATION and, for gdrive, the BYO CLIENT PAIR.
+   * They are account-level config by nature — `drive.file` confines
+   * visibility per client id and the layout hangs off root + space — so
+   * every device must agree on all of them or the store forks
+   * invisibly. The client secret is APP identity every device
+   * legitimately holds in cleartext anyway, and the channel here is
+   * keyhive E2E, so syncing it crosses no line per-device sealing had
+   * not already crossed.
+   *
+   * What does NOT ride it, and the absence IS the enforcement: there is
+   * nowhere in `UsStorage` to put an OAuth refresh token or a consent
+   * grant, and the SigV4 secret structurally cannot appear (it exists
+   * only as a non-extractable handle — there are no bytes to write).
+   *
+   * The OTHER devices learn about a change through a `storage-changed`
+   * event and announce it; this one gets no echo of its own write. */
+  usStoragePut(s: UsStorage): Promise<void>;
+
+  /** The account's storage record, or `undefined` on an account that
+   * has never bound a store (and on a user-system doc written before
+   * this key existed — additive, exactly like the partition map). Never
+   * an error for "not set". */
+  usStorageGet(): Promise<UsStorage | undefined>;
+
   usContactsList(): Promise<Array<[Uint8Array, string]>>;
   usContactPut(card: Uint8Array, petname: string): Promise<void>;
 
@@ -279,7 +308,44 @@ export type UsEvent =
   | { kind: "mark-changed"; value: string }
   | { kind: "mark-conflict-repaired"; value: [string, string] } // (provenance, "petname"|"icon")
   | { kind: "device-added"; value: string } // name
-  | { kind: "device-revoked"; value: string };
+  | { kind: "device-revoked"; value: string }
+  /** The ACCOUNT'S storage destination changed on another device; the
+   * payload is the engine's provider name ("s3" | "gdrive"), the same
+   * bare-string shape `device-added` uses. DRIVE.md rules that such a
+   * bind "is a change the OTHER devices announce (`us-events`), never
+   * silently adopt" — so this is an announcement, not a re-point. */
+  | { kind: "storage-changed"; value: string };
+
+/** The S3 arm of the account's storage record — addressing, and NO
+ * SECRET, structurally. The SigV4 secret exists only as a
+ * non-extractable handle, so there are no bytes to put in a document;
+ * `accessKey` is the PUBLIC key identifier. Every device still escrows
+ * the secret itself, per device (DRIVE.md, same section). */
+export interface UsStorageS3 {
+  endpoint: string;
+  bucket: string;
+  accessKey: string;
+}
+
+/** The gdrive arm — addressing plus the BYO client pair. `root`,
+ * `apiBase`, `space` and `clientId` are all things every device must
+ * agree on or the store forks invisibly in the appdata space;
+ * `clientSecret` is app identity, not a user credential. No token
+ * field, by design: consent stays per-device. */
+export interface UsStorageGdrive {
+  root: string;
+  apiBase: string;
+  space: string;
+  clientId: string;
+  clientSecret: string;
+}
+
+/** `us-storage` — a WIT variant, so it lowers to the `{kind, value}`
+ * convention (see the value-mapping note above); kebab fields lower to
+ * camelCase. */
+export type UsStorage =
+  | { kind: "s3"; value: UsStorageS3 }
+  | { kind: "gdrive"; value: UsStorageGdrive };
 
 export interface TodoItem {
   id: string;

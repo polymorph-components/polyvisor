@@ -28,7 +28,7 @@ import { filesystemWeb } from "@polyengine/wasi/filesystem-web";
 // PairingDriver adapter, pulled in so row 18 can prove it is
 // constructible over the REMOTE driver without a line changed.
 import { createEnginePairingDriver } from "../../pairing-engine.ts";
-import { unhex } from "../../engine.ts";
+import { unhex, type UsStorage } from "../../engine.ts";
 // The storage-egress rows (28+): the page-side half of the credential
 // ceremony (`putSigningKey`, exactly as the visor's real sheet would
 // call it) and the moved factories under direct unit test (row 33,
@@ -1260,6 +1260,48 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
     const conn = conns.get(arg.id)!;
     const attempt = await refuses(() => conn.bindStore(arg.binding));
     return { attempt, status: await conn.status() };
+  },
+
+  // --- the ACCOUNT'S storage record (DRIVE.md, "The account syncs its
+  // --- storage config; devices keep their credentials") -------------------
+
+  /** The account this device belongs to, made here so the user-system
+   * doc exists at all — `us-storage-*` lives in that doc, beside the
+   * partition-pointer map, so there is nothing to read or write before
+   * it. Synthetic labeled profile. */
+  "hc-us-create": async (arg: { id: string; displayName: string }) => {
+    const conn = conns.get(arg.id)!;
+    const groupId = await conn.driver.userCreate({ displayName: arg.displayName, hue: 0 });
+    return { groupId: groupId.length };
+  },
+
+  /**
+   * Put the account's storage record, then WAIT OUT THE CHECKPOINT
+   * DEBOUNCE and report `lastCheckpoint` either side of it.
+   *
+   * That pair of timestamps is the row's real claim: `usStoragePut` is
+   * NOT in rpc.ts's `READONLY_METHODS` (see the note there — the list is
+   * of the queries, not of the mutations), so the RPC seam treats it as
+   * a mutation and schedules a checkpoint. The 1.5 s is comfortably past
+   * the 500 ms trailing edge, the same margin `hc-checkpoint-debounce`
+   * above uses.
+   */
+  "hc-us-storage-put": async (arg: { id: string; record: UsStorage }) => {
+    const conn = conns.get(arg.id)!;
+    const before = (await conn.status()).lastCheckpoint;
+    const attempt = await refuses(() => conn.driver.usStoragePut(arg.record));
+    await new Promise((r) => setTimeout(r, 1_500));
+    const after = (await conn.status()).lastCheckpoint;
+    return { attempt, before, after, readBack: (await conn.driver.usStorageGet()) ?? null };
+  },
+
+  /** Read the account's storage record. `null` here is the engine's own
+   * `none` — an account that has never bound a store — and must arrive
+   * as an absence, never as a rejection. */
+  "hc-us-storage-get": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const attempt = await attemptValue(async () => (await conn.driver.usStorageGet()) ?? null);
+    return { attempt };
   },
 
   /**

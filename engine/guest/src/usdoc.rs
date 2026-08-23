@@ -30,7 +30,7 @@ use automerge::transaction::Transactable;
 use automerge::{AutoCommit, ObjId, ObjType, ReadDoc, ScalarValue, Value, ROOT};
 
 use crate::exports::polyvisor::engine::driver::{
-    UsDevice, UsEvent, UsMark, UsPartition, UsProfile,
+    UsDevice, UsEvent, UsMark, UsPartition, UsProfile, UsStorage, UsStorageGdrive, UsStorageS3,
 };
 use crate::{arr32, with_state, Partition};
 
@@ -84,6 +84,29 @@ const DEVICES: &str = "devices";
 /// no `partitions` entry, and every read path below turns a missing map
 /// into an empty list rather than an error.
 const PARTITIONS: &str = "partitions";
+/// THE ACCOUNT'S STORAGE RECORD (DRIVE.md, "The account syncs its storage
+/// config; devices keep their credentials"). A single top-level map, not
+/// a family map: an account has one store, so this is overwrite
+/// semantics like `profile`, not an upsert-by-key like `partitions`.
+///
+/// Encoding, version-tolerantly: `storage."provider"` is the
+/// discriminant string ("s3" | "gdrive"), and each arm's fields live in
+/// a SUBMAP NAMED FOR THE ARM (`storage."gdrive"."client-id"`, …). The
+/// arms are namespaced rather than flattened so that a switch of
+/// provider cannot interleave with a concurrent write into a half-read
+/// record: the discriminant is one LWW register, and whichever arm it
+/// names is read whole from its own submap. A stale sibling submap is
+/// inert, a missing field reads as "", and an UNKNOWN discriminant reads
+/// as `None` — a device that predates a future arm reports "no storage
+/// record I understand" rather than erroring or inventing one.
+///
+/// ADDITIVE, like `partitions`: a document written before this key
+/// existed simply has no `storage` entry.
+///
+/// What the shape does NOT have is the enforcement: there is no token
+/// field and no consent field in any arm, and no s3 secret, so standing
+/// user credentials cannot ride the account even by accident.
+const STORAGE: &str = "storage";
 /// THE WALK-ANCHOR MAP a data partition carries: `agent id (hex) ->
 /// enrolled-at`. Written into every account partition when a device is
 /// enrolled (see `anchor_data_partitions`). It lives at the document
@@ -250,6 +273,98 @@ fn read_partitions(am: &AutoCommit) -> Vec<(String, Vec<u8>)> {
     out
 }
 
+/// The account's storage record as it sits in the document: the
+/// discriminant plus the named arm's own fields, nothing interpreted.
+/// Comparing this is what the event diff diffs.
+#[derive(Clone, PartialEq)]
+struct StorageRaw {
+    provider: String,
+    fields: BTreeMap<String, String>,
+}
+
+/// The arm submaps' field names, in the order the WIT records declare
+/// them. The lists are the ONLY place a field name is spelled, so a
+/// read and a write cannot drift apart.
+const S3_FIELDS: [&str; 3] = ["endpoint", "bucket", "access-key"];
+const GDRIVE_FIELDS: [&str; 5] = ["root", "api-base", "space", "client-id", "client-secret"];
+
+fn arm_fields(provider: &str) -> Option<&'static [&'static str]> {
+    match provider {
+        "s3" => Some(&S3_FIELDS),
+        "gdrive" => Some(&GDRIVE_FIELDS),
+        // A discriminant this build does not know: not an error, and not
+        // guessed at. See STORAGE's note on version tolerance.
+        _ => None,
+    }
+}
+
+fn read_storage(am: &AutoCommit) -> Option<StorageRaw> {
+    // Missing key: an account that never bound a store, or a document
+    // written before this key existed. Same tolerance as `partitions`.
+    let storage = map_at(am, STORAGE)?;
+    let provider = get_str(am, &storage, "provider")?;
+    let names = arm_fields(&provider)?;
+    let arm = child_map(am, &storage, &provider)?;
+    let mut fields = BTreeMap::new();
+    for name in names {
+        // A field the writer never wrote reads as "" rather than
+        // dropping the whole record.
+        fields.insert(
+            (*name).to_string(),
+            get_str(am, &arm, name).unwrap_or_default(),
+        );
+    }
+    Some(StorageRaw { provider, fields })
+}
+
+fn storage_to_wit(raw: &StorageRaw) -> Option<UsStorage> {
+    let f = |k: &str| raw.fields.get(k).cloned().unwrap_or_default();
+    match raw.provider.as_str() {
+        "s3" => Some(UsStorage::S3(UsStorageS3 {
+            endpoint: f("endpoint"),
+            bucket: f("bucket"),
+            // The PUBLIC key identifier. There is no secret field here,
+            // and cannot be: the SigV4 secret is a non-extractable
+            // handle, so there are no bytes to sync (DRIVE.md).
+            access_key: f("access-key"),
+        })),
+        "gdrive" => Some(UsStorage::Gdrive(UsStorageGdrive {
+            root: f("root"),
+            api_base: f("api-base"),
+            space: f("space"),
+            client_id: f("client-id"),
+            // App identity, not a user credential — the one secret the
+            // ruling lets ride the account's E2E state.
+            client_secret: f("client-secret"),
+        })),
+        _ => None,
+    }
+}
+
+/// The document form of a WIT record: `(provider, [(field, value)])`.
+fn storage_from_wit(s: &UsStorage) -> (&'static str, Vec<(&'static str, String)>) {
+    match s {
+        UsStorage::S3(v) => (
+            "s3",
+            vec![
+                ("endpoint", v.endpoint.clone()),
+                ("bucket", v.bucket.clone()),
+                ("access-key", v.access_key.clone()),
+            ],
+        ),
+        UsStorage::Gdrive(v) => (
+            "gdrive",
+            vec![
+                ("root", v.root.clone()),
+                ("api-base", v.api_base.clone()),
+                ("space", v.space.clone()),
+                ("client-id", v.client_id.clone()),
+                ("client-secret", v.client_secret.clone()),
+            ],
+        ),
+    }
+}
+
 /// Keep a subscription open to the user-system doc with every peer.
 ///
 /// Engine-driven because `us-*` hides doc identity by design, so the host
@@ -364,6 +479,10 @@ struct Snap {
     marks: BTreeMap<String, (String, String, Option<String>, u64, bool)>,
     repairs: BTreeSet<(String, String)>,
     devices: BTreeMap<String, (String, u64, bool)>,
+    /// The account's storage record. `None` until an account binds one;
+    /// compared WHOLE, so a change of any field (not just of provider)
+    /// is a change worth announcing.
+    storage: Option<StorageRaw>,
 }
 
 fn snapshot(am: &AutoCommit) -> Snap {
@@ -388,6 +507,7 @@ fn snapshot(am: &AutoCommit) -> Snap {
             .collect(),
         repairs: repaired.repairs,
         devices: read_devices(am),
+        storage: read_storage(am),
     }
 }
 
@@ -418,6 +538,25 @@ fn diff(pre: &Snap, post: &Snap) -> Vec<UsEvent> {
                 out.push(UsEvent::DeviceRevoked(name.clone()))
             }
             Some(_) => {}
+        }
+    }
+    // The account's storage destination changed somewhere else. The
+    // visor ANNOUNCES it and never silently adopts it (DRIVE.md, "The
+    // account syncs its storage config…": a bind that changes the
+    // destination "is a change the OTHER devices announce (`us-events`),
+    // never silently adopt"). Local-echo suppression is the same
+    // mechanism as for the profile: `write` re-baselines after the local
+    // author, so the writing device's own record never appears as a
+    // delta here.
+    //
+    // Only a record that EXISTS is announced: `None -> Some` is the
+    // account's first bind (announced), `Some -> Some` any later change,
+    // and a hypothetical `Some -> None` has no provider to name and no
+    // destination to warn about, so it stays silent rather than
+    // announcing an empty string.
+    if pre.storage != post.storage {
+        if let Some(s) = &post.storage {
+            out.push(UsEvent::StorageChanged(s.provider.clone()));
         }
     }
     out
@@ -1008,6 +1147,55 @@ pub(crate) async fn partitions_list() -> Result<Vec<UsPartition>, String> {
         .into_iter()
         .map(|(name, id)| UsPartition { name, id })
         .collect())
+}
+
+/// Write the account's storage record through (DRIVE.md, "The account
+/// syncs its storage config; devices keep their credentials").
+///
+/// Overwrite semantics, like `profile_set`: an account has one store.
+/// The discriminant and the arm's own submap are written together, and
+/// the OTHER arm's submap is left where it is — inert, since nothing
+/// reads a submap the discriminant does not name (see `STORAGE`).
+///
+/// Going through `write` is what suppresses the local echo: it pumps,
+/// authors, then re-baselines, so the writing device never drains a
+/// `storage-changed` for its own bind.
+pub(crate) async fn storage_put(s: UsStorage) -> Result<(), String> {
+    let (provider, fields) = storage_from_wit(&s);
+    write(move |am| {
+        let storage = match map_at(am, STORAGE) {
+            Some(s) => s,
+            None => am
+                .put_object(ROOT, STORAGE, ObjType::Map)
+                .map_err(|e| format!("storage map: {e}"))?,
+        };
+        let arm = match child_map(am, &storage, provider) {
+            Some(a) => a,
+            None => am
+                .put_object(&storage, provider, ObjType::Map)
+                .map_err(|e| format!("storage {provider} map: {e}"))?,
+        };
+        for (key, value) in &fields {
+            am.put(&arm, *key, value.as_str())
+                .map_err(|e| format!("storage {provider}.{key}: {e}"))?;
+        }
+        // Last, so a reader that observes the discriminant observes a
+        // fully-written arm behind it.
+        am.put(&storage, "provider", provider)
+            .map_err(|e| format!("storage provider: {e}"))?;
+        Ok(())
+    })
+    .await
+}
+
+/// The account's storage record, or `none` on an account that never
+/// bound a store (and on a document written before the key existed, and
+/// on a discriminant this build does not know).
+pub(crate) async fn storage_get() -> Result<Option<UsStorage>, String> {
+    pump().await?;
+    Ok(read_us(read_storage)?
+        .as_ref()
+        .and_then(storage_to_wit))
 }
 
 pub(crate) async fn devices_list() -> Result<Vec<UsDevice>, String> {

@@ -290,6 +290,26 @@ function describeEvent(ev: UsEvent, petnameOf: (provenance: string) => string | 
       return `device added: ${ev.name || "(unnamed)"}`;
     case "device-revoked":
       return `device revoked: ${ev.name || "(unnamed)"}`;
+    case "storage-changed": {
+      // The provider is the ENGINE's word, which makes it FRAMEWORK
+      // vocabulary rather than an app-influenced string — but it is
+      // still rendered through the visor's OWN display word for the
+      // provider, not echoed raw, which is the same discipline
+      // `describeEvent` applies everywhere else: name a fact in the
+      // visor's vocabulary, and fall back to the unnamed sentence when
+      // the vocabulary has no word (another build's provider). That
+      // fallback is deliberately not a raw echo.
+      //
+      // ANNOUNCE, NEVER SILENTLY ADOPT — DRIVE.md, "The account syncs
+      // its storage config; devices keep their credentials". This
+      // device's own store is untouched; the second clause says what
+      // the user has to DO, like the repair sentences above.
+      const named: Record<string, string> = { gdrive: "Google Drive", s3: "S3" };
+      const provider = named[ev.provider];
+      return provider
+        ? `your account now syncs its storage through ${provider} — connect this device from the storage sheet`
+        : "your account now syncs its storage somewhere new — connect this device from the storage sheet";
+    }
   }
 }
 

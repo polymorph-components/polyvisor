@@ -2501,6 +2501,104 @@ async function main() {
       await probe(page, "hc-forget", { ids: [id] });
     });
 
+    // --- 45: a fresh account has no storage record, and says so ------------
+    //
+    // AN ABSENCE, NEVER AN ERROR. `us-storage-get` answers `none` on an
+    // account that has never bound a store — and on a user-system doc
+    // written before this key existed, which is the same additive story
+    // the partition map has. The sheet's whole account-aware fork hangs
+    // off being able to ask this question cheaply on every open, so a
+    // rejection here would either cost the sheet a try/catch on the
+    // common path or, worse, get papered over into "no record".
+    //
+    // Deliberately asked on an account that EXISTS (`hc-us-create`
+    // first): "no user-system at all" is a different question, already
+    // pinned as the WIT-err arm of row 18's `usProfileGet`.
+    let acctDevice = "";
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "account-storage",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const id = made.id as string;
+      acctDevice = id;
+      await probe(page, "hc-open", { id, unseal: { passphrase: PASS, untilReseal: true } });
+      await probe(page, "hc-us-create", { id, displayName: "Synthetic Account" });
+
+      const fresh = await probe(page, "hc-us-storage-get", { id });
+      const ok = fresh.attempt.ok === true && fresh.attempt.value === null;
+      record(
+        "45 account-storage",
+        "a fresh account's storage record is an absence, not an error",
+        ok,
+        `on an account created moments ago and never bound to a store, us-storage-get ` +
+          `resolved (ok=${fresh.attempt.ok}) with ${j(fresh.attempt.value ?? null)} — \`none\`, ` +
+          `arriving as an absence over the RPC rather than as a rejection. That is what lets ` +
+          `the storage sheet ask "does my ACCOUNT have a destination?" on every open and treat ` +
+          `the answer as data (DRIVE.md, "The account syncs its storage config; devices keep ` +
+          `their credentials").`,
+      );
+    });
+
+    // --- 46: the account's storage record survives the host's death --------
+    //
+    // THE CHECKPOINT CLAIM, and it is a claim about a LIST rather than
+    // about the engine: `usStoragePut` is absent from rpc.ts's
+    // `READONLY_METHODS` — whose note says the list is "of the QUERIES,
+    // NOT of the MUTATIONS, on purpose" — so the RPC seam schedules a
+    // checkpoint for it exactly as it does for any other write. Put the
+    // record, let the 500 ms trailing edge fire, KILL the worker, unseal
+    // a fresh one with no ceremony: the record is there. Had the method
+    // been filed as a read, this row would come back with `null` and the
+    // account's destination would be a thing that quietly evaporated on
+    // a crash.
+    //
+    // The record is a SYNTHETIC LABELED gdrive one — the arm that
+    // carries the client pair, so this also pins that the pair makes the
+    // round trip through the port and the checkpoint. `client-secret` is
+    // app identity, not a user credential (DRIVE.md); no token field
+    // exists in the shape to lose.
+    await guard(async () => {
+      const id = acctDevice;
+      const record_ = {
+        kind: "gdrive" as const,
+        value: {
+          root: "SYNTHETIC-ACCOUNT-ROOT",
+          apiBase: gdOrigin,
+          space: "appdata",
+          clientId: "SYNTHETIC-CLIENT-ID.example",
+          clientSecret: "SYNTHETIC-CLIENT-SECRET-LABEL",
+        },
+      };
+      const put = await probe(page, "hc-us-storage-put", { id, record: record_ });
+
+      await probe(page, "hc-die", { id });
+      const back = await probe(page, "hc-open", { id, unseal: {} });
+      const after = await probe(page, "hc-us-storage-get", { id });
+
+      const scheduled = put.after !== null && put.after !== put.before;
+      const survived = after.attempt.ok === true && j(after.attempt.value) === j(record_);
+      const ok = put.attempt.refused === false && j(put.readBack) === j(record_) &&
+        scheduled && back.unseal.refused === false && survived;
+      record(
+        "46 account-storage",
+        "the account's storage record survives the host's death (the put scheduled a checkpoint)",
+        ok,
+        `a synthetic labeled gdrive record went in through the RPC and read straight back ` +
+          `(${j(put.readBack)}) — the variant round-tripped as {kind, value} and the kebab ` +
+          `fields as camelCase. lastCheckpoint moved across the put's debounce window ` +
+          `(${j(put.before)} → ${j(put.after)}, changed=${scheduled}): \`usStoragePut\` is NOT ` +
+          `in rpc.ts's READONLY_METHODS, whose note says that list is of the queries and never ` +
+          `of the mutations, so the seam scheduled a checkpoint. The worker was then KILLED and ` +
+          `a fresh one unsealed with NO ceremony and NO second put — us-storage-get returns the ` +
+          `SAME record (${survived}), client pair included. Filed as a read, this row would ` +
+          `come back \`null\`.`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
     await ctx.close();
   } finally {
     await browser.close();
