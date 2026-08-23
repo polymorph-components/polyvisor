@@ -68,7 +68,7 @@ import {
 import { SigningKey, VerifyingKey } from "@polymorph/webcrypto-polyengine";
 import { getDevice } from "./index.ts";
 import { DEVICE_IDENTITY_KEY, loadOrMintIdentity } from "./identity-keys.ts";
-import { type DeviceNamespace, openNamespace } from "./namespace.ts";
+import { type DeviceNamespace, destroyNamespace, openNamespace } from "./namespace.ts";
 import {
   createSealedDek,
   enablePrf,
@@ -214,6 +214,23 @@ let lastCheckpoint: number | null = null;
 
 /** What `attach` was told. Null until the first client attaches. */
 let attached: AttachSpec | null = null;
+
+/**
+ * THE DEVICE WAS ERASED, and this global outlived the erasure by
+ * whatever it takes to post one reply and close.
+ *
+ * `destroy` deletes the namespace out from under everything this global
+ * owns, so the window between "the storage is gone" and "the global is
+ * gone" must not be a window in which anything else can run: a call
+ * arriving from a second tab would otherwise reopen the database it just
+ * deleted (`openNamespace` creates), and the fresh, empty namespace
+ * would have no index row pointing at it — orphaned storage nothing
+ * would ever collect. So the flag is a REFUSAL, not bookkeeping: after
+ * it is set, every method except `destroy` itself and the `__die` probe
+ * rejects, and a racing client hears a sentence instead of inheriting a
+ * half-alive host.
+ */
+let destroyed = false;
 
 /**
  * OPEN THE DEVICE — the login (PERSISTENCE.md, "Unseal UX": "Unseal is
@@ -906,6 +923,58 @@ async function callHost(method: string, args: unknown[]): Promise<unknown> {
       return await checkpoint();
     case "status":
       return await status();
+    case "destroy": {
+      // "ERASE THIS DEVICE" — the user's explicit one, and the only
+      // method here that ends with there being nothing left to host.
+      //
+      // ORDER IS THE WHOLE OF IT, because `destroyNamespace` deletes a
+      // database and an OPFS directory that three different things in
+      // this global are still entitled to write to.
+      //
+      // 1. THE DEBOUNCE TIMER. A mutation within the last 500 ms has a
+      //    checkpoint armed; letting it fire after the delete would
+      //    recreate the namespace's files behind an index row that no
+      //    longer exists.
+      if (debounceTimer !== undefined) {
+        clearTimeout(debounceTimer);
+        debounceTimer = undefined;
+      }
+      // 2. THE CHAIN. A checkpoint already RUNNING is mid-write into the
+      //    state root; draining is the only way to be sure none outlives
+      //    the storage. Awaiting the chain (rather than `checkpoint()`)
+      //    is safe by construction — the chain swallows failures so that
+      //    later checkpoints do not inherit a rejection, so this cannot
+      //    turn a stale background write into a refused erasure.
+      await checkpointChain;
+      // 3. THE REFUSAL GOES UP BEFORE THE FIRST DELETE, so nothing that
+      //    arrives while the awaits below are outstanding can reopen
+      //    what is being torn down.
+      destroyed = true;
+      // The key and the engine go the way `reseal` sends them, and for a
+      // sharper version of the same reason: the mounted state root
+      // closes over the DEK and over files that are about to stop
+      // existing. There is no dispose call on an `Engine` — dropping the
+      // reference is what we have — so the honest claim is unchanged: no
+      // NEW call can reach that instance and the wasm instance is
+      // garbage, while an in-flight call still holds its own closure
+      // until it settles. The identity promise goes too; its handles
+      // live in the `identity` store, which is one of the things being
+      // deleted.
+      dek = null;
+      engine = null;
+      resumed = null;
+      lastCheckpoint = null;
+      identityPair = undefined;
+      // The device leaves: database, OPFS directory, index row. A throw
+      // here PROPAGATES — the client's ceremony is built to refuse on
+      // it, and a swallowed failure would report an erasure that did not
+      // happen. (This is a SharedWorker, so the wasi fs backend cannot
+      // be holding OPFS sync-access handles: with the chain drained and
+      // the engine dropped, the recursive removal has nothing left to
+      // contend with.)
+      await destroyNamespace(DEVICE_ID);
+      return "destroyed";
+    }
     case "__die":
       // PROBE ONLY, and named to look like it. `SharedWorkerGlobalScope.close()`
       // is the only way to make this global go away on demand, which is
@@ -921,6 +990,15 @@ async function callHost(method: string, args: unknown[]): Promise<unknown> {
 }
 
 async function call(target: string, method: string, args: unknown[]): Promise<unknown> {
+  // THE ERASED-DEVICE REFUSAL, in front of every surface at once —
+  // `callHost` is reachable only from here, so this one place is the
+  // whole of it. `destroy` stays open because it is idempotent and a
+  // retry of a partly-failed erasure is a thing a client is entitled to
+  // do; `__die` stays open because closing the global is never wrong for
+  // a device that no longer exists.
+  if (destroyed && !(target === "host" && (method === "destroy" || method === "__die"))) {
+    throw new Error(`device-store: this device was erased (${target}.${method} refused)`);
+  }
   if (target === "host") return await callHost(method, args);
   if (!engine) {
     throw new SealError("no-rung", "the device is sealed; unseal it before calling the engine");
@@ -975,7 +1053,12 @@ function serve(port: MessagePort): void {
   ports.add(port);
   port.onmessage = (ev: MessageEvent<Req>) => {
     const { id, target, method, args } = ev.data ?? ({} as Req);
-    const dying = target === "host" && method === "__die";
+    // BOTH METHODS END THE GLOBAL, for the same mechanical reason and
+    // two different purposes: `__die` is the crash probe, and `destroy`
+    // has just deleted everything this global exists to own. A host left
+    // running over an erased namespace would keep a lock and a lease
+    // alive for a device the index no longer lists.
+    const dying = target === "host" && (method === "__die" || method === "destroy");
     call(target, method, args ?? []).then(
       (value) => {
         const res: Res = { id, ok: true, value };
@@ -1013,11 +1096,17 @@ function serve(port: MessagePort): void {
     );
     if (target === "host" && method === "detach") {
       ports.delete(port);
-      if (ports.size === 0) {
+      if (ports.size === 0 && !destroyed) {
         // TRIGGER 3. Fire-and-forget by construction — there is nobody
         // left to report to, and the global may be torn down before this
         // settles. That is the "best-effort" in the design record,
         // meant literally.
+        //
+        // NOT AFTER AN ERASE. `checkpoint()` would throw on the dropped
+        // engine and the throw would be swallowed here anyway, so the
+        // guard buys no safety it did not already have — it states the
+        // intent, which is that the last tab of an erased device leaves
+        // without writing anything back.
         if (debounceTimer !== undefined) {
           clearTimeout(debounceTimer);
           debounceTimer = undefined;

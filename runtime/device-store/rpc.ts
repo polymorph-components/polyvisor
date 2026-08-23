@@ -515,6 +515,7 @@ export type HostMethod =
   | "reseal"
   | "checkpoint"
   | "status"
+  | "destroy"
   | "__die";
 
 export interface Req {

@@ -163,6 +163,26 @@ export interface DeviceConnection {
    * checkpoint a chance) and stop listening. Idempotent. */
   close(): Promise<void>;
   /**
+   * ERASE THIS DEVICE — the user's explicit one, and the end of this
+   * connection.
+   *
+   * The worker destroys its OWN namespace (database, OPFS directory,
+   * index row) and then closes its global, which is what releases the
+   * device lock and the lease. It has to be the worker's own hand: the
+   * host is the only thing that can drain its checkpoint chain and drop
+   * the engine before the storage goes, and a page deleting a live
+   * device's database from underneath it would race a background
+   * checkpoint into recreating what it just deleted.
+   *
+   * THIS ONE IS NOT BEST-EFFORT, unlike `close()`. It is the fallible
+   * half of an erase ceremony (visor/ui/sheets.ts's `onReset` contract):
+   * a caller is meant to await it FIRST and let a rejection refuse the
+   * whole ceremony, so that a device whose storage is still there is
+   * never reported as erased. Afterwards this connection is closed and
+   * every call on it fails with the closed-connection error.
+   */
+  destroy(): Promise<void>;
+  /**
    * PROBE ONLY: ask the host to `close()` its own global — a crash,
    * on demand. Nothing in an application should call this; it exists so
    * a kill-and-resume gate can kill a host without also destroying the
@@ -367,6 +387,25 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
     worker.port.close();
   };
 
+  const destroy = async (): Promise<void> => {
+    // THE REPLY IS AWAITED, in full and on the ordinary timeout: the
+    // whole value of this call is in the answer, because a rejection is
+    // what refuses the ceremony that called it. So no `Promise.race`
+    // against a short timer here — that pattern belongs to `close()`,
+    // whose value is in the worker rather than in the reply.
+    await send("host", "destroy", []);
+    // Only now. The connection is dead either way once the worker closes
+    // its global, but flipping `closed` before the reply would turn a
+    // refusal into an unusable connection over a device that still
+    // exists. The pagehide handler below reads the same flag, so the
+    // farewell `detach` it would otherwise post — to a host that has
+    // erased itself — is a no-op from here on.
+    closed = true;
+    for (const [, entry] of pending) clearTimeout(entry.timer);
+    pending.clear();
+    worker.port.close();
+  };
+
   // `pagehide` rather than `unload`: it fires in the cases `unload` is
   // increasingly not delivered for, and it is the last point at which a
   // `postMessage` is still worth attempting. The page is
@@ -388,6 +427,7 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
     checkpoint: () => send("host", "checkpoint", []) as Promise<number>,
     status: () => send("host", "status", []) as Promise<DeviceStatus>,
     close,
+    destroy,
     __die: async () => {
       await send("host", "__die", []);
       closed = true;
