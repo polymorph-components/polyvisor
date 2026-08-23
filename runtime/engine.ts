@@ -33,7 +33,31 @@ export type StoreConfig =
   | {
     kind: "dropbox";
     value: { root: string };
+  }
+  | {
+    kind: "gdrive";
+    value: { root: string; apiBase: string; space: "appdata" | "drive" };
   };
+// gdrive: addressing only, exactly like every other arm (DRIVE.md §2)
+// — this is the user-only provider (DRIVE.md §1), so there is no
+// credential here at all, not even a public identifier like S3's
+// access key. `apiBase` is config for the same reason S3's `endpoint`
+// is: a self-hosted (or fake) backend is ordinary addressing, not a
+// probe hack.
+//
+// `space` picks WHERE in the user's Drive the root folder sits, and
+// "appdata" is the default wherever a chooser has to pick one. It is a
+// location choice, not a second strategy: the `docs`/`pickup` layout
+// and the keyed names are identical in both. Hidden appdata makes "no
+// sharing" platform-enforced (Drive cannot share those files at all)
+// and puts the store out of reach of a Drive-UI rename, which on a
+// store addressed by keyed name would strand a file for good. Visible
+// "drive" stays available because appdata cannot be inspected by its
+// owner and is orphaned INVISIBLY by an app/client rotation — and
+// because a live beat against real Google is only checkable by eye in
+// a visible folder. The value is a plain string, mirroring the WIT
+// record's plain-string fields; the guest validates it and refuses an
+// unknown value by name at initStore.
 
 // WIT `result<T, string>` returns resolve T / throw ComponentException.
 export interface Driver {

@@ -59,6 +59,7 @@ import soloPersistence from "./scenarios/solo-persistence.ts";
 import soloErase from "./scenarios/solo-erase.ts";
 import soloEphemeral from "./scenarios/solo-ephemeral.ts";
 import soloStorage from "./scenarios/solo-storage.ts";
+import soloGdrive from "./scenarios/solo-gdrive.ts";
 import soloPasskey from "./scenarios/solo-passkey.ts";
 import visorReset from "./scenarios/visor-reset.ts";
 
@@ -139,6 +140,14 @@ const SCENARIOS: Scenario[] = [
   // because a failure here with solo-persistence green says the fault is
   // in the store-egress wiring, not in the device store underneath it.
   soloStorage,
+  // GOOGLE DRIVE FROM THE WORKER HOST (runtime/DRIVE.md's e2e gate): the
+  // same solo page, the same fresh context, but this one needs no MinIO
+  // at all — it drives its own in-process fake Drive instead, and runs
+  // right after the S3 storage scenario without disturbing the
+  // harness's MinIO (which stays up regardless, for everything after
+  // it). The real popup path is the point: the worker mints PKCE, the
+  // page only ever opens a window and relays a one-shot code.
+  soloGdrive,
   // THE PRF RUNG (passkey unseal, PERSISTENCE.md). Follows the device
   // store's other two for the same reason they follow solo-pairing: a
   // failure here with those two green says the fault is in the passkey

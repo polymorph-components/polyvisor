@@ -172,8 +172,10 @@ widens this round, and that was checked rather than assumed.
 
 ## Parked, explicitly
 
-Dropbox-from-the-worker (the v2 worker-run token exchange above); the
-solo storage picker/panels registry; per-device keystore partitioning
+Dropbox-from-the-worker (the v2 worker-run token exchange above — since
+BUILT for Google Drive, see [DRIVE.md](./DRIVE.md), which makes the
+Dropbox retrofit cheap when wanted); the solo storage picker/panels
+registry; per-device keystore partitioning
 (would break the shared-escrow model for no strength gain at this
 tier); bucket-only sync between two solo devices as an e2e scenario
 (wants a relay the harness can drop mid-scenario); widening the

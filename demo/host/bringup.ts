@@ -6,11 +6,15 @@
 //   deno run -A host/bringup.ts solo          # one instance, no wire
 //   deno run -A host/bringup.ts wire          # two instances over the relay
 //   deno run -A host/bringup.ts bucket        # MinIO flush + cold pull
+//   deno run -A host/bringup.ts gdrive        # fake Drive flush + cold pull
 //
 // Infra (relay, MinIO) is started by the justfile.
 
 import { type Engine, hex, newEngine, unhex, until } from "../../runtime/engine.ts";
 import { probeNet, probeNoNet, probeReaderNet } from "./probe-net.ts";
+import { type FakeDrive, type FakeSpace, startFakeDrive } from "./fake-drive.ts";
+import { ComponentException } from "@polyengine/runtime/embedder";
+import type { EngineNet, StoreFetch } from "../../runtime/engine.ts";
 import { filesystemNode } from "@polyengine/wasi/filesystem-node";
 
 const RELAY = "http://127.0.0.1:3340";
@@ -226,6 +230,358 @@ async function bucket() {
   }
 }
 
+// --- phase: gdrive -----------------------------------------------------------
+//
+// The user-only provider (runtime/DRIVE.md): the full owner beat
+// (initStore → ensureBucket → grant → flush) plus a COLD SECOND ENGINE
+// that reconstructs the document from the fake Drive alone. It mirrors
+// the `bucket` phase beat for beat, with one deliberate difference that
+// is the whole point of the provider: the cold engine is NOT wired
+// reader-only, because there is no anonymous tier to read through. Its
+// authority is the USER'S OWN OAuth — a second device of the same
+// account, with its own consent (DRIVE.md §4: bearers are never shared
+// between devices), and the only tier this store has.
+
+const GDRIVE_ROOT = "pm-bringup";
+
+/** Run the fake's consent ceremony with real PKCE and return the access
+ * token. Synthetic material throughout: the fake mints
+ * `synthetic-access-N`, and what it actually gates on is that the
+ * verifier we present hashes to the challenge it recorded. */
+async function driveConsent(fake: FakeDrive): Promise<string> {
+  const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const challenge = base64url(
+    new Uint8Array(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier) as BufferSource),
+    ),
+  );
+  const auth = new URL(`${fake.url}/auth`);
+  auth.searchParams.set("redirect_uri", "http://127.0.0.1:1/relay");
+  auth.searchParams.set("state", "bringup-state");
+  auth.searchParams.set("code_challenge", challenge);
+  auth.searchParams.set("code_challenge_method", "S256");
+  const res = await fetch(auth, { redirect: "manual" });
+  if (res.status !== 302) throw new Error(`/auth answered ${res.status}, expected 302`);
+  await res.body?.cancel();
+  const back = new URL(res.headers.get("location") ?? "");
+  if (back.searchParams.get("state") !== "bringup-state") {
+    throw new Error("consent did not echo the state");
+  }
+  const code = back.searchParams.get("code");
+  if (!code) throw new Error("consent returned no code");
+  const tokenRes = await fetch(`${fake.url}/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      code_verifier: verifier,
+      redirect_uri: "http://127.0.0.1:1/relay",
+    }),
+  });
+  const body = await tokenRes.json();
+  if (!tokenRes.ok) throw new Error(`/token refused: ${JSON.stringify(body)}`);
+  return body.access_token as string;
+}
+
+function base64url(bytes: Uint8Array): string {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+/** The gdrive seam set, wired the way DRIVE.md §1 says this provider is
+ * wired: owner over the API origin with the held bearer injected AT THE
+ * SEAM (the guest never sees it), and the other three REFUSING — empty
+ * origin sets and no signer, so "no sharing" is structural rather than a
+ * flag the guest could be talked out of. */
+function driveNet(apiBase: string, accessToken: string): EngineNet {
+  const granted = new URL(apiBase).origin;
+  const owner: StoreFetch = async (method, url, headers, body) => {
+    const target = new URL(url).origin;
+    if (target !== granted) {
+      throw new ComponentException(`store-owner-fetch: origin not granted: ${target}`);
+    }
+    const empty = method === "GET" || method === "HEAD" || body.length === 0;
+    try {
+      const res = await fetch(url, {
+        method,
+        headers: [...headers, ["authorization", `Bearer ${accessToken}`]],
+        body: empty ? undefined : body.slice() as unknown as BodyInit,
+      });
+      return { status: res.status, body: new Uint8Array(await res.arrayBuffer()) };
+    } catch (e) {
+      throw new ComponentException(
+        `store-owner-fetch: transport: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  };
+  const refuseTier = (name: string): StoreFetch => () =>
+    Promise.reject(
+      new ComponentException(`${name}: this provider mints no capability (user-only store)`),
+    );
+  return {
+    ownerFetch: owner,
+    publicFetch: refuseTier("store-public-fetch"),
+    sharedFetch: refuseTier("store-shared-fetch"),
+    signer: () =>
+      Promise.reject(new ComponentException("store-signer: no SigV4 on this provider")),
+  };
+}
+
+/** The two storage spaces, and the fake's name for each.
+ *
+ * `"appdata"` FIRST because it is the default: where a space has to be
+ * chosen and nothing says otherwise — this harness's own config
+ * included — the hidden per-app folder is the answer. It makes "no
+ * sharing" platform-enforced (Drive cannot share appdata files at all)
+ * and puts a store addressed by keyed name out of reach of a Drive-UI
+ * rename, which would otherwise strand a file permanently. `"drive"`
+ * is proved beside it because it is a supported choice, not a legacy
+ * one: appdata cannot be inspected by its owner and an app rotation
+ * orphans it invisibly. */
+const GDRIVE_SPACES: [space: "appdata" | "drive", fake: FakeSpace][] = [
+  ["appdata", "appDataFolder"],
+  ["drive", "drive"],
+];
+
+/** The whole owner beat + cold pull, in ONE space, against a fake that
+ * both spaces share. Parameterized rather than duplicated, because the
+ * property under test is that the beat is IDENTICAL in both: the space
+ * changes where the root folder sits and nothing below it. */
+async function gdriveBeat(
+  artifacts: { envelope: string; bytes: Uint8Array },
+  fake: FakeDrive,
+  space: "appdata" | "drive",
+) {
+  // The fake's spelling of the same choice: `appdata` is the config
+  // value the guest validates, `appDataFolder` is Drive's own alias.
+  const fakeSpace: FakeSpace = space === "appdata" ? "appDataFolder" : "drive";
+
+  // Two consents, two tokens — one per device, never shared.
+  const ownerToken = await driveConsent(fake);
+  const coldToken = await driveConsent(fake);
+  if (ownerToken === coldToken) throw new Error("the two devices got the same token");
+  step(`consent ×2 (PKCE verified by the fake): ${ownerToken}, ${coldToken}`);
+
+  const owner = await newEngine("owner", artifacts, driveNet(fake.url, ownerToken));
+  const cold = await newEngine("cold", artifacts, driveNet(fake.url, coldToken));
+  step("instantiated owner + cold");
+  try {
+    const ownerId = unhex(await owner.driver.init(false));
+    const coldId = unhex(await cold.driver.init(false));
+    step("init ×2");
+
+    // Enrollment cards are host-carried (neither device has a wire).
+    await owner.driver.khIngestContact(await cold.driver.khContactCard());
+    await cold.driver.khIngestContact(await owner.driver.khContactCard());
+    step("contact cards pasted both ways");
+
+    const part = await owner.driver.createPartition();
+    await owner.driver.khAddMember(part, coldId, "edit");
+    await owner.driver.sealPartition(part);
+    step("partition sealed with the cold device as a member");
+
+    // An unknown space is refused BY NAME at init-store, never
+    // defaulted: a typo that silently fell back would put the store in
+    // the other space, where the walk finds nothing and the next flush
+    // rebuilds the tree — indistinguishable from data loss. `"appData"`
+    // is the plausible wrong spelling, which is why it is the one used.
+    let spaceRefusal = "";
+    await owner.driver.initStore({
+      kind: "gdrive",
+      value: { root: GDRIVE_ROOT, apiBase: fake.url, space: "appData" as "appdata" },
+    }).catch((e) => {
+      spaceRefusal = String(e);
+    });
+    if (!spaceRefusal.includes('unknown value "appData"')) {
+      throw new Error(`an unknown space should be refused by name, got: ${spaceRefusal || "OK"}`);
+    }
+    step(`unknown space refused: ${spaceRefusal.replace(/^\w*Error:\s*/, "")}`);
+
+    const store = {
+      kind: "gdrive" as const,
+      value: { root: GDRIVE_ROOT, apiBase: fake.url, space },
+    };
+    await owner.driver.initStore(store);
+    await owner.driver.ensureBucket();
+    // THE RULING (DRIVE.md §1): grant returns NONE. There is no link to
+    // carry because there is nothing a link could grant.
+    const granted = await owner.driver.storeGrant(part, ownerId);
+    const grantedCold = await owner.driver.storeGrant(part, coldId);
+    if (granted !== undefined || grantedCold !== undefined) {
+      throw new Error(
+        `store-grant minted a capability on the user-only store: ${granted} / ${grantedCold}`,
+      );
+    }
+    step("store configured + pickups written (grant returned none, as it must)");
+
+    await owner.tasks.add("drive task");
+    await owner.tasks.add("second drive task");
+    console.log("  flush:", await owner.driver.bucketFlush(part));
+    step("authored + flushed");
+
+    // WHAT AN OBSERVER OF THE STORE IS PREVENTED FROM LEARNING.
+    // Names are keyed now (DRIVE.md §2), so the assertion can no longer
+    // be "a child called manifest-<hex>" — it is STRUCTURE plus the
+    // negative property that is the point of the derivation: the doc
+    // id's hex appears NOWHERE in the tree, so listing this account
+    // tells you how much is stored and not which document it belongs
+    // to.
+    const docsChildren = fake.childNames(`${GDRIVE_ROOT}/docs`, fakeSpace);
+    if (docsChildren.length !== 1) {
+      throw new Error(`expected one doc folder under docs, got ${JSON.stringify(docsChildren)}`);
+    }
+    const docFolder = `${GDRIVE_ROOT}/docs/${docsChildren[0]}`;
+    const children = fake.childNames(docFolder, fakeSpace);
+    // chunk ×2 + oplog + manifest for the one flushing device.
+    if (children.length < 3) {
+      throw new Error(`too few objects landed in the fake: ${JSON.stringify(children)}`);
+    }
+    const pickups = fake.childNames(`${GDRIVE_ROOT}/pickup`, fakeSpace);
+    if (pickups.length !== 2) {
+      throw new Error(`expected two pickup objects (owner + cold), got ${JSON.stringify(pickups)}`);
+    }
+    const partHex = hex(part);
+    const everyName = fake.files().map((f) => f.name);
+    const leaked = everyName.filter((n) => n.includes(partHex));
+    if (leaked.length > 0) {
+      throw new Error(`a stored name carries the doc id: ${JSON.stringify(leaked)}`);
+    }
+    step(
+      `objects in the fake: ${children.length} under ${docFolder}, ${pickups.length} pickups; ` +
+        `no name among ${everyName.length} carries the doc id`,
+    );
+
+    await cold.driver.initStore(store);
+    await cold.driver.adoptPartition(part);
+    // A pickup argument is refused BY NAME, not ignored (DRIVE.md §1).
+    let refusal = "";
+    await cold.driver.bucketPull(part, ownerId, "https://example.invalid/whatever")
+      .catch((e) => {
+        refusal = String(e);
+      });
+    if (!refusal.includes("mints no pickup capability")) {
+      throw new Error(`link-tier pull should be refused by name, got: ${refusal || "success"}`);
+    }
+    step("link-tier pull refused by name (this store has no link tier)");
+
+    console.log("  pull:", await cold.driver.bucketPull(part, ownerId, undefined));
+    const snap = await cold.tasks.items();
+    step(`cold pull: rev=${snap.revision} items=${snap.items.length}`);
+    if (snap.items.length !== 2) throw new Error("cold boot incomplete");
+
+    // Every request the engines made carried a bearer, and every one of
+    // them went to the fake's files API: no tier but the owner's exists.
+    const files = fake.requests().filter((r) => r.path.includes("/drive/v3/"));
+    if (files.some((r) => !r.hasAuth)) {
+      throw new Error("a files-API request left without a bearer");
+    }
+    step(`${files.length} files-API requests, all bearing the owner seam's token`);
+
+    // Revoke, and the honest note (DRIVE.md §1): the pickup object goes
+    // away, and there is nothing else to take back because nothing was
+    // ever minted. The lever that actually cuts off a credential holder
+    // is at Google, not here, and the note says so.
+    const note = await owner.driver.storeRevoke(part, coldId);
+    if (!note.includes("never minted a capability")) {
+      throw new Error(`revoke note does not tell the truth about this store: ${note}`);
+    }
+    // The pickup object is name-keyed-INDEPENDENT (it is where the
+    // keychain is learned), so it is still identifiable here — by count
+    // rather than by a name the harness can spell.
+    if (fake.childNames(`${GDRIVE_ROOT}/pickup`, fakeSpace).length !== 1) {
+      throw new Error("revoke did not leave exactly the owner's own pickup behind");
+    }
+    step(`revoke: ${note.replaceAll(/\s+/g, " ")}`);
+  } catch (e) {
+    dumpOnFail([["owner", owner], ["cold", cold]]);
+    throw e;
+  }
+}
+
+async function gdrive() {
+  const artifacts = await loadArtifacts();
+  const fake = await startFakeDrive();
+  step(`fake drive up on ${fake.url}`);
+  try {
+    // ONE fake for both beats, deliberately: two fakes could not tell
+    // an isolated store from a fresh one. Sharing the server means the
+    // second beat writes the SAME root folder name into the other
+    // space, so the assertions below are about isolation and not about
+    // two servers happening to differ.
+    const landed: Record<string, Set<string>> = {};
+    for (const [space, fakeSpace] of GDRIVE_SPACES) {
+      const before = new Set(fake.files().map((f) => f.id));
+      console.log(`\n--- gdrive space=${space} (fake: ${fakeSpace}) ---`);
+      await gdriveBeat(artifacts, fake, space);
+      const after = fake.files().filter((f) => !before.has(f.id));
+      // POSITIVE assertion, not an absence: every file this beat
+      // created is IN the space it asked for. An engine that ignored
+      // the setting entirely would still pass a "the other space is
+      // empty" check on the first beat; it cannot pass this one.
+      const stray = after.filter((f) => f.space !== fakeSpace);
+      if (stray.length > 0) {
+        throw new Error(
+          `space=${space}: ${stray.length} file(s) landed in the wrong space: ` +
+            JSON.stringify(stray.map((f) => [f.name, f.space])),
+        );
+      }
+      landed[fakeSpace] = new Set(after.map((f) => f.id));
+      // The layout is the SAME in both spaces — that is what makes the
+      // space a storage location rather than a second strategy.
+      const top = fake.childNames(GDRIVE_ROOT, fakeSpace).sort();
+      if (JSON.stringify(top) !== JSON.stringify(["docs", "pickup"])) {
+        throw new Error(`space=${space}: unexpected root layout ${JSON.stringify(top)}`);
+      }
+      step(`space=${space}: ${after.length} files, all in ${fakeSpace}, layout ${top.join("+")}`);
+    }
+
+    // THE ISOLATION ASSERTIONS, now that both stores exist side by side
+    // under the same root NAME. Each space resolves that name to its
+    // OWN folder, and neither space's objects appear in the other's
+    // listing.
+    const appRoot = fake.byPath(GDRIVE_ROOT, "appDataFolder");
+    const visRoot = fake.byPath(GDRIVE_ROOT, "drive");
+    if (!appRoot || !visRoot) {
+      throw new Error(
+        `both spaces should hold a ${GDRIVE_ROOT} folder: ` +
+          `appdata=${appRoot?.id}, drive=${visRoot?.id}`,
+      );
+    }
+    if (appRoot.id === visRoot.id) {
+      throw new Error("the two spaces resolved the SAME root folder — no isolation at all");
+    }
+    const appIds = landed["appDataFolder"];
+    const visNames = new Set(
+      fake.files().filter((f) => f.space === "drive").map((f) => f.id),
+    );
+    const bleed = [...appIds].filter((id) => visNames.has(id));
+    if (bleed.length > 0) {
+      throw new Error(`appdata objects are visible to the drive space: ${JSON.stringify(bleed)}`);
+    }
+    // And by NAME, which is how a device would actually look: the
+    // appdata doc folder is not among the visible space's doc folders.
+    const appDocs = fake.childNames(`${GDRIVE_ROOT}/docs`, "appDataFolder");
+    const visDocs = fake.childNames(`${GDRIVE_ROOT}/docs`, "drive");
+    const shared = appDocs.filter((n) => visDocs.includes(n));
+    if (appDocs.length !== 1 || visDocs.length !== 1 || shared.length > 0) {
+      throw new Error(
+        `doc folders are not separate per space: appdata=${JSON.stringify(appDocs)} ` +
+          `drive=${JSON.stringify(visDocs)}`,
+      );
+    }
+    step(
+      `isolation: roots ${appRoot.id}(appdata) vs ${visRoot.id}(drive), ` +
+        `${appIds.size} appdata objects invisible to a default-space listing`,
+    );
+
+    console.log("\nGDRIVE BRINGUP PASS");
+  } finally {
+    await fake.close();
+  }
+}
+
 // --- phase: resume -----------------------------------------------------------
 //
 // The #20 G5 kill-and-resume beat under Deno (runtime/PERSISTENCE.md
@@ -421,6 +777,7 @@ const phases: Record<string, () => Promise<void>> = {
   solo,
   wire,
   bucket,
+  gdrive,
   resume,
   // The two halves `resume` re-execs; not meant to be run by hand, but
   // harmless and useful when debugging one side in isolation.

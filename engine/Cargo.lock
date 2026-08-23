@@ -1294,6 +1294,7 @@ dependencies = [
  "polymorph-webcrypto-guest",
  "provider-common",
  "provider-dropbox",
+ "provider-gdrive",
  "provider-s3",
  "rand 0.8.7",
  "sedimentree_core",
@@ -2711,6 +2712,15 @@ dependencies = [
 
 [[package]]
 name = "provider-dropbox"
+version = "0.0.0"
+dependencies = [
+ "hex",
+ "provider-common",
+ "serde_json",
+]
+
+[[package]]
+name = "provider-gdrive"
 version = "0.0.0"
 dependencies = [
  "hex",

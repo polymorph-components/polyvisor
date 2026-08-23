@@ -41,7 +41,7 @@ import {
   makePublicFetch,
   makeSharedFetch,
 } from "../../store-egress.ts";
-import type { StoreBinding } from "../../device-store/rpc.ts";
+import type { OauthStartSpec, StoreBinding } from "../../device-store/rpc.ts";
 // The brand predicate, IN THE PAGE'S REALM. Row 18's central claim since
 // the 0.4.0 bump is that `fromCloneable` mints a value this copy
 // recognizes — so the predicate has to be the page's own, not the
@@ -151,6 +151,22 @@ async function refuses(body: () => Promise<unknown>): Promise<
     return { refused: false, error: null };
   } catch (e) {
     return { refused: true, error: caught(e) };
+  }
+}
+
+/**
+ * Like `refuses`, but for a call whose SUCCESS value the row also needs
+ * (`oauthStart`'s `authorizeUrl`, `oauthComplete`'s `DeviceStatus`).
+ * `refuses` swallows it; the gdrive rows want both arms observable
+ * without two different helpers per call site.
+ */
+async function attemptValue<T>(
+  body: () => Promise<T>,
+): Promise<{ ok: true; value: T } | { ok: false; error: ReturnType<typeof caught> }> {
+  try {
+    return { ok: true, value: await body() };
+  } catch (e) {
+    return { ok: false, error: caught(e) };
   }
 }
 
@@ -1317,6 +1333,62 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
     return { notGranted, sharedRefused };
   },
 
+  // --- Google Drive (rows 34+) ------------------------------------------
+  //
+  // THE PAGE OWNS THE POPUP; THE WORKER OWNS THE VERIFIER (DRIVE.md §3).
+  // These three ops are the whole of the page's role in the ceremony:
+  // ask the worker for a URL, relay back what the popup produced, and
+  // ask to disconnect. The popup itself is the harness's job in this
+  // matrix (run.ts fetches the authorize URL with `redirect: "manual"`
+  // against the in-process fake and parses `code`/`state` off the
+  // Location header) — the e2e suite drives the real window.
+
+  /** `oauthStart` on its own value, not just its refusal — the row
+   * needs the `authorizeUrl` to hand to the harness's fetch. */
+  "gd-oauth-start": async (arg: { id: string; spec: OauthStartSpec }) => {
+    const conn = conns.get(arg.id)!;
+    return await attemptValue(() => conn.oauthStart(arg.spec));
+  },
+
+  /** `oauthComplete` on its own value: the resulting `DeviceStatus`,
+   * whose only word on the subject is `gdriveConsent` — null, or the
+   * SPACE the consent was granted for (addressing, DRIVE.md §5) — and
+   * never a token. */
+  "gd-oauth-complete": async (arg: { id: string; code: string; state: string }) => {
+    const conn = conns.get(arg.id)!;
+    return await attemptValue(() => conn.oauthComplete(arg.code, arg.state));
+  },
+
+  /** `forgetOauth`'s own value: the `DeviceStatus` after the sealed
+   * consent is gone and best-effort revoked at the (fake) provider. */
+  "gd-forget": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    return await attemptValue(() => conn.forgetOauth());
+  },
+
+  /**
+   * `bucketFlush` for a docId NEVER FLUSHED BEFORE on this device — the
+   * `ensureBucket` op the s3/gdrive rows otherwise reuse is idempotent
+   * on repeat calls (the guest caches resolved folder ids in instance
+   * memory, DRIVE.md §2's "caches folder ids in instance memory"), so a
+   * SECOND `ensureBucket()` against an already-created root can succeed
+   * with no network call at all and would silently pass a refusal row
+   * for the wrong reason. `bucketFlush` for this device's own task
+   * partition — never flushed anywhere in this matrix before it's
+   * called — always attempts the write (engine/guest/src/lib.rs's
+   * `bucket_flush`: "the guest cannot know whether the wired seam holds
+   * a token, and refusing early would be guessing"), so it is the
+   * genuine probe of whatever the owner seam currently holds.
+   */
+  "gd-flush": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const docId = await conn.tasks.partition();
+    // The doc id travels back as hex so a row can assert the NEGATIVE
+    // property keyed names exist for: that this hex appears in no
+    // stored name anywhere in the provider's tree.
+    const docHex = [...docId].map((b) => b.toString(16).padStart(2, "0")).join("");
+    return { attempt: await refuses(() => conn.driver.bucketFlush(docId)), docHex };
+  },
 };
 
 // --- the host client, per page ----------------------------------------------

@@ -83,8 +83,13 @@ import type { PrfEnrollment } from "./seal.ts";
  * `SealedFsError.fsCode` ("io"), `IdentityKeyError.code`
  * ("extractable", "algorithm", "unavailable"), the worker's own storage
  * binding refusals ("bad-destination", "no-credential" — worker.ts's
- * `StoreError`), plus this module's own "timeout", "closed" and
- * "unclonable".
+ * `StoreError`), the worker's OAuth-ceremony refusals ("bad-ceremony" —
+ * a complete with no pending ceremony, or a state that does not match
+ * the one the worker minted; "exchange-failed" — the provider's token
+ * endpoint refused the exchange, named by HTTP status and never by body
+ * content, since a token-endpoint body can echo the request back —
+ * worker.ts's `OauthError`), plus this module's own "timeout", "closed"
+ * and "unclonable".
  */
 export interface HostError {
   message: string;
@@ -473,12 +478,111 @@ export interface AttachSpec {
  *
  * It is also the shape the engine's `StoreConfig` "s3" arm carries, on
  * purpose: the worker re-applies it as `initStore` at every bring-up.
+ *
+ * THE GDRIVE ARM SAYS THE SAME THING IN ITS OWN PROVIDER'S VOCABULARY
+ * (DRIVE.md §5). `root` and `apiBase` are addressing — `apiBase` for
+ * exactly the reason S3's `endpoint` is config, because a self-hosted or
+ * fake backend is ordinary addressing rather than a probe hack — and
+ * `clientId` is an APP IDENTIFIER, not a user secret: an installed-app
+ * OAuth client id, public by nature (DRIVE.md §3, where Google's own
+ * documentation is quoted saying an installed app's client secret is
+ * "not treated as a secret"). It rides on the binding because the
+ * `drive.file` scope confines visibility PER CLIENT ID (§2), so the
+ * client id is part of the store's identity beside the root folder.
+ *
+ * What still never appears on this type: the user's own tokens. The
+ * access and refresh tokens are born in the worker, rest sealed there,
+ * and have no path across this wire in either direction (§3).
  */
-export interface StoreBinding {
-  kind: "s3";
-  endpoint: string;
-  bucket: string;
-  accessKey: string;
+export type StoreBinding =
+  | {
+    kind: "s3";
+    endpoint: string;
+    bucket: string;
+    accessKey: string;
+  }
+  | {
+    kind: "gdrive";
+    root: string;
+    apiBase: string;
+    clientId: string;
+    /**
+     * WHICH DRIVE SPACE THE ROOT FOLDER SITS IN — `"appdata"` for the
+     * hidden per-app space, `"drive"` for an ordinary visible folder in
+     * My Drive (DRIVE.md §5). ADDRESSING, exactly like `root` and
+     * `apiBase`: it names a place, grants nothing, and everything below
+     * the root folder is identical between the two.
+     *
+     * It is nonetheless not free to change: the space determines the
+     * OAuth SCOPE the consent was granted under (see `OauthStartSpec`),
+     * so a binding whose space disagrees with the sealed consent's is
+     * refused at bind rather than discovered as a provider 403 later.
+     */
+    space: GdriveSpace;
+  };
+
+/**
+ * The two Drive storage spaces this store can address (DRIVE.md §5).
+ *
+ * `"appdata"` is the default wherever a chooser must pick one: the
+ * hidden per-app space cannot be shared at all (the platform enforces
+ * it rather than the strategy promising it), and it is out of reach of
+ * a Drive-UI rename, which on a store addressed by keyed name would
+ * strand a file permanently. `"drive"` stays available because appdata
+ * cannot be inspected by its own owner and is orphaned INVISIBLY by an
+ * app/client rotation.
+ */
+export type GdriveSpace = "appdata" | "drive";
+
+/**
+ * WHAT THE WORKER NEEDS IN ORDER TO RUN THE OAUTH CEREMONY (DRIVE.md
+ * §3, "The worker runs the OAuth; the page runs the popup").
+ *
+ * The page owns the popup because a window is a page capability; the
+ * worker owns the verifier, the exchange and the tokens. So what crosses
+ * on the way IN is app identity plus addressing, and what crosses on the
+ * way BACK is a URL — never a token.
+ */
+export interface OauthStartSpec {
+  provider: "gdrive";
+  /** The installed-app client id. Public by nature (DRIVE.md §3). */
+  clientId: string;
+  /**
+   * The installed-app client secret, when the registered client class
+   * has one. IT IS AN APP IDENTIFIER, NOT A USER SECRET (DRIVE.md §3):
+   * it identifies the app, gates nothing without the user's consent, and
+   * is the same class as the Dropbox appKey/appSecret the demo's grant
+   * already carries in page memory. That is why it may cross this wire
+   * when the bearer never may.
+   */
+  clientSecret?: string;
+  /**
+   * WHICH SPACE THIS CONSENT IS BEING ASKED FOR, and it belongs on the
+   * ceremony rather than only on the binding because THE SPACE
+   * DETERMINES THE SCOPE (DRIVE.md §3/§5): `"appdata"` asks for
+   * `drive.appdata` (the hidden per-app space and nothing else),
+   * `"drive"` asks for `drive.file` (files this app created in the
+   * user's visible Drive). Those are two different permissions on two
+   * different consent screens, so choosing a space is a CONSENT-TIME
+   * decision, not merely a bind-time one — and changing it later means
+   * asking the user again.
+   */
+  space: GdriveSpace;
+  /** Where the provider sends the consent result. A loopback URI for a
+   * desktop-client pair; the page's own URL in a deployment. */
+  redirectUri: string;
+  /** ADDRESSING OVERRIDES for a self-hosted or fake backend (the
+   * devstore harness's fake Drive, DRIVE.md's Gates section). Absent,
+   * Google's own endpoints are used. */
+  authUrl?: string;
+  tokenUrl?: string;
+}
+
+/** What comes back out: a URL for the page to open a popup on. Public
+ * data — every parameter in it is either app identity or a PKCE
+ * challenge, and the verifier it was derived from stays in the worker. */
+export interface OauthStartResult {
+  authorizeUrl: string;
 }
 
 /** Everything a picker or a strip needs to know, and nothing secret. */
@@ -548,6 +652,29 @@ export interface DeviceStatus {
    * sealed device's storage is unknown, not absent.
    */
   storage: StoreBinding | null;
+  /**
+   * The sealed Google Drive consent this namespace holds, or null
+   * (DRIVE.md §5), so a sheet can offer bind-without-ceremony.
+   *
+   * NULL MEANS THE SAME TWO THINGS `storage` NULL DOES, for the same
+   * structural reason: the oauth row rests under the DEK, so a SEALED
+   * host genuinely cannot know whether one is there. Read it together
+   * with `sealed`.
+   *
+   * IT IS A NULLABLE RECORD RATHER THAN A BOOLEAN, and it mirrors
+   * `storage: StoreBinding | null` right above it for the same reason:
+   * a boolean plus a separate space field is two facts that can
+   * disagree, and one of the two would eventually be read without the
+   * other. One nullable record cannot disagree with itself — the space
+   * exists exactly when the consent does.
+   *
+   * STILL NOTHING SECRET. The space is ADDRESSING (which permission was
+   * granted, hence where this device may write), the same class as the
+   * binding's own `space`. No token, no expiry, no account name —
+   * nothing else derived from the sealed row ever appears on this type
+   * (DRIVE.md §3/§4).
+   */
+  gdriveConsent: { space: GdriveSpace } | null;
 }
 
 export type HostMethod =
@@ -560,6 +687,9 @@ export type HostMethod =
   | "status"
   | "bindStore"
   | "unbindStore"
+  | "oauthStart"
+  | "oauthComplete"
+  | "forgetOauth"
   | "destroy"
   | "__die";
 
