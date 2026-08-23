@@ -377,15 +377,37 @@ async function gdrive() {
     console.log("  flush:", await owner.driver.bucketFlush(part));
     step("authored + flushed");
 
-    const docFolder = `${GDRIVE_ROOT}/docs/${hex(part)}`;
+    // WHAT AN OBSERVER OF THE STORE IS PREVENTED FROM LEARNING.
+    // Names are keyed now (DRIVE.md §2), so the assertion can no longer
+    // be "a child called manifest-<hex>" — it is STRUCTURE plus the
+    // negative property that is the point of the derivation: the doc
+    // id's hex appears NOWHERE in the tree, so listing this account
+    // tells you how much is stored and not which document it belongs
+    // to.
+    const docsChildren = fake.childNames(`${GDRIVE_ROOT}/docs`);
+    if (docsChildren.length !== 1) {
+      throw new Error(`expected one doc folder under docs, got ${JSON.stringify(docsChildren)}`);
+    }
+    const docFolder = `${GDRIVE_ROOT}/docs/${docsChildren[0]}`;
     const children = fake.childNames(docFolder);
-    if (!children.some((n) => n.startsWith("manifest-"))) {
-      throw new Error(`no manifest landed in the fake: ${JSON.stringify(children)}`);
+    // chunk ×2 + oplog + manifest for the one flushing device.
+    if (children.length < 3) {
+      throw new Error(`too few objects landed in the fake: ${JSON.stringify(children)}`);
     }
-    if (!fake.byPath(`${GDRIVE_ROOT}/pickup/${hex(part)}/${hex(coldId)}`)) {
-      throw new Error("the cold device's pickup object is not in the fake");
+    const pickups = fake.childNames(`${GDRIVE_ROOT}/pickup`);
+    if (pickups.length !== 2) {
+      throw new Error(`expected two pickup objects (owner + cold), got ${JSON.stringify(pickups)}`);
     }
-    step(`objects in the fake: ${children.length} under ${docFolder}`);
+    const partHex = hex(part);
+    const everyName = fake.files().map((f) => f.name);
+    const leaked = everyName.filter((n) => n.includes(partHex));
+    if (leaked.length > 0) {
+      throw new Error(`a stored name carries the doc id: ${JSON.stringify(leaked)}`);
+    }
+    step(
+      `objects in the fake: ${children.length} under ${docFolder}, ${pickups.length} pickups; ` +
+        `no name among ${everyName.length} carries the doc id`,
+    );
 
     await cold.driver.initStore(store);
     await cold.driver.adoptPartition(part);
@@ -421,8 +443,11 @@ async function gdrive() {
     if (!note.includes("never minted a capability")) {
       throw new Error(`revoke note does not tell the truth about this store: ${note}`);
     }
-    if (fake.byPath(`${GDRIVE_ROOT}/pickup/${hex(part)}/${hex(coldId)}`)) {
-      throw new Error("revoke left the pickup object behind");
+    // The pickup object is name-keyed-INDEPENDENT (it is where the
+    // keychain is learned), so it is still identifiable here — by count
+    // rather than by a name the harness can spell.
+    if (fake.childNames(`${GDRIVE_ROOT}/pickup`).length !== 1) {
+      throw new Error("revoke did not leave exactly the owner's own pickup behind");
     }
     step(`revoke: ${note.replaceAll(/\s+/g, " ")}`);
 

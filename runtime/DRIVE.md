@@ -17,8 +17,9 @@ it.
 
 `gdrive` is a guest provider crate statically linked into the engine
 composite (a `store-config` arm and six match sites; no wac change),
-modeled on Dropbox's plain-derivable-path strategy with the entire link
-machinery removed: every call runs Route::Owner, and the grant an
+modeled on Dropbox's folder-shaped strategy with the entire link
+machinery removed and S3's name-keyed object naming in place of
+Dropbox's plain paths: every call runs Route::Owner, and the grant an
 embedder derives for it is owner = the API origin, public = ∅,
 shared = ∅ — the unused tiers are EMPTY, refusing by construction. The
 OAuth ceremony splits across the port along capability lines: the PAGE
@@ -40,21 +41,36 @@ story, and this provider's point is that there is none).
   therefore structural, in exactly #7's sense: `store-public-fetch` and
   `store-shared-fetch` are wired over empty origin sets, and the guest's
   gdrive paths never call them.
-- `store-grant(doc, member)` still writes the member's K_p pickup object
-  at a derivable path — the pull layer's key bootstrap, which the
+- `store-grant(doc, member)` still writes the member's pickup object at
+  a derivable path — the pull layer's key bootstrap, which the
   ACCOUNT'S OWN DEVICES need (each device is its own agent with its own
   prekeys) — and returns NONE: there is no link to carry because there
-  is nothing a link could grant. (Recorded fact from implementation: at
-  this revision the pickup record is WRITE-ONLY — the owner-tier pull
-  derives the device set from the doc folder's own listing, and keys
-  arrive through the keyhive op stream — so it is the mandated bootstrap
-  record, not yet a dependency. It becomes load-bearing the moment a
-  pull path exists that cannot list the folder.)
+  is nothing a link could grant. (Recorded fact, UPDATED once names
+  became keyed (§2): this record WAS write-only, because the owner-tier
+  pull derived its device set from the doc folder's own listing. Keyed
+  names make that listing unparseable, so the pickup is now the only
+  bootstrap — it carries the name-key keychain and the device set, the
+  same pair S3's K_p carries, and the pull cannot start without it. The
+  clause that predicted this — "it becomes load-bearing the moment a
+  pull path exists that cannot list the folder" — came due by way of a
+  pull that can list the folder and learn nothing from it. Note the
+  keychain is a SECRET but still not a CAPABILITY: knowing a name lets
+  you derive where an object sits, never read it, because every read on
+  this provider goes through the owner seam's OAuth.)
 - `store-revoke` deletes the pickup and returns the honest note: this
   store never minted a capability, so there is nothing server-side to
   revoke; a party holding the user's own Drive credential is outside
   this store's reach, and credential rotation at Google is the real
-  lever. (A consequence that follows from grant-returns-none and is
+  lever. It does NOT rotate the name-key epoch, and the difference from
+  S3 — whose revoke does — is deliberate: on S3, names ARE the read tier
+  (the bucket serves unsigned public GETs, so a name is sufficient
+  authority), and a fresh epoch is the hard forward boundary that stops
+  a revoked holder of the old key from reading new writes. Here there is
+  no anonymous tier at all, so a name is authority for nothing and
+  rotating it would be ceremony with no boundary behind it. The reading
+  side still walks a keychain newest-first exactly as S3's does, so a
+  future revision that grows a reason to rotate needs only the trigger.
+  (A consequence that follows from grant-returns-none and is
   accepted: the engine's pickup-link table stays empty on this provider,
   so revoking a member who was never granted deletes nothing and
   succeeds quietly. A louder refusal would need a grantee list the
@@ -74,9 +90,45 @@ story, and this provider's point is that there is none).
   folder ids in instance memory, and never creates duplicates itself
   (upload is list-then-create-or-update: multipart create when absent,
   media PATCH when present).
-- Layout mirrors Dropbox's: root folder (the binding's `root`) →
-  `docs/<hex(doc)>` folders holding `<kind>-<hex(id)>` children;
-  `pickup/<hex(doc)>` folders holding per-member pickup objects.
+- Layout mirrors Dropbox's SHAPE with S3's NAMES: root folder (the
+  binding's `root`) → a `docs` folder holding one folder per document,
+  and a flat `pickup` folder holding per-member bootstrap objects. Doc
+  folder names and their children's names are KEYED — `hex(HMAC(
+  name-key, kind ‖ id))`, the S3 provider's construction verbatim — so
+  the fixed words `docs` and `pickup` are the only labels an observer
+  reads. The doc folder is keyed under the doc's FOUNDING name-key
+  (epoch 0) rather than the current one, because a Drive folder is a
+  container and a container that renamed itself on an epoch boundary
+  would strand everything inside it; the objects within stay per-epoch
+  exactly as S3's are.
+- The reason names are keyed here rather than left plain like Dropbox's:
+  contents are keyhive ciphertext already, so names were the remaining
+  disclosure, and doc ids have the two properties that hurt. They are
+  GLOBAL — the same shared document carries the same id in every
+  member's store, so anyone who can list two accounts learns from the
+  names alone that those accounts share a document — and STABLE, so
+  activity on one document is trackable indefinitely. This provider's
+  threat surface is metadata-only by construction (`drive.file` plus
+  ciphertext), which is exactly why the metadata was worth spending a
+  derivation on.
+- THE PICKUP OBJECT IS THE ONE UNKEYED LOCATION, and the exception is
+  what makes the rest possible: it is where a member LEARNS the
+  keychain, so a member who does not hold the keychain yet must still be
+  able to find it. Its name mirrors S3's `kp_location` —
+  `hex(SHA-256("kp" ‖ doc ‖ owner ‖ member))` — and it sits FLAT under
+  `pickup`, with no per-doc subfolder, because any unkeyed per-doc
+  folder name (the doc id plain, or hashed) would be a global, stable
+  per-document label in every member's store: the precise disclosure the
+  keying removes. What it costs is S3's cost, unchanged: a party who
+  already knows the whole (doc, owner, member) triple can confirm the
+  object exists. Existence privacy wants a pairwise-secret location and
+  is the same #19/#10 item for both providers.
+- CONSEQUENCE FOR THE PULL, recorded because it moved a load-bearing
+  part: the owner-tier pull used to derive its device set by parsing
+  `oplog-<hex>` off the doc folder's own listing. Keyed names make that
+  listing opaque, so the device set and the keychain now arrive inside
+  the sealed pickup object, exactly as S3's K_p delivers them. The
+  bootstrap record described in §1 is therefore no longer write-only.
 - `gdrive-config` is `{ root, api-base }` — ADDRESSING ONLY, like every
   other arm. `api-base` defaults to `https://www.googleapis.com` and
   exists for the same reason S3's endpoint is config: a self-hosted (or
@@ -214,8 +266,11 @@ Recorded, not forgotten.
 - **Engine**: clippy + wasm build + compose + translate; a new headless
   bringup phase `gdrive` — the full owner beat (initStore → ensureBucket
   → grant self → flush) plus a cold second engine pulling from the
-  bucket alone, against an in-process fake Drive. Existing `solo`,
-  `resume`, `pair` batteries unchanged.
+  bucket alone, against an in-process fake Drive. The cold pull is also
+  what proves the keyed naming did not cost findability: a second device
+  reconstructs the whole document from a store whose every name it can
+  only derive, never read. Existing `solo`, `resume`, `pair` batteries
+  unchanged.
 - **The fake** (demo/host/fake-drive.ts, one module for bringup, the
   devstore harness and e2e): minimal files API (`files.list` with the
   q-subset the strategy emits, multipart create, media update,
@@ -230,7 +285,10 @@ Recorded, not forgotten.
   re-ceremony (binding AND tokens survive sealed; initStore re-applied);
   401→refresh→retry with the re-sealed token surviving a second kill;
   reseal/unseal; unbind keeps consent, forget deletes it (+revoke
-  observed at the fake).
+  observed at the fake); and the naming regression row — after a flush,
+  the structure still resolves (`docs`/`pickup`, a doc folder with
+  objects in it) while the doc id's hex appears in NO stored name
+  anywhere in the fake's tree, folders included.
 - **e2e** `solo-gdrive`: the full ceremony headless through the real
   popup path (the fake's `/auth` redirect), tokens appearing NOWHERE in
   page storage, objects landing in the fake's store, reload → sync with
@@ -333,13 +391,25 @@ settled about its shape:
   content. The storage credential is not a data-confidentiality
   credential in this design, and that is the sentence any broker's
   consent copy has to be able to say honestly.
-- **Which makes the metadata the lever.** This provider uses plain
-  derivable names (§2: `docs/<hex(doc)>`, `chunk-<hex(id)>`), mirroring
-  Dropbox — whereas the S3 provider HMACs object names under per-epoch
-  name-keys. So a broker, or the provider itself, sees doc ids, chunk
-  counts, sizes and timing. If the broker direction is taken, porting
-  the name-key scheme to Drive is the change that blinds it, and it is
-  cheapest before any account has data to migrate.
+- **Which made the metadata the lever — and the lever is now shorter.**
+  This bullet used to say that plain derivable names were the gap and
+  that porting S3's name-key scheme was the change that would blind it.
+  That change is DONE (§2): doc folder names and every object name under
+  them are keyed hashes, and the one unkeyed location is the pickup
+  object, whose name is a hash of the (doc, owner, member) triple. So a
+  broker, or Drive itself, no longer sees doc ids or chunk ids in any
+  name. WHAT REMAINS VISIBLE, stated plainly because a shorter lever is
+  not no lever: the fixed container words `docs` and `pickup`; the
+  NUMBER of documents this account stores; per-document object counts
+  and byte sizes; write and read TIMING; and the GROUPING itself — which
+  objects belong together, since the folder still gathers one document's
+  objects even though it is not labelled with which. Name-keys blind
+  labels, not traffic shape. Two further honest limits: a member who
+  once held the keychain can go on deriving names (harmless here — a
+  name is not a read, since every read needs the user's own OAuth), and
+  an observer who already knows a (doc, owner, member) triple can
+  confirm that pickup object's existence, which is the same existence-
+  privacy gap S3 carries and the same #19/#10 item.
 
 ## Parked, explicitly
 

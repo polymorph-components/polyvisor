@@ -1896,6 +1896,65 @@ async function main() {
           `${back.status.gdriveConsent}, storage=${j(back.status.storage)}) and a bucket op works ` +
           `(refused=${ensure.attempt.refused})`,
       );
+    });
+
+    // --- 37: names disclose no doc id — the keyed-name regression -----------
+    //
+    // WHAT AN OBSERVER OF THE STORE IS PREVENTED FROM LEARNING, made
+    // falsifiable. Object contents on this provider are keyhive
+    // ciphertext already, so the names were the remaining disclosure,
+    // and plain names had the two properties that hurt: a doc id is
+    // GLOBAL (the same shared document carries the same id in every
+    // member's store, so listing two accounts reveals that they share a
+    // document) and STABLE (activity on one document stays trackable
+    // forever). Object AND FOLDER names are now keyed hashes under the
+    // doc's name-key, ported from the S3 provider (DRIVE.md §2).
+    //
+    // This row is the regression test for that whole change and it
+    // asserts both halves: STRUCTURE still resolves (the fixed
+    // container words `docs`/`pickup`, one doc folder, objects inside
+    // it — so the store is still navigable), and the doc id's hex
+    // appears in NO stored name anywhere in the fake's tree. The second
+    // half is the one that would have failed before the change and the
+    // one that fails again if any call site is ever reverted to a plain
+    // name — including the doc FOLDER, which is why the scan covers
+    // folders and not just leaves.
+    await guard(async () => {
+      const id = gdriveDevice;
+      const flushed = await probe(page, "gd-flush", { id });
+      const docHex = flushed.docHex as string;
+
+      const rootChildren = fake.childNames("pm-devstore");
+      const docFolders = fake.childNames("pm-devstore/docs");
+      const perFolder = docFolders.map((f) => fake.childNames(`pm-devstore/docs/${f}`).length);
+      // Every name the provider has written anywhere — folders included.
+      const allNames = fake.files().map((f) => f.name);
+      const leaking = allNames.filter((n) => n.includes(docHex));
+
+      const ok = flushed.attempt.refused === false &&
+        rootChildren.includes("docs") && rootChildren.includes("pickup") &&
+        docFolders.length >= 1 &&
+        perFolder.some((n) => n > 0) &&
+        !docFolders.includes(docHex) &&
+        leaking.length === 0;
+      record(
+        "37 gdrive",
+        "stored names disclose no doc id (keyed names, ported from S3)",
+        ok,
+        `after a flush, the structure still resolves — ${j(rootChildren)} under the root, ` +
+          `${docFolders.length} doc folder(s) holding ${j(perFolder)} object(s) — so a device ` +
+          `that holds the name-key can still find everything. But NO doc folder is the doc id ` +
+          `(${!docFolders.includes(docHex)}), and scanning all ${allNames.length} names the ` +
+          `provider has written (folders included) for the doc id's hex finds ${leaking.length} ` +
+          `— an untrusted observer of this tree learns object counts, sizes and timing, and ` +
+          `nothing about WHICH document any of it belongs to. Name-keys blind labels, not ` +
+          `traffic shape, and this row asserts exactly the labels half. (More than one doc ` +
+          `folder is EXPECTED here and is not a naming bug: \`BucketState.name_keys\` is ` +
+          `instance memory, so each respawned worker in rows 33/34/36 minted a fresh keychain ` +
+          `and flushed a complete copy under a fresh folder name. The S3 arm orphans objects ` +
+          `the same way for the same reason — the flush re-uploads everything it does not ` +
+          `remember, so the newest folder is always whole.)`,
+      );
       await probe(page, "hc-close", { id });
       await probe(page, "hc-forget", { ids: [id] });
     });

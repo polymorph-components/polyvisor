@@ -24,8 +24,10 @@
 //      the page's side of the port at all). Scanned for the fake's own
 //      synthetic labels, in BOTH localStorage and sessionStorage.
 //   4. BYTES LANDED: the fake's own in-memory tree (DRIVE.md §2's
-//      layout — root → docs/<hex> → objects) has the root folder and at
-//      least one object after the connect's first flush.
+//      layout — root → `docs` → keyed object names) has the root
+//      folder, the `docs` container and at least one object after the
+//      connect's first flush. Structure, not literal names: the leaf
+//      names are keyed hashes on purpose.
 //   5. A todo, then Sync now, then "storage:synced" — the fake's object
 //      count does not decrease.
 //   6. A REAL RELOAD (§4: "bringUpEngine re-arms the grant and
@@ -199,9 +201,12 @@ const scenario: Scenario = {
           return names.length > 0 ? names : false;
         }, 30_000);
         assert(n.length > 0, `expected children under ${ROOT}, got none`);
-        // DRIVE.md §2's layout: root → docs/<hex(doc)> → objects (or
-        // pickup/<hex(doc)>). Either child confirms the layout landed;
-        // what matters here is that SOMETHING is under the root.
+        // DRIVE.md §2's layout: root → `docs`/`pickup` → keyed names.
+        // STRUCTURE is what this asserts, because the leaf names are
+        // keyed hashes now and nothing on this side of the fake can
+        // spell them. What an observer of the tree sees is exactly what
+        // this check can see: fixed container words, and counts.
+        assert(n.includes("docs"), `expected a docs folder under ${ROOT}, got ${JSON.stringify(n)}`);
         const total = fake.files().length;
         assert(total > 0, "the fake's store is empty after the connect's first flush");
       });

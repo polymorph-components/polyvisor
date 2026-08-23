@@ -1225,7 +1225,11 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
   "gd-flush": async (arg: { id: string }) => {
     const conn = conns.get(arg.id)!;
     const docId = await conn.tasks.partition();
-    return { attempt: await refuses(() => conn.driver.bucketFlush(docId)) };
+    // The doc id travels back as hex so a row can assert the NEGATIVE
+    // property keyed names exist for: that this hex appears in no
+    // stored name anywhere in the provider's tree.
+    const docHex = [...docId].map((b) => b.toString(16).padStart(2, "0")).join("");
+    return { attempt: await refuses(() => conn.driver.bucketFlush(docId)), docHex };
   },
 };
 

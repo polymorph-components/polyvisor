@@ -68,8 +68,8 @@ use provider_dropbox::{
     DbxSource,
 };
 use provider_gdrive::{
-    gd_child, gd_delete, gd_doc_name, gd_ensure_folder, gd_fetch_child,
-    gd_list_children, gd_pickup_name, gd_upload, GdSource, GdriveCfg,
+    gd_child, gd_delete, gd_doc_name, gd_download, gd_ensure_folder, gd_fetch_child,
+    gd_pickup_name, gd_upload, GdSource, GdriveCfg,
 };
 use provider_s3::{
     delete_object, get_object_unsigned, kp_location, object_name, put_object, s3_signed, S3Cfg,
@@ -798,13 +798,34 @@ struct DbxPickup {
 
 /// The Google Drive pickup payload, sealed to the member exactly as K_p
 /// is. NO capability inside, and that is the ruling rather than an
-/// omission (DRIVE.md §1): this store mints nothing a link could carry,
-/// so the standing secret a member needs is nothing at all. What remains
-/// is the bootstrap the pull layer wants — the device set — for the
+/// omission (DRIVE.md §1): this store mints nothing a link could carry.
+/// What it carries instead is the same bootstrap S3's `KpPayload`
+/// carries — the name-key keychain and the device set — for the
 /// ACCOUNT'S OWN DEVICES, each of which is its own agent with its own
 /// prekeys and reads the store with the user's own OAuth.
+///
+/// The keychain is a SECRET but still not a capability, and the
+/// distinction is the provider's whole shape: knowing a name lets you
+/// DERIVE where an object sits, not READ it. On S3 the two collapse
+/// (name secrecy IS the read tier, over anonymous GETs); here they do
+/// not, because every read goes through the owner seam's OAuth. So the
+/// keychain blinds an observer's labels without granting anything to
+/// whoever holds it.
+///
+/// This record was WRITE-ONLY before names were keyed — the pull
+/// derived its device set by parsing `oplog-<hex>` / `manifest-<hex>`
+/// out of the doc folder's own listing. Keyed names make those listings
+/// opaque (which is the point), so the parse is gone and this payload
+/// is now the ONLY bootstrap: DRIVE.md §1's "it becomes load-bearing
+/// the moment a pull path exists that cannot list the folder" has come
+/// due, by way of a pull path that can list the folder and learn
+/// nothing from it.
 #[derive(Serialize, Deserialize)]
 struct GdrivePickup {
+    /// (epoch, name-key) keychain, sorted by epoch — the same shape
+    /// `KpPayload::name_keys` carries, so the two providers' bootstraps
+    /// cannot drift.
+    name_keys: Vec<(u32, [u8; 32])>,
     /// Devices whose oplogs/manifests to fetch (absent ones are skipped).
     devices: Vec<[u8; 32]>,
 }
@@ -1287,35 +1308,69 @@ async fn gd_folder_path(cfg: &GdriveCfg, segments: &[String]) -> Result<String, 
     Ok(parent)
 }
 
-/// The per-doc object folder: `<root>/docs/<hex(doc)>`.
+/// This doc's name-key keychain, oldest epoch first, from bucket state.
+/// `ensure_bucket_state` must have run.
+fn doc_keychain(doc: &[u8]) -> Result<Vec<(u32, [u8; 32])>, String> {
+    with_state(|s| {
+        let b = s.buckets.get(doc).ok_or("no bucket state".to_string())?;
+        Ok::<_, String>(
+            b.name_keys
+                .iter()
+                .enumerate()
+                .map(|(e, nk)| (e as u32, *nk))
+                .collect(),
+        )
+    })?
+}
+
+/// The doc's FOUNDING name-key (epoch 0) — what the doc folder's name is
+/// derived under, so the container never has to move. See
+/// `provider_gdrive::gd_doc_name` for why the folder is keyed at all and
+/// why epoch 0 specifically.
+fn doc_founding_key(doc: &[u8]) -> Result<[u8; 32], String> {
+    with_state(|s| {
+        let b = s.buckets.get(doc).ok_or("no bucket state".to_string())?;
+        b.name_keys.first().copied().ok_or("empty keychain".to_string())
+    })?
+}
+
+/// The per-doc object folder: `<root>/docs/<keyed(doc)>`. The last
+/// segment is a keyed hash, not the doc id — an observer listing `docs`
+/// learns how many documents this account stores and nothing about
+/// which ones (DRIVE.md §2).
 async fn gd_doc_folder(cfg: &GdriveCfg, doc: &[u8]) -> Result<String, String> {
-    gd_folder_path(
-        cfg,
-        &[cfg.root.clone(), "docs".to_string(), gd_doc_name(doc)],
-    )
-    .await
+    let name = gd_doc_name(&doc_founding_key(doc)?, doc).await?;
+    gd_folder_path(cfg, &[cfg.root.clone(), "docs".to_string(), name]).await
 }
 
-/// The per-doc pickup folder: `<root>/pickup/<hex(doc)>`.
-async fn gd_pickup_folder(cfg: &GdriveCfg, doc: &[u8]) -> Result<String, String> {
-    gd_folder_path(
-        cfg,
-        &[cfg.root.clone(), "pickup".to_string(), gd_doc_name(doc)],
-    )
-    .await
+/// The pickup folder: `<root>/pickup`, FLAT — no per-doc subfolder.
+///
+/// Deliberate, and the reasoning is in `provider_gdrive::gd_pickup_name`:
+/// pickup objects must be findable by a device that does not yet hold
+/// the keychain, so their location cannot be keyed; and any unkeyed
+/// per-doc folder name — the doc id plain, or hashed — would be a
+/// global, stable per-document label sitting in every member's store,
+/// which is exactly the disclosure the keyed names remove. One flat
+/// folder of triple-hashed object names is S3's shape and the only one
+/// that does not put the label back.
+async fn gd_pickup_folder(cfg: &GdriveCfg) -> Result<String, String> {
+    gd_folder_path(cfg, &[cfg.root.clone(), "pickup".to_string()]).await
 }
 
-/// Write one member's pickup object: the device set, sealed to their
-/// prekey exactly as K_p is. Overwrite in place, so a re-grant refreshes
-/// the contents without disturbing anything else.
+/// Write one member's pickup object: the name-key keychain and the
+/// device set, sealed to their prekey exactly as K_p is. Overwrite in
+/// place, so a re-grant refreshes the contents without disturbing
+/// anything else.
 async fn gd_publish_pickup(
     cfg: &GdriveCfg,
     kh: &Kh,
     doc: &[u8],
     member: &[u8],
 ) -> Result<(), String> {
-    let folder = gd_pickup_folder(cfg, doc).await?;
+    let my_id_bytes = with_state(|s| s.my_peer.as_bytes().to_vec())?;
+    let folder = gd_pickup_folder(cfg).await?;
     let payload = GdrivePickup {
+        name_keys: doc_keychain(doc)?,
         devices: grantee_devices(doc)?,
     };
     let obj = seal_to_member(
@@ -1330,7 +1385,7 @@ async fn gd_publish_pickup(
         cfg,
         &EngineFetch,
         &folder,
-        &gd_pickup_name(member),
+        &gd_pickup_name(doc, &my_id_bytes, member).await?,
         bincode::serialize(&obj).map_err(|e| e.to_string())?,
     )
     .await
@@ -1375,9 +1430,14 @@ enum PutSink {
     S3 { st: S3Cfg, nk: [u8; 32] },
     /// Dropbox: plain `{kind}-{hex}` children of the doc folder.
     Dbx { cfg: DbxCfg, folder: String },
-    /// Google Drive: the same `{kind}-{hex}` child names, under a doc
-    /// folder named by its ID (Drive has no paths to write to).
-    Gd { cfg: GdriveCfg, folder_id: String },
+    /// Google Drive: the SAME name-keyed child names S3 writes, under a
+    /// doc folder whose own name is keyed too (Drive has no paths to
+    /// write to, so the folder id is resolved once and carried here).
+    Gd {
+        cfg: GdriveCfg,
+        folder_id: String,
+        nk: [u8; 32],
+    },
 }
 
 impl PutSink {
@@ -1396,8 +1456,13 @@ impl PutSink {
                 )
                 .await
             }
-            PutSink::Gd { cfg, folder_id } => {
-                gd_upload(cfg, &EngineFetch, folder_id, &gd_child(kind, id), body).await
+            PutSink::Gd {
+                cfg,
+                folder_id,
+                nk,
+            } => {
+                let name = gd_child(nk, kind, id).await?;
+                gd_upload(cfg, &EngineFetch, folder_id, &name, body).await
             }
         }
     }
@@ -1636,7 +1701,19 @@ async fn dbx_pull(doc_id: Vec<u8>, pickup: Option<String>) -> Result<String, Str
 /// ingest pipeline is the Dropbox one, which is the S3 one: op streams
 /// into keyhive, signed manifests into entries, chunks into the
 /// sedimentree, apply.
-async fn gd_pull(doc_id: Vec<u8>, pickup: Option<String>) -> Result<String, String> {
+///
+/// The BOOTSTRAP is now S3's rather than Dropbox's, and that is what
+/// keyed names cost and buy. Dropbox's owner arm reads its device set
+/// out of the doc folder's listing, by parsing `oplog-<hex(device)>`
+/// off each child name; this pull used to do the same. Keyed names make
+/// that listing opaque — which is the entire point of keying them — so
+/// the device set and the keychain now arrive the way S3's do, out of
+/// the member's own sealed pickup object at a location derived from
+/// public ids alone (`gd_pickup_name`). A second device of the account
+/// can therefore still FIND everything under names it cannot read: the
+/// unkeyed bootstrap is the one step, and the keychain inside it opens
+/// the rest.
+async fn gd_pull(doc_id: Vec<u8>, owner: Vec<u8>, pickup: Option<String>) -> Result<String, String> {
     if pickup.is_some() {
         return Err(
             "bucket-pull(pickup): this store mints no pickup capability (gdrive is owner-tier \
@@ -1646,60 +1723,86 @@ async fn gd_pull(doc_id: Vec<u8>, pickup: Option<String>) -> Result<String, Stri
     }
     let cfg = gd()?;
     let (kh, sd) = with_state(|s| (s.kh.clone(), s.sd.clone()))?;
+    let my_id = with_state(|s| s.my_peer.as_bytes().to_vec())?;
     let tree = tree_id(&doc_id)?;
     ensure_bucket_state(&doc_id)?;
 
-    // The doc folder's own listing is the device set — the same shape as
-    // Dropbox's owner arm, and the only shape here.
+    // 1. The pickup object: located by public ids, unwrapped by prekey
+    //    DH, exactly as `s3_pull` does with K_p.
+    let pickup_folder = gd_pickup_folder(&cfg).await?;
+    let name = gd_pickup_name(&doc_id, &owner, &my_id).await?;
+    let blob = gd_download(&cfg, &EngineFetch, &pickup_folder, &name)
+        .await?
+        .ok_or("pickup object missing: revoked, or never granted to this device")?;
+    let obj: KpObject = bincode::deserialize(&blob).map_err(|e| format!("pickup decode: {e}"))?;
+    let pairs = my_prekey_pairs(&kh).await?;
+    let sk = pairs
+        .get(&obj.member_pk)
+        .ok_or("pickup not sealed to any of my prekeys")?;
+    let ikm = sk.derive_new_secret_key(&obj.owner_pk).to_bytes();
+    let aead = ikm_aead(&ikm, b"pickup-wrap").await?;
+    let payload: GdrivePickup =
+        bincode::deserialize(&aead_open(&aead, &doc_id, &obj.sealed).await?)
+            .map_err(|e| format!("pickup payload decode: {e}"))?;
+    let mut keychain: Vec<(u32, [u8; 32])> = payload.name_keys.clone();
+    keychain.sort_by_key(|(e, _)| *e);
+    if keychain.is_empty() {
+        return Err("pickup carried no name-key keychain".to_string());
+    }
+    let name_keys: HashMap<u32, [u8; 32]> = keychain.iter().copied().collect();
+
+    // Adopt the shared keychain BEFORE resolving any folder — the same
+    // reason `s3_pull` adopts it before touching a name. This instance's
+    // own keychain was minted locally at `ensure_bucket_state` and is
+    // nobody else's; flushing or reading under it would address names no
+    // other device can derive.
+    with_state(|s| {
+        let b = s.buckets.get_mut(&doc_id).expect("bucket state");
+        b.name_keys = keychain.iter().map(|(_, nk)| *nk).collect();
+    })?;
+
     let folder = gd_doc_folder(&cfg, &doc_id).await?;
-    let mut devices: Vec<[u8; 32]> = Vec::new();
-    for name in gd_list_children(&cfg, &EngineFetch, &folder).await? {
-        for prefix in ["manifest-", "oplog-"] {
-            let Some(id_hex) = name.strip_prefix(prefix) else {
-                continue;
-            };
-            let Ok(raw) = hex::decode(id_hex) else { continue };
-            let Ok(device) = arr32(&raw, "device") else {
-                continue;
-            };
-            if !devices.contains(&device) {
-                devices.push(device);
+    let src = GdSource::Owner(folder);
+    let devices = payload.devices.clone();
+
+    // 2. Op streams into keyhive (newest epoch first: a device's oplog
+    //    lives under the newest name-key it flushed with — S3's rule,
+    //    kept identical even though this provider does not currently
+    //    rotate, so the two cannot drift).
+    let mut ingested = 0usize;
+    for device in &devices {
+        for (_, nk) in keychain.iter().rev() {
+            let child = gd_child(nk, "oplog", device).await?;
+            if let Some(blob) = gd_fetch_child(&cfg, &EngineFetch, &src, &child).await? {
+                let events: Vec<StaticEvent<T>> =
+                    bincode::deserialize(&blob).map_err(|e| format!("oplog decode: {e}"))?;
+                ingested += events.len();
+                kh.ingest_unsorted_static_events(events).await;
+                break;
             }
         }
     }
-    let src = GdSource::Owner(folder);
 
-    // 1. Op streams into keyhive.
-    let mut ingested = 0usize;
-    for device in &devices {
-        let Some(blob) = gd_fetch_child(&cfg, &EngineFetch, &src, &gd_child("oplog", device)).await?
-        else {
-            continue;
-        };
-        let events: Vec<StaticEvent<T>> =
-            bincode::deserialize(&blob).map_err(|e| format!("oplog decode: {e}"))?;
-        ingested += events.len();
-        kh.ingest_unsorted_static_events(events).await;
-    }
-
-    // 2. Manifests -> union of entries.
+    // 3. Manifests -> union of entries.
     let mut entries: Vec<Entry> = Vec::new();
     for device in &devices {
-        let Some(blob) =
-            gd_fetch_child(&cfg, &EngineFetch, &src, &gd_child("manifest", device)).await?
-        else {
-            continue;
-        };
-        let manifest = verify_manifest(&blob, device).await?;
-        for e in manifest.entries {
-            if !entries.iter().any(|(c, _, _)| *c == e.0) {
-                entries.push(e);
+        for (_, nk) in keychain.iter().rev() {
+            let child = gd_child(nk, "manifest", device).await?;
+            let Some(blob) = gd_fetch_child(&cfg, &EngineFetch, &src, &child).await? else {
+                continue;
+            };
+            let manifest = verify_manifest(&blob, device).await?;
+            for e in manifest.entries {
+                if !entries.iter().any(|(c, _, _)| *c == e.0) {
+                    entries.push(e);
+                }
             }
+            break;
         }
     }
     adopt_entries(&doc_id, &entries)?;
 
-    // 3. Chunks -> the sedimentree (envelope bytes verbatim), then the
+    // 4. Chunks -> the sedimentree (envelope bytes verbatim), then the
     // normal apply path.
     let have: HashSet<[u8; 32]> = sd
         .get_commits(tree)
@@ -1709,11 +1812,15 @@ async fn gd_pull(doc_id: Vec<u8>, pickup: Option<String>) -> Result<String, Stri
         .map(|c| *c.head().as_bytes())
         .collect();
     let mut fetched = 0u32;
-    for (cref, parents, _epoch) in &entries {
+    for (cref, parents, epoch) in &entries {
         if have.contains(cref) {
             continue;
         }
-        let blob = gd_fetch_child(&cfg, &EngineFetch, &src, &gd_child("chunk", cref))
+        let nk = name_keys
+            .get(epoch)
+            .ok_or(format!("keychain missing epoch {epoch}"))?;
+        let child = gd_child(nk, "chunk", cref).await?;
+        let blob = gd_fetch_child(&cfg, &EngineFetch, &src, &child)
             .await?
             .ok_or("chunk object missing")?;
         let parent_set: BTreeSet<CommitId> = parents.iter().map(|p| CommitId::new(*p)).collect();
@@ -1726,7 +1833,8 @@ async fn gd_pull(doc_id: Vec<u8>, pickup: Option<String>) -> Result<String, Stri
         apply_new_chunks(&doc_id).await?;
     }
     Ok(format!(
-        "pulled gdrive(owner) devices={} events={ingested} chunks={fetched}",
+        "pulled gdrive(owner) epochs={} devices={} events={ingested} chunks={fetched}",
+        keychain.len(),
         devices.len()
     ))
 }
@@ -3030,10 +3138,49 @@ impl DriverGuest for Component {
             }
             Provider::Gdrive => {
                 let cfg = gd()?;
+                let my_id = with_state(|s| s.my_peer.as_bytes().to_vec())?;
                 // The pickup object goes away (cooperative immediacy,
                 // as on S3), and that is the whole server-side story.
-                let folder = gd_pickup_folder(&cfg, &doc_id).await?;
-                gd_delete(&cfg, &EngineFetch, &folder, &gd_pickup_name(&member)).await?;
+                let folder = gd_pickup_folder(&cfg).await?;
+                gd_delete(
+                    &cfg,
+                    &EngineFetch,
+                    &folder,
+                    &gd_pickup_name(&doc_id, &my_id, &member).await?,
+                )
+                .await?;
+                // NO NAME-KEY EPOCH ROTATION HERE, and the omission is
+                // the ruling rather than an oversight — recorded because
+                // the S3 arm directly above DOES rotate at this exact
+                // point, so the difference has to be accounted for.
+                //
+                // What rotation buys on S3: names there ARE the read
+                // tier. The bucket serves unsigned public GETs, so
+                // knowing an object's name is sufficient authority to
+                // read it, and a revoked member who kept the old
+                // name-key could keep reading new writes forever. A
+                // fresh epoch is the hard forward boundary that stops
+                // that.
+                //
+                // Why it buys nothing here: this provider serves NO
+                // anonymous tier (DRIVE.md §1) — every read goes through
+                // the owner seam's OAuth. A revoked member either holds
+                // the user's Drive credential, in which case they can
+                // list and read every object regardless of what it is
+                // called, or they do not, in which case a name gets them
+                // nothing. Names on this provider blind an OBSERVER's
+                // labels; they are not an access-control mechanism, so
+                // rotating them would be ceremony with no boundary
+                // behind it. The honest note this arm returns already
+                // says where the real lever is: credential rotation at
+                // Google.
+                //
+                // The keychain machinery is still carried (the pickup
+                // payload is a Vec of (epoch, key), and the pull walks
+                // it newest-first exactly as S3's does), so if a future
+                // revision ever does grow a reason to rotate, the
+                // reading side already handles it. What is deliberately
+                // absent is only the trigger.
                 let remaining = with_state(|s| {
                     let b = s
                         .buckets
@@ -3092,7 +3239,11 @@ impl DriverGuest for Component {
                 // through the existing error paths.
                 let cfg = gd()?;
                 let folder_id = gd_doc_folder(&cfg, &doc_id).await?;
-                PutSink::Gd { cfg, folder_id }
+                PutSink::Gd {
+                    cfg,
+                    folder_id,
+                    nk: nk_current,
+                }
             }
         };
         flush_to(&sink, &doc_id, epoch).await
@@ -3109,8 +3260,11 @@ impl DriverGuest for Component {
             Provider::S3 => s3_pull(doc_id, owner).await,
             Provider::Dropbox => dbx_pull(doc_id, pickup).await,
             // Google Drive is owner tier only and REFUSES a `pickup` by
-            // name rather than ignoring it (DRIVE.md §1).
-            Provider::Gdrive => gd_pull(doc_id, pickup).await,
+            // name rather than ignoring it (DRIVE.md §1). It DOES use
+            // `owner`, unlike the Dropbox arm: since names became keyed,
+            // the bootstrap object is located from the (doc, owner,
+            // member) triple exactly as S3's K_p is.
+            Provider::Gdrive => gd_pull(doc_id, owner, pickup).await,
         }
     }
 

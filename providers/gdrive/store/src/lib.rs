@@ -1,17 +1,20 @@
 //! The Google Drive provider: the USER-ONLY store.
 //!
-//! Dropbox's plain-derivable-layout strategy (providers/dropbox/store)
-//! over an id-addressed API, with the ENTIRE LINK TIER REMOVED. Every
-//! call in this crate runs `Route::Owner`; there is no `Route::Shared`
-//! and no `Route::Public` path here, because this provider mints NO
-//! capability a non-credentialed party could use (DRIVE.md §1). The only
-//! readers of the store are holders of the user's own OAuth, wired to
+//! Dropbox's folder-shaped strategy (providers/dropbox/store) over an
+//! id-addressed API, with the ENTIRE LINK TIER REMOVED and S3's
+//! NAME-KEYED NAMES put in place of Dropbox's plain ones. Every call in
+//! this crate runs `Route::Owner`; there is no `Route::Shared` and no
+//! `Route::Public` path here, because this provider mints NO capability
+//! a non-credentialed party could use (DRIVE.md §1). The only readers of
+//! the store are holders of the user's own OAuth, wired to
 //! `store-owner-fetch`. "No sharing" is structural: the other two seams
 //! are wired over empty origin sets and these paths never call them.
 //!
 //! Blob CONTENTS are identical to the S3 and Dropbox paths — same
 //! envelope bytes, same op-stream blob, same signed manifest; only
-//! addressing and transport change.
+//! addressing and transport change. Object and folder NAMES are the S3
+//! path's: keyed hashes under a per-epoch name-key, for the reasons set
+//! out at the naming section near the bottom of this file.
 //!
 //! Two Drive facts shape everything below (DRIVE.md §2):
 //!
@@ -25,7 +28,7 @@
 //!    guest config: the guest has no use for an app identity it must
 //!    never wield itself.
 
-use provider_common::{do_fetch, request_label, FetchPort, Route};
+use provider_common::{do_fetch, hmac, request_label, sha256, FetchPort, Route};
 
 /// Google Drive store config: ADDRESSING ONLY, like every other arm.
 /// There is no credential here at all — not even a public identifier
@@ -399,24 +402,112 @@ pub async fn gd_delete(
     }
 }
 
-// Names: plain and client-derivable — no name secrecy on this provider,
-// so no name-key epochs either. Identical to the Dropbox layout with the
-// path separators replaced by parent ids (DRIVE.md §2).
+// --- names: keyed, because on this provider names are the disclosure ---
+//
+// WHAT AN OBSERVER IS PREVENTED FROM LEARNING, and why it is worth the
+// derivation. Object CONTENTS here are already keyhive ciphertext, so
+// names were the remaining disclosure — and the two properties plain
+// names have are exactly the two that hurt:
+//
+//   * doc ids are GLOBAL. The same shared document carries the same id
+//     in every member's store, so anyone who can list two accounts
+//     learns from the names alone that those accounts share a document.
+//   * doc ids are STABLE. A name never changes, so activity on one
+//     document is trackable indefinitely from the naming alone.
+//
+// It matters HERE in particular because this provider's threat surface
+// is metadata-only BY CONSTRUCTION: `drive.file` confines the token to
+// app-created files and those files are ciphertext, so a hostile Drive,
+// a hostile broker, or anyone who obtains the user's OAuth gets
+// availability and metadata and never content (DRIVE.md, "The broker,
+// parked with its measurements"). Names were the semantically rich part
+// of that metadata; keying them leaves counts, sizes, timing and folder
+// grouping, which are traffic shape rather than labels.
+//
+// The construction is PORTED, NOT INVENTED: it is the S3 provider's,
+// character for character — `provider_s3::object_name`
+// (providers/s3/store/src/lib.rs:181-185) is
+// `hex(HMAC-SHA256(name-key, kind || id))` over a per-epoch name-key,
+// and `provider_s3::kp_location` (lines 192-198) is the plain
+// `hex(SHA-256("kp" || doc || owner || member))` bootstrap. Both are
+// re-derived below rather than imported, because a gdrive crate that
+// depended on the s3 crate for two string functions would be a worse
+// coupling than a duplicated four-line body; the citation is the
+// contract.
 
 /// The per-doc folder NAME (its parent is the `docs` folder id).
-pub fn gd_doc_name(doc: &[u8]) -> String {
-    hex::encode(doc)
+///
+/// Name-keyed like every child under it — leaving the FOLDER plain
+/// would disclose the doc id and defeat the whole derivation, since a
+/// folder name is exactly as listable as an object name.
+///
+/// Keyed under the doc's FOUNDING name-key (epoch 0) rather than the
+/// current one, deliberately. S3 has no folders — its bucket is flat,
+/// so every name there is per-epoch and nothing has to stay put. A
+/// Drive folder is a CONTAINER, and a container that renamed itself on
+/// an epoch boundary would strand every object already inside it. Epoch
+/// 0 is the one epoch every holder of the keychain has, so the
+/// container is stable and the objects inside it stay per-epoch exactly
+/// as S3's are. The cost, stated: a member who once held the keychain
+/// keeps the ability to DERIVE the folder name forever — but on this
+/// provider deriving a name grants no read (there is no anonymous tier;
+/// reads need the user's own OAuth), so it costs nothing this provider
+/// was offering.
+pub async fn gd_doc_name(name_key: &[u8; 32], doc: &[u8]) -> Result<String, String> {
+    keyed_name(name_key, b"doc", doc).await
 }
 
-/// `chunk-{cref}` / `oplog-{device}` / `manifest-{device}` — the same
-/// child names `dbx_child` produces, deliberately.
-pub fn gd_child(kind: &str, id: &[u8]) -> String {
-    format!("{kind}-{}", hex::encode(id))
+/// The child object name for `chunk`/`oplog`/`manifest`.
+///
+/// Same framing as `provider_s3::object_name`
+/// (providers/s3/store/src/lib.rs:181-185): the kind's bytes
+/// concatenated with the id's, HMAC'd under the epoch's name-key. Not a
+/// second scheme — the same one, so the two providers cannot drift into
+/// disagreeing about what a name means.
+pub async fn gd_child(name_key: &[u8; 32], kind: &str, id: &[u8]) -> Result<String, String> {
+    keyed_name(name_key, kind.as_bytes(), id).await
 }
 
-/// The pickup object's name inside `pickup/<hex(doc)>`.
-pub fn gd_pickup_name(member: &[u8]) -> String {
-    hex::encode(member)
+/// `hex(HMAC(name-key, kind || id))` — the one derivation both names
+/// above go through.
+async fn keyed_name(name_key: &[u8; 32], kind: &[u8], id: &[u8]) -> Result<String, String> {
+    let mut data = kind.to_vec();
+    data.extend_from_slice(id);
+    Ok(hex::encode(hmac(name_key, &data).await?))
+}
+
+/// The pickup object's name — DELIBERATELY NOT NAME-KEYED, and the
+/// exception is the reason the rest can be keyed at all.
+///
+/// The chicken-and-egg: the pickup object is where a member LEARNS the
+/// name-key keychain. A member who does not yet hold the keychain
+/// cannot derive a keyed name, so if the bootstrap object were itself
+/// keyed there would be no first step — a second device of the account
+/// could never find its own way in. So this one location is derived
+/// from PUBLIC IDS only, exactly as `provider_s3::kp_location` is
+/// (providers/s3/store/src/lib.rs:192-198), for exactly that reason:
+/// `hex(SHA-256("kp" || doc || owner || member))`.
+///
+/// What that costs, honestly: this name is a hash of the triple, so it
+/// discloses nothing to an observer who cannot already guess all three
+/// ids — but a party who KNOWS the triple can confirm the object's
+/// existence. That is S3's accepted position too ("Production wants a
+/// pairwise-secret location (existence privacy)"), and the same #19/#10
+/// design item covers both.
+///
+/// Note the object lives FLAT under `<root>/pickup`, with no per-doc
+/// subfolder. A per-doc pickup folder would have to be derivable
+/// without the keychain — i.e. named from the doc id, plain or hashed —
+/// and either shape is a global, stable per-document label visible in
+/// every member's store: precisely the disclosure this whole change
+/// removes. Flat, like S3's bucket, is the only shape that does not
+/// reintroduce it.
+pub async fn gd_pickup_name(doc: &[u8], owner: &[u8], member: &[u8]) -> Result<String, String> {
+    let mut data = b"kp".to_vec();
+    data.extend_from_slice(doc);
+    data.extend_from_slice(owner);
+    data.extend_from_slice(member);
+    Ok(hex::encode(sha256(&data).await?))
 }
 
 /// The ONE way to reach a doc's objects on this provider: as the owner,
