@@ -38,7 +38,7 @@ export type Posture = "seed" | "platform";
 /** Which unseal ceremony the picker should offer. The tag lives in the
  * index precisely so the picker can decide WITHOUT opening anything.
  * See seal.ts for what each rung actually buys. */
-export type UnsealPolicy = "every-session" | "while-open" | "until-reseal";
+export type UnsealPolicy = "every-session" | "while-open" | "until-reseal" | "passkey";
 
 /** One row of the index. Every field here rests in the clear. */
 export interface DeviceRecord {

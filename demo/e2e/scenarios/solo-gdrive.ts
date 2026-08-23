@@ -8,38 +8,42 @@
 // (demo/host/fake-drive.ts) instead — and it must not disturb the
 // harness's MinIO, which stays up for every other scenario regardless.
 //
-// EIGHT CLAIMS, in DRIVE.md's own order:
+// NINE CLAIMS, in DRIVE.md's own order:
 //
-//   1. Kept device (until-reseal, no passphrase), exactly as
+//   1. An account and a todo, through the real app frame — made during
+//      FIRST RUN, before any other sheet ever opens (PR #88: the entry
+//      ceremony is a drawer sheet mounted only at first run, and it is
+//      gone the moment any other sheet has opened once).
+//   2. Kept device (until-reseal, no passphrase), exactly as
 //      solo-storage.ts's own first beat — this scenario needs a device
-//      that survives a reload to make claim 6 possible.
-//   2. THE REAL POPUP PATH (§3): the worker mints PKCE, the page opens
+//      that survives a reload to make claim 7 possible.
+//   3. THE REAL POPUP PATH (§3): the worker mints PKCE, the page opens
 //      window.open on the fake's headless `/auth`, which 302s straight
 //      back with a synthetic code the page relays to the opener. The
 //      breadcrumbs are two beats, not one: "storage:consented" (the
 //      exchange finished) and then "storage:bound" (bind + first
 //      flush).
-//   3. TOKENS TOUCH NO PAGE STORAGE (§3's bearer ban, and §4: the
+//   4. TOKENS TOUCH NO PAGE STORAGE (§3's bearer ban, and §4: the
 //      tokens are born in worker memory and rest DEK-sealed — never on
 //      the page's side of the port at all). Scanned for the fake's own
 //      synthetic labels, in BOTH localStorage and sessionStorage.
-//   4. BYTES LANDED: the fake's own in-memory tree (DRIVE.md §2's
+//   5. BYTES LANDED: the fake's own in-memory tree (DRIVE.md §2's
 //      layout — root → `docs` → keyed object names) has the root
 //      folder, the `docs` container and at least one object after the
 //      connect's first flush. Structure, not literal names: the leaf
 //      names are keyed hashes on purpose.
-//   5. A todo, then Sync now, then "storage:synced" — the fake's object
-//      count does not decrease.
-//   6. A REAL RELOAD (§4: "bringUpEngine re-arms the grant and
+//   6. Sync now, then "storage:synced" — the fake's object count does
+//      not decrease (the todo from claim 1 is what this sync carries).
+//   7. A REAL RELOAD (§4: "bringUpEngine re-arms the grant and
 //      re-applies initStore"): the binding and the consent both come
 //      back with NOTHING re-entered, and a Sync now afterwards succeeds
 //      with no fresh authorization_code exchange — refresh-grant calls
 //      are fine (that is the 401→refresh→retry shape), a new code
 //      exchange would mean the consent did not actually survive.
-//   7. RESEAL SEALS IT, exactly as solo-storage.ts's device-store beat:
+//   8. RESEAL SEALS IT, exactly as solo-storage.ts's device-store beat:
 //      the upgrade ceremony, the picker, nothing personal, then the
 //      passphrase brings the binding AND the consent back.
-//   8. FORGET IS THE HONEST DISCONNECT (§4's mirror of
+//   9. FORGET IS THE HONEST DISCONNECT (§4's mirror of
 //      STORAGE-EGRESS.md §6): revokes at the fake (a real POST
 //      /revoke), deletes the sealed consent, and DOES NOT touch the
 //      binding — the folder is still the device's destination, only
@@ -102,6 +106,28 @@ const scenario: Scenario = {
   async run(page: Page, _ctx: Ctx) {
     const fake = await startFakeDrive();
     try {
+      await act("an account and a todo, through the real app frame", async () => {
+        // ORDER MATTERS (PR #88): the entry ceremony (`solo-new-account`)
+        // lives in a drawer sheet mounted only at first run — click it
+        // any later (e.g. after the storage sheet has already been
+        // opened once) and the hook silently finds nothing. So the
+        // account is made HERE, before any other sheet ever opens, the
+        // same idiom solo-persistence.ts and solo-passkey.ts already
+        // follow.
+        assertEquals(await solo(page, "newAccount"), true, "the entry sheet's button was clicked");
+        await until([page], "the account", async () => await solo(page, "hasAccount"), 60_000);
+        await appFrame(page).locator("input.new-todo").waitFor({
+          state: "visible",
+          timeout: WAITS.converge,
+        });
+        await addTodo(page, "buy milk");
+        const titles = await until([page], "the todo", async () => {
+          const t = (await solo(page, "todos")) as string[];
+          return t.length >= 1 ? t : false;
+        }, WAITS.converge);
+        assertEquals(titles[0], "buy milk", `the todos: ${JSON.stringify(titles)}`);
+      });
+
       await act(
         "a device, kept (until-reseal, no passphrase) so a reload auto-unseals",
         async () => {
@@ -211,31 +237,8 @@ const scenario: Scenario = {
         assert(total > 0, "the fake's store is empty after the connect's first flush");
       });
 
-      await act("a todo, Sync now, storage:synced — the object count does not decrease", async () => {
-        await solo(page, "newAccount");
-        await until([page], "the account", async () => await solo(page, "hasAccount"), 60_000);
-        await appFrame(page).locator("input.new-todo").waitFor({
-          state: "visible",
-          timeout: WAITS.converge,
-        });
-        await addTodo(page, "buy milk");
+      await act("Sync now — storage:synced — the object count does not decrease", async () => {
         const before = fake.files().length;
-        await page.evaluate(() => {
-          (Array.from(document.querySelectorAll("#storage-sheet button")) as HTMLButtonElement[])
-            .find((b) => b.textContent === "Close")?.click();
-        });
-        await page.evaluate(() => {
-          (document.getElementById("visor-settings") as HTMLButtonElement | null)?.click();
-        });
-        await page.waitForFunction(
-          () =>
-            (document.querySelector(
-              '#visor-drawer-inner .settings-extra-action[data-action="storage"]',
-            ) as HTMLButtonElement | null) !== null,
-          undefined,
-          { timeout: 15_000 },
-        );
-        await solo(page, "openStorageSheet");
         await page.waitForSelector("#storage-sync", { state: "visible", timeout: 15_000 });
         await page.click("#storage-sync");
         const trace = await until([page], "storage:synced", async () => {

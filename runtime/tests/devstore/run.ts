@@ -21,7 +21,7 @@
 // experiment.
 
 import { chromium } from "npm:playwright@1.57.0";
-import type { Browser, BrowserContext, Page } from "npm:playwright@1.57.0";
+import type { Browser, BrowserContext, CDPSession, Page } from "npm:playwright@1.57.0";
 import { serveDir } from "jsr:@std/http@1.0.13/file-server";
 // The fake Google Drive: one module shared with the bringup phase and
 // the e2e suite (DRIVE.md's Gates section). This harness holds the
@@ -65,7 +65,12 @@ function serveSite(): { server: Deno.HttpServer; port: number } {
   let port = 0;
   const server = Deno.serve({
     port: 0,
-    hostname: "127.0.0.1",
+    // Bind all interfaces (the spike's finding, spikes/prf-unseal/run.ts:
+    // some resolvers prefer ::1) so ONE server answers both the
+    // existing 127.0.0.1 origin (rows 1-23, unchanged) and the PRF
+    // rows' http://localhost:<port> origin — WebAuthn requires a domain
+    // RP id, and 127.0.0.1 is a synchronous SecurityError.
+    hostname: "0.0.0.0",
     onListen: (addr) => {
       port = addr.port;
     },
@@ -73,7 +78,7 @@ function serveSite(): { server: Deno.HttpServer; port: number } {
   return { server, port };
 }
 
-// --- the S3-shaped RECORDER (rows 24+) ---------------------------------
+// --- the S3-shaped RECORDER (rows 28+) ---------------------------------
 //
 // AN OBSERVER, NOT A FAKE. This does not implement S3 — it never checks
 // a signature, never stores a byte — it only notes that a request
@@ -213,6 +218,40 @@ const ready = (page: Page) =>
     timeout: 30_000,
   });
 
+/**
+ * The PRF rows' own page, on `http://localhost:<port>` — a WebAuthn RP
+ * id must be a domain (spikes/prf-unseal/run.ts, re-confirmed there by
+ * construction), so 127.0.0.1 cannot host these ceremonies. A separate
+ * origin means a separate storage partition, which is fine: the PRF
+ * rows are self-contained and create their own devices here.
+ *
+ * The CDP virtual authenticator is installed BEFORE any ceremony (the
+ * spike's discipline) with `hasPrf: true` — the option that makes it
+ * implement hmac-secret. `hasPrf` is not in Playwright's CDP types, so
+ * the cast mirrors the spike's exactly.
+ */
+async function openPrfPage(ctx: BrowserContext, port: number): Promise<Page> {
+  const page = await ctx.newPage();
+  page.on("pageerror", (e) => console.log(`      · pageerror (prf): ${e.message}`));
+  const cdp: CDPSession = await ctx.newCDPSession(page);
+  await cdp.send("WebAuthn.enable");
+  await cdp.send("WebAuthn.addVirtualAuthenticator", {
+    options: {
+      protocol: "ctap2",
+      transport: "internal",
+      hasResidentKey: true,
+      hasUserVerification: true,
+      isUserVerified: true,
+      hasPrf: true,
+      automaticPresenceSimulation: true,
+    },
+    // deno-lint-ignore no-explicit-any
+  } as any);
+  await page.goto(`http://localhost:${port}/probe.html`, { waitUntil: "load" });
+  await ready(page);
+  return page;
+}
+
 // deno-lint-ignore no-explicit-any
 const probe = (page: Page, op: string, arg?: unknown): Promise<any> =>
   page.evaluate(
@@ -266,6 +305,9 @@ async function main() {
   try {
     const ctx = await browser.newContext();
     const page = await openPage(ctx, port);
+    // The PRF rows' own page/origin — opened once, up front, so the
+    // virtual authenticator is installed well before rows 24-27 run.
+    const prfPage = await openPrfPage(ctx, port);
 
     // --- 1: the index -----------------------------------------------------
     await guard(async () => {
@@ -1226,7 +1268,245 @@ async function main() {
       await probe(page, "hc-forget", { ids: [id] });
     });
 
-    // --- 24: THE SEAMS ARE REAL, AND REFUSE BEFORE ANY BINDING -------------
+    // --- 24: passkey — THE PROMOTION AND THE LOGIN --------------------------
+    //
+    // Runs on the PRF PAGE (its own localhost origin, its own devices).
+    // A T0 device gains a passkey rung the same way row 19 gains a
+    // passphrase one: created open with no ceremony, then "keep this
+    // device" — except the ceremony here (`enrollPasskey`) runs against
+    // the CDP virtual authenticator, and what crosses to the worker is
+    // not a typed passphrase but a DERIVED, NON-EXTRACTABLE KEK handle
+    // (PERSISTENCE.md's "trust sentence": the assertion runs on the
+    // page because `navigator.credentials` is window-only).
+    await guard(async () => {
+      const made = await probe(prfPage, "hc-make", {
+        petname: "not yet kept",
+        policy: "while-open",
+        promote: false,
+      });
+      const id = made.id as string;
+      const opened = await probe(prfPage, "hc-open", { id, unseal: {} });
+      await probe(prfPage, "hc-add", { id, titles: TODOS });
+      await probe(prfPage, "hc-checkpoint", { id });
+
+      const kept = await probe(prfPage, "pk-promote", { id, petname: "passkey laptop" });
+
+      // A NEW WORKER, so nothing in memory can be what opens it.
+      await probe(prfPage, "hc-die", { id });
+      const silent = await probe(prfPage, "hc-open", { id, unseal: {} });
+      const withPasskey = await probe(prfPage, "pk-unseal", { id });
+      const items = await probe(prfPage, "hc-items", { id });
+
+      const ok = kept.attempt.refused === false &&
+        kept.row.policy === "passkey" &&
+        kept.status.rungs.prf === true &&
+        kept.status.rungs.untilReseal === false &&
+        kept.status.rungs.passphrase === true &&
+        kept.status.rungs.userPassphrase === false &&
+        kept.status.needsPassphrase === false &&
+        kept.enrollment.rpId === "localhost" &&
+        kept.enrollment.credIdLen > 0 &&
+        silent.unseal.refused === true && silent.unseal.error.code === "no-rung" &&
+        silent.status.sealed === true &&
+        withPasskey.attempt.refused === false &&
+        withPasskey.status.resumed === true &&
+        TODOS.every((t: string) => items.titles.includes(t));
+      record(
+        "24 passkey",
+        "promotion: enrolling a passkey rung, and logging in with it",
+        ok,
+        `the ceremony (\`enrollPasskey\`) ran on the PAGE against the CDP virtual ` +
+          `authenticator — rpId=${j(kept.enrollment.rpId)}, credential ${kept.enrollment.credIdLen} ` +
+          `bytes, transports=${j(kept.enrollment.transports)}. What crossed to the worker was the ` +
+          `DERIVED, NON-EXTRACTABLE KEK HANDLE, never the raw PRF output or the credential; the ` +
+          `worker re-wrapped the DEK under it (refused: ${kept.attempt.refused}) and the index row ` +
+          `followed LAST: ${j(kept.row)}. rungs=${j(kept.status.rungs)} — the platform door is SHUT ` +
+          `(untilReseal=false, "asked to be asked"), and sealT0's generated passphrase wrap stays ` +
+          `behind as a door with no key (passphrase=true, userPassphrase=false); ` +
+          `needsPassphrase=${kept.status.needsPassphrase} because the picker offers the passkey ` +
+          `ceremony, not a text field. Against a FRESH worker, an unseal with no ceremony at all is ` +
+          `refused (${j(silent.unseal.error)}); asserting the passkey (\`assertPasskey\` → ` +
+          `\`conn.unseal({prfKek})\`) opens it and resumes (${withPasskey.status.resumed}) with ` +
+          `${j(items.titles)} intact`,
+      );
+      await probe(prfPage, "hc-close", { id });
+      await probe(prfPage, "hc-forget", { ids: [id] });
+    });
+
+    // --- 25: passkey — THE WRONG KEY IS ONE CLEAN BIT -----------------------
+    //
+    // A fresh device, promoted to passkey exactly as row 24 does, then
+    // an unseal attempt with a KEK derived from key material the wrap
+    // was never made with. AES-KW's integrity check makes this a clean
+    // `wrong-passkey` refusal with no partial state — a wrong credential,
+    // a wrong PRF input, and a copied wrap record all land here
+    // indistinguishably, by construction.
+    await guard(async () => {
+      const made = await probe(prfPage, "hc-make", {
+        petname: "wrong key candidate",
+        policy: "while-open",
+        promote: false,
+      });
+      const id = made.id as string;
+      await probe(prfPage, "hc-open", { id, unseal: {} });
+      await probe(prfPage, "hc-add", { id, titles: TODOS });
+      await probe(prfPage, "hc-checkpoint", { id });
+      await probe(prfPage, "pk-promote", { id, petname: "wrong key candidate" });
+
+      await probe(prfPage, "hc-die", { id });
+      // Reconnect (no ceremony) before the passkey ops, which assume an
+      // existing connection — the same shape row 24's `silent` open
+      // uses.
+      await probe(prfPage, "hc-open", { id });
+      const wrong = await probe(prfPage, "pk-unseal-wrong", { id });
+      // No partial state: a call against the still-sealed host refuses
+      // the same way it always does, not with anything half-open.
+      const sealedCall = await probe(prfPage, "hc-call-sealed", { id });
+      const right = await probe(prfPage, "pk-unseal", { id });
+      const items = await probe(prfPage, "hc-items", { id });
+
+      const ok = wrong.attempt.refused === true &&
+        wrong.attempt.error.code === "wrong-passkey" &&
+        wrong.status.sealed === true &&
+        sealedCall.refused === true && sealedCall.error.code === "no-rung" &&
+        right.attempt.refused === false && right.status.resumed === true &&
+        TODOS.every((t: string) => items.titles.includes(t));
+      record(
+        "25 passkey",
+        "a KEK derived from the wrong key material is refused cleanly — AES-KW's integrity check, no partial key",
+        ok,
+        `against a fresh worker, a KEK derived from 32 random bytes the wrap was never made ` +
+          `with — same HKDF→AES-KW shape, wrong input — refuses as ${j(wrong.attempt.error.code)} ` +
+          `(${j(wrong.attempt.error.message)}); the device stays sealed (${wrong.status.sealed}) ` +
+          `with no partial DEK ever existing, exactly as a wrong passphrase refuses (row 20). A ` +
+          `follow-up call against the still-sealed host refuses the ordinary way ` +
+          `(${j(sealedCall.error.code)}), not with anything half-open. The RIGHT passkey then ` +
+          `opens it and resumes (${right.status.resumed}) with ${j(items.titles)} intact — a wrong ` +
+          `credential, a wrong PRF input, and a copied wrap record are all this same one clean bit.`,
+      );
+      await probe(prfPage, "hc-close", { id });
+      await probe(prfPage, "hc-forget", { ids: [id] });
+    });
+
+    // --- 26: passkey — RESEAL SURVIVAL AND THE ADDITIVE FALLBACK ------------
+    //
+    // A device kept with `every-session` (a real user-chosen passphrase,
+    // so it has NO platform wrap) switched to passkey unseal — the
+    // kept-device path where the passphrase, not a platform rung,
+    // authorizes the re-wrap (PERSISTENCE.md's "On a kept device"). Then
+    // the two rulings this row exists to pin: reseal never asks an
+    // upgrade question when a PRF rung remains reachable (the
+    // generalized guard), and BOTH doors open the device afterward —
+    // rungs are additive, the policy tag names the ceremony to OFFER,
+    // not the only one.
+    await guard(async () => {
+      const made = await probe(prfPage, "hc-make", {
+        petname: "every-session then passkey",
+        policy: "every-session",
+        promote: true,
+      });
+      const id = made.id as string;
+      await probe(prfPage, "hc-open", { id, unseal: { passphrase: PASS } });
+      await probe(prfPage, "hc-add", { id, titles: TODOS });
+      await probe(prfPage, "hc-checkpoint", { id });
+
+      const switched = await probe(prfPage, "pk-switch", { id, passphrase: PASS });
+
+      // RESEAL — NO PASSPHRASE OFFERED. The generalized guard: any
+      // reachable rung (userPassphrase OR prf) makes reseal proceed
+      // with no ceremony at all.
+      const resealed = await probe(prfPage, "hc-reseal", { id });
+
+      // DOOR ONE: the passkey. A fresh worker first, so nothing in
+      // memory is what opens it.
+      await probe(prfPage, "hc-die", { id });
+      await probe(prfPage, "hc-open", { id });
+      const viaPasskey = await probe(prfPage, "pk-unseal", { id });
+
+      // RESEAL AGAIN, then DOOR TWO: the passphrase.
+      await probe(prfPage, "hc-reseal", { id });
+      await probe(prfPage, "hc-die", { id });
+      await probe(prfPage, "hc-open", { id });
+      const viaPassphrase = await probe(prfPage, "hc-unseal", { id, opts: { passphrase: PASS } });
+      const items = await probe(prfPage, "hc-items", { id });
+
+      const ok = switched.attempt.refused === false &&
+        switched.row.policy === "passkey" &&
+        switched.status.rungs.prf === true &&
+        switched.status.rungs.userPassphrase === true &&
+        switched.status.rungs.untilReseal === false &&
+        resealed.attempt.refused === false &&
+        resealed.status.sealed === true &&
+        resealed.status.rungs.prf === true &&
+        viaPasskey.attempt.refused === false && viaPasskey.status.resumed === true &&
+        viaPassphrase.attempt.refused === false && viaPassphrase.status.resumed === true &&
+        TODOS.every((t: string) => items.titles.includes(t));
+      record(
+        "26 passkey",
+        "the PRF wrap survives reseal with no upgrade ceremony, and BOTH doors still open the device",
+        ok,
+        `the device was kept as \`every-session\` with a real user passphrase (no platform ` +
+          `wrap to re-wrap from) and switched to passkey unseal — the kept-device path, ` +
+          `authorized by the passphrase itself. rungs after the switch: ${j(switched.status.rungs)} ` +
+          `— policy=${j(switched.row.policy)}, both rungs present. A reseal offering NO passphrase ` +
+          `was NOT refused (refused=${resealed.attempt.refused}): the generalized guard walks a ` +
+          `PRF rung as always-reachable, so no upgrade question was asked. After reseal ` +
+          `(sealed=${resealed.status.sealed}) the wrap SURVIVED — rungs.prf=${resealed.status.rungs.prf} ` +
+          `— which is the rung's whole point: an assertion per unseal, nothing persisted opens it ` +
+          `alone. Against fresh workers, BOTH doors open it: the passkey ` +
+          `(resumed=${viaPasskey.status.resumed}) and, after resealing again, the passphrase ` +
+          `(resumed=${viaPassphrase.status.resumed}) — rungs are additive, the policy tag names ` +
+          `the ceremony to OFFER, not the only one. Todos intact: ${j(items.titles)}`,
+      );
+
+      // --- 26b: a STALE PLATFORM WRAP is never walked silently --------------
+      //
+      // The ruling this pins (worker.ts's `climbRung`, PERSISTENCE.md's
+      // "Unseal."): the passkey policy NEVER falls to the platform wrap.
+      // Promotion deletes that wrap precisely so the device asks; no
+      // shipped path recreates it beside a PRF wrap, so this arm PLANTS
+      // one (through seal.ts's own `enableUntilReseal`) and asserts the
+      // silent unseal still refuses — a device whose owner chose the
+      // passkey ceremony must get that ceremony even when a skippable
+      // door has appeared in its namespace.
+      await probe(prfPage, "pk-plant-platform", { id, passphrase: PASS });
+      await probe(prfPage, "hc-die", { id });
+      const planted = await probe(prfPage, "hc-open", { id, unseal: {} });
+      const opened = await probe(prfPage, "pk-unseal", { id });
+      const plantedOk = planted.unseal.refused === true &&
+        planted.unseal.error.code === "no-rung" &&
+        planted.status.sealed === true &&
+        planted.status.rungs.untilReseal === true &&
+        opened.attempt.refused === false && opened.status.resumed === true;
+      record(
+        "26b passkey",
+        "a planted platform wrap beside the PRF wrap is NEVER walked silently",
+        plantedOk,
+        `with the device sealed, a platform wrap was PLANTED beside its PRF wrap ` +
+          `(rungs.untilReseal=${planted.status.rungs.untilReseal} — the skippable door exists); ` +
+          `a fresh worker's unseal with no ceremony input is still refused ` +
+          `(${j(planted.unseal.error?.code)}) and the device stays sealed ` +
+          `(${planted.status.sealed}): the passkey policy never falls to the platform wrap ` +
+          `(worker.ts's asked-to-be-asked rule, applied to the rung that replaced it). The ` +
+          `passkey ceremony then opens it as ever (resumed=${opened.status.resumed}).`,
+      );
+      await probe(prfPage, "hc-close", { id });
+      await probe(prfPage, "hc-forget", { ids: [id] });
+    });
+
+    // --- 27: passkey — capability, off the browser --------------------------
+    await guard(async () => {
+      const caps = await probe(prfPage, "pk-capability");
+      record(
+        "27 passkey",
+        "INFO: PRF capability, answered off the browser with the CDP authenticator present",
+        "info",
+        `prfCapability()=${j(caps.capability)}; PublicKeyCredential present=${caps.publicKeyCredential} ` +
+          `— a browser without either would simply not be offered the rung, never a broken ceremony.`,
+      );
+    });
+
+    // --- 28: THE SEAMS ARE REAL, AND REFUSE BEFORE ANY BINDING -------------
     //
     // A client that reaches PAST `bindStore` and calls
     // `conn.driver.initStore(...)` directly — every `Driver` method is
@@ -1256,7 +1536,7 @@ async function main() {
         ? "also refused"
         : "accepted (it only arms the guest's own address, not the worker's grant)";
       record(
-        "24 store-egress",
+        "28 store-egress",
         "the worker's seams are real and refuse before any binding",
         ok,
         `\`conn.driver.initStore(...)\` called DIRECTLY (a client sneaking addressing past the ` +
@@ -1269,7 +1549,7 @@ async function main() {
       await probe(page, "hc-forget", { ids: [id] });
     });
 
-    // --- 25: bindStore REFUSES BY NAME -------------------------------------
+    // --- 29: bindStore REFUSES BY NAME -------------------------------------
     //
     // Three distinct destinations that must never be accepted, each
     // refused with its OWN code rather than a shared message a caller
@@ -1348,7 +1628,7 @@ async function main() {
         mismatched.attempt.refused && mismatched.attempt.error.code === "no-credential" &&
         sealed.attempt.refused && sealed.attempt.error.code === "no-rung";
       record(
-        "25 store-egress",
+        "29 store-egress",
         "bindStore refuses by NAME, not by message prose",
         ok,
         `an unparseable endpoint → ${j(bad.attempt.error.code)}; a usable endpoint with nothing ` +
@@ -1367,10 +1647,10 @@ async function main() {
       await probe(page, "hc-forget", { ids: [sealId] });
     });
 
-    /** Row 26 carries its device into rows 27 and 28. */
+    /** Row 30 carries its device into rows 31 and 32. */
     let storeDevice = "";
 
-    // --- 26: bind wires the derived grant and the escrowed signer ---------
+    // --- 30: bind wires the derived grant and the escrowed signer ---------
     //
     // The page half of the ceremony (`putSigningKey`) and the worker
     // half (`bindStore`) in the order a real embedder must run them.
@@ -1408,7 +1688,7 @@ async function main() {
         j(bound.status.storage) === j(binding) &&
         log.length >= 1 && signed !== undefined;
       record(
-        "26 store-egress",
+        "30 store-egress",
         "bind wires the derived grant and the escrowed signer",
         ok,
         `escrow landed for ${s3Origin} (${escrow.ok}); bindStore accepted ` +
@@ -1422,10 +1702,10 @@ async function main() {
       );
     });
 
-    // --- 27: the binding survives the host's death -------------------------
+    // --- 31: the binding survives the host's death -------------------------
     //
     // `__die`, reconnect, `unseal` with NO passphrase (the platform
-    // wrap from row 26's `untilReseal: true`) — and the sealed row must
+    // wrap from row 30's `untilReseal: true`) — and the sealed row must
     // have been RE-APPLIED by the worker at bring-up with no page-side
     // state at all (persist.rs's "embedder-supplied addressing,
     // re-applied by the embedder", engine/guest/src/persist.rs:611-614
@@ -1447,7 +1727,7 @@ async function main() {
         back.status.storage.endpoint === s3Origin &&
         log.length >= 1 && signed !== undefined;
       record(
-        "27 store-egress",
+        "31 store-egress",
         "the binding survives the host's death: re-applied at bring-up, no re-bind",
         ok,
         `after a KILL and a fresh worker, an unseal with NO passphrase auto-unseals from the ` +
@@ -1460,7 +1740,7 @@ async function main() {
       );
     });
 
-    // --- 28: reseal seals it, unseal restores it, unbind refuses at the seam
+    // --- 32: reseal seals it, unseal restores it, unbind refuses at the seam
     //
     // Reseal drops the IN-WORKER egress authority with everything else
     // (STORAGE-EGRESS.md §6): a fresh status() on the sealed device
@@ -1471,7 +1751,7 @@ async function main() {
     await guard(async () => {
       const id = storeDevice;
       // THE UPGRADE CEREMONY (row 20's idiom): this device's only
-      // usable rung is the platform wrap from row 26, so reseal REQUIRES
+      // usable rung is the platform wrap from row 30, so reseal REQUIRES
       // the passphrase and it becomes the device's new every-session
       // rung.
       const resealed = await probe(page, "hc-reseal", { id, passphrase: PASS, upgrade: true });
@@ -1492,7 +1772,7 @@ async function main() {
         ensureAfterUnbind.attempt.refused === true &&
         logAfterUnbind.length === 0;
       record(
-        "28 store-egress",
+        "32 store-egress",
         "reseal seals the binding; unseal restores it; unbind refuses at the seam",
         ok,
         `reseal() (an upgrade ceremony, refused=${resealed.attempt.refused}) leaves the device ` +
@@ -1509,7 +1789,7 @@ async function main() {
       await probe(page, "hc-forget", { ids: [id] });
     });
 
-    // --- 29: the egress factories confine by origin and strip identity ----
+    // --- 33: the egress factories confine by origin and strip identity ----
     //
     // A PAGE-SIDE UNIT ROW: no worker, no wire, `store-egress.ts`'s
     // factories called directly over a hand-built `EgressGrant` — the
@@ -1524,7 +1804,7 @@ async function main() {
         stripped !== undefined && stripped.hasAuthorization === false &&
         r.sharedRefused.refused && r.sharedRefused.error.message.includes("no app tier on this provider");
       record(
-        "29 store-egress",
+        "33 store-egress",
         "the egress factories confine by origin and strip identity",
         ok,
         `makeOwnerFetch(grant) to an UNGRANTED origin → refused: ` +
@@ -1536,7 +1816,7 @@ async function main() {
       );
     });
 
-    // --- 30: the consent ceremony seals tokens the port never sees --------
+    // --- 34: the consent ceremony seals tokens the port never sees --------
     //
     // The v2 shape DRIVE.md §3 builds: the WORKER mints the PKCE
     // verifier and the state and hands back only a URL (public data —
@@ -1595,7 +1875,7 @@ async function main() {
         status.gdriveConsent === true && noTokenLeaked &&
         again.ok === false && again.error.code === "bad-ceremony";
       record(
-        "30 gdrive",
+        "34 gdrive",
         "the consent ceremony seals tokens the port never sees",
         ok,
         `oauthStart's authorizeUrl carries a PKCE challenge and state and the client id, no ` +
@@ -1612,7 +1892,7 @@ async function main() {
       await probe(page, "hc-forget", { ids: [id] });
     });
 
-    // --- 31: bindStore gdrive refuses by code ------------------------------
+    // --- 35: bindStore gdrive refuses by code ------------------------------
     //
     // The same rule as the S3 arm, wearing this provider's vocabulary
     // (DRIVE.md §5): everything knowable at bind time settles at bind
@@ -1674,7 +1954,7 @@ async function main() {
         badBase.attempt.refused && badBase.attempt.error.code === "bad-destination" &&
         emptyRoot.attempt.refused && emptyRoot.attempt.error.code === "bad-destination";
       record(
-        "31 gdrive",
+        "35 gdrive",
         "bindStore gdrive refuses by CODE",
         ok,
         `a fresh device with NO ceremony → ${j(noConsent.attempt.error.code)}; after a ceremony ` +
@@ -1687,7 +1967,7 @@ async function main() {
       await probe(page, "hc-forget", { ids: [id] });
     });
 
-    /** Row 32 carries its device into rows 33, 34, 35, 36. */
+    /** Row 36 carries its device into rows 37, 38, 39, 40. */
     let gdriveDevice = "";
     const gdriveBinding = { kind: "gdrive", root: "pm-devstore", apiBase: gdOrigin, clientId: GD_CLIENT_ID };
     const gdriveSpec = {
@@ -1700,7 +1980,7 @@ async function main() {
       tokenUrl: `${gdOrigin}/token`,
     };
 
-    // --- 32: bind wires the derived grant; egress carries the consent -----
+    // --- 36: bind wires the derived grant; egress carries the consent -----
     //
     // Addressing plus app identifiers, nothing user-secret (DRIVE.md
     // §5); the fake's request log is the observable that the OWNER
@@ -1731,7 +2011,7 @@ async function main() {
         root.includes("pm-devstore") &&
         rootChildren.includes("docs") && rootChildren.includes("pickup");
       record(
-        "32 gdrive",
+        "36 gdrive",
         "bind wires the derived grant; egress carries the consent",
         ok,
         `bindStore accepted and status().storage echoes the addressing: ${j(bound.status.storage)}; ` +
@@ -1743,13 +2023,13 @@ async function main() {
       );
     });
 
-    // --- 33: consent and binding survive the host's death ------------------
+    // --- 37: consent and binding survive the host's death ------------------
     //
     // `__die`, reconnect, unseal with NO ceremony — the sealed oauth row
     // AND the sealed binding both come back re-applied at bring-up, not
     // re-entered (persist.rs's "embedder-supplied addressing, re-applied
     // by the embedder", engine/guest/src/persist.rs — the same claim
-    // STORAGE-EGRESS.md's row 27 pins for S3, now for the OAuth row too).
+    // STORAGE-EGRESS.md's row 31 pins for S3, now for the OAuth row too).
     await guard(async () => {
       const id = gdriveDevice;
       await probe(page, "hc-die", { id });
@@ -1764,7 +2044,7 @@ async function main() {
         back.status.storage !== null && back.status.storage.apiBase === gdOrigin &&
         ensure.attempt.refused === false && after > before;
       record(
-        "33 gdrive",
+        "37 gdrive",
         "consent and binding survive the host's death",
         ok,
         `after a KILL and a fresh worker, an unseal with NO passphrase auto-unseals from the ` +
@@ -1773,11 +2053,11 @@ async function main() {
           `NO \`bindStore\` call anywhere in this row, \`ensureBucket()\` still reached the fake ` +
           `(${after - before} new request(s)) — \`bringUpEngine\` re-armed the grant from the ` +
           `sealed oauth row and re-applied \`initStore\`, exactly as persist.rs's comment ` +
-          `describes and row 27 already pinned for the S3 arm.`,
+          `describes and row 31 already pinned for the S3 arm.`,
       );
     });
 
-    // --- 34: 401 → refresh → retry, and the ROTATION is SEALED -------------
+    // --- 38: 401 → refresh → retry, and the ROTATION is SEALED -------------
     //
     // DRIVE.md §4's write-back, made falsifiable: `fake.expireNow()`
     // invalidates every access token, so the next bucket op must refresh
@@ -1800,7 +2080,7 @@ async function main() {
 
       const ok = first.attempt.refused === false && second.attempt.refused === false;
       record(
-        "34 gdrive",
+        "38 gdrive",
         "401 → refresh → retry, and the rotation is SEALED",
         ok,
         `expireNow() invalidates every live access token; a bucket op still succeeds ` +
@@ -1814,7 +2094,7 @@ async function main() {
       );
     });
 
-    // --- 35: forget is the honest disconnect --------------------------------
+    // --- 39: forget is the honest disconnect --------------------------------
     //
     // `forgetOauth` deletes the sealed consent and best-effort revokes
     // it at the provider; the BINDING survives (forgetting the account
@@ -1851,7 +2131,7 @@ async function main() {
         rebound.attempt.refused === false &&
         ensureAgain.attempt.refused === false;
       record(
-        "35 gdrive",
+        "39 gdrive",
         "forget is the honest disconnect",
         ok,
         `forgetOauth() reports gdriveConsent=${forgotten.value?.gdriveConsent} and the fake's log ` +
@@ -1866,11 +2146,11 @@ async function main() {
       );
     });
 
-    // --- 36: reseal seals the consent with everything else ------------------
+    // --- 40: reseal seals the consent with everything else ------------------
     //
     // Reseal drops the in-worker egress authority with everything else
     // (STORAGE-EGRESS.md §6, DRIVE.md §4): the same upgrade-ceremony
-    // shape row 28 pins for S3, now checked for the oauth row too.
+    // shape row 32 pins for S3, now checked for the oauth row too.
     await guard(async () => {
       const id = gdriveDevice;
       const resealed = await probe(page, "hc-reseal", { id, passphrase: PASS, upgrade: true });
@@ -1886,7 +2166,7 @@ async function main() {
         back.status.storage !== null &&
         ensure.attempt.refused === false;
       record(
-        "36 gdrive",
+        "40 gdrive",
         "reseal seals the consent with everything else",
         ok,
         `reseal() (an upgrade ceremony, refused=${resealed.attempt.refused}) leaves the device ` +
@@ -1898,7 +2178,7 @@ async function main() {
       );
     });
 
-    // --- 37: names disclose no doc id — the keyed-name regression -----------
+    // --- 41: names disclose no doc id — the keyed-name regression -----------
     //
     // WHAT AN OBSERVER OF THE STORE IS PREVENTED FROM LEARNING, made
     // falsifiable. Object contents on this provider are keyhive
@@ -1938,7 +2218,7 @@ async function main() {
         !docFolders.includes(docHex) &&
         leaking.length === 0;
       record(
-        "37 gdrive",
+        "41 gdrive",
         "stored names disclose no doc id (keyed names, ported from S3)",
         ok,
         `after a flush, the structure still resolves — ${j(rootChildren)} under the root, ` +
@@ -1950,7 +2230,7 @@ async function main() {
           `nothing about WHICH document any of it belongs to. Name-keys blind labels, not ` +
           `traffic shape, and this row asserts exactly the labels half. (More than one doc ` +
           `folder is EXPECTED here and is not a naming bug: \`BucketState.name_keys\` is ` +
-          `instance memory, so each respawned worker in rows 33/34/36 minted a fresh keychain ` +
+          `instance memory, so each respawned worker in rows 37/38/40 minted a fresh keychain ` +
           `and flushed a complete copy under a fresh folder name. The S3 arm orphans objects ` +
           `the same way for the same reason — the flush re-uploads everything it does not ` +
           `remember, so the newest folder is always whole.)`,

@@ -467,6 +467,16 @@ export type VisorContext =
   // and unlike "settings" it is a destructive act, which changes the
   // tenant's weight class (armed, dimmed) but not what the context means.
   | { kind: "reset" }
+  // THE ENTRY CEREMONIES (entry.ts): the device picker and the first-run
+  // fork. Bare kinds for the same reason "settings" and "reset" are —
+  // there is no component behind either. The picker is the only context
+  // that can be on the strip BEFORE the claim (see `deferClaim`), which
+  // is exactly why it must be describable without a surface: at that
+  // moment the visor knows nothing about the user and nothing about an
+  // app, and the strip's honest answer is the name of the ceremony and
+  // nothing else.
+  | { kind: "device-picker" }
+  | { kind: "first-run" }
   | null;
 
 /** USER VOICE: the user's word for a component, in THE VISOR'S voice —
@@ -566,8 +576,11 @@ export interface DrawerSheet {
    * and before `.armed` lands on the root. Only the still-current
    * session ever reaches this. */
   onArmed?: () => void;
-  /** Run once the reveal animation has been started — where a sheet with
-   * no arming delay takes focus. */
+  /** Run once the reveal animation has been started — where a sheet
+   * takes focus, IF it should: only when typing into one specific input
+   * is the interaction the user asked for (the naming sheet), never
+   * merely because the sheet contains inputs — on mobile an autofocused
+   * input raises the keyboard over the drawer it belongs to. */
   onShown?: () => void;
 }
 
@@ -730,6 +743,29 @@ export interface VisorConfig {
   /** Consulted FIRST by `restoreContext`: a live component surface, if
    * the consumer has one. Undefined/null = nothing claimed here. */
   contextOverride?: () => VisorContext | null | undefined;
+  /** BOOT UNCLAIMED: build the whole visor EXCEPT the two things that
+   * are the user's own — the anchor colour and the identity cluster.
+   *
+   * WHY A VISOR WOULD WANT THIS. A consumer whose boot passes through a
+   * login (the solo page's device picker — runtime/PERSISTENCE.md's
+   * "Unseal UX") may render nothing personal until the seal opens, and
+   * the picker is itself trusted UI that has to live in the drawer:
+   * identity/account/ceremony surfaces appear only in visor territory,
+   * because the drawer's spatial mechanics — a sheet attached to the
+   * pinned strip, the page dimmed around it — are the one thing a
+   * component confined to its own rect cannot forge. Those two demands
+   * used to be in tension (the strip had to exist for the picker, and
+   * the strip painted a colour). This splits them: the SHELL boots
+   * (strip, context, announce, drawer host, live region) wearing the
+   * CSS's generic grey fallback dress, and `claim()` at unseal is when
+   * colour and identity arrive together.
+   *
+   * Under it, `initVisor` reads no hue, writes no `--visor-bg`, and
+   * renders no identity cluster — so `stripPersonal`-style assertions
+   * ("nothing of the user's is on screen before the seal opens") hold
+   * against the DOM and not merely against the page's own account of
+   * itself. Default false: an ordinary embedder claims at boot. */
+  deferClaim?: boolean;
 }
 
 /** Late-installed handlers for controls the STRIP renders. The strip is
@@ -744,8 +780,25 @@ export interface VisorHandlers {
 
 export interface Visor {
   /** True when this boot rolled a FRESH anchor colour — the consumer is
-   * expected to announce it (a reset is announced, never quiet). */
+   * expected to announce it (a reset is announced, never quiet).
+   *
+   * FALSE WHILE UNCLAIMED (see `VisorConfig.deferClaim`): before the
+   * claim no hue has been read or rolled at all, so there is no honest
+   * "yes" to give. The real answer arrives with `claim()`. */
   readonly fresh: boolean;
+  /** THE MOMENT THE VISOR BECOMES YOURS — the other half of
+   * `deferClaim`. Reads (or rolls, and persists) the anchor hue, paints
+   * it, and renders the identity cluster: colour, name, device and the
+   * settings button all arrive in one frame, which is what makes
+   * unseal-as-login legible rather than merely successful
+   * (runtime/PERSISTENCE.md, "Unseal UX").
+   *
+   * IDEMPOTENT, and a no-op on a visor that was never deferred: a
+   * consumer may call it unconditionally at its own "the seal opened"
+   * point. The returned `fresh` is the same value `visor.fresh` reports
+   * afterwards — the caller usually wants it right here, because the
+   * announcement belongs to the claim. */
+  claim(): { fresh: boolean };
   install(handlers: VisorHandlers): void;
   /** Move the context: a MOVE preempts any live announcement. */
   setContext(ctx: VisorContext): void;
@@ -848,7 +901,13 @@ export interface Visor {
    * to a live preview a settings sheet is painting. `applyHue` paints;
    * this moves only where the choice is persisted, so a Cancel has
    * something truthful to revert to even in a browser where storage is
-   * unavailable (and a re-read would otherwise re-roll). */
+   * unavailable (and a re-read would otherwise re-roll).
+   *
+   * THROWS WHILE UNCLAIMED (`deferClaim`), rather than answering. There
+   * is no committed hue before the claim — nothing has been read and
+   * nothing rolled — and every plausible placeholder is a lie a caller
+   * would then persist or paint. No caller exists that early; a loud
+   * failure keeps it that way. */
   committedHue(): number;
   /** Paint, without committing (live preview). */
   applyHue(hue: number): void;
@@ -886,9 +945,25 @@ export interface Visor {
 }
 
 export function initVisor(config: VisorConfig): Visor {
-  const { hue, fresh } = loadVisorHue(config.hueKey, config.legacyHueKey);
-  let committedHue = hue;
-  applyVisorHue(hue);
+  // THE UNCLAIMED SHELL, and what is missing from it. Under `deferClaim`
+  // the two personal things — the anchor hue and the identity record —
+  // are not read, not painted and not rendered; everything else below
+  // (context machinery, announce, drawer host, live region, back
+  // chevron) is built exactly as always, because a picker that is a
+  // drawer sheet needs all of it. The strip and drawer then wear the
+  // zero-chroma grey FALLBACK in visor.css, so the claim reads as the
+  // arrival of colour.
+  const deferred = config.deferClaim === true;
+  let claimed = !deferred;
+  let committedHue = 0;
+  let fresh = false;
+  const rollHue = () => {
+    const rolled = loadVisorHue(config.hueKey, config.legacyHueKey);
+    committedHue = rolled.hue;
+    fresh = rolled.fresh;
+    applyVisorHue(rolled.hue);
+  };
+  if (!deferred) rollHue();
 
   // FIXED IDS. They are part of the trust model and of the e2e contract —
   // "the visor's pixels" is a claim about named elements a component
@@ -993,6 +1068,16 @@ export function initVisor(config: VisorConfig): Visor {
   // impersonating rectangle cannot reproduce, at the width where the
   // strip is most crowded.
   const renderIdentity = () => {
+    // NOTHING PERSONAL BEFORE THE CLAIM, enforced HERE rather than at
+    // the call sites. The cluster is the one place the user's own name,
+    // their word for this device and their glyph are rendered, so a
+    // stray external `renderIdentity()` from a consumer that has not
+    // claimed yet — a device-label refresh, a settings commit racing the
+    // unseal — must be inert rather than merely unlikely. An unclaimed
+    // cluster is EMPTY: no name, no device, and no settings button
+    // either, because the settings sheet is about a visor that is not
+    // yours yet.
+    if (!claimed) return;
     const rec = loadIdentity(config.identityKey);
     identityBox.replaceChildren();
     const lines = document.createElement("span");
@@ -1053,6 +1138,13 @@ export function initVisor(config: VisorConfig): Visor {
   const topSurface = (ctx: VisorContext): SurfaceIdentity | null => {
     if (ctx === null) return appSurface();
     if (ctx.kind === "settings" || ctx.kind === "reset") return appSurface();
+    // THE ENTRY CEREMONIES, same answer for the same reason: they are
+    // the visor talking about the device and the account, not about a
+    // component, so the cluster keeps naming whatever is installed. In
+    // practice, at picker time, that is NOTHING — the app has not been
+    // fetched and `appSurface()` is null — and an empty top line is the
+    // correct pre-unseal screen rather than a special case.
+    if (ctx.kind === "device-picker" || ctx.kind === "first-run") return appSurface();
     return ctx;
   };
 
@@ -1074,7 +1166,8 @@ export function initVisor(config: VisorConfig): Visor {
     // line names the sheet.
     const kind = ctx === null ? "app" : (ctx.kind ?? "panel");
     const sheet = kind === "credentials" || kind === "naming" ||
-      kind === "settings" || kind === "storage" || kind === "reset";
+      kind === "settings" || kind === "storage" || kind === "reset" ||
+      kind === "device-picker" || kind === "first-run";
 
     // --- the TOP line: THE USER'S RECOGNITION PAIR ---------------------
     // The mark the user picked and the word the user chose, side by side,
@@ -1209,6 +1302,15 @@ export function initVisor(config: VisorConfig): Visor {
         // with it.
         : kind === "reset"
         ? "erase this visor"
+        // THE ENTRY CEREMONIES. Both lines are the visor naming its own
+        // sheet, in the plainest words it has: at picker time the strip
+        // is the ONLY thing on screen that is not the sheet, so this
+        // line is the whole of what the anchor can say — and it must say
+        // nothing personal, which "choose a device" does not.
+        : kind === "device-picker"
+        ? "choose a device"
+        : kind === "first-run"
+        ? "no account on this device yet"
         : "visor settings";
       ctxBottom.append(lead);
     }
@@ -1241,8 +1343,15 @@ export function initVisor(config: VisorConfig): Visor {
     // replaces the drawer's children — leaving a tenant that believes it
     // is open with no DOM of its own. There is no ordering of those two
     // that ends well, so the tap is refused instead.
+    // The two ENTRY ceremonies join them on the mechanical half of the
+    // same argument: the picker owns the drawer exclusively and the fork
+    // is the resting state of an account-less device, so a tap that
+    // opened the naming sheet would evict (or suspend) a ceremony that
+    // is the only thing the user can currently be doing. Pre-claim there
+    // is not even a surface to name.
     const tappable = surface !== null && kind !== "credentials" && kind !== "naming" &&
-      kind !== "storage" && kind !== "reset";
+      kind !== "storage" && kind !== "reset" && kind !== "device-picker" &&
+      kind !== "first-run";
     if (tappable) {
       context.setAttribute("role", "button");
       context.setAttribute("tabindex", "0");
@@ -1607,8 +1716,8 @@ export function initVisor(config: VisorConfig): Visor {
           sheet.root.classList.add("armed");
         }, ARM_MS);
       }
-      // Where a sheet with no arming delay takes focus: there is nothing
-      // on it a mis-tap could spend.
+      // Where a sheet takes focus, if its interaction warrants taking it
+      // at all (see `DrawerSheet.onShown`).
       sheet.onShown?.();
     };
 
@@ -1794,7 +1903,26 @@ export function initVisor(config: VisorConfig): Visor {
   };
 
   return {
-    fresh,
+    // A GETTER, not the boot's value captured: under `deferClaim` the
+    // answer legitimately changes once, at the claim, and a consumer
+    // that read the property early would otherwise hold a stale `false`
+    // forever — silently swallowing the one announcement a reset owes
+    // the user.
+    get fresh() {
+      return fresh;
+    },
+    claim() {
+      // IDEMPOTENT AND ORDER-INSENSITIVE. A second call (or a call on a
+      // visor that was never deferred) reports the boot's answer and
+      // touches nothing: the hue must be rolled EXACTLY once, or a
+      // "fresh" that is announced twice would train users that the
+      // anchor colour changes on its own.
+      if (claimed) return { fresh };
+      claimed = true;
+      rollHue();
+      renderIdentity();
+      return { fresh };
+    },
     install(h) {
       if (h.requestNaming) handlers.requestNaming = h.requestNaming;
       if (h.requestSettings) handlers.requestSettings = h.requestSettings;
@@ -1807,7 +1935,13 @@ export function initVisor(config: VisorConfig): Visor {
     setBack,
     identity: () => loadIdentity(config.identityKey),
     saveIdentity: (rec) => saveIdentity(config.identityKey, rec),
-    committedHue: () => committedHue,
+    committedHue: () => {
+      // A LOUD REFUSAL, not a plausible number. Pre-claim there is no
+      // committed hue; anything returned here would be painted or
+      // persisted as though the user had chosen it.
+      if (!claimed) throw new Error("the visor is unclaimed: no committed hue before claim()");
+      return committedHue;
+    },
     applyHue: applyVisorHue,
     commitHue: (h) => {
       committedHue = h;

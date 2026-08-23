@@ -303,7 +303,12 @@ carry opaque bytes either way):
 - **Join flow** (new device): "join existing account" → shows QR
   (data-URL) + the 79-char code grouped by 4 → SAS screen → light
   confirm ("I initiated this" + SAS match) → adoption announcement
-  ("this device now follows your profile: ‹name›, your colour").
+  ("this device now follows your profile: ‹name›, your colour"). On the
+  solo page the pane mounts INSIDE the visor drawer — it is the second
+  phase of the first-run sheet (`visor/ui/entry.ts`), reached from that
+  sheet's "join another device" choice — so the code and the SAS are
+  rendered in a sheet hanging off the pinned strip over a dimmed page,
+  which is a geometry no component frame can produce.
 - **Add flow** (trusted device): strip menu → "add a device" → code
   entry (paste/typed) → SAS screen → **heavy ceremony**: statement of
   consequence ("full access to everything in your account"), the #22
@@ -317,7 +322,11 @@ carry opaque bytes either way):
   card path.
 - New CI invariant (`scripts/check-invariants.sh`): the pairing code and
   SAS render only in visor-owned surfaces, never inside a component
-  frame; grep-enforceable markers to be chosen by Track B.
+  frame; grep-enforceable markers to be chosen by Track B. Check (i)
+  joins it and extends the same argument one step outward: the surfaces
+  the join flow is REACHED from — the device picker and the first-run
+  fork — are pinned to `visor/ui/entry.ts` by the same marker pattern,
+  and no embedder page may carry their markup below the strip.
 
 ## 6. Gates
 

@@ -29,9 +29,9 @@ import { filesystemWeb } from "@polyengine/wasi/filesystem-web";
 // constructible over the REMOTE driver without a line changed.
 import { createEnginePairingDriver } from "../../pairing-engine.ts";
 import { unhex } from "../../engine.ts";
-// The storage-egress rows (24+): the page-side half of the credential
+// The storage-egress rows (28+): the page-side half of the credential
 // ceremony (`putSigningKey`, exactly as the visor's real sheet would
-// call it) and the moved factories under direct unit test (row 29,
+// call it) and the moved factories under direct unit test (row 33,
 // no worker involved at all — STORAGE-EGRESS.md §7, "verbatim in
 // semantics").
 import { putSigningKey } from "../../keystore.ts";
@@ -90,6 +90,13 @@ import {
   unsealFromPlatform,
   unsealWithPassphrase,
 } from "../../device-store/mod.ts";
+// THE PRF RUNG'S WINDOW HALF (PERSISTENCE.md, "The PRF rung: passkey
+// unseal"). `passkey.ts` is imported ONLY here, never by worker.ts —
+// every symbol in it touches `navigator`/`window`, and the dispatch's
+// governing note repeats the module's own: this is the split that
+// keeps the WebAuthn ceremony on the page.
+import { assertPasskey, enrollPasskey, prfCapability } from "../../device-store/passkey.ts";
+import { getPrfEnrollment } from "../../device-store/seal.ts";
 
 // --- obviously-synthetic test values ---------------------------------------
 
@@ -1069,10 +1076,159 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
     }
   },
 
-  // --- storage egress (rows 24+) ---------------------------------------
+  // --- the PRF rung (rows 24-27) ---------------------------------------
+  //
+  // These ops run on the PRF PAGE (its own localhost origin, its own
+  // device namespaces — a self-contained matrix section, PERSISTENCE.md's
+  // "The PRF rung: passkey unseal"), against a CDP virtual authenticator
+  // the driver installs before any ceremony.
+
+  /** An INFO row: what a page can learn before offering the rung, with
+   * the CDP authenticator present. */
+  "pk-capability": async () => ({
+    capability: await prfCapability(),
+    publicKeyCredential: typeof (globalThis as unknown as { PublicKeyCredential?: unknown })
+        .PublicKeyCredential !== "undefined",
+  }),
 
   /**
-   * ROW 24. A client that reaches for `conn.driver.initStore(...)`
+   * PROMOTE TO PASSKEY (first time): the worker half first
+   * (`conn.promote`), the index half last (`promoteDevice`) — the same
+   * discipline every other promote op follows, so a refused ceremony
+   * never leaves an index row promising a rung the device does not
+   * have. The ceremony (`enrollPasskey`) runs on THIS page, against the
+   * CDP virtual authenticator the driver installed.
+   */
+  "pk-promote": async (arg: { id: string; petname: string }) => {
+    const conn = conns.get(arg.id)!;
+    const grant = await enrollPasskey(arg.id, arg.petname);
+    const attempt = await refuses(() =>
+      conn.promote({ policy: "passkey", prf: { kek: grant.kek, ...grant.enrollment } })
+    );
+    const { record } = await promoteDevice(arg.id, {
+      petname: arg.petname,
+      unsealPolicy: "passkey",
+    });
+    return {
+      attempt,
+      row: { petname: record.petname, tier: record.tier, policy: record.unsealPolicy },
+      status: await conn.status(),
+      // LENGTHS ONLY, never the credential bytes or the salts.
+      enrollment: {
+        credIdLen: grant.enrollment.credentialId.length,
+        transports: grant.enrollment.transports ?? [],
+        rpId: grant.enrollment.rpId,
+        prfInputLen: grant.enrollment.prfInput.length,
+        hkdfSaltLen: grant.enrollment.hkdfSalt.length,
+      },
+    };
+  },
+
+  /**
+   * SWITCH AN ALREADY-KEPT DEVICE to passkey unseal. No petname change —
+   * `promoteDevice` here only flips `unsealPolicy` (PERSISTENCE.md,
+   * "On a kept device"). `passphrase` passes through to `conn.promote`
+   * so a device with no platform wrap (the `every-session` case) can
+   * still authorize the re-wrap: the passphrase is the device's login
+   * anyway.
+   */
+  "pk-switch": async (arg: { id: string; passphrase?: string }) => {
+    const conn = conns.get(arg.id)!;
+    const grant = await enrollPasskey(arg.id, "switched");
+    const attempt = await refuses(() =>
+      conn.promote({
+        policy: "passkey",
+        passphrase: arg.passphrase,
+        prf: { kek: grant.kek, ...grant.enrollment },
+      })
+    );
+    const { record } = await promoteDevice(arg.id, { unsealPolicy: "passkey" });
+    return {
+      attempt,
+      row: { petname: record.petname, tier: record.tier, policy: record.unsealPolicy },
+      status: await conn.status(),
+      enrollment: {
+        credIdLen: grant.enrollment.credentialId.length,
+        transports: grant.enrollment.transports ?? [],
+        rpId: grant.enrollment.rpId,
+        prfInputLen: grant.enrollment.prfInput.length,
+        hkdfSaltLen: grant.enrollment.hkdfSalt.length,
+      },
+    };
+  },
+
+  /** THE LOGIN: assert the enrolled passkey, derive the KEK on this
+   * page, hand the worker only the non-extractable handle. */
+  "pk-unseal": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const prfKek = await assertPasskey(arg.id);
+    const attempt = await refuses(() => conn.unseal({ prfKek }));
+    return { attempt, status: await conn.status() };
+  },
+
+  /**
+   * THE WRONG-KEY ARM OF THE GATE: a KEK derived from key material the
+   * wrap was never made with. This deliberately skips the real
+   * ceremony (no assertion, no PRF output) and builds a KEK straight
+   * from 32 random bytes through the same HKDF→AES-KW shape
+   * (device-store/passkey.ts's `deriveKek`), so the unwrap has exactly
+   * one thing wrong with it: the key. The AES-KW integrity check is
+   * what turns that into a clean `wrong-passkey` refusal rather than
+   * partial success.
+   */
+  "pk-unseal-wrong": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const wrongIkm = crypto.getRandomValues(new Uint8Array(32));
+    const material = await crypto.subtle.importKey("raw", wrongIkm as BufferSource, "HKDF", false, [
+      "deriveKey",
+    ]);
+    const wrongKek = await crypto.subtle.deriveKey(
+      {
+        name: "HKDF",
+        hash: "SHA-256",
+        salt: crypto.getRandomValues(new Uint8Array(32)) as BufferSource,
+        info: new TextEncoder().encode(`pm-device-store prf-kek v1|${arg.id}`) as BufferSource,
+      },
+      material,
+      { name: "AES-KW", length: 256 },
+      false,
+      ["wrapKey", "unwrapKey"],
+    );
+    const attempt = await refuses(() => conn.unseal({ prfKek: wrongKek }));
+    return { attempt, status: await conn.status() };
+  },
+
+  /**
+   * PLANT A PLATFORM WRAP beside a passkey device's PRF wrap — the
+   * adversarial arm of the asked-to-be-asked ruling. Promotion to
+   * `passkey` deletes the platform wrap; this puts one BACK (through
+   * seal.ts's own `enableUntilReseal`, which is exactly how a stale one
+   * could exist), so the gate can assert that a `passkey`-policy unseal
+   * still refuses to walk it silently (worker.ts's `climbRung`: the
+   * passkey arm never falls to the platform wrap).
+   */
+  "pk-plant-platform": async (arg: { id: string; passphrase: string }) => {
+    await enableUntilReseal(openNamespace(arg.id), arg.passphrase);
+    return { planted: true };
+  },
+
+  /** What the `seal` store's PRF record says, for evidence lines — the
+   * store rests unsealed by design (PERSISTENCE.md's "Unseal"). */
+  "pk-meta": async (arg: { id: string }) => {
+    const meta = await getPrfEnrollment(openNamespace(arg.id));
+    return meta
+      ? {
+        present: true,
+        credIdLen: meta.credentialId.length,
+        rpId: meta.rpId,
+        transports: meta.transports ?? [],
+      }
+      : { present: false };
+  },
+  // --- storage egress (rows 28+) ---------------------------------------
+
+  /**
+   * ROW 28. A client that reaches for `conn.driver.initStore(...)`
    * DIRECTLY — sneaking addressing past the `bindStore` ceremony,
    * since `initStore` is a plain `Driver` method and every `Driver`
    * method is on the remote proxy — must still find every seam
@@ -1099,7 +1255,7 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
     return { initAttempt, ensureAttempt };
   },
 
-  /** ROW 25. `bindStore`'s own refusals, asked by CODE. */
+  /** ROW 29. `bindStore`'s own refusals, asked by CODE. */
   "hc-bind": async (arg: { id: string; binding: StoreBinding }) => {
     const conn = conns.get(arg.id)!;
     const attempt = await refuses(() => conn.bindStore(arg.binding));
@@ -1107,7 +1263,7 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
   },
 
   /**
-   * ROW 26+. The page half of the ceremony: escrow a SYNTHETIC LABELED
+   * ROW 30+. The page half of the ceremony: escrow a SYNTHETIC LABELED
    * credential exactly as the credential sheet would
    * (`putSigningKey(origin, accessKey, secret)`), non-extractable, and
    * out of scope the instant this call returns.
@@ -1124,7 +1280,7 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
     return { attempt: await refuses(() => conn.driver.ensureBucket()) };
   },
 
-  /** ROW 28's other half: `unbindStore` refuses at the seam, never
+  /** ROW 32's other half: `unbindStore` refuses at the seam, never
    * silently. */
   "hc-unbind": async (arg: { id: string }) => {
     const conn = conns.get(arg.id)!;
@@ -1133,7 +1289,7 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
   },
 
   /**
-   * ROW 29. The moved factories, gated DIRECTLY — no worker, no wire,
+   * ROW 33. The moved factories, gated DIRECTLY — no worker, no wire,
    * one `EgressGrant` built by hand exactly as `applyBinding` would
    * build it for an s3 destination (STORAGE-EGRESS.md §4: owner and
    * public both the one origin, shared empty because S3 has no app
@@ -1177,7 +1333,7 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
     return { notGranted, sharedRefused };
   },
 
-  // --- Google Drive (rows 30+) ------------------------------------------
+  // --- Google Drive (rows 34+) ------------------------------------------
   //
   // THE PAGE OWNS THE POPUP; THE WORKER OWNS THE VERIFIER (DRIVE.md §3).
   // These three ops are the whole of the page's role in the ceremony:

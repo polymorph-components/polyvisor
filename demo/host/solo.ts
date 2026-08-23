@@ -33,11 +33,23 @@
 //     sessionStorage anchor) and is PROMOTED to T1 by a ceremony that
 //     asks the seal choices. Try, then keep (#37).
 //   * UNSEAL IS THE LOGIN, and the page renders NOTHING PERSONAL before
-//     it: no anchor colour, no name, no icon, no app. The visor itself
-//     is not constructed until the seal opens. That ordering IS the
-//     anti-spoofing property (PERSISTENCE.md, "The index: what may exist
-//     before unseal") — a page imitating the picker cannot paint your
-//     colour, because at picker time nothing on this origin has.
+//     it: no anchor colour, no name, no icon, no app. What DOES exist
+//     before it is the visor SHELL, booted UNCLAIMED
+//     (`initVisor({ deferClaim: true })`): the strip in its generic grey
+//     dress, an EMPTY identity cluster, and a live drawer — because the
+//     device picker is a visor drawer sheet (visor/ui/entry.ts), not
+//     page furniture. The CLAIM at unseal (`visor.claim()`) is when the
+//     colour and the name arrive together, which is what "the visor
+//     becomes yours" means here.
+//
+//     THE ORDERING IS UNCHANGED BY THAT, and it is the ordering that is
+//     the anti-spoofing property (PERSISTENCE.md, "The index: what may
+//     exist before unseal"): no colour, no name, no icon before the seal
+//     opens. A page imitating the picker cannot paint your colour,
+//     because at picker time nothing on this origin has — and it cannot
+//     produce the picker's geometry either, since a sheet hanging off
+//     the pinned strip over a dimmed page is not a thing a component
+//     confined to its own rectangle can draw.
 //   * THE STORAGE SEAMS REFUSE IN THE WORKER now, not here (worker.ts's
 //     `NO_STORE`). Solo never had a bucket; what changed is only which
 //     module states the refusal.
@@ -53,14 +65,21 @@ import {
 import { createRunner, type Runner } from "../../visor/surface/runner.ts";
 import { createFrameBackend } from "../../visor/frame/frame-backend.ts";
 import { createSurface } from "../../visor/surface/surface.ts";
-import { initVisor, type SurfaceIdentity, VISOR_HUES } from "../../visor/ui/visor.ts";
+import { initVisor, type SurfaceIdentity, type Visor, VISOR_HUES } from "../../visor/ui/visor.ts";
 import { registerVisorSheets } from "../../visor/ui/sheets.ts";
+import {
+  type DevicePickerHost,
+  type DevicePickerRow,
+  type FirstRunHost,
+  mountDevicePicker,
+  offerFirstRun,
+} from "../../visor/ui/entry.ts";
 import {
   type AddPaneHandle,
   type AnnounceSink,
   drainAnnouncements,
+  type JoinPaneHandle,
   mountAddPane,
-  mountJoinPane,
   reconcileFromDriver,
   usCacheKeys,
   visorAnnounceSink,
@@ -84,6 +103,12 @@ import {
 import type { DeviceStatus, StoreBinding } from "../../runtime/device-store/rpc.ts";
 import { putSigningKey } from "../../runtime/keystore.ts";
 import { normalizeOrigin } from "../../runtime/store-egress.ts";
+// THE PAGE HALF OF THE PASSKEY RUNG (PERSISTENCE.md, "The PRF rung:
+// passkey unseal"). `navigator.credentials` is window-only, so the
+// enrollment/assertion ceremonies live here — on the embedder's side of
+// the visor seam — and hand the worker only a non-extractable derived
+// KEK: never a passphrase-shaped secret, never the DEK.
+import { assertPasskey, enrollPasskey, prfCapability } from "../../runtime/device-store/passkey.ts";
 
 const params = new URLSearchParams(location.search);
 // Same default as demo.ts: n0's public relay, overridable with ?relay=…
@@ -288,6 +313,17 @@ hooks.bootTrace = () => trace.slice();
 
 // --- boot: the device comes first ------------------------------------------
 
+/** THE APP'S ROW IN THE TRUST TABLE, in a box.
+ *
+ * It is a box rather than a plain `let` because the visor is now
+ * constructed in `boot` and filled in by `startApp`: the config's
+ * `appSurface` thunk closes over boot's scope, and `startApp` writes the
+ * value once the app has mounted. One mutable field, one reader, no
+ * setter ceremony. */
+interface AppSlot {
+  surface: SurfaceIdentity | null;
+}
+
 async function boot() {
   const banner = document.getElementById("banner")!.querySelector(".bar-inner")!;
   const say = (s: string) => {
@@ -307,13 +343,36 @@ async function boot() {
       lastUsed: d.lastUsed,
     }));
 
+  // THE VISOR SHELL, BEFORE THE DEVICE IS RESOLVED — and UNCLAIMED.
+  //
+  // It has to exist this early because the device picker is one of its
+  // drawer sheets (visor/ui/entry.ts): the sheet's whole claim is that it
+  // hangs off the pinned strip over a dimmed page, which needs the strip
+  // and the drawer host to be real. It must be UNCLAIMED for exactly as
+  // long, because nothing personal may render before the seal opens — so
+  // `deferClaim` reads no hue, writes no `--visor-bg`, and renders no
+  // identity cluster. What the user sees at the picker is the generic
+  // grey dress and an empty right-hand cluster.
+  //
+  // `startApp` calls `visor.claim()` at the unseal, and THAT is the
+  // moment the colour and the name arrive.
+  const appSlot: AppSlot = { surface: null };
+  const visor = initVisor({
+    hueKey: VISOR_KEY,
+    identityKey: IDENTITY_KEY,
+    deferClaim: true,
+    // ONE app surface and no nested places: the strip's context falls
+    // back to the app's row and there is nothing to override it with.
+    appSurface: () => appSlot.surface,
+  });
+
   say("looking for your devices…");
   const devices = await listDevices();
   note(`index:${devices.length}`);
 
-  const conn = await resolveDevice(devices, say, status);
+  const conn = await resolveDevice(devices, say, status, visor);
   note(`unsealed:${conn.deviceId.slice(0, 8)}`);
-  await startApp(conn, say, status);
+  await startApp(conn, say, status, visor, appSlot);
 }
 
 /**
@@ -345,6 +404,7 @@ async function resolveDevice(
   devices: DeviceRecord[],
   say: (s: string) => void,
   status: (s: string) => void,
+  visor: Visor,
 ): Promise<DeviceConnection> {
   const anchored = await adoptAnchor();
   const anchoredRow = anchored === null ? undefined : await getDevice(anchored);
@@ -364,7 +424,7 @@ async function resolveDevice(
     return await openNew(devices);
   }
 
-  return await picker(devices, say, status);
+  return await picker(devices, say, status, visor);
 }
 
 /** A generic, non-personal default. The petname rests IN THE CLEAR
@@ -387,11 +447,15 @@ async function openNew(devices: DeviceRecord[]): Promise<DeviceConnection> {
 
 /** Attach to a known device and open it. `passphrase` is the
  * `every-session` rung's input and is not held anywhere: it goes over
- * the port and out of scope. */
+ * the port and out of scope. `prfKek` is the passkey rung's input — the
+ * non-extractable handle the page derived (`assertPasskey`) — and is
+ * under the same non-retention discipline: it crosses the port and is
+ * out of scope here too. */
 async function open(
   id: string,
   passphrase: string | undefined,
   status: (s: string) => void,
+  prfKek?: CryptoKey,
 ): Promise<DeviceConnection> {
   const conn = await connectDevice({
     device: { kind: "id", id },
@@ -399,7 +463,11 @@ async function open(
     artifacts: ENGINE_ARTIFACTS,
     label: "solo",
   });
-  const st = await conn.unseal(passphrase === undefined ? {} : { passphrase });
+  const opts: { passphrase?: string; prfKek?: CryptoKey } = {};
+  if (passphrase !== undefined) opts.passphrase = passphrase;
+  if (prfKek !== undefined) opts.prfKek = prfKek;
+  const st = await conn.unseal(opts);
+
   status(`device ${conn.deviceId.slice(0, 8)}… open (resumed: ${st.resumed})`);
   return conn;
 }
@@ -409,10 +477,12 @@ async function open(
  *
  * WHAT MAY BE ON THIS SCREEN is the index's contract and the negative
  * half is the important one: no colour, no name, no icon, no account
- * identifier (index.ts's header, PERSISTENCE.md's "The index"). So the
- * visor is not even constructed yet; the markup here is page furniture
- * in web/solo.html, in the plain page chrome, and everything it renders
- * comes from index rows.
+ * identifier (index.ts's header, PERSISTENCE.md's "The index"). The
+ * SHEET is the visor's (visor/ui/entry.ts's `mountDevicePicker`) and the
+ * visor is UNCLAIMED at this point, so the generic-ness is structural
+ * rather than a promise this file keeps: there is no hue to paint and no
+ * identity record rendered. What this function owns is the HOST half —
+ * what "open this row" actually does, and what a refusal means.
  *
  * AUTO-UNSEAL is the design record's own sentence: "One device in the
  * index and a policy that permits it: auto-unseal straight to the app."
@@ -426,127 +496,128 @@ function picker(
   devices: DeviceRecord[],
   say: (s: string) => void,
   status: (s: string) => void,
+  visor: Visor,
 ): Promise<DeviceConnection> {
-  const card = document.getElementById("device-picker")!;
-  const list = document.getElementById("device-list")!;
-  const pass = document.getElementById("device-pass") as HTMLElement;
-  const passInput = document.getElementById("device-pass-input") as HTMLInputElement;
-  const passOpen = document.getElementById("device-pass-open") as HTMLButtonElement;
-  const passLabel = document.getElementById("device-pass-for")!;
-  const problem = document.getElementById("device-problem")!;
-  passInput.type = MASKED.type;
+  // THE INDEX ROW, NARROWED to what a picker may see. The mapping is the
+  // enforcement: nothing that is not on `DevicePickerRow` can reach the
+  // sheet, so a record growing a field later cannot leak it by accident.
+  const rows: DevicePickerRow[] = devices.map((d) => ({
+    id: d.id,
+    petname: d.petname,
+    lastUsed: d.lastUsed,
+    asksPassphrase: d.unsealPolicy === "every-session",
+    asksPasskey: d.unsealPolicy === "passkey",
+  }));
+
+  // The driving hooks for this screen, installed ONCE and querying
+  // LAZILY: the picker's elements exist only while its sheet is open, so
+  // a hook that captured them at install time would be a hook that
+  // stopped working the moment the sheet was rebuilt (or never started,
+  // on the auto-unseal path where the sheet may never appear at all).
+  const el = (id: string) => document.getElementById(id);
+  const shown = (id: string) => {
+    const e = el(id);
+    return e !== null && e.hidden === false;
+  };
+  hooks.picker = () => ({
+    visible: shown("device-picker"),
+    rows: Array.from(document.querySelectorAll("#device-list .device-pick")).map(
+      (b) => b.textContent ?? "",
+    ),
+    needsPassphrase: shown("device-pass"),
+    needsPasskey: shown("device-passkey"),
+    problem: shown("device-problem") ? el("device-problem")!.textContent ?? "" : "",
+  });
+  hooks.pickDevice = (petname: string) => {
+    const b = document.querySelector(
+      `#device-list .device-pick[data-petname="${CSS.escape(petname)}"]`,
+    ) as HTMLButtonElement | null;
+    if (!b) return false;
+    b.click();
+    return true;
+  };
+  hooks.newDevice = () => (el("device-new") as HTMLButtonElement | null)?.click();
+  hooks.typePassphrase = (v: string) => {
+    const input = el("device-pass-input") as HTMLInputElement | null;
+    if (!input) return false;
+    input.value = v;
+    return true;
+  };
+  hooks.unsealClick = () => (el("device-pass-open") as HTMLButtonElement | null)?.click();
+  /** The passkey ceremony's own button, clicked as a user clicks it —
+   * the ceremony behind it is a real WebAuthn assertion either way. */
+  hooks.passkeyUnsealClick = () =>
+    (el("device-passkey-open") as HTMLButtonElement | null)?.click();
+
 
   return new Promise<DeviceConnection>((resolve) => {
-    let busy = false;
+    /** The banner is the page's own account of where it has got to, and
+     * "opening this device…" is a lie once the open has failed. A picker
+     * that is waiting for a user is READY — it is simply waiting for a
+     * different thing than usual. (The refusal itself lands IN THE
+     * SHEET; this line is page furniture.) */
+    const readyToAsk = () => say("ready — this device needs its passphrase");
 
-    const fail = (e: unknown) => {
-      busy = false;
-      problem.textContent = err(e);
-      problem.hidden = false;
-      // The banner is the page's own account of where it has got to, and
-      // "opening this device…" is a lie once the open has failed. A
-      // picker that is waiting for a user is READY — it is simply
-      // waiting for a different thing than usual.
-      say("ready — this device needs its passphrase");
-    };
-
-    /** Open `row`, asking for the passphrase first when it needs one. */
-    const choose = async (row: DeviceRecord, passphrase?: string) => {
-      if (busy) return;
-      busy = true;
-      problem.hidden = true;
-      say("opening this device…");
-      try {
-        const conn = await open(row.id, passphrase, status);
-        card.hidden = true;
-        note(passphrase === undefined ? "picked:silent" : "picked:passphrase");
-        resolve(conn);
-      } catch (e) {
-        // NOT A DEAD END, and not a guess about why. `no-rung` /
-        // `wrong-passphrase` both mean "this device wants its
-        // passphrase"; anything else is reported as it came.
-        const code = (e as { code?: string }).code;
-        if (code === "no-rung" || code === "wrong-passphrase") {
-          askFor(row);
-          fail(e);
-        } else {
-          fail(e);
+    const host: DevicePickerHost = {
+      open: async (row, passphrase) => {
+        say("opening this device…");
+        try {
+          const conn = await open(row.id, passphrase, status);
+          note(passphrase === undefined ? "picked:silent" : "picked:passphrase");
+          resolve(conn);
+        } catch (e) {
+          readyToAsk();
+          // NOT A DEAD END, and not a guess about why. `no-rung` /
+          // `wrong-passphrase` both mean "this device wants its
+          // passphrase"; anything else is reported as it came, and the
+          // sheet stays up either way.
+          const code = (e as { code?: string }).code;
+          throw {
+            needsPassphrase: code === "no-rung" || code === "wrong-passphrase",
+            message: err(e),
+          };
         }
-      }
+      },
+      openWithPasskey: async (row) => {
+        // THE CEREMONY IS THE PAGE'S (PERSISTENCE.md, "The window/worker
+        // split"): the assertion runs here, the KEK is derived here, and
+        // what crosses the port is the non-extractable handle. The KEK
+        // is a LOCAL — it is never stashed on this page.
+        say("opening this device…");
+        try {
+          const prfKek = await assertPasskey(row.id);
+          const conn = await open(row.id, undefined, status, prfKek);
+          note("picked:passkey");
+          resolve(conn);
+        } catch (e) {
+          // TWO KINDS OF REFUSAL, and the difference is which door the
+          // sheet should be showing afterwards. `no-rung` /
+          // `wrong-passphrase` mean this device wants its passphrase, so
+          // the field is revealed (rungs are additive: a passkey device
+          // may also carry the user's own). `wrong-passkey` /
+          // `unsupported` — and a ceremony the user cancelled, which
+          // arrives as a plain DOMException — are the passkey path
+          // saying no, so the sheet STAYS on the passkey view and the
+          // button stays clickable.
+          const code = (e as { code?: string }).code;
+          const needsPassphrase = code === "no-rung" || code === "wrong-passphrase";
+          if (needsPassphrase) readyToAsk();
+          else say("ready — try your passkey again");
+          throw { needsPassphrase, message: err(e) };
+        }
+      },
+      openNew: async () => {
+        say("setting this device up…");
+        try {
+          const conn = await openNew(devices);
+          note("picked:new");
+          resolve(conn);
+        } catch (e) {
+          readyToAsk();
+          throw { needsPassphrase: false, message: err(e) };
+        }
+      },
     };
-
-    const askFor = (row: DeviceRecord) => {
-      pass.hidden = false;
-      passLabel.textContent = row.petname;
-      passInput.value = "";
-      passInput.focus();
-      passOpen.onclick = () => void choose(row, passInput.value);
-      passInput.onkeydown = (ev) => {
-        if (ev.key === "Enter") void choose(row, passInput.value);
-      };
-      hooks.typePassphrase = (v: string) => {
-        passInput.value = v;
-      };
-      hooks.unsealClick = () => passOpen.click();
-    };
-
-    list.replaceChildren();
-    for (const row of devices) {
-      const item = document.createElement("div");
-      item.className = "device-row";
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "device-pick";
-      btn.dataset.petname = row.petname;
-      // The petname is the user's own word and is rendered as such;
-      // there is no component-influenced string anywhere on this screen,
-      // so there is nothing here to plate (the three-voices rule).
-      btn.textContent = row.petname;
-      const when = document.createElement("span");
-      when.className = "device-when";
-      when.textContent = row.lastUsed > 0
-        ? `last used ${new Date(row.lastUsed).toLocaleString()}`
-        : "never used";
-      item.append(btn, when);
-      list.append(item);
-      btn.onclick = () => {
-        if (row.unsealPolicy === "every-session") askFor(row);
-        else void choose(row);
-      };
-    }
-
-    const newBtn = document.getElementById("device-new") as HTMLButtonElement;
-    newBtn.onclick = () => {
-      if (busy) return;
-      busy = true;
-      problem.hidden = true;
-      say("setting this device up…");
-      openNew(devices).then((conn) => {
-        card.hidden = true;
-        note("picked:new");
-        resolve(conn);
-      }, fail);
-    };
-
-    card.hidden = false;
-    pass.hidden = true;
-    problem.hidden = true;
-
-    hooks.picker = () => ({
-      visible: card.hidden === false,
-      rows: Array.from(list.querySelectorAll(".device-pick")).map((b) => b.textContent ?? ""),
-      needsPassphrase: pass.hidden === false,
-      problem: problem.hidden ? "" : problem.textContent ?? "",
-    });
-    hooks.pickDevice = (petname: string) => {
-      const b = list.querySelector(
-        `.device-pick[data-petname="${CSS.escape(petname)}"]`,
-      ) as HTMLButtonElement | null;
-      if (!b) return false;
-      b.click();
-      return true;
-    };
-    hooks.newDevice = () => newBtn.click();
 
     // ONE KEPT DEVICE AND A POLICY THAT PERMITS IT: straight through
     // (PERSISTENCE.md, "Unseal UX": "One device in the index and a
@@ -561,16 +632,39 @@ function picker(
     // tab of one device is a case the worker host supports (two clients,
     // one engine) rather than one it needs protecting from.
     //
-    // The picker still RENDERED before this: it is the screen a user
-    // sees for the fraction of a second the unseal takes, and it is
-    // where the failure lands if the wrap turns out to be gone.
+    // NO SHEET IS MOUNTED FIRST any more, and that is a change from when
+    // the picker was page markup that merely got unhidden. A drawer
+    // sheet that opened and closed inside the fraction of a second an
+    // auto-unseal takes would be a slide-down-slide-up flicker on the
+    // trust anchor itself, teaching the user that visor motion is noise.
+    // The failure path loses nothing: the picker arrives carrying the
+    // refusal (`opts.problem`), which is where it would have landed.
+    //
+    // A `passkey` DEVICE NEVER AUTO-UNSEALS (PERSISTENCE.md, "Unseal
+    // UX", explicitly): its ceremony is a user gesture some browsers
+    // demand for `credentials.get` anyway, so this policy has no silent
+    // path at all — a single kept passkey device still gets the picker.
     const only = devices[0];
-    if (devices.length === 1 && only.tier === "t1" && only.unsealPolicy !== "every-session") {
+    if (
+      devices.length === 1 && only.tier === "t1" &&
+      only.unsealPolicy !== "every-session" && only.unsealPolicy !== "passkey"
+    ) {
       note("auto-unseal");
-      void choose(only);
+      void (async () => {
+        say("opening this device…");
+        try {
+          const conn = await open(only.id, undefined, status);
+          note("picked:silent");
+          resolve(conn);
+        } catch (e) {
+          readyToAsk();
+          mountDevicePicker(visor, rows, host, { problem: err(e) });
+        }
+      })();
     } else {
       note("picker:wait");
       say("ready — choose a device");
+      mountDevicePicker(visor, rows, host);
     }
   });
 }
@@ -581,6 +675,8 @@ async function startApp(
   conn: DeviceConnection,
   say: (s: string) => void,
   status: (s: string) => void,
+  visor: Visor,
+  appSlot: AppSlot,
 ) {
   const driver = conn.driver;
   const tasks = conn.tasks;
@@ -588,24 +684,13 @@ async function startApp(
   say("fetching the app…");
   const appArt = await fetchArtifacts(APP_ARTIFACT);
 
-  // DECLARED BEFORE `initVisor`, not beside the app mount: the config
-  // below closes over it, and the visor renders the context during
-  // setup — a `let` declared afterwards would be in its temporal dead
-  // zone at exactly that moment.
-  let appSurface: SurfaceIdentity | null = null;
-
-  // THE MOMENT THE VISOR BECOMES YOURS. Nothing above this line painted
-  // a colour, a name or an icon; this call paints all three at once,
-  // which is what makes unseal-as-login legible (PERSISTENCE.md, "Unseal
-  // UX": "Unseal success is when the visor becomes yours").
-  const visor = initVisor({
-    hueKey: VISOR_KEY,
-    identityKey: IDENTITY_KEY,
-    // ONE app surface and no nested places: the strip's context falls
-    // back to the app's row and there is nothing to override it with.
-    appSurface: () => appSurface,
-  });
-  if (visor.fresh) {
+  // THE MOMENT THE VISOR BECOMES YOURS. The shell has been on screen
+  // since before the picker, but nothing above this line painted a
+  // colour, a name or an icon; this call brings all three at once, which
+  // is what makes unseal-as-login legible (PERSISTENCE.md, "Unseal UX":
+  // "Unseal success is when the visor becomes yours").
+  const { fresh } = visor.claim();
+  if (fresh) {
     visor.announce("new visor colour set for this device — remember it", 15000);
   }
   const announce: AnnounceSink = visorAnnounceSink(visor);
@@ -718,7 +803,7 @@ async function startApp(
     // The app's row in the trust table: ONE artifact, ONE record, keyed
     // by the name the visor fetched it by.
     const { mark, isNew } = sheets.marks.mark(APP_ARTIFACT);
-    appSurface = {
+    appSlot.surface = {
       // `name` IS the provenance key — the name the visor fetched the
       // artifact by, never the component's self-declared one.
       name: APP_ARTIFACT,
@@ -745,7 +830,14 @@ async function startApp(
         polling = false;
       });
     }, 400);
-    document.getElementById("first-run")!.hidden = true;
+    // THE ENTRY CEREMONY IS OVER. It was a drawer sheet, so it is
+    // CLOSED rather than hidden — the drawer is a tenancy, and a sheet
+    // left open under a mounted app would keep the strip naming a
+    // ceremony that has finished. Null-guarded because there may never
+    // have been one: a returning device with an account mounts the app
+    // without ever offering the fork.
+    entry?.close();
+    entry = null;
     note("app:mounted");
     say("ready");
   };
@@ -779,8 +871,8 @@ async function startApp(
       })();
     },
     onNamed: (provenance, petname, icon) => {
-      if (appSurface && appSurface.name === provenance) {
-        appSurface = { ...appSurface, petname, icon, isNew: false };
+      if (appSlot.surface && appSlot.surface.name === provenance) {
+        appSlot.surface = { ...appSlot.surface, petname, icon, isNew: false };
         visor.renderContext();
       }
       void (async () => {
@@ -797,11 +889,11 @@ async function startApp(
       })();
     },
     onForgotten: (provenance) => {
-      if (appSurface && appSurface.name === provenance) {
+      if (appSlot.surface && appSlot.surface.name === provenance) {
         // BOTH HALVES GO: forgetting deletes the record, so a cached
         // surface keeping its glyph would leave the strip wearing a mark
         // the visor no longer holds.
-        appSurface = { ...appSurface, petname: undefined, icon: "" };
+        appSlot.surface = { ...appSlot.surface, petname: undefined, icon: "" };
         visor.renderContext();
       }
       void (async () => {
@@ -907,16 +999,30 @@ async function startApp(
         if (deviceTenant.owns(session)) deviceTenant.close();
       };
       container.append(close);
-      void deviceState().then(({ row, st }) => {
-        if (st.tier === "t0") renderPromotion(body, row);
-        else renderKept(body, row, st);
-      });
+      void renderBody(body);
       return { root: container };
     });
   };
 
+  /** Re-read the device's row and status and (re-)draw the sheet body.
+   * Shared by the initial open AND the switch-to-passkey flow below,
+   * which must show the device's NEW policy once it lands — the simplest
+   * honest way is to ask the device again rather than hand-patch what is
+   * on screen. */
+  const renderBody = async (body: HTMLElement) => {
+    body.replaceChildren();
+    const { row, st } = await deviceState();
+    if (st.tier === "t0") await renderPromotion(body, row);
+    else await renderKept(body, row, st);
+    // NO `rebuild()` HERE, deliberately: the tenant's builder is what
+    // calls this, so a re-measure from inside it would recurse. The
+    // drawer measures the body it is handed; the switch flow below
+    // re-renders in place, which is a height change the sheet already
+    // tolerates the same way the initial async fill does.
+  };
+
   /** THE PROMOTION CEREMONY. */
-  const renderPromotion = (body: HTMLElement, row?: DeviceRecord) => {
+  const renderPromotion = async (body: HTMLElement, row?: DeviceRecord) => {
     const lead = document.createElement("p");
     lead.className = "cred-note";
     lead.textContent =
@@ -942,9 +1048,17 @@ async function startApp(
     nameField.append(nameInput);
     body.append(nameField);
 
-    // THE TWO SHIPPED RUNGS. `while-open` is the T0 rung and is not on
+    // CAPABILITY FIRST, asked once per sheet render (PERSISTENCE.md,
+    // "Enrollment order and the degrade"). "no" means the choice is
+    // simply not offered, with a plain sentence — never a broken
+    // ceremony; "yes"/"maybe" both offer it and let enrollment be the
+    // authoritative check.
+    const prfCap = await prfCapability();
+
+    // THE SHIPPED RUNGS. `while-open` is the T0 rung and is not on
     // offer here: a device the user asked to keep must not rest on a key
-    // that dies with the worker.
+    // that dies with the worker. `passkey` is offered only when this
+    // browser might do it at all.
     const rungField = field("How should this device open?");
     const rungs: { value: UnsealPolicy; label: string; hint: string }[] = [
       {
@@ -965,6 +1079,18 @@ async function startApp(
           "and is never stored. Forget it and this device's state is gone.",
       },
     ];
+    if (prfCap !== "no") {
+      rungs.push({
+        value: "passkey",
+        label: "Open it with my passkey",
+        // THE HONEST SENTENCE for this rung (PERSISTENCE.md, "The PRF
+        // rung: passkey unseal"), in the same register as the two above.
+        hint:
+          "The key that opens this device is derived from a passkey this browser " +
+          "asks for every time. Nothing stored here can open it. Lose the passkey " +
+          "and this device's state is gone.",
+      });
+    }
     let chosen: UnsealPolicy = "until-reseal";
     const passWrap = field("Your passphrase for this device");
     const passInput = document.createElement("input");
@@ -983,6 +1109,9 @@ async function startApp(
       radio.checked = r.value === chosen;
       radio.onchange = () => {
         chosen = r.value;
+        // THE PASSPHRASE FIELD STAYS HIDDEN FOR `passkey`: promotion
+        // always has the platform rung to authorize the re-wrap
+        // (worker.ts's `enablePrf`), so no passphrase is needed here.
         passWrap.hidden = chosen !== "every-session";
       };
       label.append(radio, document.createTextNode(` ${r.label}`));
@@ -993,6 +1122,15 @@ async function startApp(
       rungField.append(line);
     }
     body.append(rungField, passWrap);
+    if (prfCap === "no") {
+      // THE PLAIN SENTENCE the degrade owes the user, instead of a
+      // choice that would break when taken.
+      const noPrf = document.createElement("div");
+      noPrf.className = "hint";
+      noPrf.id = "device-passkey-unavailable";
+      noPrf.textContent = "this browser cannot open devices with a passkey";
+      body.append(noPrf);
+    }
 
     const problem = document.createElement("div");
     problem.className = "hint";
@@ -1009,6 +1147,36 @@ async function startApp(
       problem.hidden = true;
       void (async () => {
         try {
+          if (chosen === "passkey") {
+            // ENROLL FIRST. A failure here (an authenticator declining,
+            // a cancelled ceremony) leaves the device exactly as it was
+            // — nothing below has run — and the message already says
+            // whether a credential the authenticator minted needs
+            // deleting there (passkey.ts's `enrollPasskey`).
+            const grant = await enrollPasskey(conn.deviceId, nameInput.value);
+            // THE WORKER FIRST, THE INDEX LAST, exactly as the other
+            // arms: a failed re-wrap must never leave a row claiming a
+            // rung the device does not have.
+            await conn.promote({
+              policy: "passkey",
+              prf: { kek: grant.kek, ...grant.enrollment },
+            });
+            const { persisted } = await promoteDevice(conn.deviceId, {
+              petname: nameInput.value,
+              unsealPolicy: "passkey",
+            });
+            note("promoted:passkey");
+            await refreshDeviceLabel();
+            if (deviceTenant.isOpen()) deviceTenant.close();
+            announce(
+              persisted
+                ? "this device is kept on this browser"
+                : "this device is kept, but this browser would not promise to keep it — " +
+                  "it may be cleared when space runs short",
+              !persisted,
+            );
+            return;
+          }
           // THE WORKER FIRST, THE INDEX LAST (client.ts's `promote`): a
           // failed re-wrap must never leave a row claiming a rung the
           // device does not have.
@@ -1049,7 +1217,7 @@ async function startApp(
   };
 
   /** THE KEPT DEVICE: what was chosen, and the way back out. */
-  const renderKept = (body: HTMLElement, row: DeviceRecord | undefined, st: DeviceStatus) => {
+  const renderKept = async (body: HTMLElement, row: DeviceRecord | undefined, st: DeviceStatus) => {
     const lead = document.createElement("p");
     lead.className = "cred-note";
     lead.textContent = row === undefined
@@ -1057,6 +1225,9 @@ async function startApp(
       : st.policy === "every-session"
       ? `This device is kept on this browser as "${row.petname}", and asks for its ` +
         `passphrase every session.`
+      : st.policy === "passkey"
+      ? `This device is kept on this browser as "${row.petname}", and opens with ` +
+        `your passkey.`
       : `This device is kept on this browser as "${row.petname}", and opens itself ` +
         `until you seal it again.`;
     body.append(lead);
@@ -1073,19 +1244,23 @@ async function startApp(
     // Destroying a device is a separate, explicit act; reseal must not
     // do it by omission.
     //
-    // WHICH SHAPE IS `rungs.userPassphrase`, NOT THE POLICY TAG. The tag
-    // says which ceremony to offer at unseal; it does not say whether
-    // anybody knows a passphrase, and a device can be on `until-reseal`
-    // AND have the user's own (`enableUntilReseal` is additive). The
-    // durable answer is seal.ts's `PassphraseWrap.origin`.
+    // WHICH SHAPE IS `rungs.userPassphrase` OR `rungs.prf`, NOT THE
+    // POLICY TAG. The tag says which ceremony to offer at unseal; it
+    // does not say whether anybody holds a reachable rung, and a device
+    // can be on `until-reseal` AND have the user's own passphrase, or a
+    // passkey rung (both additive — `enableUntilReseal`, `enablePrf`).
+    // A PASSKEY RUNG IS ALWAYS WALKABLE (rpc.ts's `rungs.prf`: "a
+    // passkey rung only exists because a person enrolled a credential
+    // they hold"), which is why it joins `userPassphrase` here exactly
+    // as the worker's own reseal guard generalized.
     //
     // So on that device reseal ASKS, and the sentence is the plain one:
     // sealing this device means choosing what unseals it. The worker
     // re-keys from the platform rung — which is still there, which is
     // exactly why reseal time is when this is possible at all — and the
     // device comes back an `every-session` one. A device that already
-    // has the user's own passphrase reseals with no extra ceremony.
-    const upgrades = !st.rungs.userPassphrase && st.rungs.untilReseal;
+    // has a reachable rung reseals with no extra ceremony.
+    const upgrades = !st.rungs.userPassphrase && !st.rungs.prf && st.rungs.untilReseal;
 
     const warn = document.createElement("div");
     warn.className = "hint";
@@ -1094,6 +1269,9 @@ async function startApp(
       ? "Sealing this device means choosing what unseals it. This device opens itself " +
         "today, so there is nothing yet that you know and it does not — pick a " +
         "passphrase now, and from here on it asks for that."
+      : st.policy === "passkey"
+      ? "Sealing it again drops the keys held here and returns you to the device " +
+        "picker. You open it again with your passkey."
       : "Sealing it again drops the keys held here and returns you to the device " +
         "picker. You open it again with your passphrase.";
     body.append(warn);
@@ -1162,6 +1340,72 @@ async function startApp(
       })();
     };
     body.append(seal);
+
+    // SWITCH TO PASSKEY (PERSISTENCE.md, "Enrollment placement": "On a
+    // kept device"). Offered only for a device not already on this rung,
+    // and only when the browser might do it at all — the same capability
+    // probe the promotion sheet asks.
+    if (st.policy !== "passkey" && await prfCapability() !== "no") {
+      const switchWrap = document.createElement("div");
+      switchWrap.className = "cred-field";
+      // NO PLATFORM WRAP TO AUTHORIZE FROM: the switch needs an
+      // authorizing secret and the worker's `enablePrf` refuses without
+      // one, so a device on `every-session` (whose platform wrap did not
+      // survive promotion) is asked for its passphrase FIRST — which is
+      // that device's login anyway.
+      const needsPassphrase = !st.rungs.untilReseal;
+      const switchPassField = field(
+        "Your passphrase for this device",
+        "your current passphrase authorizes the switch",
+      );
+      const switchPassInput = document.createElement("input");
+      switchPassInput.type = MASKED.type;
+      switchPassInput.id = "device-switch-passkey-pass";
+      switchPassField.append(switchPassInput);
+      switchPassField.hidden = !needsPassphrase;
+
+      const switchProblem = document.createElement("div");
+      switchProblem.className = "hint";
+      switchProblem.id = "device-switch-passkey-problem";
+      switchProblem.hidden = true;
+
+      const switchBtn = document.createElement("button");
+      switchBtn.type = "button";
+      switchBtn.id = "device-switch-passkey";
+      switchBtn.textContent = "switch to passkey unseal";
+      switchBtn.onclick = () => {
+        switchBtn.disabled = true;
+        switchProblem.hidden = true;
+        void (async () => {
+          try {
+            const grant = await enrollPasskey(conn.deviceId, row?.petname ?? "");
+            // WORKER FIRST, INDEX LAST — the worker's re-wrap order
+            // guarantees nothing partial: a failure below leaves the
+            // device on its old rung, still openable exactly as before.
+            await conn.promote({
+              policy: "passkey",
+              passphrase: needsPassphrase ? switchPassInput.value : undefined,
+              prf: { kek: grant.kek, ...grant.enrollment },
+            });
+            await promoteDevice(conn.deviceId, { unsealPolicy: "passkey" });
+            note("switched:passkey");
+            await refreshDeviceLabel();
+            // THE RE-RENDER READS THE DEVICE AGAIN rather than patching
+            // this screen by hand: the platform wrap is now gone (the
+            // worker deletes it), so the copy above must reflect the new
+            // policy, and `deviceState()` is the one place that already
+            // knows how to say so.
+            await renderBody(body);
+          } catch (e) {
+            switchBtn.disabled = false;
+            switchProblem.textContent = err(e);
+            switchProblem.hidden = false;
+          }
+        })();
+      };
+      switchWrap.append(switchPassField, switchBtn, switchProblem);
+      body.append(switchWrap);
+    }
   };
 
   // --- storage: connect this device to a bucket it can sync through --------
@@ -1734,7 +1978,6 @@ async function startApp(
 
   // --- role: the JOINER (this page is the new device) ----------------------
 
-  const joinHost = document.getElementById("solo-join")!;
   let joinWired = false;
   let joinAttempts = 0;
   const WIRE_ATTEMPTS = 3;
@@ -1798,17 +2041,18 @@ async function startApp(
     }
   };
 
-  const joinHandle = mountJoinPane(joinHost, us, announce, (profile) => {
-    // THE ADOPTION BEAT: this device takes the account's colour and name.
-    // The UI reports the value; painting is the consumer's job.
+  /** THE ADOPTION BEAT: this device takes the account's colour and name.
+   * The visor UI reports the value; painting is the consumer's job — so
+   * this is the consumer's half, handed to `offerFirstRun` and fired by
+   * the join pane inside it. */
+  const adoptionBeat = (profile: { hue: number; displayName: string }) => {
     const angle = VISOR_HUES[profile.hue] ?? VISOR_HUES[0];
     visor.commitHue(angle);
     const rec = visor.identity();
     if (profile.displayName) visor.saveIdentity({ ...rec, name: profile.displayName });
     visor.renderIdentity();
     status(`this device now follows your account: ${profile.displayName || "(unnamed)"}`);
-  });
-  joinHost.hidden = true;
+  };
 
   // --- role: the ADDER (this page already has the account) -----------------
 
@@ -1968,32 +2212,30 @@ async function startApp(
     await mountApp();
   };
 
-  const firstRun = document.getElementById("first-run")!;
+  /** THE ENTRY CEREMONY, while it is on screen. Null whenever there is
+   * none — a device that already holds an account never offers the fork,
+   * and `mountApp` closes it on the join path. It carries the JOIN
+   * PANE's handle, because the pane lives inside the sheet and its poll
+   * loop is this file's. */
+  let entry: { joinHandle: JoinPaneHandle; close(): void } | null = null;
 
-  /** Reveal the fork (the markup is web/solo.html's — page furniture,
-   * not a ceremony) and wire its two buttons. */
-  const offerFirstRun = () => {
-    firstRun.hidden = false;
-    const newBtn = document.getElementById("solo-new-account") as HTMLButtonElement;
-    const joinBtn = document.getElementById("solo-join-account") as HTMLButtonElement;
-    newBtn.onclick = () => {
-      newBtn.disabled = true;
-      joinBtn.disabled = true;
+  /** THE FORK'S first choice, as the sheet's host sees it. The visor
+   * sheet shows a failure in its own pixels; the page's status line is
+   * kept too, because it is this page's own furniture and says where the
+   * boot has got to. */
+  const firstRunHost: FirstRunHost = {
+    newAccount: async () => {
       status("creating your account…");
-      newAccount().catch((e) => {
+      try {
+        await newAccount();
+      } catch (e) {
         status(`could not create an account: ${err(e)}`);
-        newBtn.disabled = false;
-        joinBtn.disabled = false;
-      });
-    };
-    joinBtn.onclick = () => {
-      firstRun.hidden = true;
-      joinHost.hidden = false;
-      // The join pane draws its own entry button; this click is the
-      // user's, forwarded, so the ceremony still starts from visor
-      // pixels and this file still never renders a code.
-      (joinHost.querySelector("button") as HTMLButtonElement | null)?.click();
-    };
+        // RE-THROWN AS ITS READ FORM: the sheet renders `message`, and
+        // `err` is the one reader that understands both backends' error
+        // shapes (the WIT payload and the host's typed refusals).
+        throw new Error(err(e));
+      }
+    },
   };
 
   // DOES THIS DEVICE ALREADY HOLD THE ACCOUNT? `us-profile-get` refuses
@@ -2025,15 +2267,20 @@ async function startApp(
     }
   } else {
     note("account:none");
-    offerFirstRun();
+    // THE FORK, AS A VISOR DRAWER SHEET (visor/ui/entry.ts). It carries
+    // the join pane with it, which is why the handle comes back here:
+    // the pane's tick is one driver read and the wiring it triggers is
+    // entirely this file's business.
+    entry = offerFirstRun(visor, us, announce, firstRunHost, adoptionBeat);
     say("ready — no account on this device yet");
   }
 
   // The join pane's tick is one driver read; its `true` is the
   // JOIN-COMPLETED edge, which is where the embedder owes the pair a
-  // sync path.
+  // sync path. NULL-GUARDED: the pane exists only while the fork sheet
+  // does, and a device that already holds an account never has one.
   poll(250, async () => {
-    if (await joinHandle.tick()) void joinerWire();
+    if (await entry?.joinHandle.tick()) void joinerWire();
   });
   // Remotely-caused identity changes are announced, never silent.
   poll(1000, () => drainAnnouncements(us, announce));
@@ -2056,20 +2303,33 @@ async function startApp(
     deviceLabel: () =>
       (document.querySelector("#visor-identity .who.device") as HTMLElement | null)
         ?.textContent ?? "",
-    /** The first-run fork, clicked as a user clicks it. */
-    newAccount: () =>
-      (document.getElementById("solo-new-account") as HTMLButtonElement | null)?.click(),
+    /** The first-run fork, clicked as a user clicks it. LAZY LOOKUPS,
+     * all of them: the fork is a drawer sheet now, so its controls exist
+     * only while it is open — which is exactly when a scenario drives
+     * them. Returns whether the button was actually found and clicked,
+     * so a scenario that drives this hook too late (after the entry
+     * sheet has already unmounted) fails on the spot naming the cause,
+     * rather than timing out 60s later on an account that was never
+     * going to appear. */
+    newAccount: () => {
+      const b = document.getElementById("solo-new-account") as HTMLButtonElement | null;
+      b?.click();
+      return b !== null;
+    },
     joinAccount: () =>
       (document.getElementById("solo-join-account") as HTMLButtonElement | null)?.click(),
-    /** The 79-char code as the JOIN pane renders it, ungrouped. */
+    /** The 79-char code as the JOIN pane renders it, ungrouped. Scoped
+     * to `#solo-join`, the pane's own container, which is attached to
+     * the sheet exactly while the sheet is showing the join phase. */
     code: () =>
-      (joinHost.querySelector(".pm-code") as HTMLElement | null)?.textContent?.replace(
-        /\s+/g,
-        "",
-      ) ?? "",
-    sasJoin: () => (joinHost.querySelector(".pm-sas") as HTMLElement | null)?.textContent ?? "",
+      (document.querySelector("#solo-join .pm-code") as HTMLElement | null)?.textContent
+        ?.replace(/\s+/g, "") ?? "",
+    sasJoin: () =>
+      (document.querySelector("#solo-join .pm-sas") as HTMLElement | null)?.textContent ?? "",
     joinConfirm: () => {
-      const btns = Array.from(joinHost.querySelectorAll("button")) as HTMLButtonElement[];
+      const btns = Array.from(
+        document.querySelectorAll("#solo-join button"),
+      ) as HTMLButtonElement[];
       btns.find((b) => (b.textContent ?? "").includes("I initiated"))?.click();
     },
     /** The "this device" ceremony, entered the way a user enters it: the
@@ -2201,7 +2461,7 @@ async function startApp(
     },
     /** Drain both timers once, without waiting on them. */
     tick: async () => {
-      if (await joinHandle.tick()) void joinerWire();
+      if (await entry?.joinHandle.tick()) void joinerWire();
       await drainAnnouncements(us, announce);
     },
     appRunner: () => appRunner !== null,

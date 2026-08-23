@@ -45,10 +45,14 @@ picker needs and nothing personal:
   enforces that it is not even ambient in the DOM), the user's name,
   the user's icon, any account identifier, any key material.
 
-Pre-unseal chrome is therefore generic. The user's colour, name and
-icon appear at the moment of unseal — which gives unseal-as-login a
-real anti-spoofing property: a page imitating the picker cannot paint
-your colour. Render nothing personal until the seal opens.
+Pre-unseal chrome is therefore generic, and the visor itself is part of
+what "generic" has to cover: it boots UNCLAIMED — the strip and drawer
+in a zero-chroma grey dress, the identity cluster empty — so that the
+picker can be a visor drawer sheet without any of this becoming
+renderable early. The user's colour, name and icon appear at the moment
+of unseal, which gives unseal-as-login a real anti-spoofing property: a
+page imitating the picker cannot paint your colour. Render nothing
+personal until the seal opens.
 
 ## Namespaces: strict partitioning
 
@@ -159,23 +163,191 @@ wrap, not the identity key):
 
 | unseal persistence | mechanism | honest strength |
 |---|---|---|
-| every session | passphrase→KDF (or WebAuthn PRF, later) held in worker memory only | the real tier |
+| every session | passphrase→KDF held in worker memory only | the real tier |
+| every session | passkey → WebAuthn PRF → HKDF → AES-KW; the derived KEK crosses as a non-extractable handle and is held in worker memory only | the real tier, without the human secret: the credential's secret rests in the authenticator, not the profile, so the wrap at rest is not guessable at any passphrase strength — but the assertion runs in page script, which the trust sentence below owns |
 | while open | first unseal parks the KEK in the worker; dies with it | ≈ browser session; closest the platform gets |
 | until reseal | KEK wrapped by a non-extractable platform key in the namespace | convenience tier: degrades to profile access control; reseal deletes the wrap |
 
 The UI copy for the last tier says the honest sentence: it is login
 convenience, not protection against someone holding your profile.
-WebAuthn PRF is the passphrase-free rung and #11's recovery direction;
-wosh has the passkey ceremonies (enroll/adopt/assert/recover)
-validated, PRF itself is new construction — its own track, not a
-blocker.
+WebAuthn PRF — the passphrase-free rung — LANDED in the PRF-unseal
+round (its own section below; platform facts in
+[spikes/prf-unseal/](../spikes/prf-unseal/), the executed matrix).
+wosh contributed the validated passkey ceremonies
+(enroll/adopt/assert/recover, the transports capture/replay
+discipline); the PRF extension itself was this repo's new
+construction. It is NOT #11's recovery — the seam is recorded in the
+section, not built.
+
+## The PRF rung: passkey unseal
+
+Rulings settled 2026-08-22 (the PRF-unseal round). Platform facts from
+[spikes/prf-unseal/](../spikes/prf-unseal/) (executed matrix: the CDP
+virtual authenticator serves hmac-secret/PRF; outputs are
+deterministic per (credential, input) and separated per input; this
+Chromium also evaluates PRF at `create()` time, which other clients
+may not; a non-extractable derived KEK structured-clones through
+`postMessage`). The wosh ceremonies (`~/p/wosh/site/passkey-store.ts`)
+are the validated scaffolding for everything EXCEPT the extension:
+resident key required, ES256, transports captured at registration and
+replayed in `allowCredentials`, the empty-allow-list discoverable path.
+
+**The shape.** The user enrolls a passkey for the device; unsealing
+asserts it with the PRF extension; the output feeds HKDF; the derived
+KEK unwraps the DEK by AES-KW exactly as the passphrase rung does.
+"Login with your passkey" instead of a passphrase, same honest-strength
+story: nothing persisted can open the device — the secret rests in the
+authenticator, which demands user presence and verification per
+ceremony.
+
+**The wrap record** (`PrfWrap`, `wrap:prf` in the `seal` store, a
+sibling of `PassphraseWrap` with the same at-rest posture): version,
+a `kdf` tag naming this construction, `credentialId` and `transports`
+(the wosh capture/replay discipline — an identifier and routing hints,
+not secrets), `rpId`, two fresh-random 32-byte salts (the PRF input
+and the HKDF salt), and the AES-KW-wrapped DEK. A reader of the store
+learns the device has a passkey rung, which credential opens it, and
+40-odd bytes of wrapped key it cannot brute-force: unlike the
+passphrase wrap, there is no human-chosen secret to guess at. No
+`origin` field — enrollment is always a ceremony a person ran, so a
+PRF rung is always a door somebody can walk through (the fact the
+reseal-upgrade guard consults).
+
+**The derivation, ruled.** PRF input = the stored 32 random bytes
+(`eval.first` only; fresh per wrap). KEK = HKDF-SHA-256(ikm = the
+32-byte PRF output, salt = the stored HKDF salt, info = a version
+string plus the DEVICE ID) → AES-KW-256, non-extractable,
+`wrapKey`/`unwrapKey` only. Binding the device id into `info` means a
+wrap record copied between namespaces refuses at the unwrap — a clean
+`wrong-passkey` — instead of unwrapping a foreign DEK and surfacing as
+GCM tamper noise downstream. `userVerification: "required"` is PINNED
+at enrollment and at every unseal: hmac-secret keeps two per-credential
+secrets (with and without UV), so an unseal that ran with a different
+effective UV state than enrollment could derive a wrong key on a real
+authenticator even though the virtual one answers identically (spike
+row 6).
+
+**The window/worker split, and the trust sentence.** WebAuthn cannot
+run in a worker — `navigator.credentials` is window-only — so the
+assertion runs on the PAGE, the page derives the KEK, and what crosses
+the port is the NON-EXTRACTABLE KEK handle (CryptoKey structured-clones
+across `postMessage` exactly as it does into IndexedDB; spike row 9).
+Stated honestly: the raw PRF output transits page JS for the length of
+the derivation — the same class of exposure as the passphrase rung,
+whose secret is typed into a page input and crosses the port raw. What
+the rung removes is the human secret and the wrap's offline
+guessability; what it cannot remove is "script running on this origin
+at unseal time observes the ceremony". And unlike `until-reseal`,
+possession of the profile alone does not open it: the authenticator
+demands a fresh presence-plus-verification per assertion, which
+origin script cannot fake (test drivers simulate it through CDP, which
+is not a thing a page can reach).
+
+**Enrollment placement.** Two doors, one worker ceremony behind both:
+
+- **At promotion** — a third unseal-policy choice beside the two
+  shipped rungs, offered only when the capability probe says the
+  browser can do it. The worker half is `rekeyFromPlatform`'s precedent
+  verbatim: the re-wrap is authorized by the platform rung a T0 device
+  always has at promotion time, and after the PrfWrap lands the
+  platform wrap is DELETED — a user who asked to be asked must not
+  leave a silent door standing (the `every-session` arm's reasoning,
+  unchanged). `sealT0`'s generated passphrase wrap stays behind: a door
+  with no key costs nothing, and deleting it would change
+  `already-sealed` semantics for nothing.
+- **On a kept device** ("switch this device to passkey unseal", in the
+  this-device sheet): same worker ceremony, authorized by the platform
+  wrap when the device has one, else by the passphrase (which the
+  sheet asks for — it is the device's login anyway). The policy tag
+  flips to `passkey`; a user-origin passphrase rung STAYS as the
+  explicit fallback (rungs are additive — the `enableUntilReseal`
+  precedent).
+
+**Enrollment order and the degrade.** Capability first:
+`PublicKeyCredential.getClientCapabilities()` answering
+`"extension:prf"` (spike row 1); a browser without the method is a
+MAYBE — offer, and verify at enrollment. The ceremony writes NOTHING
+until `prf.enabled` is true and an output is in hand (create-time eval
+where the client returns it, else one follow-up assertion naming the
+fresh credential). A refusal leaves the device exactly as it was and
+says so plainly; the one irreversible residue is the credential the
+authenticator may have minted, which only its owner can delete there
+(wosh's `forget` note), and the copy says that too. No PRF support at
+all → the choice is simply not offered, with a plain sentence, never a
+broken ceremony.
+
+**Unseal.** The picker renders a "use your passkey" button for a
+`passkey`-policy device (a user gesture, which some browsers demand
+for `credentials.get` anyway). The page reads the wrap record — the
+`seal` store rests unsealed by design, and the salts/credential id are
+exactly the exposure the record's contract already prices in — asserts
+naming the credential and its transports, derives, and hands the
+worker the KEK handle. The worker unwraps; a wrong KEK is a typed
+`wrong-passkey` refusal (AES-KW's integrity check — no partial key
+ever exists, same as a wrong passphrase). A device that also carries a
+user-origin passphrase rung gets a "use your passphrase instead" path
+on the same screen: the policy tag names the ceremony to OFFER, not
+the only door.
+
+**Reseal.** Deletes the platform wrap and its key handle, as ever. The
+PRF wrap SURVIVES reseal — an assertion per unseal is the rung's whole
+point, so there is nothing persisted that opens the device alone. The
+reseal-upgrade guard generalizes: reseal proceeds without ceremony
+when ANY reachable rung remains (`userPassphrase` OR `prf`); the
+upgrade question is only asked when the platform wrap is the last door
+anybody can walk through.
+
+**RP-id scoping, said plainly.** `rpId` is `location.hostname` at
+enrollment and is recorded in the wrap. The namespace is origin-scoped
+IndexedDB, so the record can never be presented from another origin —
+the recorded value is a tripwire and a diagnostic, not a live degree
+of freedom. Consequence for the demos: a device on `localhost` (dev,
+e2e, the matrix) and a device on the Pages origin are different RPs
+with different credentials, which widens nothing — a device is already
+per-browser and per-origin by construction. The Pages origin is a
+`github.io` subdomain, which is on the public-suffix list: the RP ID
+cannot be widened to `github.io`, so no other Pages site can assert
+the demo's credentials.
+
+**What recovery means here, versus #11: the seam, recorded and not
+built.** Passkey sync (platform credential managers) makes the
+CREDENTIAL portable across a user's machines — but this rung's wrap
+never leaves the device namespace, and devices never sync as bytes, so
+the rung is NOT cross-device recovery and does not pretend to be. The
+recorded direction for #11: an account-level recovery bundle (the
+identity export format) resting in bucket storage, wrapped under a key
+derived from the SAME credential with a domain-separated second input
+— the PRF extension evaluates two inputs in one ceremony (spike row
+7), which is also the future re-wrap/rotation seam. Nothing else about
+it is designed here.
 
 ## Unseal UX
 
-- Boot: index read → picker (generic chrome; device petnames only).
+- Boot: index read → picker. The picker is a VISOR DRAWER SHEET in the
+  UNCLAIMED dress: generic grey (no anchor colour has been read, let
+  alone painted), an empty identity cluster, and index content only —
+  device petnames and times. It is in the drawer rather than in page
+  flow because the drawer's mechanics are the part a page-flow card
+  could not offer: the sheet hangs off the pinned strip and the page is
+  dimmed around it, neither of which a component confined to its own
+  rectangle can reproduce. So the surface where the passphrase is typed
+  is spatially distinguishable from anything an app can draw, even
+  before there is a colour to compare.
   One device in the index and a policy that permits it: auto-unseal
-  straight to the app.
+  straight to the app, with no sheet at all (a picker that flickered
+  open and shut for the fraction of a second an unseal takes would teach
+  the user that visor motion is noise). A failed auto-unseal mounts the
+  picker carrying the refusal.
+- A `passkey`-policy device never auto-unseals: the picker offers the
+  passkey button (and the passphrase fallback when a user-origin rung
+  exists). The ceremony is one authenticator prompt.
 - Unseal success is when the visor becomes yours: colour, name, icon.
+  All three arrive together, at the claim.
+- After the seal opens, an account-less device gets the same treatment:
+  the fork ("new account" / "join another device") and the join
+  ceremony's code + SAS are drawer sheets too. Identity, account and
+  ceremony UI appears only in visor territory, without exception —
+  that is the one boundary a user can be taught once.
 - **Device-name display rule** (ruled): the strip shows the device
   petname whenever this browser's index holds MORE THAN ONE device —
   pickable, not merely active. One device: no label, it is noise.
@@ -225,8 +397,13 @@ blocker.
 
 Quota accounting/GC beyond the T0 sweep; cross-device content dedupe;
 the no-worker Android-long-tail fallback; `extendedLifetime`
-re-measure; the PRF unseal rung; sealing the OPFS chunk store; multi-
-account UX beyond the picker.
+re-measure; sealing the OPFS chunk store; multi-
+account UX beyond the picker. From the PRF rung: removing a passkey
+rung (needs the same never-delete-the-last-reachable-rung guard reseal
+has), multiple credentials per device, PRF-input rotation via the
+dual-eval seam, conditional mediation in the picker, and #11's
+recovery-bundle direction (the seam is recorded in the rung's
+section).
 
 ## Tracks and gates
 
@@ -253,6 +430,14 @@ account UX beyond the picker.
   device-name strip rule. Gate: e2e.
 - **T-E (e2e)**: reload-survival, promote-then-restart, reseal, two-
   device index, swept-pointer degrade. Suite stays green throughout.
+- **T-F (PRF rung, this round)**: seal.ts's `PrfWrap` + ceremonies,
+  the worker/RPC crossing (the KEK handle), the page-side passkey
+  module (window-only, the wosh ceremonies + the PRF extension), the
+  solo page's third promotion choice + picker button + switch-to-
+  passkey. Gates: the devstore matrix's PRF rows driven through the
+  CDP virtual authenticator (spikes/prf-unseal is the feasibility
+  record), demo `just check`/`just site`, e2e green with a solo
+  passkey scenario.
 
 ## The next-release bump checklist — EXECUTED 2026-08-22
 

@@ -91,6 +91,7 @@ import { DEVICE_IDENTITY_KEY, loadOrMintIdentity } from "./identity-keys.ts";
 import { type DeviceNamespace, openNamespace } from "./namespace.ts";
 import {
   createSealedDek,
+  enablePrf,
   enableUntilReseal,
   rekeyFromPlatform,
   reseal as resealNamespace,
@@ -101,6 +102,7 @@ import {
   sealState,
   unsealFromPlatform,
   unsealWithPassphrase,
+  unsealWithPrf,
 } from "./seal.ts";
 import { sealedDirectory } from "./sealed-fs.ts";
 import { type DeviceLock, deviceLockIsHeld, holdDeviceLock, startLease } from "./locks.ts";
@@ -214,6 +216,15 @@ async function takeLock(): Promise<void> {
 //                  climb: while the global lives the device is open, and
 //                  when it dies the device is shut. See the honest
 //                  sentence on `unseal` below.
+//   passkey        THE CEREMONY RUNS ON THE PAGE, and it has to:
+//                  `navigator.credentials` is window-only, so no code in
+//                  this global can assert a passkey. What arrives here
+//                  is the DERIVED KEK HANDLE (`UnsealOptions.prfKek`) —
+//                  non-extractable, validated in seal.ts before use.
+//                  The worker never sees the raw PRF output and never
+//                  persists the handle. device-store/passkey.ts is the
+//                  window half; PERSISTENCE.md's "The PRF rung: passkey
+//                  unseal" is the record.
 
 /** The unwrapped DEK, or null while sealed. THE WHOLE UNSEALED STATE. */
 let dek: CryptoKey | null = null;
@@ -263,7 +274,14 @@ async function unseal(opts: UnsealOptions = {}): Promise<DeviceStatus> {
   }
 
   const rungs = await sealState(ns);
-  if (!rungs.passphrase && !rungs.untilReseal) {
+  // `!rungs.prf` IS A TRIPWIRE, not a reachable branch: every path that
+  // writes a PRF wrap starts from a device that already has rungs. But
+  // if a namespace ever DID hold only a PRF wrap, falling into
+  // `firstSeal` here would mint a SECOND DEK and silently orphan every
+  // byte sealed under the first — the exact failure `createSealedDek`'s
+  // `already-sealed` refusal exists to prevent. Climb instead; the worst
+  // a climb can do is refuse.
+  if (!rungs.passphrase && !rungs.untilReseal && !rungs.prf) {
     dek = await firstSeal(record.tier, opts);
   } else {
     dek = await climbRung(record.unsealPolicy, rungs, opts);
@@ -379,9 +397,32 @@ async function sealT0(namespace: DeviceNamespace): Promise<CryptoKey> {
  * would prefer. */
 async function climbRung(
   policy: string,
-  rungs: { passphrase: boolean; untilReseal: boolean },
+  rungs: { passphrase: boolean; untilReseal: boolean; prf: boolean },
   opts: UnsealOptions,
 ): Promise<CryptoKey> {
+  // THE PASSKEY POLICY IS TRIED FIRST AND NEVER FALLS TO THE PLATFORM
+  // WRAP. Promotion deleted that wrap precisely so this device asks; if
+  // a stale one somehow survived, using it would open the device without
+  // the ceremony the user chose — the `every-session` arm's
+  // asked-to-be-asked rule, applied to the rung that replaced it.
+  if (policy === "passkey") {
+    if (opts.prfKek) return await unsealWithPrf(ns, opts.prfKek);
+    // The explicit fallback the design record allows: rungs are ADDITIVE,
+    // so a device switched to passkey unseal on the this-device sheet may
+    // still carry the user's own passphrase, and the picker offers "use
+    // your passphrase instead" beside the button. A `generated` rung is
+    // not a door — `rungs.passphrase` alone would let one through — so
+    // the caller must have offered a passphrase AND the device must have
+    // a passphrase rung for this to be tried at all; a wrong one refuses
+    // in seal.ts as it always does.
+    if (opts.passphrase !== undefined && rungs.passphrase) {
+      return await unsealWithPassphrase(ns, opts.passphrase);
+    }
+    throw new SealError(
+      "no-rung",
+      "this device opens with its passkey; the page runs that ceremony and hands over the key",
+    );
+  }
   if (policy === "every-session") {
     if (opts.passphrase === undefined) {
       throw new SealError("no-rung", "this device is opened with its passphrase, every session");
@@ -427,6 +468,13 @@ async function climbRung(
  *   absent (a device that was resealed) a passphrase is required, and
  *   `enableUntilReseal` re-arms from it.
  *
+ * passkey: the PAGE ran the ceremony (it must — `navigator.credentials`
+ *   is window-only) and hands over the enrollment plus the KEK it
+ *   derived; `enablePrf` re-wraps the DEK under that handle, authorized
+ *   by the platform rung when there is one and by the passphrase when
+ *   there is not. The platform wrap is then DELETED, for
+ *   `every-session`'s reason.
+ *
  * THE HONEST SENTENCE travels with the choice and belongs in the UI:
  * `until-reseal` is login convenience, not protection against someone
  * holding your profile. See `unseal` above and seal.ts's
@@ -451,6 +499,30 @@ async function promote(opts: PromoteOptions): Promise<DeviceStatus> {
       }
       await enableUntilReseal(ns, opts.passphrase);
     }
+  } else if (opts.policy === "passkey") {
+    // The page has already run the enrollment ceremony (passkey.ts) and
+    // is handing over the metadata plus the KEK it derived; the worker
+    // cannot run it itself, because `navigator.credentials` is
+    // window-only. Without that payload there is nothing to enroll.
+    if (opts.prf === undefined) {
+      throw new SealError(
+        "no-rung",
+        "this rung is a passkey; the ceremony needs the page's enrollment and its derived key",
+      );
+    }
+    const { credentialId, transports, rpId, prfInput, hkdfSalt } = opts.prf;
+    await enablePrf(
+      ns,
+      opts.prf.kek,
+      { credentialId, transports, rpId, prfInput, hkdfSalt },
+      { passphrase: opts.passphrase },
+    );
+    // THE PLATFORM DOOR SHUTS, for the `every-session` arm's reason
+    // verbatim: a user who chose to be asked — here, asked for their
+    // passkey — must not leave a door standing that skips the question.
+    // `reseal()`'s durable half is exactly that deletion, and the PRF
+    // wrap just written survives it by design (seal.ts's `reseal`).
+    await resealNamespace(ns);
   } else {
     // `while-open` is the T0 rung and is not a thing to be promoted TO
     // (PERSISTENCE.md's ladder offers two rungs at the promotion
@@ -507,7 +579,14 @@ async function reseal(opts: ResealOptions = {}): Promise<DeviceStatus> {
   // `enableUntilReseal` being additive means). The durable answer is
   // `PassphraseWrap.origin`, which `sealState` surfaces as
   // `userPassphrase` — a rung somebody can actually walk through.
-  const platformOnly = !rungs.userPassphrase && rungs.untilReseal;
+  //
+  // THE GUARD'S QUESTION, generalized: "would deleting the platform wrap
+  // leave NO door anybody can walk through?" A PASSKEY RUNG IS ALWAYS
+  // ONE. It exists only because a person enrolled a credential they
+  // hold, which is why `PrfWrap` carries no `origin` field to consult —
+  // the reachability is by construction. So a device with a PRF rung
+  // reseals plainly, with no upgrade ceremony and nothing to ask for.
+  const platformOnly = !rungs.userPassphrase && !rungs.prf && rungs.untilReseal;
   if (platformOnly) {
     if (opts.passphrase === undefined) {
       throw new SealError(
@@ -1524,8 +1603,13 @@ async function status(): Promise<DeviceStatus> {
     rungs,
     // What the picker needs in order to decide whether to render a
     // passphrase field: `every-session` always, and any other policy
-    // whose persisted wrap has gone away (a reseal).
-    needsPassphrase: dek === null && (policy === "every-session" || !rungs.untilReseal),
+    // whose persisted wrap has gone away (a reseal) — unless a PASSKEY
+    // rung is what opens this device, in which case what the next
+    // `unseal()` needs is that ceremony, not a passphrase. The picker
+    // learns which to offer from `policy`; `rungs` tells it what else it
+    // may offer beside it.
+    needsPassphrase: dek === null &&
+      (policy === "every-session" || (!rungs.untilReseal && !rungs.prf)),
     resumed,
     lastCheckpoint,
     lockHeld: await deviceLockIsHeld(DEVICE_ID),
