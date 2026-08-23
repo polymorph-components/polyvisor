@@ -141,9 +141,20 @@ The v2 shape from the egress record's §5, now built:
   our redirect, a Web-application client with the page URL registered
   verbatim is the shape to use.
 - Nothing is baked into source, bundles, or defaults; the fields are
-  typed (or URL-param prefilled) at test time. The deployed site would
-  need a registered web client, which is the shipping story, not this
-  one.
+  typed (or URL-param prefilled — `gdclient`/`gdsecret`/`gdroot`) at
+  test time. Baking the borrowed pair in was considered and dropped in
+  favour of the params, which already existed and cost nothing.
+- THE LIVE BEAT IS LOCAL, NECESSARILY — measured 2026-08-23, not
+  assumed. A desktop-type client accepts LOOPBACK redirects only: the
+  authorize endpoint renders a sign-in page for
+  `http://127.0.0.1:8600/solo.html` and answers `redirect_uri_mismatch`
+  for the deployed Pages URL, with the same client id. So the borrowed
+  pair cannot drive the ceremony from the public site by any delivery
+  mechanism, and the two errands are separate: the Pages deploy ships
+  the page, the Drive beat happens at a loopback origin. The deployed
+  site needs a WEB-application client registered with its exact URL —
+  which is the same client that replaces the borrowed one, so the
+  replacement and the public Drive path arrive together.
 
 ### 4. Tokens rest sealed, device-scoped; refresh writes back
 
