@@ -244,6 +244,40 @@ Recorded, not forgotten.
   ciphertext objects. Documented here, not automated — a real Google
   account cannot and should not sit in CI.
 
+## The public-deploy constraint (measured 2026-08-23)
+
+The §3 classification — client id and secret as installed-app
+identifiers, public by nature — is Google's own, and it holds for
+DESKTOP clients. It does NOT transfer to the deployed site, and the
+difference is structural rather than a policy nuance:
+
+- A desktop client accepts LOOPBACK redirects only (probed: sign-in page
+  for `http://127.0.0.1:8600/solo.html`, `redirect_uri_mismatch` for the
+  Pages URL under the same client id). So the honest-secret client type
+  is exactly the one that cannot serve a public page.
+- A public page therefore needs a WEB-APPLICATION client, whose secret
+  Google DOES treat as confidential — and the token endpoint demands it:
+  probed, an authorization-code exchange with PKCE and no
+  `client_secret` is refused outright (`invalid_request:
+  client_secret is missing`). There is no secretless browser flow to
+  fall back to.
+
+The consequence, stated rather than discovered later: a browser-hosted
+Drive client cannot keep a confidential client secret, so the provider
+is honest at a loopback origin and, on a public origin, only in one of
+two postures — a TESTING-MODE app, where the test-user list is the real
+gate and the secret gates nothing beyond it, or behind a
+token-exchange broker that holds the secret, which this project does
+not have and which would put a server in the middle of a design whose
+whole point is that there isn't one. v1 ships the loopback posture and
+records the rest; a public Drive beat runs testing-mode with the
+operator as the only test user.
+
+This is a fact about GOOGLE'S OAUTH, not about the worker-run ceremony:
+the worker still owns the verifier and the tokens, and the secret it
+holds is the app's identity, never the user's. What changes on a public
+origin is only how much that app identity is worth protecting.
+
 ## Parked, explicitly
 
 Drive in the demo page/picker; shared/team drives; resumable uploads
