@@ -50,6 +50,13 @@
 //      doc rather than the tasks partition, and the drain-poll's
 //      `profile-changed` → `reconcileFromDriver` → `applyProfile` apply
 //      chain rather than the app's own repaint.
+//   6. And a MARK made on A after the double reload lands on B's strip
+//      too — the same us-doc path, but through the `mark-added` drain
+//      trigger and `applyMarks`. Cheap here (the wire is already proven
+//      up by 4 and 5, so this is one ceremony and one poll) and worth
+//      it: the mark tags are a SECOND set of drain triggers, and a
+//      resumed wire that carried profile events but not mark events
+//      would look entirely healthy.
 //
 // WHAT THIS SCENARIO DELIBERATELY DOES NOT CLAIM: that reloading ONLY
 // the adder recovers. It does not, and the reason is an engine limit
@@ -78,11 +85,20 @@
 
 import type { Page } from "npm:playwright@1.57.0";
 import type { Ctx, Scenario } from "../run.ts";
-import { act, assert, assertEquals, SOLO_KEYS, waitForBoot } from "../util.ts";
+import {
+  act,
+  assert,
+  assertEquals,
+  SOLO_KEYS,
+  stripMarkIcon,
+  stripText,
+  waitForBoot,
+} from "../util.ts";
 import {
   addTodo,
   appFrame,
   createAccount,
+  nameApp,
   pairPages,
   setAccountName,
   solo,
@@ -100,6 +116,10 @@ const NAME_BEFORE = "Ada";
 const NAME_AFTER = "Ada Lovelace";
 /** Not the 265 both pages are seeded with, for the same reason. */
 const ACCOUNT_HUE = 175;
+/** What A calls the app in the last act. The mark that goes with it is
+ * whatever the ceremony offers (a fresh random draw — see `nameApp`),
+ * so it is captured at ceremony time rather than named here. */
+const APP_PETNAME = "the tasks";
 
 /** Everything after a double reload has to wait for a wire that is being
  * rebuilt on a 5s retry cadence, behind a relay. */
@@ -255,6 +275,22 @@ const scenario: Scenario = {
         personal.anchorColour.includes(String(ACCOUNT_HUE)),
         `B's anchor is still the account's: ${JSON.stringify(personal)}`,
       );
+    });
+
+    await act("a mark made on A after the double reload lands on B's strip", async () => {
+      // THE OTHER FAMILY OF ACCOUNT EVENT. A names the app through the
+      // real ceremony; `onNamed` writes it through to the account, and B
+      // adopts it off `mark-added` — a different drain trigger and a
+      // different apply than the profile above, over the same rebuilt
+      // wire. B has never seen this record before, so its strip cannot
+      // pass by standing still.
+      const mark = await nameApp(pageA, APP_PETNAME);
+      const top = await until([pageA, pageB], "A's petname for the app on B's strip", async () => {
+        const t = (await stripText(pageB)).top;
+        return t.includes(APP_PETNAME) ? t : false;
+      }, REWIRE);
+      assert(top.includes(APP_PETNAME), `B's strip: ${JSON.stringify(top)}`);
+      assertEquals(await stripMarkIcon(pageB), mark, "A's mark on B's strip");
     });
 
   },

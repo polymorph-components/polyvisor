@@ -49,7 +49,19 @@ import { act, assert, assertEquals, SOLO_KEYS } from "../util.ts";
 // The solo pages' shared driving surface — the `__solo` root, the
 // sandboxed todomvc frame, and the pacing rule for typing into it. Three
 // scenarios drive this page now; see e2e/solo-util.ts.
-import { addTodo, appFrame, solo, stripPersonal, todoRows, until, WAITS } from "../solo-util.ts";
+import {
+  addTodo,
+  appFrame,
+  nameApp,
+  solo,
+  stripPersonal,
+  todoRows,
+  until,
+  WAITS,
+} from "../solo-util.ts";
+// The strip's own two lines and the pet icon on them — page-generic DOM
+// reads, so they work on the solo page exactly as they do on the demo's.
+import { stripMarkIcon, stripText } from "../util.ts";
 
 /** The account's own face: the name A commits before pairing and the
  * anchor colour it picks. Both must be on B's strip after B joins — and
@@ -57,6 +69,18 @@ import { addTodo, appFrame, solo, stripPersonal, todoRows, until, WAITS } from "
  * unchanged strip cannot pass the assertion by accident. */
 const ACCOUNT_NAME = "Ada";
 const ACCOUNT_HUE = 175;
+/** And A's own GLYPH. From the visor's own vocabulary (visor.ts's
+ * VISOR_ICONS) and deliberately NOT ⛨ — the default an unset record
+ * renders — so a B whose icon never synced cannot pass by wearing the
+ * fallback. It is also outside `APP_MARK_ICONS`, so nothing can confuse
+ * the user's glyph with the app's mark below. */
+const ACCOUNT_ICON = "\u263E"; // ☾ U+263E LAST QUARTER MOON
+
+/** What A calls the app, through the naming ceremony. The mark that
+ * goes with it is whatever the ceremony offers (a fresh random draw —
+ * see `nameApp`), so it is captured at ceremony time rather than named
+ * here. */
+const APP_PETNAME = "the tasks";
 
 const scenario: Scenario = {
   name: "solo-pairing",
@@ -120,7 +144,7 @@ const scenario: Scenario = {
         15_000,
       );
       await pageA.evaluate(
-        ([who, hue]) => {
+        ([who, hue, glyph]) => {
           const input = document.getElementById("visor-settings-name") as HTMLInputElement | null;
           if (input) input.value = who as string;
           // A hue that is certainly NOT the seeded 265 both pages boot
@@ -129,11 +153,18 @@ const scenario: Scenario = {
           (document.querySelector(
             `.settings-hues button[data-hue="${hue}"]`,
           ) as HTMLButtonElement | null)?.click();
+          // AND THE GLYPH, off the sheet's own picker row — the same
+          // gesture as the hue, one control along. It rides the same
+          // commit, so the write-through carries name, colour and icon
+          // in one `us-profile-set`.
+          (document.querySelector(
+            `.settings-icons button[data-glyph="${glyph}"]`,
+          ) as HTMLButtonElement | null)?.click();
           (document.querySelector(".settings-sheet .cred-row button:first-child") as
             | HTMLButtonElement
             | null)?.click();
         },
-        [ACCOUNT_NAME, ACCOUNT_HUE] as [string, number],
+        [ACCOUNT_NAME, ACCOUNT_HUE, ACCOUNT_ICON] as [string, number, string],
       );
       const personal = await until(
         [pageA],
@@ -148,6 +179,7 @@ const scenario: Scenario = {
         personal.anchorColour.includes(String(ACCOUNT_HUE)),
         `A's anchor took the picked colour: ${JSON.stringify(personal)}`,
       );
+      assertEquals(personal.icon, ACCOUNT_ICON, "A's own glyph on A's bar");
     });
 
     await act("two todos typed into A's real app frame reach A's engine", async () => {
@@ -164,6 +196,27 @@ const scenario: Scenario = {
       );
       assert(titles.includes("buy milk"), `A's todos: ${JSON.stringify(titles)}`);
       assert(titles.includes("call the bank"), `A's todos: ${JSON.stringify(titles)}`);
+    });
+
+    // WHAT A CALLS THE APP, captured at ceremony time: the sheet's offers
+    // are a fresh random draw, so the glyph is the ceremony's answer
+    // rather than this file's guess (see `nameApp`).
+    let appMark = "";
+
+    await act("A names the app through the visor's own naming ceremony", async () => {
+      // THE HONEST PATH AGAIN, and the other direction the account
+      // syncs: the trust table's mark, not the identity record's. A taps
+      // the strip's context cluster, types a name, picks a glyph and
+      // Saves — solo.ts's `onNamed` then writes it through to the
+      // account (`us-mark-put`). What B does with it is the claim below.
+      appMark = await nameApp(pageA, APP_PETNAME);
+      assertEquals(
+        await stripMarkIcon(pageA),
+        appMark,
+        "A's strip wears the mark A just picked",
+      );
+      const top = (await stripText(pageA)).top;
+      assert(top.includes(APP_PETNAME), `A's strip names the app: ${JSON.stringify(top)}`);
     });
 
     // --- PAGE B: a genuinely separate device ---------------------------
@@ -312,6 +365,31 @@ const scenario: Scenario = {
         personal.anchorColour.includes(String(ACCOUNT_HUE)),
         `B's anchor took the account's colour: ${JSON.stringify(personal)}`,
       );
+      // AND A'S GLYPH. It crossed as UTF-8 bytes in the account's
+      // profile (engine.wit's `us-profile.icon`) and was vetted against
+      // the visor's vocabulary on the way in; ⛨ here would mean B is
+      // wearing the default, i.e. that nothing arrived.
+      assertEquals(personal.icon, ACCOUNT_ICON, "the account's glyph on B's bar");
+    });
+
+    await act("B's app wears A's petname and A's mark, from the account's table", async () => {
+      // THE MARKS HALF OF THE SAME SYNC, and the beat that used to be
+      // missing: B's engine had the mark all along (the act at the end
+      // of this scenario proves the document converged), but nothing
+      // seeded B's own trust table from it, so B mounted the app UNNAMED
+      // — a paired device greeting the user's own app as a stranger.
+      // Read off the strip, because that is where the user would see it.
+      const top = await until(
+        [pageA, pageB],
+        "A's petname for the app on B's strip",
+        async () => {
+          const t = (await stripText(pageB)).top;
+          return t.includes(APP_PETNAME) ? t : false;
+        },
+        WAITS.converge,
+      );
+      assert(top.includes(APP_PETNAME), `B's strip: ${JSON.stringify(top)}`);
+      assertEquals(await stripMarkIcon(pageB), appMark, "A's mark on B's strip");
     });
 
     await act("a todo added on B appears on A", async () => {

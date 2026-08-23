@@ -116,12 +116,21 @@ export async function addTodo(page: Page, title: string) {
  * property. */
 export function stripPersonal(
   page: Page,
-): Promise<{ anchorColour: string; identityText: string }> {
+): Promise<{ anchorColour: string; identityText: string; icon: string }> {
   return page.evaluate(() => {
     const strip = document.getElementById("visor-strip");
     return {
       anchorColour: strip?.style.getPropertyValue("--visor-bg") ?? "",
       identityText: (document.getElementById("visor-identity")?.textContent ?? "").trim(),
+      // THE USER'S OWN GLYPH, read off the button that wears it rather
+      // than out of the cluster's text: the glyph IS part of
+      // `identityText` (the button is inside the cluster), but a
+      // substring test there cannot tell a synced icon from a name that
+      // happens to contain the character, and it cannot see the
+      // DEFAULT — an unset record renders ⛨, which reads as "present"
+      // to any includes() check. The button's own textContent is the
+      // one honest read of "what glyph is on the bar".
+      icon: (document.getElementById("visor-settings")?.textContent ?? "").trim(),
     };
   });
 }
@@ -248,4 +257,47 @@ export async function pairPages(
   await solo(adder, "grant");
   await solo(joiner, "joinConfirm");
   return { code, sasAdder, sasJoiner };
+}
+
+/** NAME THE APP through the visor's REAL naming ceremony, as a user
+ * does: tap the strip's context cluster, type into the sheet's own
+ * field, pick a glyph, Save. Nothing here reaches solo.ts's `onNamed`
+ * directly — the only way in is the sheet's button, which is what makes
+ * the write-through (`onNamed` → `us-mark-put`) part of what a caller's
+ * claim covers.
+ *
+ * `glyph` picks a specific offer. Omitted, this takes the app's own
+ * NOMINATION when the sheet is offering one (flagged `data-nominated`,
+ * always first — see device-pairing-acts.ts, which drives the same
+ * controls) and otherwise the FIRST offer, whatever it is: the solo
+ * page deliberately does not read the app's nomination, and the rest of
+ * the offers are a fresh random draw per ceremony (sheets.ts's
+ * `iconOffers`), so no caller may name one in advance. The glyph that
+ * was actually clicked comes back for exactly that reason — a caller
+ * asserts on the mark that crossed, not on one it hoped for. */
+export async function nameApp(page: Page, petname: string, glyph?: string): Promise<string> {
+  await page.click("#visor-context");
+  await page.waitForSelector("#visor-drawer-inner .name-sheet input", { timeout: 15_000 });
+  await page.fill("#visor-drawer-inner .name-sheet input", petname);
+  const picked = await page.evaluate((want: string | undefined) => {
+    const row = "#visor-drawer-inner .name-sheet .name-icons button";
+    const b = (want !== undefined
+      ? document.querySelector(`${row}[data-glyph="${want}"]`)
+      : document.querySelector(`${row}[data-nominated="true"]`) ??
+        document.querySelector(row)) as HTMLButtonElement | null;
+    b?.click();
+    return b?.dataset.glyph ?? "";
+  }, glyph);
+  if (picked === "") {
+    throw new Error(
+      `the naming ceremony offered no ${glyph === undefined ? "" : glyph} mark to pick`,
+    );
+  }
+  await page.click("#visor-drawer-inner .name-sheet .cred-row button:first-child");
+  await page.waitForFunction(
+    () => document.querySelector("#visor-drawer-inner .name-sheet") === null,
+    undefined,
+    { timeout: 15_000 },
+  );
+  return picked;
 }

@@ -65,7 +65,13 @@ import {
 import { createRunner, type Runner } from "../../visor/surface/runner.ts";
 import { createFrameBackend } from "../../visor/frame/frame-backend.ts";
 import { createSurface } from "../../visor/surface/surface.ts";
-import { initVisor, type SurfaceIdentity, type Visor, VISOR_HUES } from "../../visor/ui/visor.ts";
+import {
+  initVisor,
+  type SurfaceIdentity,
+  type Visor,
+  VISOR_HUES,
+  VISOR_ICONS,
+} from "../../visor/ui/visor.ts";
 import { registerVisorSheets } from "../../visor/ui/sheets.ts";
 import {
   type DevicePickerHost,
@@ -84,7 +90,7 @@ import {
   usCacheKeys,
   visorAnnounceSink,
 } from "../../visor/ui/pairing.ts";
-import type { PairingDriver, UsProfile } from "../../visor/ui/pairing-driver.ts";
+import type { PairingDriver, UsMark, UsProfile } from "../../visor/ui/pairing-driver.ts";
 import { createEnginePairingDriver } from "../../runtime/pairing-engine.ts";
 import type { UiEvent } from "../../visor/surface/events.ts";
 import { type EngineArtifacts, hex, unhex, until, type UsStorage } from "../../runtime/engine.ts";
@@ -203,6 +209,25 @@ const ENGINE_ARTIFACTS = {
  * visor's own (demo/scripts/check-invariants.sh invariant (b)), and this
  * is the platform's masking token, spelled once, here. */
 const MASKED = { type: "password" } as const;
+
+/** THE ACCOUNT'S USER ICON, coming the other way: UTF-8 bytes of one
+ * glyph (engine.wit's `us-profile.icon` — `option<list<u8>>`, opaque to
+ * the engine) turned back into a glyph this visor is willing to draw.
+ *
+ * Returns null for every "nothing to say" answer — absent, undecodable,
+ * or a glyph outside the visor's curated vocabulary (visor.ts's
+ * VISOR_ICONS; another device may run a different build) — so a caller
+ * can tell "the account has no icon" from "the account has one" and
+ * never confuse the first with "clear the one this device wears". */
+function decodeUserIcon(bytes: Uint8Array | undefined): string | null {
+  if (!bytes || bytes.length === 0) return null;
+  try {
+    const glyph = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return VISOR_ICONS.includes(glyph) ? glyph : null;
+  } catch {
+    return null;
+  }
+}
 
 async function fetchArtifacts(name: string): Promise<EngineArtifacts> {
   const [envelope, bytes] = await Promise.all([
@@ -879,10 +904,21 @@ async function startApp(
       // WRITE-THROUGH (PAIRING.md §5): the visor has already stored and
       // painted; the partition is the source of truth catching up, so a
       // failure here is announced rather than hidden.
+      //
+      // THE GLYPH GOES WITH THE NAME, as UTF-8 bytes of the glyph
+      // itself (engine.wit's `us-profile.icon` is `option<list<u8>>`
+      // and the engine treats it as opaque). `rec.icon` was already
+      // filtered to the visor's curated vocabulary by `loadIdentity`,
+      // so what crosses is one vetted glyph and never free text. An
+      // ABSENT icon crosses as `none`, which the engine reads as
+      // "delete" — right, because absent here means the user's record
+      // genuinely has no glyph, not that this device has nothing to
+      // say (the settings sheet always commits a picked one).
       void (async () => {
         const res = await us.usProfileSet({
           displayName: rec.name ?? "",
           hue: hueIndexOf(hue),
+          icon: rec.icon ? new TextEncoder().encode(rec.icon) : undefined,
         });
         if (!res.ok) announce(`could not save your profile: ${res.error}`, true);
       })();
@@ -2521,7 +2557,7 @@ async function startApp(
       // cache diff; on a device joining for the first time the cache is
       // empty, so it says nothing and the line below is the only one the
       // user hears. The two do not double-speak.
-      await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile);
+      await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile, applyMarks);
       const adopted = await us.usProfileGet();
       if (adopted.ok) {
         // THE ADOPTION ANNOUNCEMENT (PAIRING.md §5): a remotely-caused
@@ -2568,8 +2604,71 @@ async function startApp(
     const angle = VISOR_HUES[profile.hue] ?? VISOR_HUES[0];
     visor.commitHue(angle);
     const rec = visor.identity();
-    if (profile.displayName) visor.saveIdentity({ ...rec, name: profile.displayName });
+    const next = { ...rec };
+    if (profile.displayName) next.name = profile.displayName;
+    // THE GLYPH, decoded from the account's bytes and then VETTED. It
+    // was written by another device — possibly a different visor build,
+    // with a vocabulary this one does not have — so it passes the same
+    // membership test `loadIdentity` applies to hand-editable storage
+    // (visor.ts's VISOR_ICONS: the bidi/ZWJ/confusable firewall) before
+    // it can reach the one position on the strip that is supposed to be
+    // unspoofable. `saveIdentity` would refuse an outsider anyway; the
+    // check is here so a refusal does not silently DROP the glyph this
+    // device already wears.
+    //
+    // ABSENT OR INVALID MEANS "NOTHING TO SAY", never "clear it": an
+    // account that has never carried an icon must not undress a device
+    // whose user picked one locally.
+    const glyph = decodeUserIcon(profile.icon);
+    if (glyph) next.icon = glyph;
+    visor.saveIdentity(next);
     visor.renderIdentity();
+  };
+
+  /** THE ACCOUNT'S MARKS, adopted into THIS device's trust table — the
+   * inbound half of `onNamed`'s write-through, at the same three moments
+   * `applyProfile` runs at (the join beat, a resumed boot, a mark event
+   * drained off the account).
+   *
+   * WHAT MAY BE ADOPTED, and why it is narrower than the list
+   * (PAIRING.md §5 and its repaired-view rule): `us-marks-list` returns
+   * the REPAIRED view, not the raw records — the engine has already run
+   * petname- and icon-uniqueness repair over the doc, and a record that
+   * LOST is handed out with `needs-reconfirm` set and, for an icon
+   * collision, with its icon cleared to "". Such a record is not a name
+   * this device may start speaking in the visor's own voice: the
+   * contract is that it renders NEW-with-explanation and the USER
+   * re-confirms it through the naming ceremony (which is also where a
+   * cleared icon gets re-picked, since the vocabulary is the visor's and
+   * the engine cannot choose a replacement). So only WHOLE marks are
+   * seeded — petname and icon both non-empty, `needsReconfirm` false —
+   * and everything else is left for the ceremony. Note that "" icon
+   * implies `needs-reconfirm` engine-side anyway; both are tested
+   * because the contract states both, not because either is redundant.
+   *
+   * DELETIONS ARE OUT OF SCOPE. There is no mark-forgotten event to
+   * drain, so a mark forgotten on another device stays in this device's
+   * table until it is forgotten here too. That is a gap, not a decision
+   * hidden in an omission — it needs an event before it can be closed.
+   *
+   * SILENT, like `applyProfile`: the drain has already announced the
+   * event, and the join beat has its own sentence. */
+  const applyMarks = (marks: UsMark[]) => {
+    for (const m of marks) {
+      if (m.needsReconfirm) continue;
+      const petname = m.petname.trim();
+      if (petname === "" || m.icon === "") continue;
+      // `setPetname` is the same call the ceremony makes, and it applies
+      // its own write-side vocabulary gate to the glyph.
+      sheets.marks.setPetname(m.provenance, petname, m.icon);
+      // AND THE LIVE SURFACE, exactly as `onNamed` refreshes it locally:
+      // a table seeded under a mounted app would otherwise leave the
+      // strip calling the surface NEW while the record says otherwise.
+      if (appSlot.surface && appSlot.surface.name === m.provenance) {
+        appSlot.surface = { ...appSlot.surface, petname, icon: m.icon, isNew: false };
+        visor.renderContext();
+      }
+    }
   };
 
   // --- role: the ADDER (this page already has the account) -----------------
@@ -2851,7 +2950,7 @@ async function startApp(
           // from its checkpoint and must never be re-adopted.
           await enqueue(() => driver.adoptPartition(tasksId));
           tasksHeld = true;
-          await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile);
+          await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile, applyMarks);
           await mountApp();
         } catch (e) {
           announce(`could not open your account's todo list: ${err(e)}`, true);
@@ -3093,7 +3192,7 @@ async function startApp(
     // announces any diff it finds, which is the announcement this moment
     // owes; there is no adoption fanfare on a device that already
     // belongs to the account.
-    await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile);
+    await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile, applyMarks);
     // THE DIRECTORY, BEFORE ANYTHING WAITS ON IT. This device's own
     // entry is what the account's OTHER devices dial, so it is refreshed
     // at the top of the resumed boot rather than after the wiring that
@@ -3152,8 +3251,21 @@ async function startApp(
   // caller of the drain must come through here.
   const drainAndAdopt = async () => {
     const events = await drainAnnouncements(us, announce);
-    if (events.some((ev) => ev.tag === "profile-changed")) {
-      await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile);
+    // THE ADOPTION HALF, for both families of remotely-caused change the
+    // account can hand this device. `profile-changed` moves the strip's
+    // identity; the three MARK tags move the trust table — including
+    // `mark-conflict-repaired`, which is the one that most needs
+    // adopting rather than merely announcing, since after a repair the
+    // account's view of a record and this device's may genuinely differ.
+    // One reconcile covers all of them: it re-reads both halves anyway,
+    // and a batch mentioning several is still one round trip.
+    if (
+      events.some((ev) =>
+        ev.tag === "profile-changed" || ev.tag === "mark-added" ||
+        ev.tag === "mark-changed" || ev.tag === "mark-conflict-repaired"
+      )
+    ) {
+      await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile, applyMarks);
     }
   };
   poll(1000, drainAndAdopt);
