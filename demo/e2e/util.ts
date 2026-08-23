@@ -24,6 +24,12 @@ export interface Ctx {
   readonly minioUrl: string;
   readonly minioAccess: string;
   readonly minioSecret: string;
+  /** MinIO's own temp data directory (run.ts's `Minio` class) — the
+   * filesystem witness solo-storage.ts reads a bucket's objects off,
+   * rather than through anything this scenario is trying to prove.
+   * `null` only before the harness's MinIO has ever started, which
+   * cannot happen once a scenario is running. */
+  readonly minioDataDir: string | null;
 }
 
 export interface FreshOptions {

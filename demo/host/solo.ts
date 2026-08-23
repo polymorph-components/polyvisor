@@ -100,7 +100,9 @@ import {
   promoteDevice,
   type UnsealPolicy,
 } from "../../runtime/device-store/index.ts";
-import type { DeviceStatus } from "../../runtime/device-store/rpc.ts";
+import type { DeviceStatus, StoreBinding } from "../../runtime/device-store/rpc.ts";
+import { putSigningKey } from "../../runtime/keystore.ts";
+import { normalizeOrigin } from "../../runtime/store-egress.ts";
 // THE PAGE HALF OF THE PASSKEY RUNG (PERSISTENCE.md, "The PRF rung:
 // passkey unseal"). `navigator.credentials` is window-only, so the
 // enrollment/assertion ceremonies live here — on the embedder's side of
@@ -813,6 +815,10 @@ async function startApp(
   /** Where the "this device" ceremony is opened from — promotion while
    * the device is T0, reseal once it is kept. */
   let openThisDevice = () => {};
+  /** Where the storage sheet is opened from (installed below, once the
+   * storage tenant exists). v1 is S3 only, chrome only
+   * (STORAGE-EGRESS.md §5) — one sheet, no picker. */
+  let openStorage = () => {};
 
   const sheets = registerVisorSheets(visor, {
     marksKey: MARKS_KEY,
@@ -901,6 +907,12 @@ async function startApp(
         key: "add-device",
         hint: "show a code on the other device, then enter it here",
         onSelect: () => openAddDevice(),
+      },
+      {
+        label: "storage…",
+        key: "storage",
+        hint: "connect this device to a bucket it can sync through",
+        onSelect: () => openStorage(),
       },
     ],
   });
@@ -1382,6 +1394,269 @@ async function startApp(
       switchWrap.append(switchPassField, switchBtn, switchProblem);
       body.append(switchWrap);
     }
+  };
+
+  // --- storage: connect this device to a bucket it can sync through --------
+  //
+  // v1 IS S3 ONLY, CHROME ONLY (STORAGE-EGRESS.md §5): one visor drawer
+  // tenant, chrome-owned fields, no picker and no provider panels — with
+  // one worker-side provider there is nothing to pick. The invariant
+  // holds by construction rather than by review: the secret is typed in
+  // VISOR PIXELS, and no component is ever present on this path (there
+  // is no panel here at all, unlike demo.ts's credential drawer, which
+  // exists only because a PANEL asks the visor to collect on its
+  // behalf).
+  //
+  // THE ONE MOMENT OF CLEARTEXT is the connect handler below, straight
+  // off this sheet's own input, into `putSigningKey` and out of scope
+  // (§2). Nothing else in this file ever sees the secret key, and this
+  // sheet does not hold it either — the input's value is read once and
+  // the field is cleared in the same tick.
+
+  const storageTenant = visor.drawer.tenant<{ container: HTMLElement }>({
+    name: "storage",
+    exclusive: true,
+    dim: true,
+    context: () => ({ kind: "settings" }),
+  });
+
+  /** The connect ceremony's own busy-guard, mirroring `setupInFlight` in
+   * demo.ts's `setupBucket`: a duplicate click while one binding is in
+   * flight would race the same escrow write and the same bind. */
+  let storageConnectInFlight = false;
+
+  openStorage = () => {
+    const container = document.createElement("div");
+    container.className = "cred-sheet";
+    container.id = "storage-sheet";
+    const session = { container };
+    storageTenant.open(session, () => {
+      const heading = document.createElement("h2");
+      heading.textContent = "Storage";
+      const body = document.createElement("div");
+      container.replaceChildren(heading, body);
+      const close = document.createElement("button");
+      close.type = "button";
+      close.textContent = "Close";
+      close.onclick = () => {
+        if (storageTenant.owns(session)) storageTenant.close();
+      };
+      container.append(close);
+      void conn.status().then((st) => {
+        if (st.storage === null) renderUnbound(body);
+        else renderBound(body, st.storage);
+      });
+      return { root: container };
+    });
+  };
+
+  /** THE UNBOUND VIEW: the connect ceremony. `prefill` re-shows a known
+   * destination when this is reached from "Change…" (endpoint/bucket/
+   * access carried over; the secret field always starts blank — it is
+   * never read back, because it is never held here to read). */
+  const renderUnbound = (body: HTMLElement, prefill?: StoreBinding) => {
+    const lead = document.createElement("p");
+    lead.className = "cred-note";
+    lead.textContent =
+      "This device can sync through an S3-compatible bucket. The secret key you enter " +
+      "is escrowed on this browser as a non-extractable key — it is never stored as text, " +
+      "and this device does not hold it either.";
+    body.append(lead);
+
+    const endpointField = field("Endpoint");
+    const endpointInput = document.createElement("input");
+    endpointInput.type = "text";
+    endpointInput.id = "storage-endpoint";
+    endpointInput.value = prefill?.endpoint ?? "";
+    endpointField.append(endpointInput);
+    body.append(endpointField);
+
+    const bucketField = field("Bucket");
+    const bucketInput = document.createElement("input");
+    bucketInput.type = "text";
+    bucketInput.id = "storage-bucket";
+    bucketInput.value = prefill?.bucket ?? "";
+    bucketField.append(bucketInput);
+    body.append(bucketField);
+
+    const accessField = field("Access key ID");
+    const accessInput = document.createElement("input");
+    accessInput.type = "text";
+    accessInput.id = "storage-access";
+    accessInput.value = prefill?.accessKey ?? "";
+    accessField.append(accessInput);
+    body.append(accessField);
+
+    const secretField = field(
+      "Secret key",
+      "Leave blank if this browser already holds the secret for this destination.",
+    );
+    const passInput = document.createElement("input");
+    passInput.type = MASKED.type;
+    passInput.id = "storage-secret";
+    secretField.append(passInput);
+    body.append(secretField);
+
+    const problem = document.createElement("div");
+    problem.className = "hint";
+    problem.id = "storage-sheet-problem";
+    problem.hidden = true;
+    body.append(problem);
+
+    const stepNote = document.createElement("div");
+    stepNote.className = "hint";
+    stepNote.id = "storage-sheet-note";
+    body.append(stepNote);
+
+    const connect = document.createElement("button");
+    connect.type = "button";
+    connect.id = "storage-connect";
+    connect.textContent = "Save & connect";
+    connect.onclick = () => {
+      if (storageConnectInFlight) return;
+      storageConnectInFlight = true;
+      connect.disabled = true;
+      problem.hidden = true;
+      const endpoint = endpointInput.value;
+      const bucket = bucketInput.value;
+      const access = accessInput.value;
+      // THE ONE MOMENT OF CLEARTEXT: read straight off the input, used
+      // once, and the field is cleared in the same tick regardless of
+      // outcome — nothing here holds it a moment longer than it must.
+      const secret = passInput.value;
+      passInput.value = "";
+      void enqueue(async () => {
+        let step = "init";
+        const at = (s: string) => {
+          step = s;
+          stepNote.textContent = `configuring storage: ${s}…`;
+        };
+        try {
+          at("destination");
+          const origin = normalizeOrigin(endpoint);
+          if (origin === null) {
+            throw new Error(`storage endpoint is not a usable origin: ${endpoint}`);
+          }
+          if (secret !== "") {
+            at("escrow");
+            await putSigningKey(origin, access, secret);
+          }
+          at("binding");
+          const st = await conn.bindStore({ kind: "s3", endpoint, bucket, accessKey: access });
+          const part = await tasks.partition();
+          const self = st.agentId === null ? null : unhex(st.agentId);
+          if (self === null) {
+            throw new Error("this device has no agent id yet — bring it up before connecting");
+          }
+          at("bucket + policy");
+          await driver.ensureBucket();
+          at("grants");
+          await driver.storeGrant(part, self);
+          at("first sync");
+          await driver.bucketFlush(part);
+          note("storage:bound");
+          storageConnectInFlight = false;
+          const bound = await conn.status();
+          body.replaceChildren();
+          if (bound.storage) renderBound(body, bound.storage);
+          announce("this device now syncs through your bucket");
+        } catch (e) {
+          storageConnectInFlight = false;
+          connect.disabled = false;
+          problem.textContent = err(e);
+          problem.hidden = false;
+          stepNote.textContent = "";
+        }
+      });
+    };
+    body.append(connect);
+  };
+
+  /** THE BOUND VIEW: what this device syncs through, sync-now, and the
+   * way out. */
+  const renderBound = (body: HTMLElement, storage: StoreBinding) => {
+    const lead = document.createElement("p");
+    lead.className = "cred-note";
+    // These are the user's own configuration — endpoint and bucket they
+    // typed into this very sheet, never a component's — so no plating
+    // applies here (the three-voices rule is about FOREIGN prose; this
+    // is the visor reporting the user's own words back to them).
+    lead.textContent = `This device syncs through ${storage.bucket} at ${storage.endpoint}.`;
+    body.append(lead);
+
+    const stepNote = document.createElement("div");
+    stepNote.className = "hint";
+    stepNote.id = "storage-sheet-note";
+
+    const problem = document.createElement("div");
+    problem.className = "hint";
+    problem.id = "storage-sheet-problem";
+    problem.hidden = true;
+
+    const sync = document.createElement("button");
+    sync.type = "button";
+    sync.id = "storage-sync";
+    sync.textContent = "Sync to storage now";
+    sync.onclick = () => {
+      sync.disabled = true;
+      problem.hidden = true;
+      void enqueue(async () => {
+        try {
+          const part = await tasks.partition();
+          // THE ENGINE'S OWN ANSWER, and it renders as plain text inside
+          // this sheet — the same treatment demo.ts gives it in a pane
+          // status line, with no plating: it is component-influenced,
+          // but it is a status report about a sync THIS device just ran,
+          // not foreign prose being narrated as the visor's own.
+          const result = await driver.bucketFlush(part);
+          note("storage:synced");
+          stepNote.textContent = result;
+        } catch (e) {
+          problem.textContent = err(e);
+          problem.hidden = false;
+        } finally {
+          sync.disabled = false;
+        }
+      });
+    };
+
+    const change = document.createElement("button");
+    change.type = "button";
+    change.id = "storage-change";
+    change.textContent = "Change…";
+    change.onclick = () => {
+      body.replaceChildren();
+      renderUnbound(body, storage);
+    };
+
+    const disconnect = document.createElement("button");
+    disconnect.type = "button";
+    disconnect.id = "storage-disconnect";
+    disconnect.textContent = "Disconnect";
+    disconnect.onclick = () => {
+      disconnect.disabled = true;
+      problem.hidden = true;
+      void (async () => {
+        try {
+          // THE HONEST SENTENCE (STORAGE-EGRESS.md §6): disconnect
+          // forgets THIS DEVICE's binding. The escrowed secret key stays
+          // on this browser for any device that still names it — it is
+          // profile-tier escrow, not device-tier, and deleting it here
+          // would take every other device's signing with it. The erase
+          // ceremony is what deletes it.
+          await conn.unbindStore();
+          note("storage:disconnected");
+          body.replaceChildren();
+          renderUnbound(body);
+        } catch (e) {
+          disconnect.disabled = false;
+          problem.textContent = err(e);
+          problem.hidden = false;
+        }
+      })();
+    };
+
+    body.append(sync, change, disconnect, stepNote, problem);
   };
 
   // --- cross-page sync ------------------------------------------------------
@@ -1899,6 +2174,11 @@ async function startApp(
       await drainAnnouncements(us, announce);
     },
     appRunner: () => appRunner !== null,
+    /** The storage sheet, entered the way a user enters it. */
+    openStorageSheet: () => openStorage(),
+    /** The device's own claim about where it syncs — `null` sealed or
+     * unbound (`DeviceStatus.storage`'s own ambiguity; see rpc.ts). */
+    storageStatus: async () => (await conn.status()).storage,
     /** The strip's settings button. `openDevice`/`openAdd` above press
      * it on their way to an extra action; the erase ceremony's own way
      * in is a button on the settings sheet itself, so it needs the first

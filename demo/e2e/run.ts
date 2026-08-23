@@ -58,6 +58,7 @@ import soloPairing from "./scenarios/solo-pairing.ts";
 import soloPersistence from "./scenarios/solo-persistence.ts";
 import soloErase from "./scenarios/solo-erase.ts";
 import soloEphemeral from "./scenarios/solo-ephemeral.ts";
+import soloStorage from "./scenarios/solo-storage.ts";
 import soloPasskey from "./scenarios/solo-passkey.ts";
 import visorReset from "./scenarios/visor-reset.ts";
 
@@ -130,6 +131,14 @@ const SCENARIOS: Scenario[] = [
   // between ceremonies.
   soloErase,
   soloEphemeral,
+  // THE WORKER HOST'S STORAGE EGRESS (STORAGE-EGRESS.md's T-E): the same
+  // sheet the two device-store scenarios above just proved a device
+  // KEEPS itself through, now driven all the way to a real MinIO — bind,
+  // reload, reseal and unbind, with MinIO's own filesystem as the
+  // witness that bytes actually left the browser. It follows them
+  // because a failure here with solo-persistence green says the fault is
+  // in the store-egress wiring, not in the device store underneath it.
+  soloStorage,
   // THE PRF RUNG (passkey unseal, PERSISTENCE.md). Follows the device
   // store's other two for the same reason they follow solo-pairing: a
   // failure here with those two green says the fault is in the passkey
@@ -210,6 +219,13 @@ class Minio {
   constructor(port: number) {
     this.#port = port;
     this.url = `http://127.0.0.1:${port}`;
+  }
+
+  /** MinIO's own on-disk data directory — the filesystem witness a
+   * scenario reads a bucket's objects off directly, rather than through
+   * anything it is trying to prove (solo-storage.ts). */
+  get dataDir(): string | null {
+    return this.#data;
   }
 
   async start(): Promise<void> {
@@ -429,6 +445,9 @@ async function main() {
     minioUrl: minio.url,
     minioAccess: MINIO_USER,
     minioSecret: MINIO_PASS,
+    get minioDataDir() {
+      return minio.dataDir;
+    },
     stopMinio: () => minio.stop(),
     startMinio: () => minio.start(),
     fresh: async (opts: FreshOptions = {}) => {

@@ -2053,6 +2053,62 @@ origins); invariants green, the entry-markup check extended to the
 passkey ids; the e2e round caught a real picker busy-guard collision
 before it shipped.
 
+**Storage egress from the worker host: G4's browser leg meets the
+device store** (2026-08-22, the round after G5 — the seam the G5
+close-out named: a worker-hosted device had no bucket path, because the
+four `EngineNet` seams are functions and functions do not cross the RPC
+port; design record
+[runtime/STORAGE-EGRESS.md](runtime/STORAGE-EGRESS.md)). The conclusion
+drawn from that fact inverted: rather than a callback protocol, the
+store closures live INSIDE the worker, built over a worker-held mutable
+grant exactly as the demo page builds them over its own — #7's
+egress-grant machinery (the three tier factories, the structural origin
+confinement, rebind-not-relink) extracted verbatim from host/demo.ts
+into runtime/store-egress.ts, one implementation under two embedders,
+the demo page unchanged as the in-page reference. NOTHING SECRET
+CROSSES THE PORT in either direction: the credential ceremony stays on
+the page (the one moment of cleartext is still the sheet input),
+`putSigningKey` escrows into the origin keystore, and the worker reads
+the non-extractable handle back by destination origin — same origin,
+same IndexedDB, so the RPC carries only a `StoreBinding` (addressing
+plus the public access-key identifier) and rpc.ts's
+serialization discipline survives untouched. The binding is DEVICE
+state: DEK-sealed in the namespace (pre-unseal, nothing on disk names
+the destination), re-applied at every bring-up — the checkpoint
+deliberately excludes store config ("embedder-supplied addressing,
+re-applied by the embedder", persist.rs) and the worker IS the
+embedder, so a device returns to its bucket on every unseal with
+nothing re-entered. Worker-side enforcement derives the grant from the
+destination rather than accepting anything wire-shaped: `bindStore`
+refuses an unusable origin, a missing escrow, and an access key the
+escrowed record was not stored under — all at bind, never as a
+provider 403 twenty calls later. Reseal drops the in-worker authority
+(grant, signer, scope-key cache) with the DEK; the ESCROW persists,
+profile-tier and destination-bound, shared by every device on the
+origin — sealing a device takes away its name for the credential, and
+only the erase ceremony deletes the credential itself. v1 is S3-only
+and chrome-only on the solo page: one storage sheet in visor pixels, no
+picker, no panels, no component anywhere on the path; Dropbox is parked
+with the reason recorded (a bearer is a disclosed string with no
+platform escrow — handing one over the port is exactly the banned
+cleartext crossing; the recorded v2 shape runs the token exchange in
+the worker so the bearer never exists in page memory). Gates: the
+devstore matrix grew by six rows (renumbered 28–33 on integration, the
+PRF round having taken 24–27 in parallel; seams refuse before any binding even
+when a client sneaks `initStore` past the ceremony; a bind's
+`ensureBucket` egress observed by an in-harness recorder carrying
+`AWS4-HMAC-SHA256 Credential=<synthetic key>` — the page escrowed, the
+worker signed; the binding survives `__die` with no rebind; reseal
+seals it, unseal restores it, unbind refuses at the seam; the factories
+gate directly on origin confinement and authorization stripping), e2e
+16→17 with solo-storage against real MinIO (MinIO accepting the signed
+requests is the signature verification; the escrow lands
+non-extractable and appears NOWHERE in localStorage; bucket objects
+witnessed in MinIO's own data dir; a real reload re-arms storage from
+the sealed binding alone; disconnect leaves the escrow standing),
+invariants 8/8 with no scan widened, pairing-bringup and
+resume-bringup green, engine and WIT untouched.
+
 ## Parked and candidate non-goals
 
 - **Metadata privacy**: relays, push services, and origins see traffic

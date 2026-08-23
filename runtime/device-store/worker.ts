@@ -53,7 +53,27 @@ import {
   type Engine,
   newEngine,
   type PersistDir,
+  type StoreSign,
 } from "../engine.ts";
+// THE STORAGE EGRESS SEAMS AND THE ESCROW, both runtime modules and
+// both already inside this file's pin set: keystore.ts and
+// store-egress.ts import `@polyengine/runtime/embedder`, which worker.ts
+// pins anyway for the cloneable error forms and `ComponentException`, so
+// neither adds a resolution burden to this graph (runtime/README.md's
+// model; the device-store CORE modules stay package-free, this entry
+// point never was). The keystore read is a plain same-origin IndexedDB
+// read: a SharedWorker on the origin sees the very database the page's
+// credential sheet wrote into, which is what lets the secret stay on the
+// page and still reach the signer (STORAGE-EGRESS.md §2).
+import {
+  type EgressGrant,
+  emptyGrant,
+  makeOwnerFetch,
+  makePublicFetch,
+  makeSharedFetch,
+  normalizeOrigin,
+} from "../store-egress.ts";
+import { getSigningKey, makeSigner, type Signer } from "../keystore.ts";
 // THE SAME MODULE INSTANCE THE ENGINE'S OWN IMPORTS COME FROM. `newEngine`
 // builds the port's fragment with `webcryptoImports()` out of
 // `@polymorph/webcrypto-polyengine` (engine.ts:13), and these two statics
@@ -76,6 +96,9 @@ import {
   rekeyFromPlatform,
   reseal as resealNamespace,
   SealError,
+  sealedDelete,
+  sealedGet,
+  sealedPut,
   sealState,
   unsealFromPlatform,
   unsealWithPassphrase,
@@ -95,6 +118,7 @@ import {
   hostErrorOf,
   type Req,
   type Res,
+  type StoreBinding,
   TASKS_METHODS,
   type UnsealOptions,
   type WireFailure,
@@ -305,6 +329,13 @@ async function unseal(opts: UnsealOptions = {}): Promise<DeviceStatus> {
     dek = null;
     engine = null;
     resumed = null;
+    // THE GRANT GOES BACK TOO. `bringUpEngine` arms the grant BEFORE the
+    // engine exists (it has to: the seams close over it at
+    // instantiation), so a failure anywhere after that point would
+    // otherwise leave a sealed device holding live egress authority for
+    // a destination — armed seams with no engine and no DEK, which is
+    // precisely the half-open state this rollback exists to forbid.
+    clearGrant();
     throw e;
   }
   return await status();
@@ -588,30 +619,277 @@ async function reseal(opts: ResealOptions = {}): Promise<DeviceStatus> {
   // when the LAST one checkpointed invites a reader to conclude that
   // something is still being saved.
   lastCheckpoint = null;
+  // AND THE EGRESS AUTHORITY, with the DEK (STORAGE-EGRESS.md §6): the
+  // grant is emptied and the signer — with its per-scope key cache — is
+  // dropped. The BINDING rests sealed and returns at the next unseal;
+  // the ESCROW persists, because it is profile-tier and shared by every
+  // device on this origin. The honest sentence for the UI: sealing a
+  // device does not seal the escrow, it takes away this device's name
+  // for it.
+  clearGrant();
+  return await status();
+}
+
+// --- storage egress ---------------------------------------------------------
+//
+// THE SEAMS ARE REAL AND THEY REFUSE UNTIL SOMETHING BINDS THEM
+// (runtime/STORAGE-EGRESS.md §1).
+//
+// The three `EngineNet` fetch seams and the signer are FUNCTIONS, and
+// functions do not survive structured clone — so an embedder on the other
+// side of the port could not hand them over even if it wanted to. That
+// fact has not changed; what changed is the conclusion drawn from it.
+// Rather than a callback protocol, the closures live HERE, in the worker,
+// built over a worker-held mutable `EgressGrant` exactly as the demo page
+// builds them over its own — and what crosses the port is DATA: a
+// `StoreBinding`, addressing plus a public identifier, which is why the
+// binding ceremony below takes that shape and no other.
+//
+// Per #7 the authority is in the WIRING, not in a config field: an
+// instance whose grant is empty CANNOT reach a bucket, and the refusal is
+// the factories' own ("… no storage grant configured yet",
+// "store-signer: no signing credential wired for this instance"). That is
+// the same observable posture the old `NO_STORE` had, with one
+// difference that matters: a bind can now change the grant's CONTENTS
+// without relinking anything, so a device gains storage without a new
+// engine instance. Selection stays by import name; nothing here chooses a
+// credential per request.
+//
+// The binding ceremony is `bindStore`/`unbindStore` below; the sealed
+// persistence and the re-application at every bring-up are §3.
+
+/**
+ * The device's egress grant — ONE object for the life of this global.
+ *
+ * Never reassigned: every seam closes over this identity at
+ * instantiation, so a bind mutates the CONTENTS (rebind, not relink) and
+ * a reseal empties them. Reassigning it would silently orphan every live
+ * engine's wiring.
+ */
+const storeGrant: EgressGrant = emptyGrant();
+
+/** The escrowed signer for the bound destination, or null when nothing
+ * is bound. Dropped at reseal with the DEK (§6). */
+let storeSigner: Signer | null = null;
+
+/**
+ * The `store-signer` import, wired ONCE per engine instance and pointed
+ * at whatever `storeSigner` currently holds.
+ *
+ * This is demo/host/demo.ts's boot-time `wiredSigner` (demo.ts:1011),
+ * which was the reference implementation and which this replaces for the
+ * worker host: same box-holding-a-signer shape, same refusal text, for
+ * the same reason — null must mean "the seam exists and says no", not
+ * "the import is absent". An absent import would trap the guest; a
+ * present one lets it render the refusal.
+ */
+const wiredSigner: StoreSign = (stringToSign, date, region, service) => {
+  if (!storeSigner) {
+    return Promise.reject(
+      new ComponentException("store-signer: no signing credential wired for this instance"),
+    );
+  }
+  return storeSigner(stringToSign, date, region, service);
+};
+
+/** The sealed-kv name the `StoreBinding` rests under, JSON, under the
+ * device's DEK (§3). Pre-unseal nothing on disk names the destination. */
+const STORE_BINDING_KEY = "storage";
+
+/** Read the binding out of the sealed namespace, or undefined if this
+ * device has none. Propagates `SealError "tampered"` — see `readBinding`
+ * callers. */
+async function readBinding(key: CryptoKey): Promise<StoreBinding | undefined> {
+  const bytes = await sealedGet(ns, key, STORE_BINDING_KEY);
+  if (!bytes) return undefined;
+  return JSON.parse(new TextDecoder().decode(bytes)) as StoreBinding;
+}
+
+/**
+ * Point the grant and the signer at `b`'s destination.
+ *
+ * THE GRANT IS DERIVED FROM THE DESTINATION, NEVER ACCEPTED AS AN
+ * ALLOWLIST (STORAGE-EGRESS.md §4). Nothing on the wire says where this
+ * device may go: the origin is computed from the endpoint it was told to
+ * use, so a client cannot widen the reach by asking. The population is
+ * demo.ts's `setupBucket` S3 arm verbatim in effect (demo.ts:1285-1292) —
+ * owner and public both the one origin, the shared set EMPTY because S3
+ * has no app tier and the shim refuses that seam by name.
+ *
+ * Returns the normalized origin, or null when the endpoint is not one.
+ */
+function applyBinding(b: StoreBinding): string | null {
+  const origin = normalizeOrigin(b.endpoint);
+  if (origin === null) return null;
+  // Rebind: contents, not wiring.
+  storeGrant.provider = "s3";
+  storeGrant.origins = new Set([origin]);
+  storeGrant.publicOrigins = new Set([origin]);
+  storeGrant.sharedOrigins = new Set();
+  storeSigner = makeSigner(origin);
+  return origin;
+}
+
+/**
+ * Empty the grant and drop the signer — the in-worker egress authority,
+ * gone (STORAGE-EGRESS.md §6).
+ *
+ * IN PLACE, for the reason `storeGrant` is a `const`: the live engine's
+ * seams closed over this object, and only mutating it can make them
+ * refuse. Every seam checks `provider === null` first, so this is the
+ * whole of the revocation; the origin sets are replaced anyway so that a
+ * later reader cannot mistake a stale allowlist for a live one.
+ */
+function clearGrant(): void {
+  storeGrant.provider = null;
+  storeGrant.origins = new Set();
+  storeGrant.publicOrigins = new Set();
+  storeGrant.sharedOrigins = new Set();
+  delete storeGrant.bearer;
+  delete storeGrant.refresh;
+  delete storeGrant.appKey;
+  delete storeGrant.appSecret;
+  storeSigner = null;
+}
+
+/**
+ * A BIND REFUSAL — the worker's own condition, not the engine's and not
+ * the seal ladder's.
+ *
+ * It carries a `code` as an own property, which is exactly what rpc.ts's
+ * `hostCodeOf` reads (structurally, deliberately: "a hand-rolled refusal
+ * with one is as legitimate as `SealError`"), so it crosses the port as
+ * a typed `{form:"host"}` failure and the client can branch on the code
+ * rather than on a message. The two codes are the two ways a destination
+ * can be unusable, and both are settled AT BIND TIME rather than being
+ * discovered as a provider error later:
+ *
+ *   bad-destination  the endpoint is not a usable origin, or the bucket
+ *                    or access key is empty.
+ *   no-credential    nothing is escrowed for that origin, so this device
+ *                    could address the bucket and never sign for it.
+ */
+class StoreError extends Error {
+  constructor(readonly code: "bad-destination" | "no-credential", message: string) {
+    super(message);
+    this.name = "StoreError";
+  }
+}
+
+/**
+ * BIND THIS DEVICE TO A BUCKET — the worker half of the storage
+ * ceremony (STORAGE-EGRESS.md §§2-4). The page half escrowed the secret
+ * before calling; what arrived here is addressing and a public
+ * identifier.
+ *
+ * The order is chosen so a failure leaves nothing half-armed: everything
+ * fallible and cheap is checked first, the binding is PERSISTED before
+ * the grant is armed (a bind that survives the answer but not the disk
+ * would come back unbound at the next unseal, which is the confusing
+ * direction), and `initStore` re-points the LIVE engine last — the same
+ * call `bringUpEngine` makes for a device that was already bound.
+ */
+async function bindStore(binding: StoreBinding): Promise<DeviceStatus> {
+  // Sealed means no DEK to seal the binding under and no engine to
+  // re-point; the file's idiom for "open it first" is a `SealError
+  // "no-rung"`, and clients already branch on that code.
+  if (!dek || !engine) {
+    throw new SealError("no-rung", "the device is sealed; open it before binding storage");
+  }
+  if (binding?.kind !== "s3") {
+    // v1 is S3 only, and the reason is recorded rather than pending:
+    // a Dropbox bearer is a disclosed string with no platform escrow, so
+    // handing one across this port is the cleartext crossing the design
+    // bans (§5, "Dropbox is PARKED for the worker").
+    throw new StoreError("bad-destination", "this host binds s3 destinations only");
+  }
+  const origin = normalizeOrigin(binding.endpoint);
+  if (origin === null) {
+    throw new StoreError(
+      "bad-destination",
+      `storage endpoint is not a usable origin: ${binding.endpoint}`,
+    );
+  }
+  if (binding.bucket.trim() === "" || binding.accessKey.trim() === "") {
+    throw new StoreError("bad-destination", "a storage binding needs a bucket and an access key");
+  }
+  // THE SIGNING AUTHORITY COMES FROM THE KEYSTORE, NOT FROM THE
+  // BINDING, and its absence is a refusal HERE — the demo's own rule
+  // (demo.ts:1275-1283: "saying so plainly beats discovering it as a 403
+  // twenty provider calls later"). The read is by destination origin,
+  // which is the escrow's key: profile-tier, destination-bound, shared
+  // by every device on the origin (§2).
+  const held = await getSigningKey(origin);
+  if (!held) {
+    throw new StoreError(
+      "no-credential",
+      `no signing credential escrowed for ${origin} — enter the secret key in the storage sheet first`,
+    );
+  }
+  // THE ESCROW IS KEYED BY ORIGIN, BUT IT SIGNS FOR ONE ACCESS KEY.
+  // `SigningRecord` keeps the public identifier beside the handle
+  // (keystore.ts:37-47) precisely so this can be checked: a REBIND that
+  // changed the access key without a fresh secret would find the OLD
+  // record, pass the existence check above, and then sign every request
+  // with the wrong key's derivation — a provider 403 twenty calls later,
+  // which is exactly the outcome §4's fail-at-bind rule exists to
+  // prevent. From the user's side it is the same condition as "nothing
+  // escrowed" (this browser cannot sign for that destination), so it
+  // takes the same code.
+  if (held.accessKey !== binding.accessKey) {
+    throw new StoreError(
+      "no-credential",
+      `the secret this browser holds for ${origin} was escrowed for a different access key — ` +
+        `re-enter the secret key for ${binding.accessKey}`,
+    );
+  }
+  const stored: StoreBinding = {
+    kind: "s3",
+    endpoint: binding.endpoint,
+    bucket: binding.bucket,
+    accessKey: binding.accessKey,
+  };
+  await sealedPut(ns, dek, STORE_BINDING_KEY, new TextEncoder().encode(JSON.stringify(stored)));
+  applyBinding(stored);
+  // A THROW FROM HERE LEAVES THE BINDING SEALED AND THE GRANT ARMED
+  // while the live instance still has no addressing — self-consistent
+  // rather than half-open (the seams refuse or the engine does, and
+  // nothing writes anywhere unintended), and the next bring-up repairs
+  // it by re-applying the same config. Rolling the seal back instead
+  // would throw away a binding the user correctly entered because one
+  // engine call failed.
+  await engine.driver.initStore({
+    kind: "s3",
+    value: { endpoint: stored.endpoint, bucket: stored.bucket, accessKey: stored.accessKey },
+  });
+  return await status();
+}
+
+/**
+ * FORGET THE DESTINATION (STORAGE-EGRESS.md §6).
+ *
+ * The sealed binding goes and the grant is emptied IMMEDIATELY, so every
+ * seam refuses from the next call onward. The live engine instance keeps
+ * the addressing `initStore` gave it until the next bring-up — there is
+ * no un-init on the driver — and that is deliberately not chased: an
+ * instance that still knows an address and can no longer reach it is the
+ * enforced property, and it is the one the matrix checks.
+ *
+ * THE ESCROW IS NOT TOUCHED. It is profile-tier and destination-bound,
+ * shared with every other device on this origin, and deleting it here
+ * would take their signing with it. Erasing it is the erase ceremony's
+ * job (keystore.ts's `eraseKeystore`).
+ */
+async function unbindStore(): Promise<DeviceStatus> {
+  if (!dek) {
+    throw new SealError("no-rung", "the device is sealed; open it before unbinding storage");
+  }
+  await sealedDelete(ns, STORE_BINDING_KEY);
+  clearGrant();
   return await status();
 }
 
 // --- the engine -------------------------------------------------------------
-
-/**
- * NO STORAGE EGRESS FROM THE WORKER, v1.
- *
- * The three `EngineNet` seams and the signer are FUNCTIONS, and functions
- * do not survive structured clone — so an embedder could not hand them
- * across the port even if it wanted to. Rather than invent a callback
- * protocol nothing needs yet, all four are wired to refusal, which is
- * what the spike's engine probe and the solo page already do. Per #7's
- * ruling this is not a missing feature but a stated authority: an
- * instance wired this way CANNOT reach a bucket, and that is legible
- * here rather than hidden in a config field. Giving the worker real
- * egress is its own track.
- */
-const NO_STORE = {
-  ownerFetch: () => Promise.reject(new ComponentException("no storage destination")),
-  publicFetch: () => Promise.reject(new ComponentException("no storage destination")),
-  sharedFetch: () => Promise.reject(new ComponentException("no storage destination")),
-  signer: () => Promise.reject(new ComponentException("no signing credential")),
-};
 
 async function fetchArtifacts(spec: AttachSpec["artifacts"]) {
   const [envelope, bytes] = await Promise.all([
@@ -725,6 +1003,20 @@ async function bringUpEngine(): Promise<void> {
   if (!dek) throw new SealError("no-rung", "the device is sealed");
 
   const dir = await ns.directory();
+  // THE BINDING IS READ AND APPLIED BEFORE THE ENGINE EXISTS, which is
+  // safe because the seams read the grant AT CALL TIME: they close over
+  // the object, not over a snapshot of its contents, so arming it early
+  // and instantiating over it is the same wiring either way. Doing it
+  // here rather than after also means there is no window in which a
+  // resumed engine could reach a seam that has not caught up yet.
+  //
+  // `sealedGet` throws `SealError "tampered"` for a row that is present
+  // and does not open. It is left to PROPAGATE: unseal's atomic rollback
+  // is right above us and will put the device back to sealed rather than
+  // leave it half open, and a binding that has been altered underneath
+  // the DEK is a finding worth surfacing at the ceremony that touched it.
+  const binding = await readBinding(dek);
+  if (binding) applyBinding(binding);
   // The cast is the one engine.ts, sealed-fs.ts and the spike all
   // document: the DOM's `FileSystemDirectoryHandle` does not
   // STRUCTURALLY satisfy the published handle interfaces (writer
@@ -736,8 +1028,15 @@ async function bringUpEngine(): Promise<void> {
   const e = await newEngine(
     attached.label ?? `device-${DEVICE_ID.slice(0, 8)}`,
     artifacts,
-    // deno-lint-ignore no-explicit-any
-    NO_STORE as any,
+    // The instance's storage authority, and all of it (#7): three named
+    // seams plus the signer, over this global's one grant. While the
+    // grant is empty every one of them refuses by name.
+    {
+      ownerFetch: makeOwnerFetch(storeGrant),
+      publicFetch: makePublicFetch(storeGrant),
+      sharedFetch: makeSharedFetch(storeGrant),
+      signer: wiredSigner,
+    },
     sealed as unknown as PersistDir,
     deviceIdentityFragment(),
   );
@@ -772,6 +1071,27 @@ async function bringUpEngine(): Promise<void> {
     await ns.put("meta", AGENT_KEY, agent);
     const partition = await e.driver.createPartition();
     await e.driver.sealPartition(partition);
+  }
+
+  // THE STORE CONFIG IS RE-APPLIED, EVERY BRING-UP, BY US. It is not in
+  // the checkpoint and that is a decision, not an omission:
+  // engine/guest/src/persist.rs:611-614 records store config as
+  // "embedder-supplied addressing, re-applied by the embedder" — and in
+  // this deployment the worker IS the embedder. So it goes after
+  // `stateResume()`/`init` (there is no engine state to configure before
+  // one of those has run) and before the instance is published below, so
+  // no client can reach an engine that knows its bucket's seams but not
+  // its address. A device therefore returns to its bucket on every
+  // unseal with no page-side state and nothing re-entered (§3).
+  if (binding) {
+    await e.driver.initStore({
+      kind: "s3",
+      value: {
+        endpoint: binding.endpoint,
+        bucket: binding.bucket,
+        accessKey: binding.accessKey,
+      },
+    });
   }
   engine = e;
 
@@ -883,6 +1203,12 @@ async function status(): Promise<DeviceStatus> {
     bootSeq: await bootSeq,
     instanceNonce: INSTANCE_NONCE,
     clients: ports.size,
+    // Null while sealed BECAUSE IT IS UNREADABLE THEN, not as a
+    // simplification: the binding rests under the DEK. A tampered row
+    // would throw out of here rather than report null, and that is the
+    // ruling — swallowing it in `status()` would hide a real finding
+    // from the one call everything makes.
+    storage: dek === null ? null : ((await readBinding(dek)) ?? null),
   };
 }
 
@@ -921,6 +1247,10 @@ async function callHost(method: string, args: unknown[]): Promise<unknown> {
       return await reseal((args[0] as ResealOptions) ?? {});
     case "checkpoint":
       return await checkpoint();
+    case "bindStore":
+      return await bindStore(args[0] as StoreBinding);
+    case "unbindStore":
+      return await unbindStore();
     case "status":
       return await status();
     case "destroy": {
@@ -965,6 +1295,15 @@ async function callHost(method: string, args: unknown[]): Promise<unknown> {
       resumed = null;
       lastCheckpoint = null;
       identityPair = undefined;
+      // AND THE EGRESS AUTHORITY, exactly as reseal drops it (§6 of
+      // STORAGE-EGRESS.md; the sealed rows below go with the namespace,
+      // but the grant and the signer are THIS GLOBAL'S memory and would
+      // otherwise stay armed on a device that no longer exists —
+      // unreachable by any new call once `destroyed` is up, but an
+      // in-flight engine call still holds the seams' closures until it
+      // settles, and a destroyed device must not be able to sign or
+      // egress even from that window).
+      clearGrant();
       // The device leaves: database, OPFS directory, index row. A throw
       // here PROPAGATES — the client's ceremony is built to refuse on
       // it, and a swallowed failure would report an erasure that did not

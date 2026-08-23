@@ -50,13 +50,14 @@ import {
   type ResealOptions,
   type Req,
   type Res,
+  type StoreBinding,
   TASKS_METHODS,
   type UnsealOptions,
   type WireFailure,
 } from "./rpc.ts";
 
 export { DeviceHostError };
-export type { DeviceStatus, PromoteOptions, ResealOptions, UnsealOptions };
+export type { DeviceStatus, PromoteOptions, ResealOptions, StoreBinding, UnsealOptions };
 
 /** Which device this tab wants. */
 export type DeviceChoice =
@@ -156,6 +157,46 @@ export interface DeviceConnection {
   reseal(opts?: ResealOptions): Promise<DeviceStatus>;
   /** Force a checkpoint now. Resolves with its timestamp. */
   checkpoint(): Promise<number>;
+  /**
+   * POINT THIS DEVICE AT A BUCKET, durably.
+   *
+   * WHAT CROSSES IS ADDRESSING AND A PUBLIC IDENTIFIER — endpoint,
+   * bucket, access key — AND NOTHING ELSE. The SECRET half never travels
+   * this wire and has no need to: the credential ceremony runs here on
+   * the page, `putSigningKey(origin, accessKey, secret)` escrows it into
+   * the origin keystore as a non-extractable handle, and the worker —
+   * being a SharedWorker on this same origin — reads that handle back BY
+   * DESTINATION ORIGIN out of the same IndexedDB database
+   * (runtime/STORAGE-EGRESS.md §2). So the escrow must land BEFORE this
+   * call: a bind with nothing escrowed for the endpoint's origin is
+   * refused with `code === "no-credential"` rather than accepted and
+   * discovered later as a provider 403.
+   *
+   * The worker DERIVES what this device may reach from the endpoint
+   * (§4); an allowlist is not something a caller can hand it. The
+   * binding then persists sealed under the device's DEK and is
+   * re-applied at every unseal, so nothing here has to be remembered or
+   * re-entered.
+   *
+   * Refusals: `SealError`-shaped `code: "no-rung"` while sealed,
+   * `"bad-destination"` for an unusable endpoint/bucket/access key, and
+   * `"no-credential"` as above — all as `DeviceHostError`, branch on
+   * `code`.
+   */
+  bindStore(binding: StoreBinding): Promise<DeviceStatus>;
+  /**
+   * Forget the destination. The sealed binding goes and the worker's
+   * grant is emptied at once, so every storage seam refuses from the
+   * next call onward; the live engine keeps the addressing it was given
+   * until the next bring-up, which is harmless precisely because the
+   * authority is in the wiring (§6).
+   *
+   * IT DOES NOT DELETE THE ESCROWED CREDENTIAL. That record is
+   * profile-tier and destination-bound — shared with every other device
+   * on this origin — so removing it belongs to the erase ceremony
+   * (`eraseKeystore`), not to one device's unbind.
+   */
+  unbindStore(): Promise<DeviceStatus>;
   status(): Promise<DeviceStatus>;
   /** The worker's identity as this client first saw it. */
   readonly hello: Hello;
@@ -425,6 +466,9 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
     reseal: (opts?: ResealOptions) =>
       send("host", "reseal", [opts ?? {}]) as Promise<DeviceStatus>,
     checkpoint: () => send("host", "checkpoint", []) as Promise<number>,
+    bindStore: (binding: StoreBinding) =>
+      send("host", "bindStore", [binding]) as Promise<DeviceStatus>,
+    unbindStore: () => send("host", "unbindStore", []) as Promise<DeviceStatus>,
     status: () => send("host", "status", []) as Promise<DeviceStatus>,
     close,
     destroy,
