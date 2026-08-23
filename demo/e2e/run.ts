@@ -61,6 +61,7 @@ import soloResumeSync from "./scenarios/solo-resume-sync.ts";
 import soloEphemeral from "./scenarios/solo-ephemeral.ts";
 import soloStorage from "./scenarios/solo-storage.ts";
 import soloGdrive from "./scenarios/solo-gdrive.ts";
+import drawerOverflow from "./scenarios/drawer-overflow.ts";
 import soloAccountStorage from "./scenarios/solo-account-storage.ts";
 import soloPasskey from "./scenarios/solo-passkey.ts";
 import visorReset from "./scenarios/visor-reset.ts";
@@ -160,6 +161,15 @@ const SCENARIOS: Scenario[] = [
   // it). The real popup path is the point: the worker mints PKCE, the
   // page only ever opens a window and relays a one-shot code.
   soloGdrive,
+  // THE OPEN DRAWER'S GEOMETRY ON A PHONE. It follows solo-gdrive
+  // because it drives the same storage sheet, and it needs that sheet's
+  // ASYNC FILL to be working before its own claims mean anything: what
+  // it asserts is that the drawer's BOX keeps up with content that
+  // arrives late, that the assembly leaves a band of app surface
+  // showing, and that a gesture inside the visor stays inside it. It
+  // needs no MinIO and no fake Drive — nothing here connects to
+  // anything, and the connect button is only checked for reachability.
+  drawerOverflow,
   // THE ACCOUNT'S STORAGE RECORD (DRIVE.md, "The account syncs its
   // storage config; devices keep their credentials"): the pairing
   // scenario's two isolated contexts and the Drive scenario's fake, in

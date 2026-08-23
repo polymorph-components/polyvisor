@@ -243,13 +243,27 @@ const scenario: Scenario = {
       await waitForSheet(narrow, "settings", true);
       const ok = await narrow.evaluate(() => {
         const r = document.getElementById("visor-strip")!.getBoundingClientRect();
+        const zone = document.getElementById("visor-zone")!.getBoundingClientRect();
         return {
           onScreen: r.bottom <= globalThis.innerHeight + 1 && r.top >= -1,
+          // What is left of the app under the whole assembly.
+          appBand: globalThis.innerHeight - zone.bottom,
           overflow: document.documentElement.scrollWidth -
             document.documentElement.clientWidth,
         };
       });
       assert(ok.onScreen, "the strip was pushed off-screen by an open sheet at 390");
+      // AND THE BAND BELOW IT (visor.ts's APP_REVEAL): the anchor being
+      // on screen is not enough on its own — a sheet allowed to grow
+      // until the assembly fills the viewport leaves nothing of the app
+      // showing, and a visor covering everything is indistinguishable
+      // from a page that has drawn one. 40 rather than the constant's
+      // 48, so layout rounding cannot read as a regression.
+      assert(
+        ok.appBand >= 40,
+        `an open sheet at 390 left only ${ok.appBand.toFixed(1)}px of app surface below the ` +
+          `assembly — the boundary between the visor's pixels and the page's stops being visible`,
+      );
       assert(ok.overflow <= 0, `an open sheet overflowed horizontally by ${ok.overflow}px at 390`);
     });
   },
