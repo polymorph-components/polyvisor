@@ -3592,19 +3592,45 @@ async function boot() {
   const joinHost = document.createElement("div");
   joinHost.id = "tablet-join";
   tabletPane.append(joinHost);
-  const joinHandle = mountJoinPane(joinHost, tabletUs, usAnnounce, (profile) => {
-    // THE ADOPTION BEAT (§5): the tablet takes the account's colour and
-    // name. The value arrives from the visor's UI; painting the pane is
-    // this page's job, exactly as `applyVisorHue` is (the UI reports,
-    // the consumer paints).
+  const joinHandle = mountJoinPane(joinHost, tabletUs, usAnnounce);
+
+  /** THE ADOPTION BEAT (§5): the tablet takes the account's colour and
+   * name. The value arrives from the visor's UI; painting the pane is
+   * this page's job, exactly as `applyVisorHue` is (the UI reports, the
+   * consumer paints).
+   *
+   * AFTER THE WIRING, NOT AT THE ENROLLMENT EDGE. Enrollment makes the
+   * tablet a member and hands it an EMPTY user-system doc; alice's name
+   * and colour only arrive over the subduction wired below. Reading at
+   * the edge would therefore adopt an empty name and hue 0, once, for
+   * ever — which is precisely why `mountJoinPane` no longer reads the
+   * profile itself (see its doc comment). Mock mode wires nothing and
+   * hands the doc over in-page, so there the wiring call is a no-op and
+   * this runs immediately.
+   *
+   * ONCE: `joinTick` keeps reporting done on every poll, and
+   * `wireUsSubduction` is itself retry-bounded, so the latch is here. */
+  let adopted = false;
+  const adoptFromAccount = async () => {
+    if (adopted) return;
+    const res = await tabletUs.usProfileGet();
+    if (!res.ok) return;
+    adopted = true;
+    const profile = res.value;
     const angle = VISOR_HUES[profile.hue] ?? VISOR_HUES[0];
     joinHost.style.setProperty("--pm-join-hue", String(angle));
     joinHost.style.background = `oklch(92% .03 ${angle})`;
+    // Announced, never silent — both surfaces the pane used to reach:
+    // the strip, and the tablet pane's own line.
+    usAnnounce(
+      `this device now follows your profile: ${profile.displayName || "(unnamed)"}, your colour`,
+      true,
+    );
     tablet.status(
       `this device now follows your profile: ${profile.displayName || "(unnamed)"}, your colour`,
       true,
     );
-  });
+  };
   /** POST-ENROLLMENT SYNC — the embedder's half of PAIRING.md §2 step 7.
    *
    * Pairing grants MEMBERSHIP. It does not, by itself, wire subduction
@@ -3688,10 +3714,10 @@ async function boot() {
         }
       });
       usSynced = true;
-      // The user-visible half of this beat is already on the strip (the
-      // adoption announcement the join pane made); this line is for the
-      // console, where a wiring that silently did not happen would
-      // otherwise look exactly like one that did.
+      // The user-visible half of this beat is the adoption announcement
+      // `adoptFromAccount` makes on the strip the moment this returns;
+      // this line is for the console, where a wiring that silently did
+      // not happen would otherwise look exactly like one that did.
       console.log("[us] subduction wired: alice ⇄ tablet on the user-system partition");
     } catch (e) {
       // A transient relay hiccup is worth a second attempt; an endless
@@ -3708,7 +3734,16 @@ async function boot() {
   // is the JOIN-COMPLETED edge, which is the moment the embedder owes
   // the pair a sync path.
   const joinTick = poll("pair-join", 250, async () => {
-    if (await joinHandle.tick()) void wireUsSubduction();
+    if (await joinHandle.tick()) {
+      void wireUsSubduction();
+      // NOT `await wireUsSubduction(); adopt()` — the wiring's own
+      // once-guard returns instantly to every poll after the first
+      // while the first is still crossing the relay, so chaining off it
+      // would adopt from a doc that has not arrived. `usSynced` is the
+      // flag that means it HAS. Mock mode wires nothing, so there the
+      // enrollment edge is already the arrival.
+      if (PAIRING_BACKEND !== "engine" || usSynced) void adoptFromAccount();
+    }
   });
 
   // Debug/validation handles (the paseo browser driver uses these).

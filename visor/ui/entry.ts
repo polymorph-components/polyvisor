@@ -448,14 +448,15 @@ export interface FirstRunHost {
  *
  * The returned `joinHandle` is the caller's to drive: the pane advances
  * on a poll (`tick()`), and the caller owns the poll loop because the
- * caller owns everything that has to happen after enrollment.
+ * caller owns everything that has to happen after enrollment — the sync
+ * path, and the adoption of the account's profile once that path has
+ * delivered the account's document (see `mountJoinPane`).
  */
 export function offerFirstRun(
   visor: Visor,
   driver: PairingDriver,
   status: AnnounceSink,
   host: FirstRunHost,
-  onAdopt: (profile: { hue: number; displayName: string }) => void,
 ): { joinHandle: JoinPaneHandle; close(): void } {
   const tenant = visor.drawer.tenant<{ root: HTMLElement }>({
     name: "first-run",
@@ -497,7 +498,7 @@ export function offerFirstRun(
    * adopts the container. */
   const joinContainer = document.createElement("div");
   joinContainer.id = "solo-join";
-  const joinHandle = mountJoinPane(joinContainer, driver, status, onAdopt);
+  const joinHandle = mountJoinPane(joinContainer, driver, status);
 
   let phase: "fork" | "join" = "fork";
 

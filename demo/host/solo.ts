@@ -84,7 +84,7 @@ import {
   usCacheKeys,
   visorAnnounceSink,
 } from "../../visor/ui/pairing.ts";
-import type { PairingDriver } from "../../visor/ui/pairing-driver.ts";
+import type { PairingDriver, UsProfile } from "../../visor/ui/pairing-driver.ts";
 import { createEnginePairingDriver } from "../../runtime/pairing-engine.ts";
 import type { UiEvent } from "../../visor/surface/events.ts";
 import { type EngineArtifacts, hex, unhex, until } from "../../runtime/engine.ts";
@@ -2173,6 +2173,26 @@ async function startApp(
       });
       usSynced = true;
       console.log("[solo] subduction wired: this device ⇄ the device that added it");
+      // THE ADOPTION BEAT, at the only honest moment for it. The join
+      // pane's tick fired this wiring on the enrollment edge, when the
+      // adopted us doc was still empty; the account's actual document
+      // arrived over the subscription above — the tasks pointer this
+      // function waited on IS us-doc content, so its arrival is the
+      // proof. Only now is there a name and a colour to take.
+      //
+      // `reconcileFromDriver` refreshes the boot cache and announces any
+      // cache diff; on a device joining for the first time the cache is
+      // empty, so it says nothing and the line below is the only one the
+      // user hears. The two do not double-speak.
+      await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile);
+      const adopted = await us.usProfileGet();
+      if (adopted.ok) {
+        // THE ADOPTION ANNOUNCEMENT (PAIRING.md §5): a remotely-caused
+        // identity change is announced, never silent. Once, here.
+        status(
+          `this device now follows your account: ${adopted.value.displayName || "(unnamed)"}`,
+        );
+      }
       await mountApp();
     } catch (e) {
       if (joinAttempts < WIRE_ATTEMPTS) joinWired = false;
@@ -2181,17 +2201,31 @@ async function startApp(
     }
   };
 
-  /** THE ADOPTION BEAT: this device takes the account's colour and name.
-   * The visor UI reports the value; painting is the consumer's job — so
-   * this is the consumer's half, handed to `offerFirstRun` and fired by
-   * the join pane inside it. */
-  const adoptionBeat = (profile: { hue: number; displayName: string }) => {
+  /** THE ADOPTION BEAT, silent half: this device takes the account's
+   * colour and name. The visor UI reports the value; painting is the
+   * consumer's job — so this is the consumer's half, and it lives here
+   * rather than in the join pane because only this file knows WHEN the
+   * account's document has actually arrived.
+   *
+   * DIRECTION IS ACCOUNT → VISOR, and only at three moments: the join
+   * beat, a resumed boot, and a `profile-changed` event drained off the
+   * account. The opposite direction is the settings write-through
+   * (`onIdentityCommitted` above), which is the only writer going
+   * visor → account. Adding a fourth caller here would be inventing a
+   * second writer of the strip and racing the user's own edit.
+   *
+   * SILENT ON PURPOSE — the announcement is the caller's, because what
+   * there is to say differs by moment: the join beat says this device
+   * has taken the account's identity, a resumed boot's diff is announced
+   * by `reconcileFromDriver` itself, and a remote change was already
+   * announced by the drain that noticed it. §5's announced-never-silent
+   * is kept by every one of the three, not by this function. */
+  const applyProfile = (profile: UsProfile) => {
     const angle = VISOR_HUES[profile.hue] ?? VISOR_HUES[0];
     visor.commitHue(angle);
     const rec = visor.identity();
     if (profile.displayName) visor.saveIdentity({ ...rec, name: profile.displayName });
     visor.renderIdentity();
-    status(`this device now follows your account: ${profile.displayName || "(unnamed)"}`);
   };
 
   // --- role: the ADDER (this page already has the account) -----------------
@@ -2393,7 +2427,13 @@ async function startApp(
   if (probe.ok) {
     note("account:resumed");
     say("your account…");
-    await reconcileFromDriver(us, US_CACHE_KEYS, announce);
+    // WITH `applyProfile`: a resumed boot repaints from the ACCOUNT, not
+    // from the device-local cache the strip drew at boot — the cache is
+    // a first-paint convenience, not the source of truth. Reconcile
+    // announces any diff it finds, which is the announcement this moment
+    // owes; there is no adoption fanfare on a device that already
+    // belongs to the account.
+    await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile);
     const parts = await enqueue(() => driver.usPartitions());
     const tasksPart = parts.find((p) => p.name === TASKS_POINTER);
     if (tasksPart) {
@@ -2411,7 +2451,7 @@ async function startApp(
     // the join pane with it, which is why the handle comes back here:
     // the pane's tick is one driver read and the wiring it triggers is
     // entirely this file's business.
-    entry = offerFirstRun(visor, us, announce, firstRunHost, adoptionBeat);
+    entry = offerFirstRun(visor, us, announce, firstRunHost);
     say("ready — no account on this device yet");
   }
 
@@ -2422,8 +2462,18 @@ async function startApp(
   poll(250, async () => {
     if (await entry?.joinHandle.tick()) void joinerWire();
   });
-  // Remotely-caused identity changes are announced, never silent.
-  poll(1000, () => drainAnnouncements(us, announce));
+  // Remotely-caused identity changes are announced, never silent — and
+  // then ADOPTED, which is the other half. The drain has already spoken
+  // the event; a `profile-changed` in the batch means the account's name
+  // or colour moved under this device, so the strip is repainted from
+  // the account rather than left stale behind a sentence describing a
+  // change the user cannot see.
+  poll(1000, async () => {
+    const events = await drainAnnouncements(us, announce);
+    if (events.some((ev) => ev.tag === "profile-changed")) {
+      await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile);
+    }
+  });
 
   // --- driving hooks --------------------------------------------------------
   //
