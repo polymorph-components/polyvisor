@@ -15,7 +15,7 @@
 // `fetch`/`URL`/`TextEncoder`/`TextDecoder`/`btoa` (all present in
 // workers).
 
-import { ComponentException } from "@polyengine/runtime/embedder";
+import { ComponentException } from "@polyengine/protocol";
 import type { StoreFetch } from "./engine.ts";
 
 /** `throw new ComponentException(payload)` is the err side of a

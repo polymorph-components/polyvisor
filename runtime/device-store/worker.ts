@@ -47,7 +47,7 @@ import {
   isComponentException,
   isTrap,
   toCloneable,
-} from "@polyengine/runtime/embedder";
+} from "@polyengine/protocol";
 import {
   type DeviceIdentityFragment,
   type Engine,
@@ -57,8 +57,9 @@ import {
 } from "../engine.ts";
 // THE STORAGE EGRESS SEAMS AND THE ESCROW, both runtime modules and
 // both already inside this file's pin set: keystore.ts and
-// store-egress.ts import `@polyengine/runtime/embedder`, which worker.ts
-// pins anyway for the cloneable error forms and `ComponentException`, so
+// store-egress.ts import `@polyengine/protocol` (they took it from
+// `@polyengine/runtime/embedder` until A22 moved the vocabulary), which
+// worker.ts pins anyway for the cloneable forms and `ComponentException`, so
 // neither adds a resolution burden to this graph (runtime/README.md's
 // model; the device-store CORE modules stay package-free, this entry
 // point never was). The keystore read is a plain same-origin IndexedDB

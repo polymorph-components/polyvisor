@@ -10,11 +10,8 @@
 // `polyvisor:tasks` import is wired DIRECTLY to the engine
 // instance's export — the framework-links-apps-to-services topology.
 
-import {
-  artifactsFromEnvelope,
-  ComponentException,
-  instantiate,
-} from "@polyengine/runtime/embedder";
+import { artifactsFromEnvelope, instantiate } from "@polyengine/runtime/embedder";
+import { ComponentException } from "@polyengine/protocol";
 import { createRunner, type Runner } from "../../visor/surface/runner.ts";
 import { createFrameBackend } from "../../visor/frame/frame-backend.ts";
 import { createSurface } from "../../visor/surface/surface.ts";

@@ -45,7 +45,7 @@ JUST_VERSION="${JUST_VERSION:-1.54.0}"
 # still a live sibling consumer (demo/deno.json maps it there) and
 # stays checked out below.
 WEBRTC_REPO=https://github.com/polymorph-components/polymorph-webrtc-datachannels.git
-WEBRTC_PIN=42f76c988c3356e62abf33af6a04f1daf8f0839c
+WEBRTC_PIN=db187f4b7d9d72bdc673ddb91c3170f0d9c7e325 # v0.5.0 — A22-clean: no runtime pin of its own, couples to @polyengine/protocol; the 0.5.1 bump needs it
 
 log() { printf '\n==> %s\n' "$1"; }
 

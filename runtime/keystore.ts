@@ -26,7 +26,7 @@
 // whole chain inside the platform (a webcrypto SigV4 primitive), which
 // does not exist.
 
-import { ComponentException } from "@polyengine/runtime/embedder";
+import { ComponentException } from "@polyengine/protocol";
 
 const DB_NAME = "pm-demo-keystore";
 const DB_VERSION = 1;

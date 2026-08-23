@@ -11,7 +11,7 @@
 // Loaded as a MODULE SharedWorker (`{type:"module"}`) — see page.ts.
 
 import { hex, newEngine, unhex } from "../../runtime/engine.ts";
-import { ComponentException } from "@polyengine/runtime/embedder";
+import { ComponentException } from "@polyengine/protocol";
 import { filesystemWeb } from "@polyengine/wasi/filesystem-web";
 
 // --- worker-global identity + boot counter (question 4) ---------------------

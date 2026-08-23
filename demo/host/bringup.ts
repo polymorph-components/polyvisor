@@ -13,7 +13,7 @@
 import { type Engine, hex, newEngine, unhex, until } from "../../runtime/engine.ts";
 import { probeNet, probeNoNet, probeReaderNet } from "./probe-net.ts";
 import { type FakeDrive, type FakeSpace, startFakeDrive } from "./fake-drive.ts";
-import { ComponentException } from "@polyengine/runtime/embedder";
+import { ComponentException } from "@polyengine/protocol";
 import type { EngineNet, StoreFetch } from "../../runtime/engine.ts";
 import { filesystemNode } from "@polyengine/wasi/filesystem-node";
 

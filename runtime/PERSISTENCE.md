@@ -531,3 +531,83 @@ shipped.
   out yet.
 - POLYVISOR-1 (#83): the docs spike's vendored deltic-0.1.0 bundle —
   still its own turn, untouched by this bump.
+
+### Addendum — 0.4.0 → 0.5.1, EXECUTED 2026-08-23
+
+A second bump followed within the day, and it was a BUG FIX first and a
+version-tracking exercise second.
+
+- **Why**: polyengine#239 (af97c13, in v0.5.1). 0.4.0's `driveAsync` took
+  its speculative pending-resumption entry UNCONDITIONALLY
+  (0.4.0 `src/exec/boundary.ts:1064`), and that entry is a **store-wide**
+  scheduling gate: `Store.tick` refuses while it is non-empty, and every
+  `driveAsync` hops at its top under a 10,000-hop bound. Two of this
+  device's OWN periodic drivers collide there. The worker's 500 ms
+  debounced, **non-blocking** state-checkpoint (worker.ts's "Ordinary
+  driver/tasks calls are NOT blocked behind a checkpoint" — a recorded
+  design decision, not an accident) is near-always in flight; the solo
+  page's 1 s `us-events` drain (demo/host/solo.ts) arrives into it and can
+  only hop. Ten thousand hops later the internal-bug assert fires with the
+  user-facing text `driveAsync: a resumed-activation claim was never
+  released`. The fix guards exactly that line: the entry is taken only by
+  the sole driver, plus a driver-arrival one-shot that wakes the incumbent
+  promptly.
+- **What it is NOT**, because the first diagnosis got this wrong and the
+  retraction is worth keeping legible: there is **no latency threshold**
+  and no egress involved — the storm reproduces with the harness
+  answering instantly. There is **no Gecko differential**; a nine-case
+  JSPI ordering probe found SpiderMonkey ≡ V8. It was field-reported from
+  mobile Firefox only because slow OPFS widens the window between the two
+  drivers. The fix is upstream, not a polyvisor-side serialization, which
+  would have contradicted the non-blocking-checkpoint decision above.
+- **The gate**: devstore **row 47b** — 12 s of back-to-back
+  `state-checkpoint` and `us-events` calls on one store. RED on stock
+  0.4.0 (21 checkpoints, **1** drain, then the trap); GREEN on 0.5.1 (107
+  checkpoints, **108** drains, no trap). The drain count is the
+  interesting half: it measures the starvation directly, and its recovery
+  is what validates the shipped fix's driver-arrival wake rather than
+  merely the removal of the entry.
+- **Pins** (done): demo/deno.json and runtime/tests/devstore/deno.json —
+  @polyengine runtime/wasi/translator 0.4.0 → **0.5.1**; @polymorph
+  webcrypto/websocket 0.4.0 → **0.5.0**; plus a NEW
+  **@polyengine/protocol@0.2.3** pin, which A22 makes necessary.
+- **A22 is the breaking part** (polyengine 1e31210): `@polyengine/runtime
+  /embedder` is application-only now — the A9 courtesy re-exports and the
+  concrete handle classes are gone. `ComponentException`,
+  `isComponentException`, `isTrap`, `toCloneable`, `fromCloneable` and
+  `suspending` all moved to `@polyengine/protocol`. Eleven modules changed
+  their import line and nothing else: pairing-engine, stubs, keystore,
+  store-egress, device-store/{worker,client}, tests/devstore/page,
+  demo/host/{demo,bringup,probe-net}, spikes/worker-host/worker.
+  `instantiate`/`artifactsFromEnvelope` stayed in the embedder — that is
+  A22's dividing line, and engine.ts and solo.ts were untouched.
+  Consequently the ports no longer constrain our runtime version at all:
+  webcrypto and websocket 0.5.0 name no `@polyengine/runtime` specifier
+  anywhere.
+- **wasi/fs** (watched, no change needed): f07a3b9 made directory-mutating
+  ops require the `mutate-directory` flag specifically, refusing read-only
+  with the WIT-mandated code. Every preopen this repo builds passes
+  `writable: true`, which the provider turns into
+  read+write+mutate-directory on the preopened descriptor
+  (`fs_provider.ts`'s `PREOPEN_FLAGS`), so the sealed-fs wrapper and the
+  engine's state root are unaffected — sealed-fs row 7 and the resume
+  batteries confirm. Note this DOES invalidate the previous bump's "no
+  wasi/ changes in the window" line; there were changes, they just landed
+  on the permissive side of our usage.
+- **The webrtc sibling checkout must now be at its v0.5.0**, and this is a
+  hard prerequisite rather than hygiene: at 0.4.0 the sibling's own
+  `polyengine-impl/deno.json` declares `@polyengine/runtime@^0.4.0`, and
+  Deno **does** consult it for our relative import — `deno info` showed a
+  second `@polyengine/runtime@0.4.0` beside our 0.5.1. Moving to the JSR
+  copy instead is still blocked by the same `deno bundle --external`
+  hazard the last bump recorded, re-measured here (the `node:` tripwire
+  fires). At v0.5.0 the sibling is A22-clean — no runtime specifier at all
+  — so one runtime serves the graph and lazy bundling is retained.
+- **Harness findings folded in**: `demo/e2e/run.ts`'s FIREFOX_PREFS gains
+  `"permissions.default.persistent-storage": 1` (headless Playwright
+  Firefox never settles `navigator.storage.persist()` without it, wedging
+  every kept-device ceremony), and the engine-selection machinery carries
+  the measured Juggler hazard — calling a `WebAssembly.promising` export
+  from inside a `page.evaluate` frame SIGSEGVs the Firefox content
+  process, so Firefox-lane scenarios must drive through page
+  scripts/hooks.
