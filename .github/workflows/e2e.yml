@@ -92,11 +92,17 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "pinned playwright: $version"
 
-      - name: Cache the Playwright browser
+      - name: Cache the Playwright browsers
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.deps/pw-browsers
-          key: pw-${{ runner.os }}-${{ runner.arch }}-${{ steps.pw.outputs.version }}
+          # The `-ff` suffix is load-bearing: the cache saves only on a
+          # key MISS, so when the browser set grew (chromium + firefox,
+          # the firefox-smoke scenario) the old key would have hit
+          # forever with a chromium-only archive and e2e-deps would have
+          # re-downloaded Firefox's ~90MB on every single run. A browser-
+          # set change must change the key.
+          key: pw-${{ runner.os }}-${{ runner.arch }}-${{ steps.pw.outputs.version }}-ff
 
       - name: Cache the MinIO binary
         # ~110 MB fetched from dl.min.io; the credential scenarios need a

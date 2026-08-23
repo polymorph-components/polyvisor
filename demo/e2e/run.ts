@@ -1,4 +1,5 @@
-// End-to-end scenarios for the demo visor, in a REAL Chromium.
+// End-to-end scenarios for the demo visor, in a REAL browser — Chromium
+// for all but one of them, and Firefox for the one Gecko smoke beat.
 //
 //   just e2e            (builds the site first, then runs this)
 //   deno run -A e2e/run.ts [scenario-name ...]
@@ -23,12 +24,12 @@
 // the built `serve/` directory, a MinIO with CORS open (the credential
 // beats need a real S3 to talk to, and one of them needs it DOWN), an
 // iroh relay (every engine instance binds an endpoint through one, and
-// the pairing ceremony actually crosses it), and one browser. Each
+// the pairing ceremony actually crosses it), and the browsers. Each
 // scenario gets a fresh browser context, so no scenario can pass because
 // of something another one left in storage — and nothing here reaches
 // off this machine.
 
-import { chromium } from "npm:playwright@1.57.0";
+import { chromium, firefox } from "npm:playwright@1.57.0";
 import type { Browser, Page } from "npm:playwright@1.57.0";
 import { serveDir } from "jsr:@std/http@1.0.13/file-server";
 import {
@@ -65,6 +66,7 @@ import drawerOverflow from "./scenarios/drawer-overflow.ts";
 import soloAccountStorage from "./scenarios/solo-account-storage.ts";
 import soloPasskey from "./scenarios/solo-passkey.ts";
 import visorReset from "./scenarios/visor-reset.ts";
+import firefoxSmoke from "./scenarios/firefox-smoke.ts";
 
 // Re-exported so a scenario imports its whole contract from one place:
 // `Scenario` and the `Ctx` it is handed.
@@ -83,6 +85,10 @@ export interface Scenario {
   /** Whether the store must be reachable. `down` stops MinIO for the
    * duration and brings it back afterwards. */
   minio?: "up" | "down";
+  /** Which browser drives this scenario. Chromium unless named: the
+   * suite is a Chromium suite plus ONE Gecko smoke beat, deliberately —
+   * see `firefox-smoke` and the `FIREFOX_PREFS` note below. */
+  engine?: "chromium" | "firefox";
   run(page: Page, ctx: Ctx): Promise<void>;
 }
 
@@ -196,10 +202,16 @@ const SCENARIOS: Scenario[] = [
   // after the other identity/naming scenarios and before the one that
   // must stay last, on its own fresh context either way.
   visorReset,
-  // Last: it provokes the visor-timer races, so it is the scenario most
-  // likely to leave a page in an interesting state — and it gets a fresh
-  // context either way.
+  // Second to last: it provokes the visor-timer races, so it is the
+  // scenario most likely to leave a page in an interesting state — and
+  // it gets a fresh context either way.
   stripOwnership,
+  // LAST, and in a different browser. Firefox is launched lazily, so
+  // putting the only Gecko beat at the end means a run that fails
+  // earlier never pays for a second browser at all — and a Chromium
+  // suite that is already green is the right place to ask "and does it
+  // work under the other engine".
+  firefoxSmoke,
 ];
 
 const here = new URL(".", import.meta.url).pathname;
@@ -463,6 +475,49 @@ async function main() {
     });
   let browser: Browser = await launchBrowser();
 
+  // --- the Gecko side ---------------------------------------------------
+  //
+  // ONE SCENARIO RUNS UNDER FIREFOX (`firefox-smoke`), because the demo's
+  // whole persistence story rides on platform features that are per-engine
+  // facts rather than per-standard ones: JSPI, module SharedWorkers, OPFS,
+  // Web Locks, and a non-extractable CryptoKey structured-cloned into
+  // IndexedDB. A Chromium-only suite means a Gecko regression is only ever
+  // found BY HAND, which is how this scenario came to exist.
+  //
+  // THE PREF, AND WHY IT IS NOT A COMPATIBILITY SHIM. Playwright 1.57.0's
+  // Firefox build (144.0.2) ships with
+  // `javascript.options.wasm_js_promise_integration` DEFAULTED OFF, so
+  // `WebAssembly.Suspending` is simply absent and the engine cannot be
+  // instantiated at all. Release Firefox of the same generation has it ON
+  // — the project owner runs this demo on a real mobile Firefox, account
+  // creation and storage sheet included. The pref therefore restores the
+  // RELEASE default that Playwright's build lags; it does not grant the
+  // page anything a real user's browser does not already have. Measured
+  // 2026-08-23: with the pref, that same build reports JSPI, module
+  // SharedWorker, OPFS, Web Locks and CryptoKey-in-IndexedDB all present
+  // and the solo page boots clean; without it, boot refuses by name
+  // ("this browser cannot run the engine: it has no WebAssembly JS
+  // Promise Integration…", runtime/device-store/worker.ts's
+  // `requireJspi`). If a future Playwright build turns it on, this map
+  // becomes a no-op rather than a lie.
+  //
+  // (Not covered by the pref, and not needed: `createSyncAccessHandle` is
+  // absent on OPFS files in this build. The device store never asks for
+  // one — it writes through `createWritable` — so the boot is green
+  // regardless. Worth knowing before someone reaches for the sync API.)
+  const FIREFOX_PREFS: Record<string, boolean> = {
+    "javascript.options.wasm_js_promise_integration": true,
+  };
+  let firefoxBrowser: Browser | null = null;
+  const launchFirefox = () =>
+    firefox.launch({ headless: !headed, firefoxUserPrefs: FIREFOX_PREFS });
+  /** Which engine the scenario now running asked for. `ctx.browser` and
+   * `fresh` both read it through `current()` rather than closing over a
+   * browser, for the same reason the chromium handle is a getter: the
+   * runner replaces a wedged browser underneath a scenario. */
+  let engine: "chromium" | "firefox" = "chromium";
+  const current = (): Browser => engine === "firefox" ? firefoxBrowser! : browser;
+
   const openPages: Page[] = [];
   // Phase tracing for the deadline diagnostics: every await between a
   // scenario banner and its first act sets the phase it is entering, so
@@ -480,7 +535,7 @@ async function main() {
     // deadline machinery below), and a scenario must always see the live
     // one.
     get browser() {
-      return browser;
+      return current();
     },
     minioUrl: minio.url,
     minioAccess: MINIO_USER,
@@ -492,7 +547,7 @@ async function main() {
     startMinio: () => minio.start(),
     fresh: async (opts: FreshOptions = {}) => {
       setPhase("newContext");
-      const bctx = await newContext(browser, opts);
+      const bctx = await newContext(current(), opts);
       setPhase("newPage");
       const page = await bctx.newPage();
       openPages.push(page);
@@ -598,14 +653,18 @@ async function main() {
   };
   /** Bounded close-and-relaunch for a browser presumed wedged: close()
    * itself is a protocol call and can hang, so it races a short fuse
-   * and the old process is abandoned to the OS if it does. */
+   * and the old process is abandoned to the OS if it does. Whichever
+   * engine the failing scenario was driving is the one replaced — a
+   * relaunched Chromium would do nothing for a wedged Gecko. */
   const recoverBrowser = async () => {
+    const dying = current();
     await Promise.race([
-      browser.close().catch(() => {}),
+      dying.close().catch(() => {}),
       new Promise((r) => setTimeout(r, 5_000)),
     ]);
-    browser = await launchBrowser();
-    console.log("         (browser relaunched)");
+    if (engine === "firefox") firefoxBrowser = await launchFirefox();
+    else browser = await launchBrowser();
+    console.log(`         (${engine} relaunched)`);
   };
 
   // --- memory watch -------------------------------------------------------
@@ -671,7 +730,13 @@ async function main() {
       };
       for (const [pid, p] of table) {
         if (pid === Deno.pid) continue;
-        const chromeish = /chrom|headless/i.test(p.comm);
+        // "browser-ish": the Chromium tree, plus the Gecko one the
+        // firefox-smoke scenario launches (`comm` is `firefox` for the
+        // parent and `Isolated Web Co`/`Web Content` for its children,
+        // which the harness lumps into `otherMb` — the trend is what
+        // this watch reads, and a browser tree in the wrong column
+        // would misread it).
+        const chromeish = /chrom|headless|firefox|Web Content|Isolated Web/i.test(p.comm);
         if (isOurs(pid)) {
           if (chromeish) s.chromeMb += p.rssMb;
           else if (/minio/i.test(p.comm)) s.minioMb += p.rssMb;
@@ -722,6 +787,15 @@ async function main() {
           setPhase("minio");
           if (scenario.minio === "down") await minio.stop();
           else await minio.start();
+          // The engine is chosen BEFORE `fresh`, since that is what
+          // `current()` resolves against. Firefox is launched lazily and
+          // kept for the rest of the run: a suite that is one Gecko beat
+          // long should not pay for a second browser it never opens.
+          engine = scenario.engine ?? "chromium";
+          if (engine === "firefox") {
+            setPhase("launchFirefox");
+            if (!firefoxBrowser) firefoxBrowser = await launchFirefox();
+          }
           page = await ctx.fresh(
             typeof scenario.page === "function" ? scenario.page(ctx) : scenario.page,
           );
@@ -750,7 +824,7 @@ async function main() {
           // manifests as exactly this kind of silence).
           const stuck = ((performance.now() - phaseAt) / 1000).toFixed(1);
           console.log(`         wedged in phase '${phase}' for ${stuck}s`);
-          console.log(`         browser.isConnected(): ${browser.isConnected()}`);
+          console.log(`         browser.isConnected(): ${current().isConnected()}`);
           const crashedPages = openPages.filter((p) =>
             (p as unknown as { __crashed?: () => boolean }).__crashed?.()
           ).length;
@@ -835,7 +909,14 @@ async function main() {
   }
 
   await Promise.race([
-    browser.close().catch(() => {}),
+    Promise.all([
+      browser.close().catch(() => {}),
+      // The annotation is not decoration: every assignment to
+      // `firefoxBrowser` happens inside the scenario loop's closures, so
+      // the checker's flow analysis reaches here still believing it is
+      // `null`.
+      (firefoxBrowser as Browser | null)?.close().catch(() => {}) ?? Promise.resolve(),
+    ]),
     new Promise((r) => setTimeout(r, 5_000)),
   ]);
   await minio.dispose();

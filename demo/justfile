@@ -245,6 +245,35 @@ e2e-deps:
             deno run -A {{PLAYWRIGHT}} install chromium
         fi
     fi
+    # THE GECKO SIDE, same probe-then-install shape. One scenario
+    # (firefox-smoke) drives Firefox, because the demo's persistence
+    # story rests on per-engine platform features and a Chromium-only
+    # suite finds a Gecko regression only when someone opens the demo by
+    # hand. The launch probe passes the SAME pref the harness launches
+    # with (e2e/run.ts's FIREFOX_PREFS) so this recipe cannot certify a
+    # browser the suite would then refuse.
+    if deno eval "import { firefox } from '{{PLAYWRIGHT}}';
+                  const b = await firefox.launch({
+                      firefoxUserPrefs: { 'javascript.options.wasm_js_promise_integration': true },
+                  });
+                  await b.close();" >/dev/null 2>&1; then
+        echo "playwright firefox: already launchable"
+    else
+        echo "playwright firefox: installing…"
+        pwver="{{PLAYWRIGHT}}"; pwver="${pwver#npm:playwright@}"
+        if command -v npx >/dev/null 2>&1; then
+            if [ -n "${CI:-}" ]; then
+                npx --yes "playwright@${pwver}" install --with-deps firefox
+            else
+                npx --yes "playwright@${pwver}" install firefox
+            fi
+        else
+            if [ -n "${CI:-}" ]; then
+                deno run -A {{PLAYWRIGHT}} install-deps firefox || true
+            fi
+            deno run -A {{PLAYWRIGHT}} install firefox
+        fi
+    fi
     # The store the credential scenarios talk to (and that one of them
     # deliberately stops), plus the relay the suite's own hermetic iroh
     # rides (run.ts spawns it on an ephemeral port; nothing reaches the
