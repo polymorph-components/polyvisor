@@ -17,12 +17,30 @@
 // resembles real credential material, and nothing real should ever be
 // typed into it.
 
+/** Drive's storage SPACES, as the two values this store can use.
+ *
+ * `drive` is the ordinary visible My Drive; `appDataFolder` is the
+ * hidden per-app space. THE FAKE ENFORCES ISOLATION between them
+ * because that is the only thing that makes a space test non-vacuous:
+ * a `files.list` defaults to `spaces=drive` and CANNOT see appdata
+ * files, and a list carrying `spaces=appDataFolder` cannot see
+ * ordinary ones. Real Drive answers a cross-space query with an empty
+ * file list rather than an error, so the fake does too — a strategy
+ * that forgot the `spaces` parameter must fail by finding nothing,
+ * exactly as it would live. */
+export type FakeSpace = "drive" | "appDataFolder";
+
 export interface FakeFile {
   id: string;
   name: string;
   parents: string[];
   mimeType: string;
   bytes: Uint8Array;
+  /** Which space this file landed in — INHERITED FROM ITS PARENT at
+   * create time, as it is in Drive: parentage is what places a file in
+   * a space, which is why a create in the hidden space needs no
+   * parameter beyond the `appDataFolder` alias in `parents`. */
+  space: FakeSpace;
 }
 
 export interface FakeRequest {
@@ -47,12 +65,19 @@ export interface FakeDrive {
   /** Origin, e.g. `http://127.0.0.1:41234` — pass as `apiBase`. */
   url: string;
   port: number;
-  /** Every file currently in the store (folders included). */
+  /** Every file currently in the store (folders included), each
+   * carrying the `space` it landed in. */
   files(): FakeFile[];
-  /** Resolve a `/`-separated path from My Drive's root, or undefined. */
-  byPath(path: string): FakeFile | undefined;
-  /** Child names of a `/`-separated folder path (empty if absent). */
-  childNames(path: string): string[];
+  /** Resolve a `/`-separated path from the given space's root
+   * (default `drive`, i.e. My Drive's root), or undefined. The walk
+   * stays inside that space throughout, so the same path can name two
+   * different files in the two spaces — which is the case the
+   * isolation assertions turn on. */
+  byPath(path: string, space?: FakeSpace): FakeFile | undefined;
+  /** Child names of a `/`-separated folder path within one space
+   * (default `drive`); empty if the path is absent in that space. An
+   * empty path means the space's own root. */
+  childNames(path: string, space?: FakeSpace): string[];
   /** Recorded request log, oldest first. */
   requests(): FakeRequest[];
   /** Invalidate every access token issued so far: the next files-API
@@ -185,17 +210,40 @@ export async function startFakeDrive(opts: FakeDriveOptions = {}): Promise<FakeD
   const refreshTokens = new Set<string>();
   if (opts.seedAccessToken) accessTokens.add(opts.seedAccessToken);
 
+  /** A file's space is its PARENT's space, and the two root aliases are
+   * the base cases. An unknown parent id is treated as `drive`: it can
+   * only be a parent the fake never minted, and inventing a third
+   * answer for it would hide the bug. */
+  function spaceOfParent(parent: string): FakeSpace {
+    if (parent === "appDataFolder") return "appDataFolder";
+    if (parent === "root") return "drive";
+    return store.get(parent)?.space ?? "drive";
+  }
+
   function create(name: string, parents: string[], mimeType: string, bytes: Uint8Array): FakeFile {
-    const f: FakeFile = { id: `file-${nextFile++}`, name, parents, mimeType, bytes };
+    const f: FakeFile = {
+      id: `file-${nextFile++}`,
+      name,
+      parents,
+      mimeType,
+      bytes,
+      space: spaceOfParent(parents[0] ?? "root"),
+    };
     store.set(f.id, f);
     return f;
   }
 
-  function resolvePath(path: string): FakeFile | undefined {
-    let parent = "root";
+  function rootId(space: FakeSpace): string {
+    return space === "appDataFolder" ? "appDataFolder" : "root";
+  }
+
+  function resolvePath(path: string, space: FakeSpace): FakeFile | undefined {
+    let parent = rootId(space);
     let found: FakeFile | undefined;
     for (const seg of path.split("/").filter((s) => s.length)) {
-      found = [...store.values()].find((f) => f.name === seg && f.parents.includes(parent));
+      found = [...store.values()].find((f) =>
+        f.name === seg && f.space === space && f.parents.includes(parent)
+      );
       if (!found) return undefined;
       parent = found.id;
     }
@@ -318,7 +366,19 @@ export async function startFakeDrive(opts: FakeDriveOptions = {}): Promise<FakeD
       const q = url.searchParams.get("q") ?? "";
       const parsed = parseQuery(q);
       if (!parsed) return driveError(400, `unsupported q expression: ${q}`);
+      // THE SPACE GATE. `spaces` defaults to `drive`, exactly as the
+      // real API does, and a file outside the requested space is
+      // invisible here — no error, just absent. That is what lets a
+      // test tell the two stores apart, and what makes a strategy that
+      // omits the parameter fail the same way it would against Google
+      // (every resolve misses, every upload re-creates).
+      const spacesParam = url.searchParams.get("spaces") ?? "drive";
+      if (spacesParam !== "drive" && spacesParam !== "appDataFolder") {
+        return driveError(400, `fake-drive: unsupported spaces=${spacesParam}`);
+      }
+      const space: FakeSpace = spacesParam;
       const files = [...store.values()].filter((f) =>
+        f.space === space &&
         (parsed.name === undefined || f.name === parsed.name) &&
         (parsed.parent === undefined || f.parents.includes(parsed.parent)) &&
         (parsed.mimeType === undefined || f.mimeType === parsed.mimeType)
@@ -429,16 +489,18 @@ export async function startFakeDrive(opts: FakeDriveOptions = {}): Promise<FakeD
     url: `http://127.0.0.1:${port}`,
     port,
     files: () => [...store.values()].map((f) => ({ ...f, bytes: f.bytes.slice() })),
-    byPath: (p: string) => {
-      const f = resolvePath(p);
+    byPath: (p: string, space: FakeSpace = "drive") => {
+      const f = resolvePath(p, space);
       return f ? { ...f, bytes: f.bytes.slice() } : undefined;
     },
-    childNames: (p: string) => {
+    childNames: (p: string, space: FakeSpace = "drive") => {
       const parent = p.split("/").filter((s) => s.length).length === 0
-        ? { id: "root" }
-        : resolvePath(p);
+        ? { id: rootId(space) }
+        : resolvePath(p, space);
       if (!parent) return [];
-      return [...store.values()].filter((f) => f.parents.includes(parent.id)).map((f) => f.name);
+      return [...store.values()]
+        .filter((f) => f.space === space && f.parents.includes(parent.id))
+        .map((f) => f.name);
     },
     requests: () => log.map((r) => ({ ...r })),
     expireNow: () => accessTokens.clear(),

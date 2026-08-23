@@ -12,7 +12,7 @@
 
 import { type Engine, hex, newEngine, unhex, until } from "../../runtime/engine.ts";
 import { probeNet, probeNoNet, probeReaderNet } from "./probe-net.ts";
-import { type FakeDrive, startFakeDrive } from "./fake-drive.ts";
+import { type FakeDrive, type FakeSpace, startFakeDrive } from "./fake-drive.ts";
 import { ComponentException } from "@polyengine/runtime/embedder";
 import type { EngineNet, StoreFetch } from "../../runtime/engine.ts";
 import { filesystemNode } from "@polyengine/wasi/filesystem-node";
@@ -329,10 +329,34 @@ function driveNet(apiBase: string, accessToken: string): EngineNet {
   };
 }
 
-async function gdrive() {
-  const artifacts = await loadArtifacts();
-  const fake = await startFakeDrive();
-  step(`fake drive up on ${fake.url}`);
+/** The two storage spaces, and the fake's name for each.
+ *
+ * `"appdata"` FIRST because it is the default: where a space has to be
+ * chosen and nothing says otherwise — this harness's own config
+ * included — the hidden per-app folder is the answer. It makes "no
+ * sharing" platform-enforced (Drive cannot share appdata files at all)
+ * and puts a store addressed by keyed name out of reach of a Drive-UI
+ * rename, which would otherwise strand a file permanently. `"drive"`
+ * is proved beside it because it is a supported choice, not a legacy
+ * one: appdata cannot be inspected by its owner and an app rotation
+ * orphans it invisibly. */
+const GDRIVE_SPACES: [space: "appdata" | "drive", fake: FakeSpace][] = [
+  ["appdata", "appDataFolder"],
+  ["drive", "drive"],
+];
+
+/** The whole owner beat + cold pull, in ONE space, against a fake that
+ * both spaces share. Parameterized rather than duplicated, because the
+ * property under test is that the beat is IDENTICAL in both: the space
+ * changes where the root folder sits and nothing below it. */
+async function gdriveBeat(
+  artifacts: { envelope: string; bytes: Uint8Array },
+  fake: FakeDrive,
+  space: "appdata" | "drive",
+) {
+  // The fake's spelling of the same choice: `appdata` is the config
+  // value the guest validates, `appDataFolder` is Drive's own alias.
+  const fakeSpace: FakeSpace = space === "appdata" ? "appDataFolder" : "drive";
 
   // Two consents, two tokens — one per device, never shared.
   const ownerToken = await driveConsent(fake);
@@ -358,7 +382,27 @@ async function gdrive() {
     await owner.driver.sealPartition(part);
     step("partition sealed with the cold device as a member");
 
-    const store = { kind: "gdrive" as const, value: { root: GDRIVE_ROOT, apiBase: fake.url } };
+    // An unknown space is refused BY NAME at init-store, never
+    // defaulted: a typo that silently fell back would put the store in
+    // the other space, where the walk finds nothing and the next flush
+    // rebuilds the tree — indistinguishable from data loss. `"appData"`
+    // is the plausible wrong spelling, which is why it is the one used.
+    let spaceRefusal = "";
+    await owner.driver.initStore({
+      kind: "gdrive",
+      value: { root: GDRIVE_ROOT, apiBase: fake.url, space: "appData" as "appdata" },
+    }).catch((e) => {
+      spaceRefusal = String(e);
+    });
+    if (!spaceRefusal.includes('unknown value "appData"')) {
+      throw new Error(`an unknown space should be refused by name, got: ${spaceRefusal || "OK"}`);
+    }
+    step(`unknown space refused: ${spaceRefusal.replace(/^\w*Error:\s*/, "")}`);
+
+    const store = {
+      kind: "gdrive" as const,
+      value: { root: GDRIVE_ROOT, apiBase: fake.url, space },
+    };
     await owner.driver.initStore(store);
     await owner.driver.ensureBucket();
     // THE RULING (DRIVE.md §1): grant returns NONE. There is no link to
@@ -384,17 +428,17 @@ async function gdrive() {
     // id's hex appears NOWHERE in the tree, so listing this account
     // tells you how much is stored and not which document it belongs
     // to.
-    const docsChildren = fake.childNames(`${GDRIVE_ROOT}/docs`);
+    const docsChildren = fake.childNames(`${GDRIVE_ROOT}/docs`, fakeSpace);
     if (docsChildren.length !== 1) {
       throw new Error(`expected one doc folder under docs, got ${JSON.stringify(docsChildren)}`);
     }
     const docFolder = `${GDRIVE_ROOT}/docs/${docsChildren[0]}`;
-    const children = fake.childNames(docFolder);
+    const children = fake.childNames(docFolder, fakeSpace);
     // chunk ×2 + oplog + manifest for the one flushing device.
     if (children.length < 3) {
       throw new Error(`too few objects landed in the fake: ${JSON.stringify(children)}`);
     }
-    const pickups = fake.childNames(`${GDRIVE_ROOT}/pickup`);
+    const pickups = fake.childNames(`${GDRIVE_ROOT}/pickup`, fakeSpace);
     if (pickups.length !== 2) {
       throw new Error(`expected two pickup objects (owner + cold), got ${JSON.stringify(pickups)}`);
     }
@@ -446,15 +490,93 @@ async function gdrive() {
     // The pickup object is name-keyed-INDEPENDENT (it is where the
     // keychain is learned), so it is still identifiable here — by count
     // rather than by a name the harness can spell.
-    if (fake.childNames(`${GDRIVE_ROOT}/pickup`).length !== 1) {
+    if (fake.childNames(`${GDRIVE_ROOT}/pickup`, fakeSpace).length !== 1) {
       throw new Error("revoke did not leave exactly the owner's own pickup behind");
     }
     step(`revoke: ${note.replaceAll(/\s+/g, " ")}`);
-
-    console.log("\nGDRIVE BRINGUP PASS");
   } catch (e) {
     dumpOnFail([["owner", owner], ["cold", cold]]);
     throw e;
+  }
+}
+
+async function gdrive() {
+  const artifacts = await loadArtifacts();
+  const fake = await startFakeDrive();
+  step(`fake drive up on ${fake.url}`);
+  try {
+    // ONE fake for both beats, deliberately: two fakes could not tell
+    // an isolated store from a fresh one. Sharing the server means the
+    // second beat writes the SAME root folder name into the other
+    // space, so the assertions below are about isolation and not about
+    // two servers happening to differ.
+    const landed: Record<string, Set<string>> = {};
+    for (const [space, fakeSpace] of GDRIVE_SPACES) {
+      const before = new Set(fake.files().map((f) => f.id));
+      console.log(`\n--- gdrive space=${space} (fake: ${fakeSpace}) ---`);
+      await gdriveBeat(artifacts, fake, space);
+      const after = fake.files().filter((f) => !before.has(f.id));
+      // POSITIVE assertion, not an absence: every file this beat
+      // created is IN the space it asked for. An engine that ignored
+      // the setting entirely would still pass a "the other space is
+      // empty" check on the first beat; it cannot pass this one.
+      const stray = after.filter((f) => f.space !== fakeSpace);
+      if (stray.length > 0) {
+        throw new Error(
+          `space=${space}: ${stray.length} file(s) landed in the wrong space: ` +
+            JSON.stringify(stray.map((f) => [f.name, f.space])),
+        );
+      }
+      landed[fakeSpace] = new Set(after.map((f) => f.id));
+      // The layout is the SAME in both spaces — that is what makes the
+      // space a storage location rather than a second strategy.
+      const top = fake.childNames(GDRIVE_ROOT, fakeSpace).sort();
+      if (JSON.stringify(top) !== JSON.stringify(["docs", "pickup"])) {
+        throw new Error(`space=${space}: unexpected root layout ${JSON.stringify(top)}`);
+      }
+      step(`space=${space}: ${after.length} files, all in ${fakeSpace}, layout ${top.join("+")}`);
+    }
+
+    // THE ISOLATION ASSERTIONS, now that both stores exist side by side
+    // under the same root NAME. Each space resolves that name to its
+    // OWN folder, and neither space's objects appear in the other's
+    // listing.
+    const appRoot = fake.byPath(GDRIVE_ROOT, "appDataFolder");
+    const visRoot = fake.byPath(GDRIVE_ROOT, "drive");
+    if (!appRoot || !visRoot) {
+      throw new Error(
+        `both spaces should hold a ${GDRIVE_ROOT} folder: ` +
+          `appdata=${appRoot?.id}, drive=${visRoot?.id}`,
+      );
+    }
+    if (appRoot.id === visRoot.id) {
+      throw new Error("the two spaces resolved the SAME root folder — no isolation at all");
+    }
+    const appIds = landed["appDataFolder"];
+    const visNames = new Set(
+      fake.files().filter((f) => f.space === "drive").map((f) => f.id),
+    );
+    const bleed = [...appIds].filter((id) => visNames.has(id));
+    if (bleed.length > 0) {
+      throw new Error(`appdata objects are visible to the drive space: ${JSON.stringify(bleed)}`);
+    }
+    // And by NAME, which is how a device would actually look: the
+    // appdata doc folder is not among the visible space's doc folders.
+    const appDocs = fake.childNames(`${GDRIVE_ROOT}/docs`, "appDataFolder");
+    const visDocs = fake.childNames(`${GDRIVE_ROOT}/docs`, "drive");
+    const shared = appDocs.filter((n) => visDocs.includes(n));
+    if (appDocs.length !== 1 || visDocs.length !== 1 || shared.length > 0) {
+      throw new Error(
+        `doc folders are not separate per space: appdata=${JSON.stringify(appDocs)} ` +
+          `drive=${JSON.stringify(visDocs)}`,
+      );
+    }
+    step(
+      `isolation: roots ${appRoot.id}(appdata) vs ${visRoot.id}(drive), ` +
+        `${appIds.size} appdata objects invisible to a default-space listing`,
+    );
+
+    console.log("\nGDRIVE BRINGUP PASS");
   } finally {
     await fake.close();
   }

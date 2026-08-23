@@ -506,7 +506,33 @@ export type StoreBinding =
     root: string;
     apiBase: string;
     clientId: string;
+    /**
+     * WHICH DRIVE SPACE THE ROOT FOLDER SITS IN — `"appdata"` for the
+     * hidden per-app space, `"drive"` for an ordinary visible folder in
+     * My Drive (DRIVE.md §5). ADDRESSING, exactly like `root` and
+     * `apiBase`: it names a place, grants nothing, and everything below
+     * the root folder is identical between the two.
+     *
+     * It is nonetheless not free to change: the space determines the
+     * OAuth SCOPE the consent was granted under (see `OauthStartSpec`),
+     * so a binding whose space disagrees with the sealed consent's is
+     * refused at bind rather than discovered as a provider 403 later.
+     */
+    space: GdriveSpace;
   };
+
+/**
+ * The two Drive storage spaces this store can address (DRIVE.md §5).
+ *
+ * `"appdata"` is the default wherever a chooser must pick one: the
+ * hidden per-app space cannot be shared at all (the platform enforces
+ * it rather than the strategy promising it), and it is out of reach of
+ * a Drive-UI rename, which on a store addressed by keyed name would
+ * strand a file permanently. `"drive"` stays available because appdata
+ * cannot be inspected by its own owner and is orphaned INVISIBLY by an
+ * app/client rotation.
+ */
+export type GdriveSpace = "appdata" | "drive";
 
 /**
  * WHAT THE WORKER NEEDS IN ORDER TO RUN THE OAUTH CEREMONY (DRIVE.md
@@ -530,6 +556,18 @@ export interface OauthStartSpec {
    * when the bearer never may.
    */
   clientSecret?: string;
+  /**
+   * WHICH SPACE THIS CONSENT IS BEING ASKED FOR, and it belongs on the
+   * ceremony rather than only on the binding because THE SPACE
+   * DETERMINES THE SCOPE (DRIVE.md §3/§5): `"appdata"` asks for
+   * `drive.appdata` (the hidden per-app space and nothing else),
+   * `"drive"` asks for `drive.file` (files this app created in the
+   * user's visible Drive). Those are two different permissions on two
+   * different consent screens, so choosing a space is a CONSENT-TIME
+   * decision, not merely a bind-time one — and changing it later means
+   * asking the user again.
+   */
+  space: GdriveSpace;
   /** Where the provider sends the consent result. A loopback URI for a
    * desktop-client pair; the page's own URL in a deployment. */
   redirectUri: string;
@@ -615,19 +653,28 @@ export interface DeviceStatus {
    */
   storage: StoreBinding | null;
   /**
-   * Whether a sealed Google Drive consent rests in this namespace
+   * The sealed Google Drive consent this namespace holds, or null
    * (DRIVE.md §5), so a sheet can offer bind-without-ceremony.
    *
-   * FALSE MEANS THE SAME TWO THINGS `storage` NULL DOES, for the same
+   * NULL MEANS THE SAME TWO THINGS `storage` NULL DOES, for the same
    * structural reason: the oauth row rests under the DEK, so a SEALED
    * host genuinely cannot know whether one is there. Read it together
    * with `sealed`.
    *
-   * IT IS A BOOLEAN AND IT WILL STAY ONE. No token, no expiry, no
-   * account name — nothing derived from the sealed row beyond its
-   * existence ever appears on this type (DRIVE.md §3/§4).
+   * IT IS A NULLABLE RECORD RATHER THAN A BOOLEAN, and it mirrors
+   * `storage: StoreBinding | null` right above it for the same reason:
+   * a boolean plus a separate space field is two facts that can
+   * disagree, and one of the two would eventually be read without the
+   * other. One nullable record cannot disagree with itself — the space
+   * exists exactly when the consent does.
+   *
+   * STILL NOTHING SECRET. The space is ADDRESSING (which permission was
+   * granted, hence where this device may write), the same class as the
+   * binding's own `space`. No token, no expiry, no account name —
+   * nothing else derived from the sealed row ever appears on this type
+   * (DRIVE.md §3/§4).
    */
-  gdriveConsent: boolean;
+  gdriveConsent: { space: GdriveSpace } | null;
 }
 
 export type HostMethod =

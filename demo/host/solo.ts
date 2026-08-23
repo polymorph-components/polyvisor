@@ -100,7 +100,11 @@ import {
   promoteDevice,
   type UnsealPolicy,
 } from "../../runtime/device-store/index.ts";
-import type { DeviceStatus, StoreBinding } from "../../runtime/device-store/rpc.ts";
+import type {
+  DeviceStatus,
+  GdriveSpace,
+  StoreBinding,
+} from "../../runtime/device-store/rpc.ts";
 import { putSigningKey } from "../../runtime/keystore.ts";
 import { normalizeOrigin } from "../../runtime/store-egress.ts";
 // THE PAGE HALF OF THE PASSKEY RUNG (PERSISTENCE.md, "The PRF rung:
@@ -1563,6 +1567,63 @@ async function startApp(
     const gdriveGroup = document.createElement("div");
     gdriveGroup.hidden = chosenKind !== "gdrive";
 
+    // WHERE IN THE DRIVE, and the visor says both halves plainly
+    // (DRIVE.md §5). HIDDEN APP DATA IS THE DEFAULT: the platform
+    // itself refuses to share those files, and nothing in the Drive UI
+    // can rename or move them out from under a store that addresses
+    // them by keyed name. The visible folder stays on offer because
+    // some people want to see the thing they are trusting.
+    let chosenSpace: GdriveSpace = prefill?.kind === "gdrive" ? prefill.space : "appdata";
+    const spaceField = field("Where in your Drive?");
+    const spaceChoices: { value: GdriveSpace; id: string; label: string; note: string }[] = [
+      {
+        value: "appdata",
+        id: "storage-gd-space-appdata",
+        label: "Hidden app data (recommended)",
+        note: "Your Drive will not show these files; they cannot be shared; and you cannot " +
+          "move or delete them one at a time — Drive's own settings can remove all of this " +
+          "app's hidden data at once.",
+      },
+      {
+        value: "drive",
+        id: "storage-gd-space-drive",
+        label: "A visible folder in your Drive",
+        note: "You will see a folder in your Drive. Its files are encrypted, so they will " +
+          "look like meaningless names — and if you rename or move them, this device cannot " +
+          "find them again.",
+      },
+    ];
+    for (const sp of spaceChoices) {
+      const line = document.createElement("div");
+      line.className = "cred-field";
+      const label = document.createElement("label");
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "storage-gd-space";
+      radio.id = sp.id;
+      radio.value = sp.value;
+      radio.checked = sp.value === chosenSpace;
+      radio.onchange = () => {
+        chosenSpace = sp.value;
+      };
+      label.append(radio, document.createTextNode(` ${sp.label}`));
+      line.append(label);
+      const note = document.createElement("div");
+      note.className = "hint";
+      note.textContent = sp.note;
+      line.append(note);
+      spaceField.append(line);
+    }
+    const spaceSwitchNote = document.createElement("div");
+    spaceSwitchNote.className = "hint";
+    // THE CONSENT COUPLING, said once and where it lands (DRIVE.md §5):
+    // the space picks the scope, so the two choices are two different
+    // permissions and a change means a fresh consent screen.
+    spaceSwitchNote.textContent =
+      "Changing this later asks for a new consent, because it is a different permission.";
+    spaceField.append(spaceSwitchNote);
+    gdriveGroup.append(spaceField);
+
     const rootField = field(
       "Drive folder",
       "The folder this device syncs through — created in your Drive if it does not exist yet.",
@@ -1648,6 +1709,7 @@ async function startApp(
       // typed secret.
       const root = gdRootInput.value;
       const client = gdClientInput.value;
+      const space = chosenSpace;
       const gdSecret = gdSecretInput.value;
       gdSecretInput.value = "";
       void enqueue(async () => {
@@ -1688,19 +1750,29 @@ async function startApp(
             at("destination");
             if (root.trim() === "") throw new Error("a Drive folder name is required");
             if (client.trim() === "") throw new Error("an OAuth client id is required");
-            // BIND-WITHOUT-CEREMONY (DRIVE.md §5): a consent already
-            // sealed for this device is reused rather than asked for
-            // twice. `gdriveConsent` says nothing about WHICH client id
-            // it was minted for — `bindStore` is where a mismatch is
-            // caught, by name, as `no-credential` (the access-key
-            // mismatch rule's exact analog).
-            const already = (await conn.status()).gdriveConsent;
-            if (already) {
+            // BIND-WITHOUT-CEREMONY (DRIVE.md §5), NOW SPACE-AWARE: a
+            // consent already sealed for this device is reused rather
+            // than asked for twice — but only when it was granted for
+            // the space this connect names. The space picks the SCOPE,
+            // so a consent for the other one is a consent to a
+            // different permission, and reusing it would only produce
+            // `bindStore`'s `no-credential` a moment later. Asking
+            // again is the honest move, and the step text says so.
+            // (`gdriveConsent` still says nothing about WHICH client id
+            // it was minted for — that mismatch stays `bindStore`'s to
+            // catch, by name, as the access-key analog.)
+            const consent = (await conn.status()).gdriveConsent;
+            if (consent && consent.space === space) {
               step = "consent";
               stepNote.textContent =
                 "configuring storage: consent (using the consent this device already holds)…";
             } else {
               at("consent");
+              if (consent) {
+                stepNote.textContent =
+                  "configuring storage: consent (this device's consent was for a different " +
+                  "place in your Drive, so Google will ask again)…";
+              }
               // THE WORKER OWNS THE VERIFIER; THE PAGE OWNS THE POPUP
               // (DRIVE.md §3). What crosses here is app identity and
               // addressing; what comes back is a URL, never a token.
@@ -1708,6 +1780,11 @@ async function startApp(
                 provider: "gdrive",
                 clientId: client,
                 clientSecret: gdSecret || undefined,
+                // THE SPACE IS A CONSENT-TIME DECISION: it selects the
+                // scope this URL asks for (`drive.appdata` vs
+                // `drive.file`), which is why it crosses here and not
+                // only at bind.
+                space,
                 // web/oauth-callback.html is the REGISTERED redirect for
                 // a web-application client (DRIVE.md §3) — resolved
                 // relative to the current page, never a hardcoded
@@ -1783,6 +1860,7 @@ async function startApp(
               root,
               apiBase: gdriveEndpoints.apiBase ?? "https://www.googleapis.com",
               clientId: client,
+              space,
             });
             const part = await tasks.partition();
             const self = st.agentId === null ? null : unhex(st.agentId);
@@ -1833,8 +1911,11 @@ async function startApp(
     // reporting the user's own words back to them).
     lead.textContent = storage.kind === "s3"
       ? `This device syncs through ${storage.bucket} at ${storage.endpoint}.`
-      : `This device syncs through the "${storage.root}" folder in your Google Drive, ` +
-        `using client ${storage.clientId}.`;
+      : `This device syncs through the "${storage.root}" folder in ${
+        storage.space === "appdata"
+          ? "your Google Drive's hidden app data, where your Drive will not show it"
+          : "your Google Drive, where you can see it"
+      }, using client ${storage.clientId}.`;
     body.append(lead);
 
     const stepNote = document.createElement("div");
@@ -2497,8 +2578,10 @@ async function startApp(
     /** The device's own claim about where it syncs — `null` sealed or
      * unbound (`DeviceStatus.storage`'s own ambiguity; see rpc.ts). */
     storageStatus: async () => (await conn.status()).storage,
-    /** Whether this device already holds a sealed Drive consent — the
-     * bind-without-ceremony condition (DRIVE.md §5). */
+    /** The sealed Drive consent this device holds, or null — the
+     * bind-without-ceremony condition (DRIVE.md §5). Its one field is
+     * the SPACE it was granted for, which is what makes the skip
+     * space-aware. */
     gdriveConsent: async () => (await conn.status()).gdriveConsent,
   });
 }

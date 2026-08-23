@@ -1351,7 +1351,9 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
   },
 
   /** `oauthComplete` on its own value: the resulting `DeviceStatus`,
-   * whose only word on the subject is `gdriveConsent` — never a token. */
+   * whose only word on the subject is `gdriveConsent` — null, or the
+   * SPACE the consent was granted for (addressing, DRIVE.md §5) — and
+   * never a token. */
   "gd-oauth-complete": async (arg: { id: string; code: string; state: string }) => {
     const conn = conns.get(arg.id)!;
     return await attemptValue(() => conn.oauthComplete(arg.code, arg.state));

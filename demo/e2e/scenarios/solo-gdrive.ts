@@ -8,7 +8,7 @@
 // (demo/host/fake-drive.ts) instead — and it must not disturb the
 // harness's MinIO, which stays up for every other scenario regardless.
 //
-// NINE CLAIMS, in DRIVE.md's own order:
+// NINE CLAIMS (plus 3b, the space choice), in DRIVE.md's own order:
 //
 //   1. An account and a todo, through the real app frame — made during
 //      FIRST RUN, before any other sheet ever opens (PR #88: the entry
@@ -23,15 +23,23 @@
 //      breadcrumbs are two beats, not one: "storage:consented" (the
 //      exchange finished) and then "storage:bound" (bind + first
 //      flush).
+//   3b. THE SPACE CHOICE IS THE SHEET'S, AND ITS DEFAULT IS THE HIDDEN
+//      app-data space (§5): the scenario asserts the default is
+//      pre-selected rather than setting it, so a regression that
+//      silently flipped the default to the visible folder fails here.
+//      The space rides the whole way through — consent scope, binding,
+//      and the space the bytes actually land in.
 //   4. TOKENS TOUCH NO PAGE STORAGE (§3's bearer ban, and §4: the
 //      tokens are born in worker memory and rest DEK-sealed — never on
 //      the page's side of the port at all). Scanned for the fake's own
 //      synthetic labels, in BOTH localStorage and sessionStorage.
-//   5. BYTES LANDED: the fake's own in-memory tree (DRIVE.md §2's
-//      layout — root → `docs` → keyed object names) has the root
-//      folder, the `docs` container and at least one object after the
-//      connect's first flush. Structure, not literal names: the leaf
-//      names are keyed hashes on purpose.
+//   5. BYTES LANDED IN THE HIDDEN SPACE: the fake's own in-memory tree
+//      (DRIVE.md §2's layout — root → `docs` → keyed object names) has
+//      the root folder, the `docs` container and at least one object
+//      after the connect's first flush — all of it in the APPDATA
+//      space, which is what the sheet defaults to (DRIVE.md §5), and
+//      NONE of it in the visible one. Structure, not literal names: the
+//      leaf names are keyed hashes on purpose.
 //   6. Sync now, then "storage:synced" — the fake's object count does
 //      not decrease (the todo from claim 1 is what this sync carries).
 //   7. A REAL RELOAD (§4: "bringUpEngine re-arms the grant and
@@ -183,6 +191,19 @@ const scenario: Scenario = {
             (document.getElementById("storage-kind-gdrive") as HTMLInputElement).click();
           });
           await page.waitForSelector("#storage-gd-root", { state: "visible", timeout: 15_000 });
+          // THE DEFAULT IS ASSERTED, NOT SET (DRIVE.md §5): the sheet
+          // must arrive with hidden app data already chosen, so a
+          // regression that flipped the default to the visible folder
+          // fails right here rather than quietly changing where every
+          // user's bytes land. The scenario then leaves it alone and
+          // drives the whole ceremony on the default.
+          const spaceDefaults = await page.evaluate(() => ({
+            appdata:
+              (document.getElementById("storage-gd-space-appdata") as HTMLInputElement).checked,
+            drive: (document.getElementById("storage-gd-space-drive") as HTMLInputElement).checked,
+          }));
+          assertEquals(spaceDefaults.appdata, true, "hidden app data is the sheet's default");
+          assertEquals(spaceDefaults.drive, false, "the visible folder is not the default");
           await page.fill("#storage-gd-root", ROOT);
           await page.fill("#storage-gd-client", CLIENT_ID);
           await page.fill("#storage-gd-secret", CLIENT_SECRET);
@@ -217,16 +238,29 @@ const scenario: Scenario = {
             (document.getElementById("storage-gd-secret") as HTMLInputElement | null)?.value ?? ""
           );
           assertEquals(secretValue, "", "the client secret field after connect");
-          assertEquals(await solo(page, "gdriveConsent"), true, "the device holds a consent");
+          // The consent is a nullable RECORD naming the space it was
+          // granted for (rpc.ts) — and the space it names is the one
+          // the sheet defaulted to, which is how "the default reached
+          // the OAuth scope" is observable from out here at all.
+          assertEquals(
+            (await solo(page, "gdriveConsent"))?.space,
+            "appdata",
+            "the device holds a consent, granted for the hidden app-data space",
+          );
         },
       );
 
       await act("bytes landed: the fake's tree has the root folder and an object", async () => {
-        const n = await until([page], "an object in the fake's tree", async () => {
-          const names = fake.childNames(ROOT);
+        // ASKED OF THE HIDDEN SPACE, because that is where the sheet's
+        // default sends them. `childNames` DEFAULTS to the visible
+        // space (fake-drive.ts), so the negative below is the same
+        // question asked the other way — and it is the half that would
+        // catch a space that never made it past the sheet.
+        const n = await until([page], "an object in the fake's hidden space", async () => {
+          const names = fake.childNames(ROOT, "appDataFolder");
           return names.length > 0 ? names : false;
         }, 30_000);
-        assert(n.length > 0, `expected children under ${ROOT}, got none`);
+        assert(n.length > 0, `expected children under ${ROOT} in the app-data space, got none`);
         // DRIVE.md §2's layout: root → `docs`/`pickup` → keyed names.
         // STRUCTURE is what this asserts, because the leaf names are
         // keyed hashes now and nothing on this side of the fake can
@@ -235,6 +269,20 @@ const scenario: Scenario = {
         assert(n.includes("docs"), `expected a docs folder under ${ROOT}, got ${JSON.stringify(n)}`);
         const total = fake.files().length;
         assert(total > 0, "the fake's store is empty after the connect's first flush");
+        // NOTHING IN THE VISIBLE SPACE. The fake answers a cross-space
+        // list with an EMPTY list rather than an error, exactly as
+        // Google does, so this is the shape a mis-spaced strategy fails
+        // in: the user's own Drive shows nothing at all.
+        assertEquals(
+          fake.childNames("").includes(ROOT),
+          false,
+          "the visible Drive root must not carry the store's folder",
+        );
+        assertEquals(
+          fake.files().filter((f) => f.space === "drive").length,
+          0,
+          "no file may land in the visible space on an app-data binding",
+        );
       });
 
       await act("Sync now — storage:synced — the object count does not decrease", async () => {
@@ -269,7 +317,12 @@ const scenario: Scenario = {
           assertEquals(status.kind, "gdrive", "the restored binding's kind");
           assertEquals(status.root, ROOT, "the restored root folder");
           assertEquals(status.clientId, CLIENT_ID, "the restored client id");
-          assertEquals(await solo(page, "gdriveConsent"), true, "the consent survived the reload");
+          assertEquals(status.space, "appdata", "the restored space");
+          assertEquals(
+            (await solo(page, "gdriveConsent"))?.space,
+            "appdata",
+            "the consent — and its space — survived the reload",
+          );
 
           // Sync now afterwards must succeed with NO new authorization_code
           // exchange. A fresh ceremony would have to hit `/auth` first (the
@@ -374,9 +427,9 @@ const scenario: Scenario = {
           }, 30_000);
           assertEquals(status.root, ROOT, "the same binding, back with the seal");
           assertEquals(
-            await solo(page, "gdriveConsent"),
-            true,
-            "the consent came back sealed with the device",
+            (await solo(page, "gdriveConsent"))?.space,
+            "appdata",
+            "the consent, and the space it names, came back sealed with the device",
           );
         },
       );
@@ -414,7 +467,7 @@ const scenario: Scenario = {
           );
           assertEquals(
             await solo(page, "gdriveConsent"),
-            false,
+            null,
             "the consent is gone after forgetting the account",
           );
           // THE MIRROR (DRIVE.md §4 / STORAGE-EGRESS.md §6): forgetting

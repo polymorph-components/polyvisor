@@ -37,10 +37,118 @@ use provider_common::{do_fetch, hmac, request_label, sha256, FetchPort, Route};
 /// (#7, DRIVE.md §2). `api_base` defaults to `https://www.googleapis.com`
 /// at the embedder and exists for the same reason S3's `endpoint` is
 /// config: a self-hosted (or fake) backend is ordinary addressing, not a
-/// probe hack.
+/// probe hack. `space` is addressing too — WHICH of the user's Drive
+/// spaces the root folder sits in — and is the only field that changes
+/// what a request looks like rather than merely where it points.
 pub struct GdriveCfg {
     pub root: String,
     pub api_base: String,
+    /// WHICH DRIVE SPACE the root folder lives in. See `GdSpace`.
+    pub space: GdSpace,
+}
+
+/// The storage SPACE: where in the user's Drive this store's root
+/// folder sits. A LOCATION CHOICE, not a second strategy — everything
+/// below the root folder (the `docs`/`pickup` layout, the keyed names,
+/// the pickup's unkeyed flat location) is byte-for-byte identical
+/// between the two, and the only things this selects are the ROOT
+/// PARENT the walk starts from and whether `files.list` carries
+/// `spaces=appDataFolder`.
+///
+/// WHY APPDATA IS THE DEFAULT, and why it fits this provider better
+/// than a visible folder does:
+///
+///   * NO SHARING BECOMES PLATFORM-ENFORCED. Files in the app data
+///     folder cannot be shared at all — Drive has no sharing surface
+///     for them. DRIVE.md §1 rules that this provider mints no
+///     capability, and until now that was true because these paths
+///     never call the sharing seams. In the appdata space it is true
+///     because there is nothing to call: the same structural-not-
+///     checked principle the empty-origin-set wiring already follows,
+///     one layer further down.
+///   * THE USER CANNOT BREAK IT BY ACCIDENT. This strategy resolves
+///     every object by KEYED NAME inside a specific parent (see the
+///     naming section below). A visible folder is editable from the
+///     Drive UI, and a rename or a move there makes a file
+///     PERMANENTLY UNFINDABLE — there is no fallback lookup, because
+///     the name IS the address. Hidden storage removes the hand.
+///   * AND SINCE NAME-KEYS LANDED, THERE IS NOTHING TO LOOK AT. The
+///     visible store is a folder of meaningless hex under two fixed
+///     words. Hiding it is now the more coherent choice rather than
+///     merely the tidier one.
+///
+/// WHY VISIBLE STAYS AVAILABLE, because appdata has a real cost that
+/// is not worth hiding:
+///
+///   * THE USER CANNOT INSPECT. Nothing in drive.google.com shows the
+///     app data folder; the store's existence is taken on faith.
+///   * AN APP/CLIENT ROTATION ORPHANS THE STORE INVISIBLY. The appdata
+///     space is scoped to the APP, so a new Cloud project (the exact
+///     rotation DRIVE.md §3 says to expect when the borrowed client
+///     pair lapses) sees an EMPTY appdata folder with no sign that the
+///     old one still holds the bytes. With a visible folder the data
+///     at least stays legible to its owner and can be re-adopted.
+///   * IT IS WHAT MAKES A LIVE BEAT CHECKABLE BY EYE. DRIVE.md's
+///     manual gate — "verify in drive.google.com that the app's folder
+///     exists and holds ciphertext objects" — can only be run against
+///     a visible folder.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GdSpace {
+    /// The hidden per-app space. Default and preferred.
+    AppData,
+    /// A visible folder in the user's My Drive.
+    Drive,
+}
+
+impl GdSpace {
+    /// Parse the wire value. The WIT field is a PLAIN STRING (matching
+    /// `s3-config`'s plain-string fields rather than introducing a
+    /// WIT-enum value-mapping convention this codebase has not
+    /// exercised), so this is where an unknown value is REFUSED BY
+    /// NAME — loudly at `init-store`, never silently defaulted, because
+    /// a typo that fell back to a default would put the store in the
+    /// wrong space and look like data loss.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "appdata" => Ok(GdSpace::AppData),
+            "drive" => Ok(GdSpace::Drive),
+            other => Err(format!(
+                "gdrive space: unknown value {other:?} (expected \"appdata\" or \"drive\")"
+            )),
+        }
+    }
+
+    /// The ROOT PARENT the folder walk starts from. Both are Drive's
+    /// own reserved aliases: `appDataFolder` stands for the hidden
+    /// per-app folder and `root` for My Drive's root.
+    pub fn root_parent(self) -> &'static str {
+        match self {
+            GdSpace::AppData => "appDataFolder",
+            GdSpace::Drive => "root",
+        }
+    }
+
+    /// The `spaces` query parameter for `files.list`, when one is
+    /// needed.
+    ///
+    /// THE FAILURE MODE THIS EXISTS TO PREVENT: `files.list` defaults
+    /// to `spaces=drive`, and a query that searches the wrong space
+    /// does not error — it returns an EMPTY file list. On this
+    /// strategy an empty list means "absent", so a forgotten `spaces`
+    /// parameter would make every resolve miss, every upload take the
+    /// create branch, and the store silently fork into duplicates that
+    /// no read can ever find. Hence: the parameter is attached in
+    /// `gd_list`, the ONE function every query in this crate goes
+    /// through, and not at the seven call sites that build a `q`.
+    pub fn spaces_param(self) -> Option<&'static str> {
+        match self {
+            GdSpace::AppData => Some("appDataFolder"),
+            // Omitted rather than sent explicitly: `drive` is the
+            // documented default, and sending it would suggest the
+            // other spaces (`photos`) are ones this store might mean.
+            GdSpace::Drive => None,
+        }
+    }
 }
 
 /// The multipart/related boundary. Local and fixed: the bodies this
@@ -127,6 +235,11 @@ fn json_headers() -> Vec<(String, String)> {
 
 /// `files.list` over one parent, returning `(id, name)` pairs and
 /// following `nextPageToken`. `q` is built by the callers below.
+///
+/// THE SPACE IS ATTACHED HERE AND ONLY HERE. Every query this crate
+/// emits funnels through this function, so the `spaces` parameter
+/// cannot be forgotten at a call site — see `GdSpace::spaces_param`
+/// for why forgetting it would fail silently rather than loudly.
 async fn gd_list(
     cfg: &GdriveCfg,
     port: &impl FetchPort,
@@ -141,6 +254,9 @@ async fn gd_list(
             q_encode(q),
             q_encode("nextPageToken,files(id,name)"),
         );
+        if let Some(spaces) = cfg.space.spaces_param() {
+            url.push_str(&format!("&spaces={}", q_encode(spaces)));
+        }
         if let Some(token) = &page {
             url.push_str(&format!("&pageToken={}", q_encode(token)));
         }
@@ -196,8 +312,13 @@ pub async fn gd_resolve(
     Ok(gd_list(cfg, port, &q).await?.into_iter().next().map(|(id, _)| id))
 }
 
-/// Resolve-or-create a folder under `parent` (`"root"` is Drive's alias
-/// for the user's My Drive root). Idempotent by construction: the create
+/// Resolve-or-create a folder under `parent`. The walk's first
+/// `parent` is the space's root alias — `root` for My Drive,
+/// `appDataFolder` for the hidden per-app space
+/// (`GdSpace::root_parent`); a create in the appdata space needs no
+/// parameter beyond that alias appearing in `parents`, because
+/// parentage is what places a file in a space. Idempotent by
+/// construction: the create
 /// only runs when the resolve found nothing, so a re-`ensure-bucket` or a
 /// re-flush costs one list and nothing else.
 ///

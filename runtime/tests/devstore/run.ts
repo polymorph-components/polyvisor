@@ -185,7 +185,17 @@ const GD_CLIENT_SECRET = "synthetic-client-secret-0000";
 async function startAndFetchAuth(
   page: Page,
   id: string,
-  spec: { clientId: string; clientSecret?: string; redirectUri: string; authUrl: string; tokenUrl: string },
+  spec: {
+    clientId: string;
+    clientSecret?: string;
+    redirectUri: string;
+    authUrl: string;
+    tokenUrl: string;
+    /** WHICH SPACE THE CONSENT IS FOR — it picks the scope the worker
+     * puts in the authorize URL, so every ceremony in this file has to
+     * name one (DRIVE.md §5). */
+    space: "appdata" | "drive";
+  },
   // deno-lint-ignore no-explicit-any
 ): Promise<{ start: any; code: string; state: string }> {
   const start = await probe(page, "gd-oauth-start", {
@@ -1840,6 +1850,7 @@ async function main() {
         redirectUri: `http://127.0.0.1:${port}/probe.html`,
         authUrl: `${gdOrigin}/auth`,
         tokenUrl: `${gdOrigin}/token`,
+        space: "drive" as const,
       };
       const { start, code, state } = await startAndFetchAuth(page, id, spec);
       const authorizeUrl = String(start.value?.authorizeUrl ?? "");
@@ -1871,8 +1882,8 @@ async function main() {
 
       const ok = start.ok && urlCarriesChallenge && urlCarriesNoSecret &&
         wrongState.ok === false && wrongState.error.code === "bad-ceremony" &&
-        completed.ok && completed.value.gdriveConsent === true &&
-        status.gdriveConsent === true && noTokenLeaked &&
+        completed.ok && completed.value.gdriveConsent?.space === "drive" &&
+        status.gdriveConsent?.space === "drive" && noTokenLeaked &&
         again.ok === false && again.error.code === "bad-ceremony";
       record(
         "34 gdrive",
@@ -1883,7 +1894,9 @@ async function main() {
           `with the WRONG state is refused (${j(wrongState.ok ? "accepted" : wrongState.error.code)}) ` +
           `and does not consume the pending ceremony; the CORRECT pair (via the harness's own ` +
           `fetch of that URL with redirect:"manual", standing in for the popup) completes ` +
-          `(gdriveConsent=${completed.value?.gdriveConsent}); the FULL serialized status contains ` +
+          `(gdriveConsent=${j(completed.value?.gdriveConsent)} — a nullable RECORD naming the ` +
+          `space the consent was granted for, never a boolean beside a separate space); the ` +
+          `FULL serialized status contains ` +
           `no "synthetic-access"/"synthetic-refresh" substring (${noTokenLeaked}) — no token ever ` +
           `crossed this port; a SECOND complete after success finds the slot cleared ` +
           `(${j(again.ok ? "accepted" : again.error.code)})`,
@@ -1909,7 +1922,13 @@ async function main() {
       // (1) no-credential: no ceremony at all on this device yet.
       const noConsent = await probe(page, "hc-bind", {
         id,
-        binding: { kind: "gdrive", root: "pm-devstore", apiBase: gdOrigin, clientId: GD_CLIENT_ID },
+        binding: {
+          kind: "gdrive",
+          root: "pm-devstore",
+          apiBase: gdOrigin,
+          clientId: GD_CLIENT_ID,
+          space: "drive",
+        },
       });
 
       // Run a real ceremony under GD_CLIENT_ID, so the next sub-case has
@@ -1920,6 +1939,7 @@ async function main() {
         redirectUri: `http://127.0.0.1:${port}/probe.html`,
         authUrl: `${gdOrigin}/auth`,
         tokenUrl: `${gdOrigin}/token`,
+        space: "drive" as const,
       };
       const { code, state } = await startAndFetchAuth(page, id, spec);
       const consented = await probe(page, "gd-oauth-complete", { id, code, state });
@@ -1933,23 +1953,36 @@ async function main() {
           root: "pm-devstore",
           apiBase: gdOrigin,
           clientId: "SYNTHETIC-OTHER",
+          space: "drive",
         },
       });
 
       // (3) bad-destination: an unusable apiBase.
       const badBase = await probe(page, "hc-bind", {
         id,
-        binding: { kind: "gdrive", root: "pm-devstore", apiBase: "not a url at all", clientId: GD_CLIENT_ID },
+        binding: {
+          kind: "gdrive",
+          root: "pm-devstore",
+          apiBase: "not a url at all",
+          clientId: GD_CLIENT_ID,
+          space: "drive",
+        },
       });
 
       // (4) bad-destination: an empty root.
       const emptyRoot = await probe(page, "hc-bind", {
         id,
-        binding: { kind: "gdrive", root: "", apiBase: gdOrigin, clientId: GD_CLIENT_ID },
+        binding: {
+          kind: "gdrive",
+          root: "",
+          apiBase: gdOrigin,
+          clientId: GD_CLIENT_ID,
+          space: "drive",
+        },
       });
 
       const ok = noConsent.attempt.refused && noConsent.attempt.error.code === "no-credential" &&
-        consented.ok && consented.value.gdriveConsent === true &&
+        consented.ok && consented.value.gdriveConsent?.space === "drive" &&
         mismatch.attempt.refused && mismatch.attempt.error.code === "no-credential" &&
         badBase.attempt.refused && badBase.attempt.error.code === "bad-destination" &&
         emptyRoot.attempt.refused && emptyRoot.attempt.error.code === "bad-destination";
@@ -1969,10 +2002,17 @@ async function main() {
 
     /** Row 36 carries its device into rows 37, 38, 39, 40. */
     let gdriveDevice = "";
-    const gdriveBinding = { kind: "gdrive", root: "pm-devstore", apiBase: gdOrigin, clientId: GD_CLIENT_ID };
+    const gdriveBinding = {
+      kind: "gdrive",
+      root: "pm-devstore",
+      apiBase: gdOrigin,
+      clientId: GD_CLIENT_ID,
+      space: "drive" as const,
+    };
     const gdriveSpec = {
       clientId: GD_CLIENT_ID,
       clientSecret: GD_CLIENT_SECRET,
+      space: "drive" as const,
       get redirectUri() {
         return `http://127.0.0.1:${port}/probe.html`;
       },
@@ -2004,7 +2044,7 @@ async function main() {
       const root = fake.childNames("");
       const rootChildren = fake.childNames("pm-devstore");
 
-      const ok = consent.ok && consent.value.gdriveConsent === true &&
+      const ok = consent.ok && consent.value.gdriveConsent?.space === "drive" &&
         bound.attempt.refused === false && j(bound.status.storage) === j(gdriveBinding) &&
         ensure.attempt.refused === false &&
         authedCalls.length > 0 &&
@@ -2040,7 +2080,7 @@ async function main() {
       const after = fake.requests().length;
 
       const ok = back.unseal.refused === false &&
-        back.status.gdriveConsent === true &&
+        back.status.gdriveConsent?.space === "drive" &&
         back.status.storage !== null && back.status.storage.apiBase === gdOrigin &&
         ensure.attempt.refused === false && after > before;
       record(
@@ -2048,7 +2088,7 @@ async function main() {
         "consent and binding survive the host's death",
         ok,
         `after a KILL and a fresh worker, an unseal with NO passphrase auto-unseals from the ` +
-          `platform wrap and status() reports gdriveConsent=${back.status.gdriveConsent} AND the ` +
+          `platform wrap and status() reports gdriveConsent=${j(back.status.gdriveConsent)} AND the ` +
           `binding (${j(back.status.storage)}) — both sealed rows survived. With NO ceremony and ` +
           `NO \`bindStore\` call anywhere in this row, \`ensureBucket()\` still reached the fake ` +
           `(${after - before} new request(s)) — \`bringUpEngine\` re-armed the grant from the ` +
@@ -2124,24 +2164,24 @@ async function main() {
       const rebound = await probe(page, "hc-bind", { id, binding: gdriveBinding });
       const ensureAgain = await probe(page, "gd-flush", { id });
 
-      const ok = forgotten.ok && forgotten.value.gdriveConsent === false && revoked &&
-        statusAfter.gdriveConsent === false && statusAfter.storage !== null &&
+      const ok = forgotten.ok && forgotten.value.gdriveConsent === null && revoked &&
+        statusAfter.gdriveConsent === null && statusAfter.storage !== null &&
         ensureRefused.attempt.refused === true &&
-        reconsent.ok && reconsent.value.gdriveConsent === true &&
+        reconsent.ok && reconsent.value.gdriveConsent?.space === "drive" &&
         rebound.attempt.refused === false &&
         ensureAgain.attempt.refused === false;
       record(
         "39 gdrive",
         "forget is the honest disconnect",
         ok,
-        `forgetOauth() reports gdriveConsent=${forgotten.value?.gdriveConsent} and the fake's log ` +
+        `forgetOauth() reports gdriveConsent=${j(forgotten.value?.gdriveConsent)} and the fake's log ` +
           `shows the /revoke POST (${revoked}); status() agrees (gdriveConsent=` +
-          `${statusAfter.gdriveConsent}) while storage stays non-null (${j(statusAfter.storage)}) ` +
+          `${j(statusAfter.gdriveConsent)}) while storage stays non-null (${j(statusAfter.storage)}) ` +
           `— forgetting the account is not forgetting the destination; a bucket op now refuses ` +
           `at the owner seam (${ensureRefused.attempt.refused}: ` +
           `${j(ensureRefused.attempt.error?.message)}). A FRESH ceremony under the same client id ` +
           `plus the SAME bind (nothing re-addressed) puts it back to work: ` +
-          `gdriveConsent=${reconsent.value?.gdriveConsent}, rebind refused=` +
+          `gdriveConsent=${j(reconsent.value?.gdriveConsent)}, rebind refused=` +
           `${rebound.attempt.refused}, ensureBucket refused=${ensureAgain.attempt.refused}`,
       );
     });
@@ -2160,9 +2200,9 @@ async function main() {
       const ensure = await probe(page, "hc-ensure-bucket", { id });
 
       const ok = resealed.attempt.refused === false && resealed.status.sealed === true &&
-        sealedStatus.gdriveConsent === false && sealedStatus.storage === null &&
+        sealedStatus.gdriveConsent === null && sealedStatus.storage === null &&
         sealedStatus.sealed === true &&
-        back.attempt.refused === false && back.status.gdriveConsent === true &&
+        back.attempt.refused === false && back.status.gdriveConsent?.space === "drive" &&
         back.status.storage !== null &&
         ensure.attempt.refused === false;
       record(
@@ -2170,10 +2210,10 @@ async function main() {
         "reseal seals the consent with everything else",
         ok,
         `reseal() (an upgrade ceremony, refused=${resealed.attempt.refused}) leaves the device ` +
-          `sealed; a FRESH status() reports gdriveConsent=${sealedStatus.gdriveConsent} and ` +
+          `sealed; a FRESH status() reports gdriveConsent=${j(sealedStatus.gdriveConsent)} and ` +
           `storage=${j(sealedStatus.storage)} — both unreadable while sealed, read together with ` +
           `sealed=${sealedStatus.sealed}; unseal brings BOTH back (gdriveConsent=` +
-          `${back.status.gdriveConsent}, storage=${j(back.status.storage)}) and a bucket op works ` +
+          `${j(back.status.gdriveConsent)}, storage=${j(back.status.storage)}) and a bucket op works ` +
           `(refused=${ensure.attempt.refused})`,
       );
     });
@@ -2234,6 +2274,174 @@ async function main() {
           `and flushed a complete copy under a fresh folder name. The S3 arm orphans objects ` +
           `the same way for the same reason — the flush re-uploads everything it does not ` +
           `remember, so the newest folder is always whole.)`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
+    /** Rows 42-44 share one device: an APPDATA-space store. */
+    let appdataDevice = "";
+    const APPDATA_ROOT = "pm-appdata";
+    const appdataBinding = {
+      kind: "gdrive",
+      root: APPDATA_ROOT,
+      apiBase: gdOrigin,
+      clientId: GD_CLIENT_ID,
+      space: "appdata" as const,
+    };
+    const appdataSpec = {
+      clientId: GD_CLIENT_ID,
+      clientSecret: GD_CLIENT_SECRET,
+      get redirectUri() {
+        return `http://127.0.0.1:${port}/probe.html`;
+      },
+      authUrl: `${gdOrigin}/auth`,
+      tokenUrl: `${gdOrigin}/token`,
+      space: "appdata" as const,
+    };
+
+    // --- 42: an appdata bind writes into the hidden space, and only there ---
+    //
+    // THE ISOLATION PROPERTY, PROVEN THROUGH THE WORKER (DRIVE.md §5).
+    // The bringup phase already shows the strategy can address both
+    // spaces; what this row adds is that the whole worker path — an
+    // `appdata` consent, an `appdata` binding, `initStore`, the owner
+    // seam — lands the bytes in the HIDDEN space and NOWHERE in the
+    // visible one. The negative half is what makes it non-vacuous: the
+    // fake answers a cross-space list with an EMPTY LIST rather than an
+    // error (real Drive does the same), so a strategy that forgot the
+    // `spaces` parameter would leave its objects visible here and this
+    // row would catch it.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "gdrive-appdata",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const id = made.id as string;
+      appdataDevice = id;
+      await probe(page, "hc-open", { id, unseal: { passphrase: PASS, untilReseal: true } });
+
+      const { code, state } = await startAndFetchAuth(page, id, appdataSpec);
+      const consent = await probe(page, "gd-oauth-complete", { id, code, state });
+      const bound = await probe(page, "hc-bind", { id, binding: appdataBinding });
+      const ensure = await probe(page, "hc-ensure-bucket", { id });
+      const flushed = await probe(page, "gd-flush", { id });
+
+      const hiddenRoot = fake.childNames("", "appDataFolder");
+      const hiddenChildren = fake.childNames(APPDATA_ROOT, "appDataFolder");
+      const hiddenDocs = fake.childNames(`${APPDATA_ROOT}/docs`, "appDataFolder");
+      // THE NEGATIVE HALF, in the DEFAULT (visible) space — the same
+      // path, asked the other way.
+      const visibleRoot = fake.childNames("");
+      const visibleChildren = fake.childNames(APPDATA_ROOT);
+      const strayed = fake.files().filter((f) =>
+        f.space === "drive" && (f.name === APPDATA_ROOT)
+      );
+
+      const ok = consent.ok && bound.attempt.refused === false &&
+        j(bound.status.storage) === j(appdataBinding) &&
+        ensure.attempt.refused === false && flushed.attempt.refused === false &&
+        hiddenRoot.includes(APPDATA_ROOT) &&
+        hiddenChildren.includes("docs") && hiddenChildren.includes("pickup") &&
+        hiddenDocs.length >= 1 &&
+        !visibleRoot.includes(APPDATA_ROOT) && visibleChildren.length === 0 &&
+        strayed.length === 0;
+      record(
+        "42 gdrive",
+        "an appdata bind writes into the HIDDEN space and nowhere in the visible one",
+        ok,
+        `a consent granted for the appdata space plus a binding naming it: status().storage ` +
+          `echoes the addressing INCLUDING the space (${j(bound.status.storage)}); after ` +
+          `ensureBucket + flush the fake's HIDDEN space holds ${j(hiddenRoot)} at its root, ` +
+          `${j(hiddenChildren)} inside it and ${hiddenDocs.length} doc folder(s) — the same ` +
+          `root/docs/pickup layout the visible space gets, because everything below the root ` +
+          `is identical between spaces. Asked the DEFAULT (visible) way, the same paths are ` +
+          `EMPTY: root children ${j(visibleRoot)} (no ${j(APPDATA_ROOT)}), ` +
+          `${visibleChildren.length} child(ren) under it, and ${strayed.length} file(s) named ` +
+          `${j(APPDATA_ROOT)} anywhere in the visible space. The fake answers a cross-space ` +
+          `list with an empty list, not an error — exactly as Google does — so a strategy that ` +
+          `dropped \`spaces=appDataFolder\` would show up here as objects in the wrong space.`,
+      );
+    });
+
+    // --- 43: a consent for one space cannot bind the other ------------------
+    //
+    // THE SPACE MISMATCH REFUSAL (DRIVE.md §5), the client-id
+    // mismatch's exact analog and refused with the same code. The space
+    // selects the OAuth SCOPE (`drive.appdata` vs `drive.file`), so the
+    // consent this device holds is a consent to a DIFFERENT permission
+    // — this browser cannot act for that destination, and it says so at
+    // bind rather than as a provider 403 later (STORAGE-EGRESS.md §4).
+    await guard(async () => {
+      const id = appdataDevice;
+      // Everything identical except the space: same client id, same
+      // root, same apiBase — so the space is the ONLY thing this
+      // refusal can be about.
+      const crossSpace = await probe(page, "hc-bind", {
+        id,
+        binding: { ...appdataBinding, space: "drive" },
+      });
+      // The appdata bind still works right after, so the refusal did
+      // not damage the device or its consent.
+      const stillFine = await probe(page, "hc-bind", { id, binding: appdataBinding });
+      const message = String(crossSpace.attempt.error?.message ?? "");
+
+      const ok = crossSpace.attempt.refused === true &&
+        crossSpace.attempt.error.code === "no-credential" &&
+        message.includes("space") && message.includes("consent") &&
+        stillFine.attempt.refused === false &&
+        j(stillFine.status.storage) === j(appdataBinding);
+      record(
+        "43 gdrive",
+        "a consent for one space cannot bind the other",
+        ok,
+        `this device's consent was granted for \`appdata\`; a bind identical in every other ` +
+          `respect (same client id, same root, same apiBase) but naming \`drive\` → ` +
+          `${j(crossSpace.attempt.error?.code)}: ${j(message)} — the access-key-mismatch rule's ` +
+          `exact analog, because the space picks the SCOPE and the consent granted was for a ` +
+          `different permission; the message tells the user to run the consent again. The ` +
+          `matching appdata bind still succeeds immediately after ` +
+          `(refused=${stillFine.attempt.refused}, storage=${j(stillFine.status.storage)}).`,
+      );
+    });
+
+    // --- 44: status() reports the space a consent was granted for -----------
+    //
+    // `gdriveConsent` is a NULLABLE RECORD, not a boolean beside a
+    // separate space (rpc.ts): it mirrors `storage` right beside it, and
+    // the two facts cannot disagree because there is only one. Both
+    // halves are checked here — the space it names while open, and the
+    // null a SEALED host reports because the oauth row rests under the
+    // DEK and is genuinely unreadable then.
+    await guard(async () => {
+      const id = appdataDevice;
+      const open = await probe(page, "hc-status", { id });
+      const serialized = j(open);
+      const noTokenLeaked = !serialized.includes("synthetic-access") &&
+        !serialized.includes("synthetic-refresh");
+
+      const resealed = await probe(page, "hc-reseal", { id, passphrase: PASS, upgrade: true });
+      const sealedStatus = await probe(page, "hc-status", { id });
+      const back = await probe(page, "hc-unseal", { id, opts: { passphrase: PASS } });
+
+      const ok = open.gdriveConsent !== null && open.gdriveConsent.space === "appdata" &&
+        open.storage !== null && open.storage.space === "appdata" && noTokenLeaked &&
+        resealed.attempt.refused === false &&
+        sealedStatus.sealed === true && sealedStatus.gdriveConsent === null &&
+        back.attempt.refused === false && back.status.gdriveConsent?.space === "appdata";
+      record(
+        "44 gdrive",
+        "status() names the space a consent was granted for, and null while sealed",
+        ok,
+        `while open, status().gdriveConsent=${j(open.gdriveConsent)} — the SPACE, and only the ` +
+          `space: the full serialized status still contains no token substring ` +
+          `(${noTokenLeaked}). It agrees with the binding beside it ` +
+          `(storage.space=${j(open.storage?.space)}) because both are addressing. After a ` +
+          `reseal a FRESH status() reports gdriveConsent=${j(sealedStatus.gdriveConsent)} — ` +
+          `unreadable, not absent, read together with sealed=${sealedStatus.sealed}, exactly ` +
+          `the ambiguity \`storage\` carries — and an unseal brings the SAME space back ` +
+          `(${j(back.status.gdriveConsent)}).`,
       );
       await probe(page, "hc-close", { id });
       await probe(page, "hc-forget", { ids: [id] });

@@ -110,6 +110,7 @@ import {
   type AttachSpec,
   type DeviceStatus,
   DRIVER_METHODS,
+  type GdriveSpace,
   type Hello,
   type OauthStartResult,
   type OauthStartSpec,
@@ -716,6 +717,11 @@ interface OauthRow {
    * confines visibility per client id (DRIVE.md §2), so a binding naming
    * a different one is a mismatch to refuse at bind. */
   clientId: string;
+  /** WHICH SPACE THIS CONSENT WAS GRANTED FOR — i.e. which SCOPE was
+   * asked for and agreed to (DRIVE.md §5). Recorded here because a
+   * binding naming the other space is asking this device to act under a
+   * permission it was never given, and that is a bind-time refusal. */
+  space: GdriveSpace;
   clientSecret?: string;
   /** The token endpoint this consent was obtained from, kept so the
    * refresh behind the owner seam goes back to the SAME backend a
@@ -891,9 +897,25 @@ class OauthError extends Error {
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke";
-/** The minimal honest scope: files this app created, and nothing else
- * in the user's Drive (DRIVE.md §2). */
+/** The minimal honest scope for a VISIBLE folder: files this app
+ * created, and nothing else in the user's Drive (DRIVE.md §2). */
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+/** The scope for the HIDDEN per-app space — narrower still than
+ * `drive.file`, and that narrowing is the point (DRIVE.md §5): it can
+ * reach the app-data folder and NOTHING in the user's own Drive at all,
+ * not even files this app made there. The consent screen a user is
+ * asked to read is correspondingly smaller, and the permission they
+ * grant cannot be turned on their documents even by a bug. */
+const DRIVE_APPDATA_SCOPE = "https://www.googleapis.com/auth/drive.appdata";
+
+/** THE SPACE PICKS THE SCOPE, which is why the space rides on
+ * `OauthStartSpec` and not only on the binding: these are two different
+ * permissions, asked for on two different consent screens, and a device
+ * that consented to one cannot act in the other. */
+function scopeForSpace(space: GdriveSpace): string {
+  return space === "appdata" ? DRIVE_APPDATA_SCOPE : DRIVE_SCOPE;
+}
+
 
 /**
  * THE ONE PENDING CEREMONY, in memory only.
@@ -959,7 +981,7 @@ async function oauthStart(spec: OauthStartSpec): Promise<OauthStartResult> {
   url.searchParams.set("client_id", spec.clientId);
   url.searchParams.set("redirect_uri", spec.redirectUri);
   url.searchParams.set("response_type", "code");
-  url.searchParams.set("scope", DRIVE_SCOPE);
+  url.searchParams.set("scope", scopeForSpace(spec.space));
   url.searchParams.set("code_challenge", challenge);
   url.searchParams.set("code_challenge_method", "S256");
   // `offline` + `consent` together are what make Google issue a REFRESH
@@ -1026,6 +1048,11 @@ async function oauthComplete(code: string, state: string): Promise<DeviceStatus>
   const row: OauthRow = {
     access,
     clientId: spec.clientId,
+    // THE SPACE THE CONSENT WAS ASKED FOR, sealed with the tokens it
+    // bought: it is what the scope above was chosen from, so it is the
+    // only honest record of what this consent actually permits, and
+    // `bindGdrive` refuses a binding that disagrees with it.
+    space: spec.space,
     obtainedAt: Date.now(),
   };
   if (parsed.refresh_token) row.refresh = parsed.refresh_token;
@@ -1215,13 +1242,17 @@ async function bindStore(binding: StoreBinding): Promise<DeviceStatus> {
  *   bad-destination  an empty root or client id, or an apiBase that is
  *                    not a usable origin.
  *   no-credential    no sealed consent rests on this device, or the one
- *                    that does was granted to a DIFFERENT client id.
- *                    That second case is the access-key-mismatch rule's
- *                    exact analog (§4, and the S3 arm above): the
- *                    `drive.file` scope confines visibility PER CLIENT
- *                    ID (DRIVE.md §2), so binding a root under a client
- *                    id the consent was not granted to would produce a
- *                    store whose own objects are invisible to it.
+ *                    that does was granted to a DIFFERENT client id, or
+ *                    for a DIFFERENT SPACE. Both mismatch cases are the
+ *                    access-key-mismatch rule's exact analog (§4, and
+ *                    the S3 arm above): the `drive.file` scope confines
+ *                    visibility PER CLIENT ID (DRIVE.md §2), so binding
+ *                    a root under a client id the consent was not
+ *                    granted to would produce a store whose own objects
+ *                    are invisible to it — and the SPACE selects the
+ *                    scope itself (DRIVE.md §5), so a consent for the
+ *                    other space is a consent to a different permission
+ *                    entirely.
  */
 async function bindGdrive(
   binding: Extract<StoreBinding, { kind: "gdrive" }>,
@@ -1252,19 +1283,37 @@ async function bindGdrive(
         `run the consent again for ${binding.clientId}`,
     );
   }
+  if (row.space !== binding.space) {
+    // THE SPACE MISMATCH, and it is the client-id mismatch above
+    // wearing the scope's vocabulary rather than the visibility's: the
+    // consent this device holds was granted for a DIFFERENT PERMISSION
+    // (`drive.appdata` vs `drive.file` — see `scopeForSpace`), so this
+    // browser cannot act for that destination at all. Same rule as
+    // STORAGE-EGRESS.md §4's access-key mismatch: settle it at bind,
+    // never as a provider 403 twenty calls later.
+    throw new StoreError(
+      "no-credential",
+      `the consent this device holds was granted for a different Drive space ` +
+        `(${row.space}, not ${binding.space}) — that is a different permission, so ` +
+        `run the consent again for ${binding.space}`,
+    );
+  }
   const stored: StoreBinding = {
     kind: "gdrive",
     root: binding.root,
     apiBase: binding.apiBase,
     clientId: binding.clientId,
+    space: binding.space,
   };
   await sealedPut(ns, key, STORE_BINDING_KEY, new TextEncoder().encode(JSON.stringify(stored)));
   await applyBinding(stored);
   // Addressing only, exactly like every other arm (DRIVE.md §2): the
-  // guest gets no credential here, not even a public identifier.
+  // guest gets no credential here, not even a public identifier. The
+  // space is addressing too — it picks the root parent the strategy
+  // creates under, and nothing else.
   await live.driver.initStore({
     kind: "gdrive",
-    value: { root: stored.root, apiBase: stored.apiBase },
+    value: { root: stored.root, apiBase: stored.apiBase, space: stored.space },
   });
   return await status();
 }
@@ -1495,7 +1544,13 @@ async function bringUpEngine(): Promise<void> {
   if (binding) {
     await e.driver.initStore(
       binding.kind === "gdrive"
-        ? { kind: "gdrive", value: { root: binding.root, apiBase: binding.apiBase } }
+        ? {
+          kind: "gdrive",
+          // The space rides on the sealed binding, so the re-apply
+          // restores the SAME space the bind chose — a bring-up that
+          // defaulted here would silently move the store.
+          value: { root: binding.root, apiBase: binding.apiBase, space: binding.space },
+        }
         : {
           kind: "s3",
           value: {
@@ -1588,6 +1643,9 @@ async function status(): Promise<DeviceStatus> {
   const record = await getDevice(DEVICE_ID);
   const rungs = await sealState(ns);
   const policy = record?.unsealPolicy ?? "every-session";
+  // Read once, reported below: `null` while sealed is UNREADABLE, not
+  // absent (see the field's own note).
+  const gdriveRow = dek === null ? undefined : await readOauth(dek);
   return {
     deviceId: DEVICE_ID,
     tier: record?.tier ?? "t0",
@@ -1622,13 +1680,23 @@ async function status(): Promise<DeviceStatus> {
     // ruling — swallowing it in `status()` would hide a real finding
     // from the one call everything makes.
     storage: dek === null ? null : ((await readBinding(dek)) ?? null),
-    // EXISTENCE ONLY, and the same cannot-know semantics as `storage`
-    // above: the oauth row rests under the DEK, so `false` on a sealed
-    // device means unreadable rather than absent. Nothing else about
-    // the row — no token, no expiry, no account name — is derivable
-    // from this field, which is the whole design of it (DRIVE.md §3).
-    gdriveConsent: dek !== null && (await readOauth(dek)) !== undefined,
+    // THE CONSENT AS A NULLABLE RECORD, with the same cannot-know
+    // semantics as `storage` above: the oauth row rests under the DEK,
+    // so `null` on a sealed device means unreadable rather than absent.
+    // The one field on it is the SPACE the consent was granted for —
+    // addressing, the same class as the binding's own space, and the
+    // thing a sheet needs in order to know whether the consent it has
+    // matches the destination the user picked. Nothing else about the
+    // row — no token, no expiry, no account name — is derivable from
+    // this field, which is the whole design of it (DRIVE.md §3).
+    gdriveConsent: gdriveConsentOf(gdriveRow),
   };
+}
+
+/** `status()`'s one derivation from the sealed oauth row: existence,
+ * plus the space that existence was granted for. */
+function gdriveConsentOf(row: OauthRow | undefined): { space: GdriveSpace } | null {
+  return row === undefined ? null : { space: row.space };
 }
 
 // --- the RPC ----------------------------------------------------------------

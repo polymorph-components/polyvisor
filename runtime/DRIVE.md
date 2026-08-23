@@ -80,8 +80,10 @@ story, and this provider's point is that there is none).
 
 ### 2. The strategy: Dropbox's shape over an id-addressed API
 
-- Scope is `drive.file` — files created by this app only. That is the
-  minimal honest scope, and it carries a fact worth stating twice: the
+- Scope is `drive.file` in the VISIBLE space — files created by this app
+  only — and `drive.appdata` in the hidden one, which is narrower still
+  and is the default (§5b). `drive.file` is the minimal honest scope for
+  a folder a user can see, and it carries a fact worth stating twice: the
   confinement is PER CLIENT ID, so every device of an account must use
   the SAME client id or they cannot see each other's store. The client
   id is part of the store's identity, beside the root folder name.
@@ -129,8 +131,9 @@ story, and this provider's point is that there is none).
   listing opaque, so the device set and the keychain now arrive inside
   the sealed pickup object, exactly as S3's K_p delivers them. The
   bootstrap record described in §1 is therefore no longer write-only.
-- `gdrive-config` is `{ root, api-base }` — ADDRESSING ONLY, like every
-  other arm. `api-base` defaults to `https://www.googleapis.com` and
+- `gdrive-config` is `{ root, api-base, space }` — ADDRESSING ONLY, like
+  every other arm (`space` is §5b's, and the guest refuses an unknown
+  value by name). `api-base` defaults to `https://www.googleapis.com` and
   exists for the same reason S3's endpoint is config: a self-hosted (or
   fake) backend is ordinary addressing, not a probe hack. The client id
   is NOT guest config — auth is entirely the seam's, and the guest has
@@ -246,15 +249,79 @@ The v2 shape from the egress record's §5, now built:
   {origin(apiBase)}, public = shared = ∅, signer = the refusing one (no
   SigV4 on this provider).
 - `DeviceStatus` reports the binding as it does S3's, and grows
-  `gdriveConsent: boolean` — false while sealed or absent, so the sheet
-  can offer bind-without-ceremony when a consent already rests sealed.
+  `gdriveConsent: {space} | null` — null while sealed or absent, so the
+  sheet can offer bind-without-ceremony when a consent already rests
+  sealed. IT IS A NULLABLE RECORD RATHER THAN A BOOLEAN, mirroring
+  `storage: StoreBinding | null` beside it and for the same reason: a
+  boolean plus a separate space field is two facts that can disagree,
+  and one of them would eventually be read without the other. The space
+  is addressing, not a secret; nothing else derived from the sealed row
+  ever appears here.
+
+#### 5b. BOTH SPACES, AND THE USER CHOOSES (settled 2026-08-23)
+
+- The binding's gdrive arm carries `space: "appdata" | "drive"`, and the
+  guest's `gdrive-config` carries the same string, which it validates and
+  refuses by name. It is ADDRESSING, like `root` and `apiBase`: it picks
+  the root folder's parent (`appDataFolder` vs `root`) and adds
+  `spaces=appDataFolder` to list queries, and everything below the root
+  folder — the `docs`/`pickup` layout, the keyed names, the pickup
+  construction — is identical between the two. This is a location
+  choice, not a second strategy.
+- **APPDATA IS THE DEFAULT**, and the reasons are the ones a user cannot
+  give themselves: the hidden per-app space CANNOT BE SHARED at all, so
+  §1's "no sharing" becomes platform-enforced rather than a property this
+  strategy promises about itself; the Drive UI offers no rename or move
+  for those files, which matters here more than usual, because a store
+  addressed by KEYED NAME (§2) cannot find a file a user renamed — the
+  visible-folder version of that mistake strands data permanently; and it
+  keeps a folder of meaningless hex out of the user's own Drive, which is
+  the thing they would otherwise have to look at forever. Drive's
+  settings still offer the one bulk lever that matters — remove all of
+  this app's hidden data — so "hidden" is not "unremovable".
+- **VISIBLE STAYS ON OFFER**, and not as a courtesy. Appdata cannot be
+  INSPECTED by its own owner: there is no way to look at it, count it, or
+  confirm with your own eyes that the thing you were told is happening is
+  happening. It is also orphaned INVISIBLY by an app/client rotation — a
+  new client id sees an empty app-data space and the old one's contents
+  are unreachable AND unseeable, where the same rotation over a visible
+  folder leaves a folder the user can still find. And the manual live
+  beat against real Google (see Gates) is only checkable by eye in a
+  visible folder. Inspectability is a real property; the ruling is that
+  it is not the DEFAULT one.
+- **THE SPACE IS COUPLED TO THE CONSENT, so it rides on `OauthStartSpec`
+  too.** The space selects the SCOPE: `appdata` asks for
+  `drive.appdata`, `drive` asks for `drive.file`. Those are two
+  different permissions on two different consent screens, so choosing a
+  space is a consent-time decision and not merely a bind-time one — and
+  the narrowing is a benefit in its own right, since `drive.appdata`
+  cannot reach anything in the user's Drive at all, not even files this
+  app made there. `bindStore` therefore refuses a binding whose space
+  differs from the sealed consent's with `no-credential`, the client-id
+  mismatch's exact analog (§5): the consent granted was for a different
+  permission, so this browser cannot act for that destination, and the
+  message tells the user to run the consent again. The sheet's
+  bind-without-ceremony skip is space-aware for the same reason —
+  it reuses a sealed consent only when the space matches, and otherwise
+  runs the ceremony and says why.
+- **AN API FINDING FROM THE STRATEGY SIDE, recorded because it decides
+  the failure mode**: a `files.list` that OMITS `spaces=appDataFolder`
+  does not error — it returns an EMPTY LIST. On a list-then-create
+  strategy that reads as "absent", so the store does not fail loudly; it
+  FORKS, re-creating everything under a second root and diverging from
+  the one that already exists. The fake reproduces this exactly (an
+  empty list, never an error), which is what makes the space rows
+  non-vacuous.
 
 ### 6. v1 surface: the solo page only
 
 The solo sheet grows a provider choice (S3-compatible | Google Drive);
-the Drive form is chrome-owned fields — root folder, client id, client
-secret (masked; it is an app identifier, but it is also not something to
-paint on a screen) — a Connect ceremony that runs consent → bind →
+the Drive form is chrome-owned fields — the space choice (§5b; hidden
+app data DEFAULT, visible folder the alternative, both described in the
+visor's own words including what each one costs, plus the one line that
+changing it later asks for a new consent because it is a different
+permission), root folder, client id, client secret (masked; it is an app
+identifier, but it is also not something to paint on a screen) — a Connect ceremony that runs consent → bind →
 activation beats, and the same sync/change/disconnect controls. The solo
 boot grows the popup-relay branch the demo page already has. The demo
 page does NOT grow a Drive panel: its storage theatre exists to show the
@@ -280,7 +347,12 @@ Recorded, not forgotten.
   what it gates), issues synthetic labeled tokens, supports refresh
   with rotation and on-demand expiry.
 - **Devstore rows**: ceremony tokens sealed and never in `status()`;
-  bind refusals by code (no consent; client-id mismatch); bind + flush
+  bind refusals by code (no consent; client-id mismatch; SPACE mismatch
+  — a consent for one space cannot bind the other); an appdata bind
+  landing its objects in the HIDDEN space and nowhere in the visible one
+  (the isolation property proven through the worker, not only in
+  bringup); `status().gdriveConsent` naming the space it was granted for
+  and reporting null while sealed; bind + flush
   with Bearer egress observed; kill/`__die` + re-unseal with no
   re-ceremony (binding AND tokens survive sealed; initStore re-applied);
   401→refresh→retry with the re-sealed token surviving a second kill;

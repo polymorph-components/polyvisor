@@ -122,6 +122,42 @@ interface driver {
     record gdrive-config {
         root: string,
         api-base: string,
+        /// WHICH DRIVE SPACE the root folder lives in: `"appdata"` (the
+        /// hidden per-app folder — the DEFAULT and preferred value) or
+        /// `"drive"` (a visible folder in the user's My Drive). Anything
+        /// else is REFUSED BY NAME at `init-store`; there is no silent
+        /// fallback, because a typo that defaulted would put the store
+        /// in the wrong space and read as data loss.
+        ///
+        /// A LOCATION CHOICE, not a second strategy: the `docs`/`pickup`
+        /// layout, the keyed names and the pickup's unkeyed flat spot are
+        /// identical in both spaces. All this selects is the root parent
+        /// the folder walk starts from and whether list queries carry
+        /// `spaces=appDataFolder`.
+        ///
+        /// APPDATA IS PREFERRED because it makes two of this provider's
+        /// properties structural rather than merely unimplemented. Files
+        /// there CANNOT BE SHARED AT ALL — so §1's "mints no capability"
+        /// stops depending on these paths declining to call the sharing
+        /// seams — and the user cannot rename or move them from the Drive
+        /// UI, which on a store that resolves objects by KEYED NAME
+        /// inside a known parent (§2) would make a file permanently
+        /// unfindable. Since names became keyed, the visible store is a
+        /// folder of meaningless hex anyway.
+        ///
+        /// VISIBLE STAYS AVAILABLE because appdata costs something real:
+        /// the user cannot inspect it, and an app/client rotation (§3
+        /// expects one) orphans the store INVISIBLY — appdata is scoped
+        /// to the app, so a new Cloud project sees an empty one with no
+        /// hint that the bytes are still somewhere. A visible folder
+        /// keeps the data legible to its owner, and is what makes the
+        /// manual live beat against real Google checkable by eye.
+        ///
+        /// A PLAIN STRING, like `s3-config`'s fields, rather than a WIT
+        /// enum: the guest validates it, and this avoids introducing a
+        /// value-mapping convention the rest of this interface does not
+        /// use.
+        space: string,
     }
 
     variant store-config {

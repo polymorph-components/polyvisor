@@ -45,6 +45,7 @@ import {
   type DeviceStatus,
   DeviceHostError,
   DRIVER_METHODS,
+  type GdriveSpace,
   type Hello,
   type OauthStartResult,
   type OauthStartSpec,
@@ -61,6 +62,7 @@ import {
 export { DeviceHostError };
 export type {
   DeviceStatus,
+  GdriveSpace,
   OauthStartResult,
   OauthStartSpec,
   PromoteOptions,
@@ -219,7 +221,9 @@ export interface DeviceConnection {
    * So what crosses on this call is app identity and addressing (the
    * client id and secret are INSTALLED-APP identifiers, the same public
    * class as the Dropbox appKey/appSecret the demo already holds in page
-   * memory — DRIVE.md §3), and what comes back is a URL. Open a popup on
+   * memory — DRIVE.md §3) plus the SPACE, which is what picks the scope
+   * this consent asks for and so has to be decided before the popup
+   * opens, not at bind. What comes back is a URL. Open a popup on
    * it; the redirect lands back on `spec.redirectUri` with `?code&state`
    * and both go to `oauthComplete`.
    *
@@ -236,8 +240,9 @@ export interface DeviceConnection {
    * worker, consumed inside the ceremony. It is not a standing
    * credential, and the bearer ban is about standing credentials. NO
    * TOKEN EVER TRAVELS BACK — what returns is the ordinary
-   * `DeviceStatus`, whose only word on the subject is the boolean
-   * `gdriveConsent`.
+   * `DeviceStatus`, whose only word on the subject is
+   * `gdriveConsent` — null, or the SPACE the consent was granted for,
+   * which is addressing and never a credential.
    *
    * Refusals: `"no-rung"` while sealed; `"bad-ceremony"` when no
    * ceremony is pending or the state does not match the one the worker

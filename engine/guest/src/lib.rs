@@ -69,7 +69,7 @@ use provider_dropbox::{
 };
 use provider_gdrive::{
     gd_child, gd_delete, gd_doc_name, gd_download, gd_ensure_folder, gd_fetch_child,
-    gd_pickup_name, gd_upload, GdSource, GdriveCfg,
+    gd_pickup_name, gd_upload, GdSource, GdSpace, GdriveCfg,
 };
 use provider_s3::{
     delete_object, get_object_unsigned, kp_location, object_name, put_object, s3_signed, S3Cfg,
@@ -1280,6 +1280,7 @@ fn gd() -> Result<GdriveCfg, String> {
         Some(StoreCfg::Gdrive(c)) => Ok(GdriveCfg {
             root: c.root.clone(),
             api_base: c.api_base.clone(),
+            space: c.space,
         }),
         Some(StoreCfg::S3(_)) => Err("gdrive path called on an s3 store".to_string()),
         Some(StoreCfg::Dropbox(_)) => Err("gdrive path called on a dropbox store".to_string()),
@@ -1291,8 +1292,21 @@ fn gd() -> Result<GdriveCfg, String> {
 /// segment, memoized in instance state. Drive has no paths (DRIVE.md
 /// §2), so this walk IS the path; the cache is what keeps a flush from
 /// re-walking it per object.
+/// THE SPACE ENTERS HERE, as the walk's starting parent: `root` for a
+/// visible My Drive folder, `appDataFolder` for the hidden per-app
+/// space (`GdSpace::root_parent`). Everything after that first segment
+/// is identical between the spaces, which is what makes the space a
+/// storage LOCATION and not a second strategy.
+///
+/// The folder-id cache is keyed by path only, which is safe because a
+/// store's space is fixed at `init-store` and an instance holds one
+/// store config at a time.
+// CONTRACT: DRIVE.md predates the space choice and says nothing about
+// re-`init-store` into a DIFFERENT space on a live instance; the
+// conservative reading is that this cache would have to be cleared for
+// that, and no caller does it today.
 async fn gd_folder_path(cfg: &GdriveCfg, segments: &[String]) -> Result<String, String> {
-    let mut parent = "root".to_string();
+    let mut parent = cfg.space.root_parent().to_string();
     let mut key = String::new();
     for seg in segments {
         key.push('/');
@@ -2902,9 +2916,17 @@ impl DriverGuest for Component {
             // carry: no credential of any kind crosses this boundary
             // (DRIVE.md §2). `api-base` is addressing, exactly like
             // S3's endpoint.
+            //
+            // `space` is the one field validated here rather than
+            // carried through: it is a plain WIT string, and an unknown
+            // value is refused BY NAME at init-store. Defaulting a typo
+            // would put the store in the other space, where the walk
+            // finds nothing and a re-flush rebuilds the whole tree —
+            // indistinguishable from data loss to the user.
             StoreConfig::Gdrive(c) => StoreCfg::Gdrive(GdriveCfg {
                 root: c.root.trim_matches('/').to_string(),
                 api_base: c.api_base.trim_end_matches('/').to_string(),
+                space: GdSpace::parse(&c.space)?,
             }),
         };
         with_state(|s| s.store = Some(cfg))
