@@ -69,6 +69,10 @@
           ? "authorization was refused — you can close this window"
           : "authorization relayed — you can close this window";
       }
+      // The code is dead after relay, but a credential-shaped string in
+      // synced history is noise someone will one day have to explain
+      // away — cheaper to not write it.
+      history.replaceState(null, "", location.pathname);
       window.close();
       // If the browser blocked the close (some do, for a window not
       // opened by a very recent user gesture), the banner above is what

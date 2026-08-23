@@ -443,6 +443,12 @@ which is precisely the property the worker host exists to provide. It
 becomes the right answer only if zero-setup Drive ever outweighs
 background sync.
 
+The boundary this draws for the sheet's own dev conveniences: the
+client id may travel in a URL (`?gdclient=`) because it is a public
+identifier, but the secret may not — a URL is synced browser history
+plus a server request log, and it enters this sheet through the masked
+field only.
+
 Note that §3's classification is DROPBOX-SHAPED and does not
 generalize: Dropbox issues PKCE public clients, so the demo's owner seam
 refreshes with a client id and no secret at all. Google has no such

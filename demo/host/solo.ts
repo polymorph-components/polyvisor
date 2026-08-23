@@ -145,6 +145,11 @@ if (isAuthPopup) {
   );
   const el = document.getElementById("banner");
   if (el) el.textContent = "authorization relayed — close this window";
+  // Scrub ?code&state before the close, in case the browser blocks it
+  // (close usually wins; this covers the page lingering): a one-shot
+  // code is dead after relay, but a credential-shaped string left in
+  // synced history is noise someone will one day have to explain away.
+  history.replaceState(null, "", location.pathname);
   window.close();
 }
 
@@ -1687,9 +1692,12 @@ async function startApp(
     gdSecretInput.type = MASKED.type;
     gdSecretInput.id = "storage-gd-secret";
     // Never prefilled from a binding — the secret is not part of
-    // `StoreBinding` and this sheet never holds one to read back. The
-    // dev URL param is test convenience only (DRIVE.md's Gates).
-    gdSecretInput.value = params.get("gdsecret") ?? "";
+    // `StoreBinding` and this sheet never holds one to read back. NO
+    // `?gdsecret=` URL param, unlike gdclient/gdroot above: a URL is
+    // synced history plus a server request line, and a confidential
+    // secret (DRIVE.md's BYO ruling) must never ride either — the
+    // masked field below is its only entry path.
+    gdSecretInput.value = "";
     gdSecretField.append(gdSecretInput);
     gdriveGroup.append(gdSecretField);
     body.append(gdriveGroup);
