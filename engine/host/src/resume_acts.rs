@@ -391,6 +391,67 @@ pub(crate) async fn resume_act(
     Ok(())
 }
 
+/// PLATFORM POSTURE, WITH NO DEVICE IDENTITY GRANTED — the half of the
+/// app-owned `device-identity` import this host CAN assert natively.
+///
+/// `polymorph-webcrypto-wasmtime` at the pinned rev exposes no way to
+/// build a `signing-key` resource from Rust-held material (main.rs's
+/// BLOCKED note), so this host fills the import with `none`. That is not
+/// a degenerate configuration: it is exactly "an embedding that grants no
+/// persistence", which the contract gives its own behavior.
+///
+/// The two claims:
+///
+/// 1. `init(exportable-identity: false)` still works and still MINTS.
+///    Consulting the import first must not have changed the no-persistence
+///    path — that is the compatibility claim for every existing consumer.
+/// 2. Resuming that device's checkpoint is an EXPLICIT REFUSAL naming the
+///    import, not `false` (which would send the embedder to `init` and
+///    silently mint a new device, losing every membership) and not a
+///    silent downgrade.
+pub(crate) async fn platform_no_identity_act(
+    acc: &Accessor<Ctx>,
+    device: crate::bindings::Engine,
+    resumed: crate::bindings::Engine,
+) -> Result<()> {
+    let d: &Driver = device.polyvisor_engine_driver();
+    let dt: &Tasks = device.polyvisor_tasks_tasks();
+
+    let id = step!(
+        "platform: device.init(platform posture, import answers none)",
+        d.call_init(acc, false)
+    );
+    if id.len() != 64 {
+        bail!("init returned a malformed identity: {id}");
+    }
+    ok("platform: init minted through the port (no identity granted)", Instant::now());
+
+    let part = step!("platform: create-partition", d.call_create_partition(acc));
+    step!("platform: seal-partition", d.call_seal_partition(acc, part));
+    step!("platform: tasks.add", dt.call_add(acc, "platform todo".to_string()));
+    step!("platform: state-checkpoint", d.call_state_checkpoint(acc));
+
+    let r: &Driver = resumed.polyvisor_engine_driver();
+    let t = Instant::now();
+    match r.call_state_resume(acc).await? {
+        Ok(true) => bail!(
+            "state-resume RESUMED a platform-posture checkpoint while the \
+             device-identity import answered `none` — it cannot have the key"
+        ),
+        Ok(false) => bail!(
+            "state-resume answered `false` on a platform-posture checkpoint: the \
+             embedder would go on to `init` and silently mint a NEW device"
+        ),
+        Err(e) => {
+            if !e.contains("granted no device identity") || !e.contains("device-identity") {
+                bail!("refusal did not name the missing import: {e}");
+            }
+            ok(&format!("platform: resume refused, naming the import ({e})"), t);
+        }
+    }
+    Ok(())
+}
+
 /// THE CRASH-CONSISTENCY CLAIM, ASSERTED — the half of this track that is
 /// prose everywhere else.
 ///

@@ -12,7 +12,12 @@ interface driver {
     /// `exportable-identity` selects the G5 demo-grade SOFT key (in-guest,
     /// bundle-exportable) instead of the platform-held default — the
     /// webcrypto interface has no private-key export at this rev (a #11
-    /// data point; the platform keystore slice is the honest fix).
+    /// data point; the export/recovery format is the identity bundle).
+    ///
+    /// PLATFORM POSTURE CONSULTS `device-identity` FIRST: an embedder that
+    /// persists a device key hands it over here and the engine adopts it
+    /// rather than minting, which is what makes a reload the SAME device.
+    /// `none` mints through the port, as before.
     init: async func(exportable-identity: bool) -> result<string, string>;
 
     // --- keyhive membership (synced by the bridge over the wire) ---
@@ -199,11 +204,9 @@ interface driver {
     /// In `platform` posture the snapshot is written WITHOUT identity
     /// material — the private half is a non-extractable host handle the
     /// guest cannot see. Such a checkpoint is complete in every other
-    /// respect and `state-resume` refuses it with an explicit message
-    /// until the platform-posture resume lands: an app-owned
-    /// device-identity import on this world, implemented by the embedder
-    /// over the port's `SigningKey.fromCryptoKey` seam (webcrypto#392;
-    /// PERSISTENCE.md "Engine contract additions").
+    /// respect: its resume takes the identity from the `device-identity`
+    /// import instead, and the manifest's recorded agent id is what the
+    /// handed key is checked against.
     state-checkpoint: async func() -> result<_, string>;
 
     /// Resume from the state root INSTEAD of `init` — the embedder calls
@@ -216,13 +219,15 @@ interface driver {
     /// should `init` a fresh device. Errors are real faults (a corrupt
     /// state root, an unsupported posture), never "nothing there".
     ///
-    /// v1 restores the SEED-posture identity from the persisted material.
-    /// THE SEAM: `platform` posture rests as a non-extractable WebCrypto
-    /// handle the guest cannot see, so its resume arrives from OUTSIDE the
-    /// checkpoint: an app-owned device-identity import (embedder-implemented
-    /// via the port's fromCryptoKey seam — webcrypto#392, PERSISTENCE.md). Until
-    /// that lands, a platform-posture checkpoint is refused here rather
-    /// than silently downgraded to a fresh identity.
+    /// `seed` posture restores the identity from the persisted material.
+    /// `platform` posture takes it from the `device-identity` import
+    /// instead — a non-extractable handle the guest cannot see was never
+    /// written down, so it arrives from OUTSIDE the checkpoint. The handed
+    /// pair is verified against the manifest's recorded agent id first: a
+    /// mismatch is an error naming both, because it means either a corrupt
+    /// state root or the wrong device's namespace. An embedding whose
+    /// import answers `none` gets an explicit refusal, never a silent
+    /// downgrade to a fresh identity.
     state-resume: async func() -> result<bool, string>;
 
     // --- the iroh wire + subduction sync (from the skeleton) ---
@@ -404,6 +409,53 @@ interface driver {
     stats: async func() -> string;
 }
 
+/// THE EMBEDDER-HELD DEVICE IDENTITY (#20 G5; runtime/PERSISTENCE.md
+/// "Engine contract additions"; the webcrypto#391 ruling).
+///
+/// An APP-OWNED interface, deliberately: "store a handle" is
+/// browser-specific, so persistence of the device signing key is an
+/// EMBEDDER library and the guest-facing function belongs to this world
+/// rather than to the `polymorph:webcrypto` port. The browser embedder
+/// implements it by loading the persisted non-extractable `CryptoKey`
+/// from the device namespace and laundering it into the port's typed
+/// handles through `SigningKey.fromCryptoKey` / `VerifyingKey.fromCryptoKey`
+/// (the merged webcrypto#392 seams, shipped in 0.4.0).
+///
+/// The posture story it completes: `platform` posture rests as a
+/// non-extractable handle the guest cannot see, so it never enters a
+/// checkpoint. It arrives from OUTSIDE — here.
+interface device-identity {
+    use polymorph:webcrypto/signature@0.1.0.{signing-key, verifying-key};
+
+    /// The embedder-held device identity, if this embedding persists one.
+    ///
+    /// Consulted at platform-posture init AND platform-posture resume:
+    ///
+    /// - `init(exportable-identity: false)` — `some(pair)` adopts the
+    ///   handed identity (the agent id is derived from the handed
+    ///   verifying key, exactly as for a minted pair); `none` mints a
+    ///   fresh pair through the port, which is the unchanged behavior of
+    ///   an embedding that grants no persistence.
+    /// - `state-resume` of a `platform`-posture checkpoint — `some(pair)`
+    ///   is VERIFIED against the checkpoint (the recorded agent id must
+    ///   equal the id derived from the handed verifying key) and then
+    ///   becomes the resumed device's signer; `none` is an explicit
+    ///   refusal, never a silent downgrade to a fresh identity.
+    ///
+    /// The mismatch check is corrupt-state / wrong-device detection, not
+    /// trust: the restored archive's delegations only verify under the
+    /// right key anyway, so a wrong key would fail later and far less
+    /// legibly.
+    ///
+    /// Keys travel as the PAIR because the port mints them as pairs and a
+    /// `signing-key` carries no accessor to its verifying half.
+    ///
+    /// `none` is the default an embedder gets for free: a host that fills
+    /// this import with a stub answering `none` is byte-for-byte the
+    /// engine it was before this interface existed.
+    device-key-pair: async func() -> option<tuple<signing-key, verifying-key>>;
+}
+
 /// The shared shape of the storage egress imports below. Named as its
 /// own interface so the tier-specific world imports (owner / app /
 /// anonymous) are the SAME interface type under different import names
@@ -418,6 +470,13 @@ interface store-fetch-types {
 world engine {
     import polymorph:iroh/endpoint@0.1.0;
     import polymorph:iroh/identity-generate@0.1.0;
+
+    /// The embedder-held device identity (see the interface above). The
+    /// world import MUST be filled at instantiation, so every embedder
+    /// supplies at least the `none`-answering default —
+    /// runtime/engine.ts's `newEngine` ships one, and the worker host
+    /// overrides it with the device namespace's persisted handle.
+    import device-identity;
 
     /// Storage egress, owner tier: the instance wired here carries the
     /// user's storage authority (SigV4-signed or bearer-injected AT THE

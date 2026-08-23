@@ -107,16 +107,17 @@ const KEEP_GENERATIONS: usize = 2;
 // --- the on-disk shapes ------------------------------------------------------
 
 /// How the device's signing identity rests, per PERSISTENCE.md
-/// "Posture". Only `Seed` round-trips at this rev.
+/// "Posture". `Seed` round-trips through the checkpoint; `Platform`
+/// round-trips through the `device-identity` import instead.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 enum Posture {
     /// The extractable in-guest key (`init(exportable-identity: true)`),
     /// the same material `identity-export`'s bundle carries.
     Seed,
     /// A non-extractable WebCrypto handle. The guest cannot see the
-    /// private half, so nothing identity-shaped is written; resume is
-    /// refused pending the app-owned device-identity import
-    /// (webcrypto#392's fromCryptoKey seam; PERSISTENCE.md "Engine
+    /// private half, so nothing identity-shaped is written; resume takes
+    /// the pair from the app-owned `device-identity` import and checks it
+    /// against `Manifest::verifying` (engine.wit; PERSISTENCE.md "Engine
     /// contract additions").
     Platform,
 }
@@ -128,7 +129,10 @@ struct Manifest {
     posture: Posture,
     /// The device's public identity, in the clear: it is a public key,
     /// and having it outside the sealed members makes "which device is
-    /// this generation" answerable without opening anything.
+    /// this generation" answerable without opening anything. In
+    /// `platform` posture it is ALSO the load-bearing check — the only
+    /// record of which device this state belongs to, against which the
+    /// `device-identity` import's handed pair is verified.
     verifying: [u8; 32],
     /// `(file name, byte length, BLAKE3)` for every member of this
     /// generation. Resume validates all of them before selecting it.
@@ -329,11 +333,9 @@ pub(crate) async fn checkpoint() -> Result<(), String> {
         }
         // CONTRACT: engine.wit's `state-checkpoint` — "In `platform`
         // posture the snapshot is written WITHOUT identity material".
-        // Everything else is still captured, so when the app-owned
-        // device-identity import lands (webcrypto#392) these generations
-        // become resumable with the identity arriving from OUTSIDE the
-        // checkpoint; refusing to checkpoint at all would have thrown
-        // that away.
+        // The manifest's `verifying` is all that records WHICH device
+        // this is; resume gets the key itself from the `device-identity`
+        // import and checks it against that.
         IdentityKey::Platform(_) => Posture::Platform,
     };
 
@@ -442,43 +444,67 @@ pub(crate) async fn resume() -> Result<bool, String> {
         return Ok(false);
     };
 
-    // CONTRACT / THE DOCUMENTED SEAM (engine.wit's `state-resume`):
-    // `platform` posture rests as a non-extractable WebCrypto handle the
-    // guest cannot see; its resume arrives from outside the checkpoint,
-    // through an app-owned device-identity import the embedder implements
-    // via the port's fromCryptoKey seam (webcrypto#392, PERSISTENCE.md).
-    // Refusing is the conservative reading: answering `false` here would
-    // send the embedder to `init`, which mints a NEW identity, and the
-    // device would silently lose every membership it held.
-    if manifest.posture == Posture::Platform {
-        return Err(format!(
-            "checkpoint generation {n} rests in `platform` posture: resuming a \
-             non-extractable device key needs the device-identity import \
-             (webcrypto#392; PERSISTENCE.md) and is not wired at this \
-             rev. Use `init(exportable-identity: true)` for a resumable device."
-        ));
-    }
+    // THE POSTURE FORK. `seed` restores the identity from the persisted
+    // material below; `platform` never wrote any, so its identity arrives
+    // from OUTSIDE the checkpoint — the app-owned `device-identity` import
+    // (engine.wit; runtime/PERSISTENCE.md "Engine contract additions",
+    // the webcrypto#391 ruling).
+    let signer = if manifest.posture == Posture::Platform {
+        let Some((key, verifying)) = crate::embedder_device_key().await? else {
+            // NOT `Ok(false)`: answering "nothing here" would send the
+            // embedder to `init`, which mints a NEW identity, and the
+            // device would silently lose every membership it held.
+            return Err(format!(
+                "checkpoint generation {n} rests in `platform` posture, but this \
+                 embedding granted no device identity: the `device-identity` \
+                 import answered `none`. The device key is a non-extractable \
+                 handle the checkpoint could not contain — the embedder must \
+                 hand back the one it persisted (PERSISTENCE.md \"Engine \
+                 contract additions\")."
+            ));
+        };
+        // CORRUPT-STATE / WRONG-DEVICE DETECTION, not trust. The archive's
+        // delegations only verify under the right key anyway, so a wrong
+        // key fails later and far less legibly; catching it here names
+        // both ids instead. `manifest.verifying` IS the recorded agent id
+        // (checkpoint writes it in the clear — it is a public key).
+        if manifest.verifying != verifying.to_bytes() {
+            return Err(format!(
+                "device-identity mismatch: checkpoint generation {n} belongs to \
+                 agent {}…, the embedder handed agent {}… — a corrupt state root, \
+                 or another device's namespace",
+                &hex::encode(manifest.verifying)[..8],
+                &hex::encode(verifying.to_bytes())[..8],
+            ));
+        }
+        WebcryptoSigner(Rc::new(SignerInner {
+            key,
+            verifying,
+            sign_count: Cell::new(0),
+        }))
+    } else {
+        let identity: IdentityState = bincode::deserialize(
+            &read_member(n, IDENTITY_FILE, &manifest)
+                .ok_or("checkpoint validated but identity member vanished")?,
+        )
+        .map_err(|e| format!("identity decode: {e}"))?;
 
-    let identity: IdentityState = bincode::deserialize(
-        &read_member(n, IDENTITY_FILE, &manifest)
-            .ok_or("checkpoint validated but identity member vanished")?,
-    )
-    .map_err(|e| format!("identity decode: {e}"))?;
-
-    let sk = ed25519_dalek::SigningKey::from_bytes(&identity.seed);
-    let verifying = DalekVerifyingKey::from_bytes(&identity.verifying)
-        .map_err(|e| format!("bad verifying key: {e:?}"))?;
-    if sk.verifying_key() != verifying {
-        return Err("checkpoint inconsistent: seed does not match verifying key".into());
-    }
-    if manifest.verifying != identity.verifying {
-        return Err("checkpoint inconsistent: manifest and identity disagree".into());
-    }
-    let signer = WebcryptoSigner(Rc::new(SignerInner {
-        key: IdentityKey::Soft(Box::new(sk)),
-        verifying,
-        sign_count: Cell::new(0),
-    }));
+        let sk = ed25519_dalek::SigningKey::from_bytes(&identity.seed);
+        let verifying = DalekVerifyingKey::from_bytes(&identity.verifying)
+            .map_err(|e| format!("bad verifying key: {e:?}"))?;
+        if sk.verifying_key() != verifying {
+            return Err("checkpoint inconsistent: seed does not match verifying key".into());
+        }
+        if manifest.verifying != identity.verifying {
+            return Err("checkpoint inconsistent: manifest and identity disagree".into());
+        }
+        WebcryptoSigner(Rc::new(SignerInner {
+            key: IdentityKey::Soft(Box::new(sk)),
+            verifying,
+            sign_count: Cell::new(0),
+        }))
+    };
+    let verifying = signer.0.verifying;
 
     let archive: keyhive_core::archive::Archive<crate::T> = bincode::deserialize(
         &read_member(n, KEYHIVE_FILE, &manifest)

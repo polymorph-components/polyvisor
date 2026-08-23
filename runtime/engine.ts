@@ -37,6 +37,9 @@ export type StoreConfig =
 
 // WIT `result<T, string>` returns resolve T / throw ComponentException.
 export interface Driver {
+  /** Platform posture (`false`) consults the `device-identity` import
+   * first and ADOPTS the embedder-held pair when there is one; only
+   * `undefined` mints. `true` is the seed posture and never consults it. */
   init(exportableIdentity: boolean): Promise<string>;
   khKnowsAgent(agentId: Uint8Array): Promise<boolean>;
   khCreateGroup(): Promise<Uint8Array>;
@@ -107,10 +110,10 @@ export interface Driver {
    *
    * `false` means "nothing to resume" (no state root, or none valid) and
    * is the fresh-boot path, never an error. A rejection is a real fault —
-   * a corrupt root, or a checkpoint in `platform` posture, whose resume
-   * awaits the app-owned device-identity import over the port's
-   * seam (webcrypto#392's fromCryptoKey; PERSISTENCE.md "Engine contract
-   * additions"). */
+   * a corrupt root, or a `platform`-posture checkpoint the
+   * `device-identity` import cannot answer for: either it answered
+   * `none` (this embedding granted no device identity) or it handed back
+   * a DIFFERENT device's key than the checkpoint records. */
   stateResume(): Promise<boolean>;
 
   // --- device pairing (#10) + user-system (#36) --- (engine.wit ~214-280)
@@ -401,11 +404,56 @@ async function persistImports(dir: PersistDir): Promise<Record<string, unknown>>
   return filesystemWeb({ preopens: { "/": dir as any }, writable: true }).imports;
 }
 
+/**
+ * THE APP-OWNED DEVICE IDENTITY (#20 G5; runtime/PERSISTENCE.md "Engine
+ * contract additions"; the webcrypto#391 ruling).
+ *
+ * `polyvisor:engine/device-identity@0.1.0` — a world import, so it MUST be
+ * filled at instantiation; `newEngine` therefore always supplies at least
+ * the `none`-answering default below.
+ *
+ * `deviceKeyPair()` resolves the embedder-held pair, or `undefined` for
+ * "this embedding persists no device identity" (WIT `option`). The engine
+ * consults it at platform-posture `init(false)` — `undefined` means mint a
+ * fresh key, the pre-existing behavior — and at `stateResume()` of a
+ * platform-posture checkpoint, where `undefined` is an explicit refusal
+ * rather than a silent new device.
+ *
+ * The values are the PORT's typed handles, not raw `CryptoKey`s: the
+ * device store's identity library loads the persisted non-extractable
+ * `CryptoKey` from the device namespace and launders it through
+ * `SigningKey.fromCryptoKey` / `VerifyingKey.fromCryptoKey`
+ * (@polymorph/webcrypto 0.4.0, the merged #392 seams). They travel as the
+ * PAIR because the port mints them as pairs and a signing key carries no
+ * accessor to its verifying half. `unknown` here rather than the port's
+ * classes: this module deliberately does not depend on the port's JS
+ * surface, and the resource identity that matters is per-instance
+ * registry identity, which no static type captures.
+ */
+export interface DeviceIdentityFragment {
+  deviceKeyPair(): Promise<[unknown, unknown] | undefined>;
+}
+
+/** The import key for {@link DeviceIdentityFragment}. */
+export const DEVICE_IDENTITY = "polyvisor:engine/device-identity@0.1.0";
+
+/** The default: this embedding persists no device identity.
+ *
+ * Every existing consumer gets this and is byte-for-byte the engine it
+ * was before the import existed — platform-posture `init` mints, as it
+ * always did. The WORKER HOST OVERRIDES IT (`newEngine`'s
+ * `deviceIdentity` parameter) with the device namespace's persisted
+ * handle; that fragment is the device-store track's. */
+const noDeviceIdentity: DeviceIdentityFragment = {
+  deviceKeyPair: () => Promise.resolve(undefined),
+};
+
 export async function newEngine(
   label: string,
   artifacts: EngineArtifacts,
   net: EngineNet,
   persistDir?: PersistDir,
+  deviceIdentity?: DeviceIdentityFragment,
 ): Promise<Engine> {
   const shims = wasi({ cli: { args: [`engine-${label}`] } });
   const imports = {
@@ -435,6 +483,11 @@ export async function newEngine(
     // above can stay — whereas a missing one would be fatal if a future
     // translator does surface it.
     "polyvisor:engine/store-fetch-types@0.1.0": {},
+    // The app-owned device identity. NOT optional the way the state root
+    // is: a world import must be filled at instantiation, so the stub
+    // ships by default and an embedder that persists a key overrides it
+    // — exactly the sockets-stub pattern above.
+    [DEVICE_IDENTITY]: deviceIdentity ?? noDeviceIdentity,
     // THE STATE ROOT, last so it REPLACES the batteries' empty-preopens
     // filesystem on the `@0.2` track rather than sitting beside it: the
     // resolver refuses a track key and an exact-versioned sibling on one

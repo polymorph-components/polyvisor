@@ -29,6 +29,19 @@ mod bindings {
         exports: {
             default: async,
         },
+        // The world names `polymorph:webcrypto` types now (the
+        // `device-identity` import carries `signing-key`/`verifying-key`),
+        // so those interfaces are remapped onto the bindings
+        // `polymorph-webcrypto-wasmtime` already generated and already
+        // links (`add_to_linker` below). Generating them a second time
+        // here would mint distinct resource types and a second, unwired
+        // host trait. `signature` is what `device-identity` uses; `types`
+        // and `wrapping` are what `signature` uses.
+        with: {
+            "polymorph:webcrypto/signature": polymorph_webcrypto_wasmtime::bindings::webcrypto::signature,
+            "polymorph:webcrypto/types": polymorph_webcrypto_wasmtime::bindings::webcrypto::types,
+            "polymorph:webcrypto/wrapping": polymorph_webcrypto_wasmtime::bindings::webcrypto::wrapping,
+        },
     });
 }
 
@@ -344,6 +357,53 @@ impl bindings::store_signer::HostWithStore<Ctx> for Ctx {
     }
 }
 
+// --- the app-owned device identity (#20 G5) ---
+//
+// BLOCKED, PRECISELY, and the reason this seam answers `none`:
+//
+//   crate:   polymorph-webcrypto-wasmtime 0.1.0
+//            (git polymorph-components/polymorph-webcrypto @ b13d2523,
+//            the rev this host pins)
+//   missing: any public way to construct a `signature.signing-key` /
+//            `signature.verifying-key` resource from Rust-held key
+//            material. The backing types ARE public
+//            (`polymorph_webcrypto_wasmtime::{SigningKey, VerifyingKey}`),
+//            but they are minted only through the crate-private
+//            `Minted` trait (rust/wasmtime/src/lib.rs:~226,
+//            `pub(crate) trait Minted`), their payload fields are
+//            `pub(crate)`, and the hidden `_retention` field is a
+//            `pub(crate) type Reservation` from `limits.rs`. So a host
+//            cannot build a value to push into the table, and nothing
+//            like an `import_signing_key_pkcs8`-from-Rust entry point
+//            exists. This is the Rust-side counterpart of webcrypto#392's
+//            JS `SigningKey.fromCryptoKey`, which shipped for the browser
+//            (0.4.0) and not for wasmtime.
+//
+// What the gap costs: the native act battery cannot exercise a
+// platform-posture RESUME with a real embedder-held key, so those acts
+// stay on seed posture. What it does NOT cost: the import is real, the
+// guest consults it, and the `none` branch — an embedding that grants no
+// persistence — IS asserted natively (resume_acts::platform_no_identity_act).
+//
+// Deliberately NOT worked around by hacking resources into the crate's
+// table: the retention accounting is the crate's own invariant.
+impl bindings::polyvisor::engine::device_identity::HostWithStore<Ctx> for Ctx {
+    async fn device_key_pair(
+        _accessor: &Accessor<Ctx, Self>,
+    ) -> Result<
+        Option<(
+            wasmtime::component::Resource<polymorph_webcrypto_wasmtime::SigningKey>,
+            wasmtime::component::Resource<polymorph_webcrypto_wasmtime::VerifyingKey>,
+        )>,
+    > {
+        Ok(None)
+    }
+}
+
+/// The sync half of the same interface: empty (every function here is
+/// `async`), but `add_to_linker` still requires it.
+impl bindings::polyvisor::engine::device_identity::Host for Ctx {}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -407,6 +467,10 @@ async fn main() -> Result<()> {
     bindings::store_shared_fetch::add_to_linker::<Ctx, Ctx>(&mut linker, |c| c)?;
     bindings::store_public_fetch::add_to_linker::<Ctx, Ctx>(&mut linker, |c| c)?;
     bindings::store_signer::add_to_linker::<Ctx, Ctx>(&mut linker, |c| c)?;
+    // The app-owned device-identity import. Filled with the `none`
+    // default (see the impl above's BLOCKED note); the import must still
+    // be linked, because a world import is not optional.
+    bindings::polyvisor::engine::device_identity::add_to_linker::<Ctx, Ctx>(&mut linker, |c| c)?;
 
     // One store per act set. The negative pairing acts need guest-side
     // verification hooks, and WASI environment is per-store, so isolating
@@ -526,6 +590,26 @@ async fn resume_scenarios(
         store
             .run_concurrent(async move |acc| {
                 resume_acts::resume_act(acc, device, resumed, peer, relay).await
+            })
+            .await?
+            .map_err(|e| e.to_string()),
+    ));
+
+    // Platform posture with the import answering `none` (the native gap;
+    // resume_acts.rs). Its own state root: this device's checkpoint is
+    // deliberately unresumable here and must not pollute the seed root.
+    let platform_root = std::env::temp_dir().join(format!("pm-engine-platform-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&platform_root);
+    std::fs::create_dir_all(&platform_root)
+        .with_context(|| format!("creating {}", platform_root.display()))?;
+    let mut store = make_store_in(&[], Some(&platform_root));
+    let device = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    let resumed = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    outcomes.push((
+        "platform posture, no device identity granted: init mints, resume refuses explicitly",
+        store
+            .run_concurrent(async move |acc| {
+                resume_acts::platform_no_identity_act(acc, device, resumed).await
             })
             .await?
             .map_err(|e| e.to_string()),
