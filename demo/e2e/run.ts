@@ -60,6 +60,7 @@ import soloErase from "./scenarios/solo-erase.ts";
 import soloEphemeral from "./scenarios/solo-ephemeral.ts";
 import soloStorage from "./scenarios/solo-storage.ts";
 import soloGdrive from "./scenarios/solo-gdrive.ts";
+import soloAccountStorage from "./scenarios/solo-account-storage.ts";
 import soloPasskey from "./scenarios/solo-passkey.ts";
 import visorReset from "./scenarios/visor-reset.ts";
 
@@ -148,6 +149,15 @@ const SCENARIOS: Scenario[] = [
   // it). The real popup path is the point: the worker mints PKCE, the
   // page only ever opens a window and relays a one-shot code.
   soloGdrive,
+  // THE ACCOUNT'S STORAGE RECORD (DRIVE.md, "The account syncs its
+  // storage config; devices keep their credentials"): the pairing
+  // scenario's two isolated contexts and the Drive scenario's fake, in
+  // one story — A binds and writes the destination through the account,
+  // B announces the change and then adopts it with nothing typed but a
+  // consent click. It runs directly after solo-gdrive because a failure
+  // here with that one green says the fault is in the SYNC of the
+  // config, not in the Drive ceremony it reuses wholesale.
+  soloAccountStorage,
   // THE PRF RUNG (passkey unseal, PERSISTENCE.md). Follows the device
   // store's other two for the same reason they follow solo-pairing: a
   // failure here with those two green says the fault is in the passkey

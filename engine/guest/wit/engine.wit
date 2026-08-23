@@ -228,6 +228,15 @@ interface driver {
     // raw 32-byte-secret slot (passkey-PRF / recovery-code stand-in).
     // Everything else rehydrates from the bucket (G4), so this bundle
     // plus store config is a complete device restart.
+    //
+    // What rehydrates now includes the ACCOUNT'S STORAGE RECORD: it
+    // lives in the user-system document, which is one of the bundled
+    // partition refs, so a restored account knows where its bucket is
+    // and holds the client pair to reach it (`us-storage-get`). It
+    // still lacks THIS device's own consent (gdrive) or SigV4 secret
+    // escrow (s3) — those never sync, by the shape of the record.
+    // DRIVE.md, "The account syncs its storage config; devices keep
+    // their credentials".
 
     /// Export the sealed bundle. At least one slot must be requested.
     identity-export: async func(label: string, passphrase: option<string>, secret-slot: option<list<u8>>) -> result<list<u8>, string>;
@@ -434,6 +443,17 @@ interface driver {
         mark-conflict-repaired(tuple<string, string>), // (provenance, "petname"|"icon")
         device-added(string),                     // name
         device-revoked(string),
+        /// The ACCOUNT'S STORAGE DESTINATION changed on another device;
+        /// the payload is the provider name ("s3" | "gdrive"), the same
+        /// shape `device-added` uses for its name.
+        ///
+        /// It exists because DRIVE.md ("The account syncs its storage
+        /// config; devices keep their credentials") rules that a bind
+        /// which changes the destination "is a change the OTHER devices
+        /// announce (`us-events`), never silently adopt". The visor
+        /// tells the user their account now points somewhere else; it
+        /// does not re-point this device's store behind their back.
+        storage-changed(string),                  // provider name
     }
 
     /// First device only: create user group + user-system partition,
@@ -471,6 +491,90 @@ interface driver {
 
     /// Every pointer the account has published, name-ordered.
     us-partitions: async func() -> result<list<us-partition>, string>;
+
+    // --- the account's storage config (DRIVE.md, "The account syncs its
+    // --- storage config; devices keep their credentials") ---
+    //
+    // ONE record, account-wide, beside the partition-pointer map and for
+    // the same reason it exists: this is configuration every device is
+    // REQUIRED to agree on, and which each device would otherwise type
+    // independently. `drive.file` confines visibility per client id and
+    // the layout hangs off root + space, so a second device typing a
+    // different-but-valid client id consents fine and then sees an EMPTY
+    // store — a silent fork with a UI. So the destination and the client
+    // pair sync, through the account's user-system document.
+    //
+    // WHAT IS NOT HERE IS THE POINT. There are no token fields and no
+    // consent state in this shape, and their ABSENCE IS THE ENFORCEMENT:
+    // an OAuth refresh token or a consent grant cannot ride the account
+    // because there is nowhere in the record to put one. Standing user
+    // credentials never sync, and at Google a refresh token belongs to
+    // one client session — concurrent use from several devices risks
+    // invalidating the whole token family, one device's refresh killing
+    // its siblings'. Consent is also the moment the user authorizes THIS
+    // device, and it costs one click.
+    //
+    // The sync channel is keyhive E2E: the record is ciphertext on the
+    // wire, in the bucket, and in every checkpoint.
+
+    /// S3 addressing — and NO SECRET, structurally.
+    ///
+    /// The SigV4 secret cannot appear here even in principle: it exists
+    /// only as a non-extractable handle, so there are no bytes to put in
+    /// a document (DRIVE.md, same section). `access-key` is the PUBLIC
+    /// key identifier, addressing rather than credential. Every device
+    /// still escrows the secret itself, per device.
+    record us-storage-s3 {
+        endpoint: string,
+        bucket: string,
+        access-key: string,
+    }
+
+    /// Google Drive addressing plus the BYO client pair.
+    ///
+    /// `root` and `space` decide the layout, and `client-id` decides
+    /// what `drive.file` even makes visible, so all three are things
+    /// every device must agree on or the store forks invisibly in the
+    /// appdata space.
+    ///
+    /// `client-secret` rides the account deliberately: it is APP
+    /// identity, not a user credential, and every device legitimately
+    /// holds it in cleartext anyway — so syncing it over the E2E channel
+    /// crosses no line that per-device sealing had not already crossed.
+    /// This does not contradict the never-in-URLs rule: that one is
+    /// about UNTRUSTED channels (synced browser history, request logs);
+    /// this is the trusted one. Different question, opposite answers,
+    /// both right.
+    record us-storage-gdrive {
+        root: string,
+        api-base: string,
+        space: string,
+        client-id: string,
+        client-secret: string,
+    }
+
+    /// The account's storage destination. One record, overwritten — not
+    /// a map: an account has one store.
+    variant us-storage {
+        s3(us-storage-s3),
+        gdrive(us-storage-gdrive),
+    }
+
+    /// Write the account's storage record through. Overwrite semantics,
+    /// like `us-profile-set`; the OTHER devices learn about it through a
+    /// `storage-changed` event, and this one gets no echo of its own
+    /// write.
+    us-storage-put: async func(s: us-storage) -> result<_, string>;
+
+    /// The account's storage record, or `none` on an account that has
+    /// never bound a store (and on a document written before this key
+    /// existed — additive, exactly like the partition map).
+    ///
+    /// Recovery inherits the right property for free: the user-system
+    /// doc rides the account, so a restored account knows where its
+    /// bucket is and holds the client pair to reach it, lacking only
+    /// this device's own consent (gdrive) or secret escrow (s3).
+    us-storage-get: async func() -> result<option<us-storage>, string>;
 
     us-contacts-list: async func() -> result<list<tuple<list<u8>, string>>, string>;
     us-contact-put:   async func(card: list<u8>, petname: string) -> result<_, string>;

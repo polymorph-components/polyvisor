@@ -220,6 +220,8 @@ function toMockEvent(e: UsEvent): MockUsEvent {
       return { tag: "device-added", name: e.value };
     case "device-revoked":
       return { tag: "device-revoked", name: e.value };
+    case "storage-changed":
+      return { tag: "storage-changed", provider: e.value };
     default:
       throw new Error(`us-event: unknown variant case '${(e as { kind: string }).kind}'`);
   }

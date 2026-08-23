@@ -19,7 +19,8 @@ use wasmtime::component::Accessor;
 use wasmtime::{bail, format_err, Result};
 
 use crate::bindings::exports::polyvisor::engine::driver::{
-    Guest as Driver, PairAddState, PairJoinState, UsEvent, UsMark, UsProfile,
+    Guest as Driver, PairAddState, PairJoinState, UsEvent, UsMark, UsProfile, UsStorage,
+    UsStorageGdrive, UsStorageS3,
 };
 use crate::bindings::exports::polyvisor::tasks::tasks::Guest as Tasks;
 use crate::Ctx;
@@ -308,6 +309,169 @@ fn same_marks(a: &[UsMark], b: &[UsMark]) -> bool {
         })
 }
 
+/// THE ACCOUNT'S STORAGE RECORD, both halves of the ruling in DRIVE.md
+/// ("The account syncs its storage config; devices keep their
+/// credentials"): the destination and the client pair SYNC, and a
+/// destination change on one device is ANNOUNCED on the others — never
+/// silently adopted, and never echoed back to the device that wrote it.
+///
+/// Three beats:
+///
+///  1. The laptop binds a Google Drive destination. Every field of the
+///     record reaches the phone, byte for byte — including the client
+///     pair, which is app identity riding the account's E2E channel.
+///     (The values here are SYNTHETIC and labelled as such; nothing in
+///     this act is, or resembles, real credential material. What the
+///     record CANNOT carry is the point: there is no token field and no
+///     consent field in the shape at all.)
+///  2. The phone re-binds to S3 — the arm that structurally carries no
+///     secret, since the SigV4 secret exists only as a non-extractable
+///     handle. The laptop reads the new destination back.
+///  3. The laptop is TOLD ("storage-changed(s3)"), and the phone, which
+///     wrote it, is not.
+async fn act_storage_config(acc: &Accessor<Ctx>, l: &Driver, p: &Driver) -> Result<()> {
+    // SYNTHETIC values throughout — labelled so that no reader mistakes
+    // them for material worth protecting.
+    let gdrive = UsStorageGdrive {
+        root: "polyvisor-synthetic".into(),
+        api_base: "https://www.googleapis.com".into(),
+        // The STACK'S vocabulary for this field is "appdata" (the WIT
+        // types it as a bare string, but every reader of the record —
+        // `StoreBinding.space`, the sheet's radio values, the gdrive
+        // strategy — spells the hidden space this way; "appDataFolder"
+        // is the PROVIDER's wire word for the same place, and does not
+        // belong in the record).
+        space: "appdata".into(),
+        client_id: "SYNTHETIC-CLIENT".into(),
+        client_secret: "synthetic-client-secret-0000".into(),
+    };
+
+    // Beat 1: the laptop binds, and reads back its own write.
+    l.call_us_storage_put(acc, UsStorage::Gdrive(gdrive.clone()))
+        .await?
+        .map_err(|e| format_err!("us-storage-put(gdrive): {e}"))?;
+    match l.call_us_storage_get(acc).await?.map_err(|e| format_err!("{e}"))? {
+        Some(UsStorage::Gdrive(v)) if same_gdrive(&v, &gdrive) => {}
+        other => bail!("the writer does not read back its own storage record: {}", describe_storage(&other)),
+    }
+
+    let t = Instant::now();
+    let mut announced: Vec<UsEvent> = Vec::new();
+    let mut synced = None;
+    for _ in 0..POLLS {
+        let got = p.call_us_storage_get(acc).await?.map_err(|e| format_err!("{e}"))?;
+        announced.extend(p.call_us_events(acc).await?.map_err(|e| format_err!("{e}"))?);
+        if let Some(UsStorage::Gdrive(v)) = got {
+            synced = Some(v);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(POLL_MS)).await;
+    }
+    let Some(synced) = synced else {
+        bail!("the account's storage record never reached the second device");
+    };
+    if !same_gdrive(&synced, &gdrive) {
+        bail!("the storage record arrived with different fields than were written");
+    }
+    ok("gdrive storage record syncs to the second device, field for field", t);
+    if !announced
+        .iter()
+        .any(|e| matches!(e, UsEvent::StorageChanged(prov) if prov == "gdrive"))
+    {
+        bail!(
+            "the account's first storage bind was not announced on the other device: {:?}",
+            describe_events(&announced)
+        );
+    }
+
+    // The WRITER gets no echo of its own bind. Drained here (destructively)
+    // so beat 3's drain on this device can only contain what beat 2 causes.
+    let l_events = l.call_us_events(acc).await?.map_err(|e| format_err!("{e}"))?;
+    if l_events.iter().any(|e| matches!(e, UsEvent::StorageChanged(_))) {
+        bail!(
+            "the binding device was announced its own storage write: {:?}",
+            describe_events(&l_events)
+        );
+    }
+    ok("the binding device receives no event for its own storage write", Instant::now());
+
+    // Beat 2: the phone re-binds the account to S3 — the arm with no
+    // secret in it, by construction.
+    let s3 = UsStorageS3 {
+        endpoint: "http://127.0.0.1:9000".into(),
+        bucket: "synthetic-bucket".into(),
+        access_key: "SYNTHETIC-ACCESS-KEY-ID".into(),
+    };
+    p.call_us_storage_put(acc, UsStorage::S3(s3.clone()))
+        .await?
+        .map_err(|e| format_err!("us-storage-put(s3): {e}"))?;
+
+    // Beat 3: the laptop reads the new destination AND is told about it.
+    let t = Instant::now();
+    let mut l_announced: Vec<UsEvent> = Vec::new();
+    let mut switched = None;
+    for _ in 0..POLLS {
+        let got = l.call_us_storage_get(acc).await?.map_err(|e| format_err!("{e}"))?;
+        l_announced.extend(l.call_us_events(acc).await?.map_err(|e| format_err!("{e}"))?);
+        if let Some(UsStorage::S3(v)) = got {
+            switched = Some(v);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(POLL_MS)).await;
+    }
+    let Some(switched) = switched else {
+        bail!("the re-bound destination never reached the other device");
+    };
+    if switched.endpoint != s3.endpoint
+        || switched.bucket != s3.bucket
+        || switched.access_key != s3.access_key
+    {
+        bail!("the re-bound s3 record arrived with different addressing than was written");
+    }
+    ok("the other device reads the re-bound destination (gdrive -> s3)", t);
+
+    if !l_announced
+        .iter()
+        .any(|e| matches!(e, UsEvent::StorageChanged(prov) if prov == "s3"))
+    {
+        bail!(
+            "the remote destination change was not announced: {:?}",
+            describe_events(&l_announced)
+        );
+    }
+    ok("the remote destination change is ANNOUNCED, never silently adopted", Instant::now());
+
+    let p_events = p.call_us_events(acc).await?.map_err(|e| format_err!("{e}"))?;
+    if p_events.iter().any(|e| matches!(e, UsEvent::StorageChanged(_))) {
+        bail!(
+            "the re-binding device was announced its own storage write: {:?}",
+            describe_events(&p_events)
+        );
+    }
+    ok("the re-binding device drains no storage-changed of its own", Instant::now());
+    Ok(())
+}
+
+/// Field-for-field, including the client pair: this is the assertion
+/// that the account carries the whole destination, not a summary of it.
+fn same_gdrive(a: &UsStorageGdrive, b: &UsStorageGdrive) -> bool {
+    a.root == b.root
+        && a.api_base == b.api_base
+        && a.space == b.space
+        && a.client_id == b.client_id
+        && a.client_secret == b.client_secret
+}
+
+/// Provider + addressing only. Deliberately never prints the client
+/// pair, even though these are synthetic values: act output is a log.
+fn describe_storage(s: &Option<UsStorage>) -> String {
+    match s {
+        None => "none".into(),
+        Some(UsStorage::S3(v)) => format!("s3({}, {})", v.endpoint, v.bucket),
+        Some(UsStorage::Gdrive(v)) => format!("gdrive({}, {})", v.api_base, v.space),
+    }
+}
+
 fn describe_events(events: &[UsEvent]) -> Vec<String> {
     events
         .iter()
@@ -318,6 +482,7 @@ fn describe_events(events: &[UsEvent]) -> Vec<String> {
             UsEvent::MarkConflictRepaired((p, k)) => format!("mark-conflict-repaired({p},{k})"),
             UsEvent::DeviceAdded(n) => format!("device-added({n})"),
             UsEvent::DeviceRevoked(n) => format!("device-revoked({n})"),
+            UsEvent::StorageChanged(p) => format!("storage-changed({p})"),
         })
         .collect()
 }
@@ -466,6 +631,20 @@ pub(crate) async fn positive_acts(
     } else {
         results.push((
             "partition pointer syncs; group-delegated partition is readable by the joiner",
+            Err("not reached: the joiner never became a reader of the user-system partition".into()),
+        ));
+    }
+
+    if adopted {
+        results.push((
+            "the account's storage record syncs; a remote destination change is \
+             announced, never echoed to its writer",
+            act_storage_config(acc, l, p).await.map_err(|e| e.to_string()),
+        ));
+    } else {
+        results.push((
+            "the account's storage record syncs; a remote destination change is \
+             announced, never echoed to its writer",
             Err("not reached: the joiner never became a reader of the user-system partition".into()),
         ));
     }

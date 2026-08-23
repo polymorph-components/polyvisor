@@ -89,7 +89,15 @@ export type UsEvent =
   | { tag: "mark-changed"; provenance: string }
   | { tag: "mark-conflict-repaired"; provenance: string; field: "petname" | "icon" }
   | { tag: "device-added"; name: string }
-  | { tag: "device-revoked"; name: string };
+  | { tag: "device-revoked"; name: string }
+  /** The account's storage destination changed on another device.
+   * `provider` is the ENGINE's own word ("s3" | "gdrive") — framework
+   * vocabulary, not an app-influenced string, so it is admissible
+   * inline in an announcement sentence (see pairing.ts's three-voices
+   * note). DRIVE.md, "The account syncs its storage config; devices
+   * keep their credentials": other devices ANNOUNCE such a change,
+   * never silently adopt it. */
+  | { tag: "storage-changed"; provider: string };
 
 /** The async, WIT-shaped surface a pairing backend implements. Visor
  * code is written against exactly this interface and nothing wider —

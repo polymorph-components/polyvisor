@@ -87,7 +87,7 @@ import {
 import type { PairingDriver } from "../../visor/ui/pairing-driver.ts";
 import { createEnginePairingDriver } from "../../runtime/pairing-engine.ts";
 import type { UiEvent } from "../../visor/surface/events.ts";
-import { type EngineArtifacts, hex, unhex, until } from "../../runtime/engine.ts";
+import { type EngineArtifacts, hex, unhex, until, type UsStorage } from "../../runtime/engine.ts";
 import { adoptAnchor, clearAnchor } from "../../runtime/device-store/anchor.ts";
 import {
   connectDevice,
@@ -1483,6 +1483,109 @@ async function startApp(
    * ceremony) and the same bind. */
   let storageConnectInFlight = false;
 
+  /** THE ACCOUNT'S STORAGE RECORD as this sheet last read it, kept so a
+   * bind can tell whether it would be saying anything new. The diverge
+   * path (`#storage-diverge`) drops the adopt view but not this
+   * knowledge — that is what makes the redundant-put check possible
+   * from there too. */
+  let accountStorageSeen: UsStorage | undefined;
+
+  /** Is `a` the same destination `b` names? Field-wise, because the
+   * record is flat and the comparison is only ever used to SKIP work. */
+  const sameStorage = (a: UsStorage | undefined, b: UsStorage | undefined): boolean => {
+    if (!a || !b || a.kind !== b.kind) return false;
+    if (a.kind === "s3" && b.kind === "s3") {
+      return a.value.endpoint === b.value.endpoint && a.value.bucket === b.value.bucket &&
+        a.value.accessKey === b.value.accessKey;
+    }
+    if (a.kind === "gdrive" && b.kind === "gdrive") {
+      return a.value.root === b.value.root && a.value.apiBase === b.value.apiBase &&
+        a.value.space === b.value.space && a.value.clientId === b.value.clientId &&
+        a.value.clientSecret === b.value.clientSecret;
+    }
+    return false;
+  };
+
+  /**
+   * WRITE-THROUGH after a manual bind (DRIVE.md, "The account syncs its
+   * storage config; devices keep their credentials": the record is
+   * "written through when a device binds, announced on the others when
+   * it changes").
+   *
+   * SAME IDIOM AS `onIdentityCommitted` above (see its WRITE-THROUGH
+   * note, ~line 878): the local thing has already happened — the store
+   * is bound and the first flush landed — so the account is the source
+   * of truth CATCHING UP, and a failure here is ANNOUNCED rather than
+   * hidden or retried behind the user's back. Fire-and-forget for the
+   * same reason: nothing on screen is waiting for it.
+   *
+   * WHAT IT DOES NOT DO:
+   *   - it does not fire for a bind that ADOPTED the record (the caller
+   *     decides that), and it skips a record identical to the one
+   *     already in the account — track 1 diffs, so an identical put
+   *     raises no event on the other devices, but a redundant write to
+   *     the user-system doc is still a redundant write;
+   *   - it does not write a gdrive record without a client secret.
+   *     CONTRACT: `us-storage-gdrive.client-secret` is a plain `string`
+   *     with no "absent" case, and a record carrying an EMPTY one would
+   *     be actively harmful — a second device would adopt it, consent,
+   *     and then fail the token exchange with nothing on screen to
+   *     explain why. The conservative reading is to leave the account's
+   *     existing record alone and say so, which is what the announce
+   *     below does. (Reached when a bind reuses a consent this device
+   *     already holds and the secret field was left blank.)
+   */
+  const writeThroughAccountStorage = (
+    storage: StoreBinding | null,
+    clientSecret: string,
+  ) => {
+    if (storage === null) return;
+    let record: UsStorage;
+    if (storage.kind === "s3") {
+      // NO SECRET, STRUCTURALLY (DRIVE.md): `accessKey` is the public
+      // identifier; the SigV4 secret is a non-extractable handle and
+      // has no bytes to write. Each device escrows its own.
+      record = {
+        kind: "s3",
+        value: {
+          endpoint: storage.endpoint,
+          bucket: storage.bucket,
+          accessKey: storage.accessKey,
+        },
+      };
+    } else {
+      if (clientSecret === "") {
+        announce(
+          "this device is connected, but your account's storage settings were left unchanged " +
+            "— reconnect with the client secret to share this destination with your other " +
+            "devices",
+          true,
+        );
+        return;
+      }
+      record = {
+        kind: "gdrive",
+        value: {
+          root: storage.root,
+          apiBase: storage.apiBase,
+          space: storage.space,
+          clientId: storage.clientId,
+          clientSecret,
+        },
+      };
+    }
+    if (sameStorage(record, accountStorageSeen)) return;
+    void (async () => {
+      try {
+        await enqueue(() => driver.usStoragePut(record));
+        accountStorageSeen = record;
+        note("storage:account-written");
+      } catch (e) {
+        announce(`could not save your account's storage settings: ${err(e)}`, true);
+      }
+    })();
+  };
+
   openStorage = () => {
     const container = document.createElement("div");
     container.className = "cred-sheet";
@@ -1500,8 +1603,20 @@ async function startApp(
         if (storageTenant.owns(session)) storageTenant.close();
       };
       container.append(close);
-      void conn.status().then((st) => {
-        if (st.storage === null) renderUnbound(body);
+      // THE ACCOUNT'S RECORD IS READ ON EVERY OPEN AND EVERY RE-RENDER
+      // (DRIVE.md, "The account syncs its storage config; devices keep
+      // their credentials"): whether this device has a store of its own
+      // and whether its ACCOUNT has one are two different questions, and
+      // the interesting cell of that table — unbound device, bound
+      // account — is exactly the freshly-paired second device. A failed
+      // read is not a failed sheet: it degrades to the plain manual
+      // form, which is always correct, merely more typing.
+      void Promise.all([
+        conn.status(),
+        enqueue(() => driver.usStorageGet()).catch(() => undefined),
+      ]).then(([st, account]) => {
+        accountStorageSeen = account ?? undefined;
+        if (st.storage === null) renderUnbound(body, undefined, accountStorageSeen);
         else renderBound(body, st.storage);
       });
       return { root: container };
@@ -1513,20 +1628,58 @@ async function startApp(
    * "Change…" — whichever provider it names is the one selected and
    * pre-filled; the OTHER provider's fields start at their defaults,
    * and no secret is ever carried into a prefill (neither the S3 secret
-   * key nor the Drive client secret is held here to read back). */
-  const renderUnbound = (body: HTMLElement, prefill?: StoreBinding) => {
+   * key nor the Drive client secret is held here to read back).
+   *
+   * `account` FORKS THE VIEW (DRIVE.md, "The account syncs its storage
+   * config; devices keep their credentials"): when the account already
+   * carries a storage record and THIS device is unbound, the sheet
+   * leads with "your account syncs through …" and offers exactly the
+   * per-device half of the ceremony — the consent click (gdrive) or the
+   * secret-key escrow (s3). Nothing that syncs is typed again: typing a
+   * different-but-valid client id is the silent-fork failure mode the
+   * record exists to prevent.
+   *
+   * The account view is a MODE OF THIS FUNCTION rather than a second
+   * renderer, deliberately: the bind ceremony below (consent, escrow,
+   * `ensureBucket`/`storeGrant`/`bucketFlush`, the failure wording) is
+   * the same ceremony either way, and a copy of it would be a copy that
+   * drifts. What the mode changes is which values it reads and which
+   * fields it paints. */
+  const renderUnbound = (body: HTMLElement, prefill?: StoreBinding, account?: UsStorage) => {
+    // The synced record this render is ADOPTING, if any. Non-undefined
+    // means: every field that syncs comes from the account, not from
+    // this sheet — which is also what suppresses the write-through
+    // below (a bind that came FROM the record has nothing to write).
+    const adopting = account;
     const lead = document.createElement("p");
     lead.className = "cred-note";
-    lead.textContent =
-      "This device can sync through a bucket it reaches directly. Whichever provider you " +
-      "choose, the secret half of the ceremony is typed here and never stored as text.";
+    lead.id = "storage-lead";
+    if (adopting) {
+      // VISOR VOICE, and the destination is the USER'S own
+      // configuration (typed on their other device), so no plating
+      // applies — same reasoning as `renderBound`'s lead below.
+      lead.textContent = adopting.kind === "gdrive"
+        ? `Your account syncs its storage through the "${adopting.value.root}" folder in ` +
+          `${
+            adopting.value.space === "appdata"
+              ? "your Google Drive's hidden app data"
+              : "your Google Drive"
+          }. This device only needs your permission — nothing to type.`
+        : `Your account syncs its storage through ${adopting.value.bucket} at ` +
+          `${adopting.value.endpoint}. This device only needs the secret key for it — ` +
+          "the rest is already settled by your account.";
+    } else {
+      lead.textContent =
+        "This device can sync through a bucket it reaches directly. Whichever provider you " +
+        "choose, the secret half of the ceremony is typed here and never stored as text.";
+    }
     body.append(lead);
 
     // THE PROVIDER CHOICE (DRIVE.md §6). S3 is the default — it is the
     // provider this sheet has always offered — and choosing Drive shows
     // its own fields in place of S3's rather than beside them: the two
     // providers are alternatives, not a combined form.
-    let chosenKind: StoreBinding["kind"] = prefill?.kind ?? "s3";
+    let chosenKind: StoreBinding["kind"] = adopting?.kind ?? prefill?.kind ?? "s3";
     const kindField = field("Where do you want this device to sync?");
     const kindChoices: { value: StoreBinding["kind"]; id: string; label: string }[] = [
       { value: "s3", id: "storage-kind-s3", label: "S3-compatible object storage" },
@@ -1551,17 +1704,36 @@ async function startApp(
       line.append(label);
       kindField.append(line);
     }
-    body.append(kindField);
+    // THE PROVIDER CHOICE IS NOT OFFERED WHEN ADOPTING: an account has
+    // ONE store, so on this path the provider is already decided and a
+    // radio pair would be an invitation to fork it. The way to change
+    // the account's mind is the diverge link at the bottom, which is a
+    // different, louder gesture.
+    if (!adopting) body.append(kindField);
 
     // --- the S3 fields (unchanged ids: this is the existing sheet) ---------
     const s3Group = document.createElement("div");
     s3Group.hidden = chosenKind !== "s3";
 
+    // WHEN ADOPTING S3, addressing comes from the account and is
+    // SETTLED — shown, because the user is entitled to see where their
+    // data goes, but not editable, because every device must agree on
+    // it. The one input left is the secret key: "the SigV4 secret
+    // structurally cannot sync … each device still escrows the secret
+    // itself" (DRIVE.md, same section).
+    const acctS3 = adopting?.kind === "s3" ? adopting.value : undefined;
+    const settle = (input: HTMLInputElement) => {
+      if (!acctS3) return;
+      input.readOnly = true;
+      input.setAttribute("aria-readonly", "true");
+    };
+
     const endpointField = field("Endpoint");
     const endpointInput = document.createElement("input");
     endpointInput.type = "text";
     endpointInput.id = "storage-endpoint";
-    endpointInput.value = prefill?.kind === "s3" ? prefill.endpoint : "";
+    endpointInput.value = acctS3?.endpoint ?? (prefill?.kind === "s3" ? prefill.endpoint : "");
+    settle(endpointInput);
     endpointField.append(endpointInput);
     s3Group.append(endpointField);
 
@@ -1569,7 +1741,8 @@ async function startApp(
     const bucketInput = document.createElement("input");
     bucketInput.type = "text";
     bucketInput.id = "storage-bucket";
-    bucketInput.value = prefill?.kind === "s3" ? prefill.bucket : "";
+    bucketInput.value = acctS3?.bucket ?? (prefill?.kind === "s3" ? prefill.bucket : "");
+    settle(bucketInput);
     bucketField.append(bucketInput);
     s3Group.append(bucketField);
 
@@ -1577,20 +1750,27 @@ async function startApp(
     const accessInput = document.createElement("input");
     accessInput.type = "text";
     accessInput.id = "storage-access";
-    accessInput.value = prefill?.kind === "s3" ? prefill.accessKey : "";
+    accessInput.value = acctS3?.accessKey ?? (prefill?.kind === "s3" ? prefill.accessKey : "");
+    settle(accessInput);
     accessField.append(accessInput);
     s3Group.append(accessField);
 
     const secretField = field(
       "Secret key",
-      "Leave blank if this browser already holds the secret for this destination.",
+      acctS3
+        ? "The one thing your account cannot carry for you: it is held here as a key this " +
+          "browser can use and never read back."
+        : "Leave blank if this browser already holds the secret for this destination.",
     );
     const passInput = document.createElement("input");
     passInput.type = MASKED.type;
     passInput.id = "storage-secret";
     secretField.append(passInput);
     s3Group.append(secretField);
-    body.append(s3Group);
+    // Adopting a gdrive account leaves the S3 group off the page
+    // entirely rather than merely hidden: there is no provider choice
+    // on that path, so a hidden alternative form is dead weight.
+    if (!adopting || adopting.kind === "s3") body.append(s3Group);
 
     // --- the Drive fields (DRIVE.md §6) -------------------------------------
     const gdriveGroup = document.createElement("div");
@@ -1602,7 +1782,30 @@ async function startApp(
     // can rename or move them out from under a store that addresses
     // them by keyed name. The visible folder stays on offer because
     // some people want to see the thing they are trusting.
-    let chosenSpace: GdriveSpace = prefill?.kind === "gdrive" ? prefill.space : "appdata";
+    const acctGdrive = adopting?.kind === "gdrive" ? adopting.value : undefined;
+    // CONTRACT: engine.wit types the record's `space` as a bare
+    // `string`, not the two-case enum `GdriveSpace` — so a record
+    // written by a NEWER build could name a space this one does not
+    // know. That is REFUSED, not narrowed.
+    //
+    // Narrowing it (to the hidden app data, say, as the safer-looking of
+    // the two known values) would be the exact failure this whole
+    // feature exists to prevent: the account agreed on a destination,
+    // this device would flush into a DIFFERENT one, and in the appdata
+    // space the fork is invisible in the user's own Drive UI — a silent
+    // fork with a UI, DRIVE.md's own phrase. An unknown space is not a
+    // value to guess at; it is a device that is too old to join this
+    // account's store, and the honest move is to say so and refuse the
+    // bind. The diverge hatch below still works: rebinding the account
+    // is a legitimate answer to "my other device moved on".
+    const acctSpaceUnknown = acctGdrive !== undefined &&
+      acctGdrive.space !== "drive" && acctGdrive.space !== "appdata";
+    const acctSpace: GdriveSpace = acctGdrive?.space === "drive" ? "drive" : "appdata";
+    let chosenSpace: GdriveSpace = acctGdrive
+      ? acctSpace
+      : prefill?.kind === "gdrive"
+      ? prefill.space
+      : "appdata";
     const spaceField = field("Where in your Drive?");
     const spaceChoices: { value: GdriveSpace; id: string; label: string; note: string }[] = [
       {
@@ -1700,7 +1903,12 @@ async function startApp(
     gdSecretInput.value = "";
     gdSecretField.append(gdSecretInput);
     gdriveGroup.append(gdSecretField);
-    body.append(gdriveGroup);
+    // ADOPTING A DRIVE ACCOUNT PAINTS NO FIELDS AT ALL. Root, space,
+    // client id and client secret all ride the account precisely so a
+    // second device never types them — retyping is the silent-fork
+    // failure mode (DRIVE.md). What is left is the consent click, which
+    // is the button below.
+    if (!adopting) body.append(gdriveGroup);
 
     const problem = document.createElement("div");
     problem.className = "hint";
@@ -1716,15 +1924,36 @@ async function startApp(
     const connect = document.createElement("button");
     connect.type = "button";
     connect.id = "storage-connect";
-    connect.textContent = "Save & connect";
+    connect.textContent = adopting ? "Connect this device" : "Save & connect";
+    // THE REFUSAL (see the `acctSpaceUnknown` note above): a record
+    // naming a Drive space this build does not know cannot be adopted,
+    // because adopting it would mean flushing somewhere other than
+    // where the account agreed. Said in the visor's own voice, naming
+    // the cause and both ways out — and the button stays dead, so there
+    // is no path from here into the wrong store.
+    if (acctSpaceUnknown) {
+      problem.textContent =
+        "This account's storage was set up by a newer version of this app than this device is " +
+        "running — update this device, or choose a different destination below.";
+      problem.hidden = false;
+      connect.disabled = true;
+    }
     connect.onclick = () => {
+      // Belt as well as braces: the button is disabled above, so this is
+      // unreachable through the DOM — but "cannot adopt" is a rule about
+      // the BIND, not about a button's state, and it is cheaper to state
+      // it here than to rely on nobody ever calling `.click()` on a
+      // disabled element from a hook.
+      if (acctSpaceUnknown) return;
       if (storageConnectInFlight) return;
       storageConnectInFlight = true;
       connect.disabled = true;
       problem.hidden = true;
       const kind = chosenKind;
       // s3's fields, read once regardless of which provider is chosen —
-      // harmless, since only the chosen branch below uses them.
+      // harmless, since only the chosen branch below uses them. When
+      // adopting, the addressing inputs hold the account's own values
+      // (settled above), so reading them here is reading the record.
       const endpoint = endpointInput.value;
       const bucket = bucketInput.value;
       const access = accessInput.value;
@@ -1739,10 +1968,16 @@ async function startApp(
       // `oauthStart`, a blocked or closed popup, a timeout, or a failed
       // exchange all leave the field empty rather than sitting on a
       // typed secret.
-      const root = gdRootInput.value;
-      const client = gdClientInput.value;
+      //
+      // WHEN ADOPTING, these come from the ACCOUNT and not from the
+      // page: no gdrive field was painted at all on that path. The
+      // client secret arrives over the account's keyhive-E2E channel
+      // rather than through a keyboard, which is exactly the ruling —
+      // app identity may ride the account, user credentials may not.
+      const root = acctGdrive?.root ?? gdRootInput.value;
+      const client = acctGdrive?.clientId ?? gdClientInput.value;
       const space = chosenSpace;
-      const gdSecret = gdSecretInput.value;
+      const gdSecret = acctGdrive?.clientSecret ?? gdSecretInput.value;
       gdSecretInput.value = "";
       void enqueue(async () => {
         let step = "init";
@@ -1890,7 +2125,8 @@ async function startApp(
             const st = await conn.bindStore({
               kind: "gdrive",
               root,
-              apiBase: gdriveEndpoints.apiBase ?? "https://www.googleapis.com",
+              apiBase: acctGdrive?.apiBase ?? gdriveEndpoints.apiBase ??
+                "https://www.googleapis.com",
               clientId: client,
               space,
             });
@@ -1910,6 +2146,16 @@ async function startApp(
             announce("this device now syncs through your Drive folder");
           }
           storageConnectInFlight = false;
+          if (adopting) {
+            // THE HEADLINE, as a breadcrumb: this bind used the
+            // account's synced record, so nothing that syncs was typed
+            // on this device.
+            note("storage:account-adopted");
+          } else {
+            // WRITE-THROUGH, and DELIBERATELY NOT when adopting: a bind
+            // that came FROM the record has nothing to say back to it.
+            writeThroughAccountStorage(bound.storage, gdSecret);
+          }
           body.replaceChildren();
           if (bound.storage) renderBound(body, bound.storage);
         } catch (e) {
@@ -1930,6 +2176,31 @@ async function startApp(
       });
     };
     body.append(connect);
+
+    // THE ESCAPE HATCH. Adopting is the right default and not an
+    // obligation: an account member may legitimately want to REBIND THE
+    // ACCOUNT — a bucket that is going away, a Drive client being
+    // replaced. So the adopt view offers a way to the full manual form,
+    // quietly (a link, not a second primary button), and the bind that
+    // follows it is an ordinary manual bind: it writes the record
+    // through, and the OTHER devices announce the change rather than
+    // silently adopting it (DRIVE.md).
+    if (adopting) {
+      const diverge = document.createElement("button");
+      diverge.type = "button";
+      diverge.id = "storage-diverge";
+      diverge.className = "hint";
+      diverge.textContent = "use a different destination…";
+      diverge.onclick = () => {
+        if (storageConnectInFlight) return;
+        body.replaceChildren();
+        // No `account` — that is the whole gesture. `accountStorageSeen`
+        // still remembers the record, so a bind that lands on the very
+        // same destination anyway still skips its redundant put.
+        renderUnbound(body);
+      };
+      body.append(diverge);
+    }
   };
 
   /** THE BOUND VIEW: what this device syncs through, sync-now, and the
@@ -2615,6 +2886,14 @@ async function startApp(
      * the SPACE it was granted for, which is what makes the skip
      * space-aware. */
     gdriveConsent: async () => (await conn.status()).gdriveConsent,
+    /** The ACCOUNT'S storage record, or null — the other half of the
+     * table `storageStatus` reads one column of. The interesting cell is
+     * (device unbound, account bound): a freshly paired device, whose
+     * sheet leads with "your account syncs through …" (DRIVE.md, "The
+     * account syncs its storage config; devices keep their
+     * credentials"). Read straight from the engine, not from whatever
+     * the sheet last cached, so a scenario can assert the SYNCED fact. */
+    accountStorage: async () => (await enqueue(() => driver.usStorageGet())) ?? null,
     /** The strip's settings button. `openDevice`/`openAdd` above press
      * it on their way to an extra action; the erase ceremony's own way
      * in is a button on the settings sheet itself, so it needs the first

@@ -279,6 +279,8 @@ export const DRIVER_METHODS = [
   "usMarkConfirm",
   "usPartitionPut",
   "usPartitions",
+  "usStoragePut",
+  "usStorageGet",
   "usContactsList",
   "usContactPut",
   "usDevicesList",
@@ -343,6 +345,12 @@ export const READONLY_METHODS: ReadonlySet<string> = new Set([
   "usProfileGet",
   "usMarksList",
   "usPartitions",
+  // `usStorageGet` is a pure read of the account's storage record.
+  // `usStoragePut` is DELIBERATELY ABSENT: it writes the user-system
+  // doc, so it is a mutation and must schedule a checkpoint — that
+  // scheduling is exactly what makes a freshly bound destination
+  // survive a worker kill and come back on unseal.
+  "usStorageGet",
   "usContactsList",
   "usDevicesList",
   "stats",
