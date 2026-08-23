@@ -566,8 +566,11 @@ export interface DrawerSheet {
    * and before `.armed` lands on the root. Only the still-current
    * session ever reaches this. */
   onArmed?: () => void;
-  /** Run once the reveal animation has been started — where a sheet with
-   * no arming delay takes focus. */
+  /** Run once the reveal animation has been started — where a sheet
+   * takes focus, IF it should: only when typing into one specific input
+   * is the interaction the user asked for (the naming sheet), never
+   * merely because the sheet contains inputs — on mobile an autofocused
+   * input raises the keyboard over the drawer it belongs to. */
   onShown?: () => void;
 }
 
@@ -1607,8 +1610,8 @@ export function initVisor(config: VisorConfig): Visor {
           sheet.root.classList.add("armed");
         }, ARM_MS);
       }
-      // Where a sheet with no arming delay takes focus: there is nothing
-      // on it a mis-tap could spend.
+      // Where a sheet takes focus, if its interaction warrants taking it
+      // at all (see `DrawerSheet.onShown`).
       sheet.onShown?.();
     };
 

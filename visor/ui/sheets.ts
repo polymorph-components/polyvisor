@@ -945,8 +945,10 @@ export function registerVisorSheets(visor: Visor, config: VisorSheetsConfig): Vi
       // sheet that hangs off it) and the reveal are the host's.
       return {
         root: built.root,
-        // No arming delay (see the naming tenant's spec): focus is given
-        // immediately, because there is nothing here a mis-tap could spend.
+        // Focus is taken here because typing the petname IS the requested
+        // interaction — the sheet exists for that one field — and taking
+        // it is safe because there is no arming delay to respect (see the
+        // naming tenant's spec): nothing here a mis-tap could spend.
         onShown: () => built.input.focus(),
       };
     });
@@ -1259,13 +1261,13 @@ export function registerVisorSheets(visor: Visor, config: VisorSheetsConfig): Vi
         closeSettings();
       };
 
-      return {
-        root: built.root,
-        // No arming delay (see the settings tenant's spec): focus goes
-        // straight to the first field, because there is nothing here a
-        // mis-tap could spend.
-        onShown: () => built.nameInput.focus(),
-      };
+      // No `onShown` focus: the user asked for SETTINGS, not for any one
+      // field of it — name, device, icon and colour are all equally the
+      // errand, so pre-focusing the name input would be a guess. On
+      // mobile the guess also costs pixels: focusing an input raises the
+      // keyboard, which covers part of the sheet it was raised over.
+      // (Contrast the naming sheet, where typing IS the interaction.)
+      return { root: built.root };
     });
   };
 
