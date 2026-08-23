@@ -28,10 +28,20 @@
 //                  platform key living as a structured-cloned handle in
 //                  the namespace. See `enableUntilReseal` for the
 //                  honest sentence.
+//   passkey        the DEK wrapped under a KEK derived from a WebAuthn
+//                  PRF output — HKDF-SHA-256 → AES-KW, the passphrase
+//                  rung's ladder with the human secret replaced by a
+//                  credential the authenticator gates behind presence
+//                  plus verification. The CEREMONY IS NOT HERE: it
+//                  cannot be, because `navigator.credentials` is
+//                  window-only. This module only ever sees the derived
+//                  KEK handle (passkey.ts is the window half; the
+//                  design record is PERSISTENCE.md's "The PRF rung:
+//                  passkey unseal").
 //
-// Argon2 and the WebAuthn PRF rung are RECORDED FUTURE RUNGS, not this
-// track's: the wrap record carries a `kdf` tag so a later rung can be
-// told apart from this one rather than guessed at.
+// Argon2 is a RECORDED FUTURE RUNG, not this module's: each wrap record
+// carries a `kdf` tag so a later rung can be told apart from these
+// rather than guessed at.
 
 import type { DeviceNamespace } from "./namespace.ts";
 
@@ -46,6 +56,11 @@ export class SealError extends Error {
   constructor(
     readonly code:
       | "wrong-passphrase"
+      /** The passkey ceremony ran and the KEK it derived did not open
+       * the wrap — a wrong credential, a wrong PRF input, or a wrap
+       * record copied in from another device. Indistinguishable by
+       * construction, exactly as `wrong-passphrase` is. */
+      | "wrong-passkey"
       | "no-rung"
       | "already-sealed"
       | "tampered"
@@ -68,6 +83,7 @@ export class SealError extends Error {
 const KEY_PASSPHRASE_WRAP = "wrap:passphrase";
 const KEY_PLATFORM_WRAP = "wrap:platform";
 const KEY_PLATFORM_KEK = "kek:platform";
+const KEY_PRF_WRAP = "wrap:prf";
 
 /** PBKDF2 parameters, v1. 600k iterations is OWASP's 2023 floor for
  * PBKDF2-HMAC-SHA-256; the salt is 16 fresh random bytes per wrap, so
@@ -116,6 +132,67 @@ interface PlatformWrap {
   wrapped: Uint8Array;
 }
 
+/**
+ * THE PASSKEY RUNG'S RECORD (PERSISTENCE.md, "The PRF rung: passkey
+ * unseal"). A sibling of `PassphraseWrap`, with the same at-rest
+ * posture and a different honest sentence.
+ *
+ * WHAT A READER OF THIS STORE LEARNS, stated as plainly as the
+ * passphrase wrap's exposure is stated above: that the device has a
+ * passkey rung; WHICH credential opens it (`credentialId` plus the
+ * `transports` routing hints and the `rpId` — an identifier and where
+ * to look for it, not secrets); the two fresh-random 32-byte salts;
+ * and 40-odd bytes of wrapped key. Unlike the passphrase wrap there is
+ * NO HUMAN-CHOSEN SECRET behind those bytes to guess at offline: the
+ * key material rests in the authenticator, which demands presence and
+ * verification per ceremony, so possession of this record is not the
+ * start of an attack the way a passphrase wrap is.
+ *
+ * NO `origin` FIELD, deliberately, and the absence is load-bearing.
+ * `PassphraseWrap` needs one because a passphrase rung may be a door
+ * with no key (`sealT0`'s generated wrap). A PRF rung cannot be: it
+ * only ever exists because a person ran an enrollment ceremony on an
+ * authenticator they hold, so it is ALWAYS a door somebody can walk
+ * through. That is the fact the reseal-upgrade guard consults
+ * (worker.ts's `reseal`), and it is true by construction rather than
+ * by a recorded bit.
+ */
+interface PrfWrap {
+  v: 1;
+  /** Names THIS construction, so a later rung (a rotated input, a
+   * different KDF) is told apart rather than guessed at — the `kdf`
+   * tag's job on the passphrase wrap too. */
+  kdf: "prf-hkdf-sha-256";
+  credentialId: Uint8Array;
+  transports?: string[];
+  rpId: string;
+  /** The 32 random bytes handed to the PRF extension as `eval.first`.
+   * Fresh per wrap; not a secret (the authenticator's per-credential
+   * key is what makes the output unpredictable). */
+  prfInput: Uint8Array;
+  /** HKDF's salt, 32 fresh random bytes. */
+  hkdfSalt: Uint8Array;
+  /** The DEK wrapped with AES-KW under the derived KEK. */
+  wrapped: Uint8Array;
+}
+
+/**
+ * What the PAGE hands the worker beside the KEK at enrollment, and
+ * what it reads back (`getPrfEnrollment`) to run an unseal assertion.
+ *
+ * It is `PrfWrap` MINUS the wrapped bytes: the ceremony half of the
+ * record and nothing that a page has any use for. The page cannot
+ * unwrap anyway — the DEK never crosses to it — so handing it the wrap
+ * would be exposure bought for nothing.
+ */
+export interface PrfEnrollment {
+  credentialId: Uint8Array;
+  transports?: string[];
+  rpId: string;
+  prfInput: Uint8Array;
+  hkdfSalt: Uint8Array;
+}
+
 /** What rungs this device actually has — the picker's question, asked
  * without opening anything. */
 export interface SealState {
@@ -128,17 +205,23 @@ export interface SealState {
   userPassphrase: boolean;
   /** This device auto-unseals from the platform key until reseal. */
   untilReseal: boolean;
+  /** This device has a passkey rung. Unlike `passphrase`, this bit
+   * needs no companion "does anybody know it": a PRF rung is always
+   * reachable by whoever holds the authenticator (see `PrfWrap`). */
+  prf: boolean;
 }
 
 export async function sealState(ns: DeviceNamespace): Promise<SealState> {
-  const [p, k] = await Promise.all([
+  const [p, k, r] = await Promise.all([
     ns.get<PassphraseWrap>("seal", KEY_PASSPHRASE_WRAP),
     ns.get<PlatformWrap>("seal", KEY_PLATFORM_WRAP),
+    ns.get<PrfWrap>("seal", KEY_PRF_WRAP),
   ]);
   return {
     passphrase: p !== undefined,
     userPassphrase: p !== undefined && p.origin === "user",
     untilReseal: k !== undefined,
+    prf: r !== undefined,
   };
 }
 
@@ -474,6 +557,190 @@ export async function unsealFromPlatform(ns: DeviceNamespace): Promise<CryptoKey
   }
 }
 
+// --- the `passkey` rung -----------------------------------------------------
+//
+// THE WORKER'S HALF, AND ONLY THAT HALF. WebAuthn cannot run here
+// (`navigator.credentials` is window-only), so the assertion runs on the
+// PAGE, the page derives the KEK, and what reaches this module is the
+// NON-EXTRACTABLE AES-KW handle — a CryptoKey structured-clones through
+// `postMessage` exactly as it does into IndexedDB (spikes/prf-unseal,
+// row 9). The raw PRF output never comes near this module.
+
+/**
+ * VALIDATE THE CROSSED KEK BEFORE USING IT — the same refusal
+ * `unsealFromPlatform` makes about a persisted platform key, for the
+ * same reason wearing different clothes.
+ *
+ * A key that arrived from somewhere else is untrusted input. There it
+ * arrives from IndexedDB, which anything on this origin may write; here
+ * it arrives over the port from the page, which anything running on this
+ * origin may hold. Either way an EXTRACTABLE key, or one whose algorithm
+ * is not AES-KW, is not the handle this ceremony was designed around, and
+ * using it anyway would mean wrapping the device's DEK under something
+ * whose material can be read back. So it is refused as `tampered` rather
+ * than coerced.
+ *
+ * Both usages matter and both are checked at the operation, not here:
+ * enrollment needs `wrapKey`, unseal needs `unwrapKey`, and passkey.ts
+ * derives with both — WebCrypto raises on a usage the key does not have,
+ * which is a refusal in its own right.
+ */
+function requirePrfKek(kek: CryptoKey): void {
+  if (!(kek instanceof CryptoKey) || kek.extractable !== false || kek.algorithm.name !== "AES-KW") {
+    throw new SealError(
+      "tampered",
+      "the passkey KEK handed to this ceremony is not a usable non-extractable AES-KW key",
+    );
+  }
+}
+
+/**
+ * The ceremony metadata the page needs to run an unseal assertion:
+ * which credential, where to look for it, and the PRF input to ask it
+ * to evaluate. The WRAPPED BYTES ARE NOT RETURNED — the page has no use
+ * for them and no way to open them.
+ *
+ * `undefined` when this device has no passkey rung, which is the normal
+ * case rather than an error (the picker asks this to decide whether to
+ * offer the button).
+ *
+ * VALIDATE-ON-LOAD, for `unsealFromPlatform`'s reason: the `seal` store
+ * is writable by anything else on this origin, so a record read back out
+ * is untrusted input. A malformed one is refused as `tampered` rather
+ * than handed to a ceremony that would then ask an authenticator to
+ * evaluate whatever bytes were planted in it.
+ */
+export async function getPrfEnrollment(
+  ns: DeviceNamespace,
+): Promise<PrfEnrollment | undefined> {
+  const rec = await readPrfWrap(ns);
+  if (!rec) return undefined;
+  const out: PrfEnrollment = {
+    credentialId: rec.credentialId,
+    rpId: rec.rpId,
+    prfInput: rec.prfInput,
+    hkdfSalt: rec.hkdfSalt,
+  };
+  if (rec.transports?.length) out.transports = rec.transports;
+  return out;
+}
+
+/**
+ * Load the PRF wrap and validate its shape — the ONE reader both
+ * ceremonies go through, so a planted record is refused identically
+ * whether the page is about to run an assertion or the worker is about
+ * to unwrap. The salts are pinned at the length this construction
+ * writes (32 bytes): a planted 1-byte input would otherwise reach an
+ * authenticator ceremony before anything refused it.
+ */
+async function readPrfWrap(ns: DeviceNamespace): Promise<PrfWrap | undefined> {
+  const rec = await ns.get<PrfWrap>("seal", KEY_PRF_WRAP);
+  if (!rec) return undefined;
+  const bytes = (v: unknown): v is Uint8Array => v instanceof Uint8Array && v.length > 0;
+  const salt = (v: unknown): v is Uint8Array => v instanceof Uint8Array && v.length === 32;
+  const ok = rec.v === 1 && rec.kdf === "prf-hkdf-sha-256" &&
+    bytes(rec.credentialId) && salt(rec.prfInput) && salt(rec.hkdfSalt) &&
+    bytes(rec.wrapped) &&
+    typeof rec.rpId === "string" && rec.rpId.length > 0 &&
+    (rec.transports === undefined ||
+      (Array.isArray(rec.transports) && rec.transports.every((t) => typeof t === "string")));
+  if (!ok) throw new SealError("tampered", "this device's passkey rung record is not readable");
+  return rec;
+}
+
+/**
+ * ADD THE PASSKEY RUNG: re-wrap this device's DEK under a KEK the page
+ * derived from a passkey's PRF output.
+ *
+ * WHAT AUTHORIZES IT, stated as plainly as `rekeyFromPlatform` states
+ * its own. Preferentially the PLATFORM rung — a device at the promotion
+ * moment always has one, and its existing passphrase rung may well be
+ * the door with no key `sealT0` left behind. That authorization is
+ * possession of the profile, which is exactly the `until-reseal` tier's
+ * honest strength and not a widening: anything that could call this
+ * could equally call `unsealFromPlatform` and read the device. When the
+ * platform rung is gone (a resealed device being switched to passkey
+ * unseal on the this-device sheet) the authority is the PASSPHRASE,
+ * which the sheet asks for and which is that device's login anyway.
+ * With neither, this refuses — there is no third authority, and a
+ * ceremony that re-wrapped a DEK on nobody's say-so would be one.
+ *
+ * IT DOES NOT DELETE THE PLATFORM WRAP. Shutting that door is the
+ * caller's half, exactly as it is for `every-session` (worker.ts's
+ * `promote` calls `reseal` after this returns): the decision "a user who
+ * asked to be asked must not leave a silent door standing" belongs to
+ * the ceremony that knows what the user chose, not to the re-wrap.
+ *
+ * ONE WRITE, after every fallible step has already succeeded — the
+ * assertion, the derivation, the unwrap and the re-wrap all happen
+ * first, so a failed enrollment leaves the device exactly as it was.
+ */
+export async function enablePrf(
+  ns: DeviceNamespace,
+  kek: CryptoKey,
+  enrollment: PrfEnrollment,
+  authz: { passphrase?: string },
+): Promise<void> {
+  requirePrfKek(kek);
+  const rungs = await sealState(ns);
+  let dek: CryptoKey;
+  if (rungs.untilReseal) {
+    dek = await wrappableDekFromPlatform(ns);
+  } else if (authz.passphrase !== undefined) {
+    dek = await wrappableDek(ns, authz.passphrase);
+  } else {
+    throw new SealError(
+      "no-rung",
+      "enrolling a passkey needs an authority: this device has no platform rung, " +
+        "and no passphrase was offered",
+    );
+  }
+  const record: PrfWrap = {
+    v: 1,
+    kdf: "prf-hkdf-sha-256",
+    credentialId: enrollment.credentialId,
+    rpId: enrollment.rpId,
+    prfInput: enrollment.prfInput,
+    hkdfSalt: enrollment.hkdfSalt,
+    wrapped: await wrapDek(dek, kek),
+  };
+  if (enrollment.transports?.length) record.transports = enrollment.transports;
+  await ns.put("seal", KEY_PRF_WRAP, record);
+}
+
+/**
+ * THE LOGIN, passkey flavour: open the device with the KEK the page
+ * derived from a fresh assertion. The returned handle is
+ * non-extractable and is the whole unsealed state, exactly as
+ * `unsealWithPassphrase`'s is.
+ *
+ * A FAILED UNWRAP IS ONE BIT, deliberately. AES-KW's integrity check
+ * fails inside WebCrypto and no partial key ever exists to be mistaken
+ * for a real one, so "a different credential answered", "the PRF input
+ * was not the one this wrap was made with" and "this record was copied
+ * in from another device" are indistinguishable here — the same
+ * property that makes a wrong passphrase a clean refusal. The last of
+ * those three is why the derivation binds the device id into HKDF's
+ * `info` (passkey.ts): a wrap carried between namespaces refuses HERE,
+ * as a typed `wrong-passkey`, instead of opening a foreign DEK and
+ * surfacing as GCM tamper noise somewhere downstream.
+ */
+export async function unsealWithPrf(ns: DeviceNamespace, kek: CryptoKey): Promise<CryptoKey> {
+  // The validated reader, so a MALFORMED record refuses as `tampered`
+  // here too — "someone altered the record" and "the right record, the
+  // wrong key" are different facts and get different codes.
+  const rec = await readPrfWrap(ns);
+  if (!rec) throw new SealError("no-rung", "this device has no passkey rung");
+  requirePrfKek(kek);
+  try {
+    return await unwrapDek(rec.wrapped, kek, false);
+  } catch {
+    // Nothing was written and nothing cached; the caller learns exactly
+    // one bit.
+    throw new SealError("wrong-passkey", "that passkey did not open this device");
+  }
+}
+
 /**
  * RESEAL (PERSISTENCE.md, "Unseal UX"): delete the persisted wrap and
  * the platform key handle, so the next boot has to ask for the
@@ -483,6 +750,11 @@ export async function unsealFromPlatform(ns: DeviceNamespace): Promise<CryptoKey
  * The handle goes too, not just the wrap. Leaving a non-extractable key
  * lying in the namespace would leave the thing whose existence the user
  * just asked to end.
+ *
+ * THE PASSKEY WRAP SURVIVES, and that is the design record's ruling
+ * (PERSISTENCE.md, "The PRF rung", "Reseal"): an assertion per unseal is
+ * that rung's whole point, so what it leaves behind opens nothing on its
+ * own — there is no door here to shut.
  */
 export async function reseal(ns: DeviceNamespace): Promise<void> {
   await ns.delete("seal", KEY_PLATFORM_WRAP);

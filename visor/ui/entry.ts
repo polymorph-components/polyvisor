@@ -88,6 +88,14 @@ export interface DevicePickerRow {
   /** The index's unseal-policy tag, which PREDICTS the ceremony before
    * anything is attached: true = this row will ask for a passphrase. */
   asksPassphrase: boolean;
+  /** The same tag, read for the OTHER ceremony: true = this row will ask
+   * for a passkey (runtime/PERSISTENCE.md, "The PRF rung: passkey
+   * unseal"). MUTUALLY EXCLUSIVE WITH `asksPassphrase` BY
+   * CONSTRUCTION — a policy names exactly ONE ceremony to OFFER, and the
+   * offered one is not the only door: a passkey row still reaches the
+   * passphrase field through the fallback control below, because rungs
+   * are additive and the tag never claimed otherwise. */
+  asksPasskey: boolean;
 }
 
 /** What a `DevicePickerHost.open` rejection may carry to land a refusal
@@ -106,6 +114,25 @@ export interface DevicePickerHost {
    * opened, and this module closes the sheet. Reject with a
    * `PickerRefusal`-shaped value to keep the sheet up and say why. */
   open(row: DevicePickerRow, passphrase?: string): Promise<void>;
+  /** Open `row` through its PASSKEY ceremony: the host runs the WebAuthn
+   * assertion, derives the key that unwraps the device, and opens it.
+   *
+   * THE CEREMONY IS THE HOST'S, NOT THE VISOR'S, and that is the seam
+   * this optional method exists to keep: `navigator.credentials` is
+   * window-only and embedder-side, the visor never touches a credential,
+   * and nothing about the device store is imported here. The visor
+   * renders the door; the host walks it.
+   *
+   * Same resolve/reject contract as `open`: resolve = opened and this
+   * module closes the sheet; reject with a `PickerRefusal`-shaped value
+   * to keep the sheet up and say why (`needsPassphrase: true` reveals
+   * the passphrase field — the fallback the record allows for a device
+   * that also carries a user-origin rung).
+   *
+   * OPTIONAL because an embedder may have no passkey path at all; a row
+   * that asks for one on such a host is told so plainly rather than
+   * silently offered a ceremony nobody will run. */
+  openWithPasskey?(row: DevicePickerRow): Promise<void>;
   /** "Set up a new device here." Same resolve/reject contract; a new
    * device never needs a passphrase, so a refusal here is only ever a
    * report. */
@@ -202,6 +229,34 @@ export function mountDevicePicker(
   passOpen.textContent = "Open this device";
   pass.append(passLabelEl, passInput, passOpen);
 
+  // THE PASSKEY BLOCK — a sibling of the passphrase field, and part of
+  // the PERSISTENT ROOT for the same reason it is: it is created once,
+  // hidden, and merely revealed, so a rebuild under a refusal cannot
+  // wipe the screen the user is mid-ceremony on.
+  const passkey = document.createElement("div");
+  passkey.id = "device-passkey";
+  passkey.hidden = true;
+  const passkeyLabelEl = document.createElement("label");
+  const passkeyFor = document.createElement("span");
+  passkeyFor.id = "device-passkey-for";
+  // USER VOICE for the petname, framework voice for the sentence around
+  // it — the same shape as the passphrase label above.
+  passkeyLabelEl.append(document.createTextNode("The passkey for "), passkeyFor);
+  const passkeyOpen = document.createElement("button");
+  passkeyOpen.type = "button";
+  passkeyOpen.id = "device-passkey-open";
+  passkeyOpen.textContent = "Use your passkey";
+  // THE FALLBACK, offered unconditionally on a passkey row: the policy
+  // tag names the ceremony to OFFER, not the only door
+  // (runtime/PERSISTENCE.md, "Unseal"). A device with no user-origin
+  // passphrase simply refuses at the host, exactly as a wrong one would.
+  const passkeyFallback = document.createElement("button");
+  passkeyFallback.type = "button";
+  passkeyFallback.id = "device-passkey-fallback";
+  passkeyFallback.className = "entry-secondary";
+  passkeyFallback.textContent = "use your passphrase instead";
+  passkey.append(passkeyLabelEl, passkeyOpen, passkeyFallback);
+
   const problem = document.createElement("div");
   problem.id = "device-problem";
   problem.className = "entry-problem";
@@ -212,7 +267,7 @@ export function mountDevicePicker(
   newBtn.id = "device-new";
   newBtn.textContent = "Set up a new device here";
 
-  root.append(heading, note, list, pass, problem, newBtn);
+  root.append(heading, note, list, pass, passkey, problem, newBtn);
 
   /** THE HEIGHT IS MEASURED, so every visibility change owes the drawer
    * a re-measure: the sheet animates to a pixel target and clips
@@ -228,6 +283,11 @@ export function mountDevicePicker(
   };
 
   const askFor = (row: DevicePickerRow) => {
+    // ONE CEREMONY ON SCREEN AT A TIME: revealing the passphrase field
+    // is also how the passkey row's fallback is taken, and two doors up
+    // at once would be the sheet failing to say which one it is asking
+    // for.
+    passkey.hidden = true;
     pass.hidden = false;
     // USER VOICE: the petname is the user's own word, said plainly in
     // the visor's sentence — not quoted, not plated.
@@ -265,6 +325,65 @@ export function mountDevicePicker(
     }
   };
 
+  /** Reveal the passkey ceremony for `row` and wire its two controls.
+   *
+   * THE BUSY GUARD HAS ONE OWNER HERE. The click handler takes it, and
+   * the same handler is the only path that releases it: the host runs
+   * the WHOLE open (assertion, derivation, unseal), so there is no
+   * nested `choose()` to hand ownership to — and handing it over was
+   * precisely how an earlier round left the ceremony permanently
+   * no-opping. A second click while an authenticator prompt is pending
+   * must not raise a second prompt. */
+  const askForPasskey = (row: DevicePickerRow) => {
+    pass.hidden = true;
+    passkey.hidden = false;
+    // USER VOICE: the petname plain, unquoted, as everywhere else.
+    passkeyFor.textContent = row.petname;
+
+    passkeyOpen.onclick = () => {
+      // AN EMBEDDER THAT CANNOT: honest degrade rather than a silent
+      // swap to a ceremony the user did not ask for. The row's policy
+      // says "passkey"; this host has no passkey path; the sheet says
+      // exactly that and stays where it is. The fallback control below
+      // is still there for a user who does know this device's
+      // passphrase.
+      if (host.openWithPasskey === undefined) {
+        showProblem("this page cannot open devices with a passkey");
+        resize();
+        return;
+      }
+      if (busy) return;
+      busy = true;
+      problem.hidden = true;
+      resize();
+      void host.openWithPasskey(row).then(() => {
+        tenant.close();
+      }, (e: unknown) => {
+        busy = false;
+        // NOT A DEAD END: the button stays clickable (a cancelled or
+        // refused ceremony is a thing to try again), and only a refusal
+        // that says the device wants its passphrase grows the field.
+        const refusal = refusalOf(e);
+        showProblem(refusal.message);
+        if (refusal.needsPassphrase) askFor(row);
+        else resize();
+      });
+    };
+
+    passkeyFallback.onclick = () => {
+      // BUSY-GATED: the screen must not be swapped out from under a
+      // pending authenticator prompt.
+      if (busy) return;
+      askFor(row);
+    };
+
+    // MEASURE AFTER THE REVEAL, before anything else (askFor's ordering,
+    // and its reason: the block lives in a clipped box whose height just
+    // changed). Nothing here takes focus — the interaction the user
+    // asked for is a button press, not typing.
+    resize();
+  };
+
   for (const row of rows) {
     const item = document.createElement("div");
     item.className = "device-row";
@@ -283,7 +402,8 @@ export function mountDevicePicker(
     item.append(btn, when);
     list.append(item);
     btn.onclick = () => {
-      if (row.asksPassphrase) askFor(row);
+      if (row.asksPasskey) askForPasskey(row);
+      else if (row.asksPassphrase) askFor(row);
       else void choose(row);
     };
   }

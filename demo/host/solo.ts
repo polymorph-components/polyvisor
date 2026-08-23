@@ -101,6 +101,12 @@ import {
   type UnsealPolicy,
 } from "../../runtime/device-store/index.ts";
 import type { DeviceStatus } from "../../runtime/device-store/rpc.ts";
+// THE PAGE HALF OF THE PASSKEY RUNG (PERSISTENCE.md, "The PRF rung:
+// passkey unseal"). `navigator.credentials` is window-only, so the
+// enrollment/assertion ceremonies live here — on the embedder's side of
+// the visor seam — and hand the worker only a non-extractable derived
+// KEK: never a passphrase-shaped secret, never the DEK.
+import { assertPasskey, enrollPasskey, prfCapability } from "../../runtime/device-store/passkey.ts";
 
 const params = new URLSearchParams(location.search);
 // Same default as demo.ts: n0's public relay, overridable with ?relay=…
@@ -403,11 +409,15 @@ async function openNew(devices: DeviceRecord[]): Promise<DeviceConnection> {
 
 /** Attach to a known device and open it. `passphrase` is the
  * `every-session` rung's input and is not held anywhere: it goes over
- * the port and out of scope. */
+ * the port and out of scope. `prfKek` is the passkey rung's input — the
+ * non-extractable handle the page derived (`assertPasskey`) — and is
+ * under the same non-retention discipline: it crosses the port and is
+ * out of scope here too. */
 async function open(
   id: string,
   passphrase: string | undefined,
   status: (s: string) => void,
+  prfKek?: CryptoKey,
 ): Promise<DeviceConnection> {
   const conn = await connectDevice({
     device: { kind: "id", id },
@@ -415,7 +425,11 @@ async function open(
     artifacts: ENGINE_ARTIFACTS,
     label: "solo",
   });
-  const st = await conn.unseal(passphrase === undefined ? {} : { passphrase });
+  const opts: { passphrase?: string; prfKek?: CryptoKey } = {};
+  if (passphrase !== undefined) opts.passphrase = passphrase;
+  if (prfKek !== undefined) opts.prfKek = prfKek;
+  const st = await conn.unseal(opts);
+
   status(`device ${conn.deviceId.slice(0, 8)}… open (resumed: ${st.resumed})`);
   return conn;
 }
@@ -454,6 +468,7 @@ function picker(
     petname: d.petname,
     lastUsed: d.lastUsed,
     asksPassphrase: d.unsealPolicy === "every-session",
+    asksPasskey: d.unsealPolicy === "passkey",
   }));
 
   // The driving hooks for this screen, installed ONCE and querying
@@ -472,6 +487,7 @@ function picker(
       (b) => b.textContent ?? "",
     ),
     needsPassphrase: shown("device-pass"),
+    needsPasskey: shown("device-passkey"),
     problem: shown("device-problem") ? el("device-problem")!.textContent ?? "" : "",
   });
   hooks.pickDevice = (petname: string) => {
@@ -490,6 +506,11 @@ function picker(
     return true;
   };
   hooks.unsealClick = () => (el("device-pass-open") as HTMLButtonElement | null)?.click();
+  /** The passkey ceremony's own button, clicked as a user clicks it —
+   * the ceremony behind it is a real WebAuthn assertion either way. */
+  hooks.passkeyUnsealClick = () =>
+    (el("device-passkey-open") as HTMLButtonElement | null)?.click();
+
 
   return new Promise<DeviceConnection>((resolve) => {
     /** The banner is the page's own account of where it has got to, and
@@ -517,6 +538,34 @@ function picker(
             needsPassphrase: code === "no-rung" || code === "wrong-passphrase",
             message: err(e),
           };
+        }
+      },
+      openWithPasskey: async (row) => {
+        // THE CEREMONY IS THE PAGE'S (PERSISTENCE.md, "The window/worker
+        // split"): the assertion runs here, the KEK is derived here, and
+        // what crosses the port is the non-extractable handle. The KEK
+        // is a LOCAL — it is never stashed on this page.
+        say("opening this device…");
+        try {
+          const prfKek = await assertPasskey(row.id);
+          const conn = await open(row.id, undefined, status, prfKek);
+          note("picked:passkey");
+          resolve(conn);
+        } catch (e) {
+          // TWO KINDS OF REFUSAL, and the difference is which door the
+          // sheet should be showing afterwards. `no-rung` /
+          // `wrong-passphrase` mean this device wants its passphrase, so
+          // the field is revealed (rungs are additive: a passkey device
+          // may also carry the user's own). `wrong-passkey` /
+          // `unsupported` — and a ceremony the user cancelled, which
+          // arrives as a plain DOMException — are the passkey path
+          // saying no, so the sheet STAYS on the passkey view and the
+          // button stays clickable.
+          const code = (e as { code?: string }).code;
+          const needsPassphrase = code === "no-rung" || code === "wrong-passphrase";
+          if (needsPassphrase) readyToAsk();
+          else say("ready — try your passkey again");
+          throw { needsPassphrase, message: err(e) };
         }
       },
       openNew: async () => {
@@ -552,8 +601,16 @@ function picker(
     // trust anchor itself, teaching the user that visor motion is noise.
     // The failure path loses nothing: the picker arrives carrying the
     // refusal (`opts.problem`), which is where it would have landed.
+    //
+    // A `passkey` DEVICE NEVER AUTO-UNSEALS (PERSISTENCE.md, "Unseal
+    // UX", explicitly): its ceremony is a user gesture some browsers
+    // demand for `credentials.get` anyway, so this policy has no silent
+    // path at all — a single kept passkey device still gets the picker.
     const only = devices[0];
-    if (devices.length === 1 && only.tier === "t1" && only.unsealPolicy !== "every-session") {
+    if (
+      devices.length === 1 && only.tier === "t1" &&
+      only.unsealPolicy !== "every-session" && only.unsealPolicy !== "passkey"
+    ) {
       note("auto-unseal");
       void (async () => {
         say("opening this device…");
@@ -894,16 +951,30 @@ async function startApp(
         if (deviceTenant.owns(session)) deviceTenant.close();
       };
       container.append(close);
-      void deviceState().then(({ row, st }) => {
-        if (st.tier === "t0") renderPromotion(body, row);
-        else renderKept(body, row, st);
-      });
+      void renderBody(body);
       return { root: container };
     });
   };
 
+  /** Re-read the device's row and status and (re-)draw the sheet body.
+   * Shared by the initial open AND the switch-to-passkey flow below,
+   * which must show the device's NEW policy once it lands — the simplest
+   * honest way is to ask the device again rather than hand-patch what is
+   * on screen. */
+  const renderBody = async (body: HTMLElement) => {
+    body.replaceChildren();
+    const { row, st } = await deviceState();
+    if (st.tier === "t0") await renderPromotion(body, row);
+    else await renderKept(body, row, st);
+    // NO `rebuild()` HERE, deliberately: the tenant's builder is what
+    // calls this, so a re-measure from inside it would recurse. The
+    // drawer measures the body it is handed; the switch flow below
+    // re-renders in place, which is a height change the sheet already
+    // tolerates the same way the initial async fill does.
+  };
+
   /** THE PROMOTION CEREMONY. */
-  const renderPromotion = (body: HTMLElement, row?: DeviceRecord) => {
+  const renderPromotion = async (body: HTMLElement, row?: DeviceRecord) => {
     const lead = document.createElement("p");
     lead.className = "cred-note";
     lead.textContent =
@@ -929,9 +1000,17 @@ async function startApp(
     nameField.append(nameInput);
     body.append(nameField);
 
-    // THE TWO SHIPPED RUNGS. `while-open` is the T0 rung and is not on
+    // CAPABILITY FIRST, asked once per sheet render (PERSISTENCE.md,
+    // "Enrollment order and the degrade"). "no" means the choice is
+    // simply not offered, with a plain sentence — never a broken
+    // ceremony; "yes"/"maybe" both offer it and let enrollment be the
+    // authoritative check.
+    const prfCap = await prfCapability();
+
+    // THE SHIPPED RUNGS. `while-open` is the T0 rung and is not on
     // offer here: a device the user asked to keep must not rest on a key
-    // that dies with the worker.
+    // that dies with the worker. `passkey` is offered only when this
+    // browser might do it at all.
     const rungField = field("How should this device open?");
     const rungs: { value: UnsealPolicy; label: string; hint: string }[] = [
       {
@@ -952,6 +1031,18 @@ async function startApp(
           "and is never stored. Forget it and this device's state is gone.",
       },
     ];
+    if (prfCap !== "no") {
+      rungs.push({
+        value: "passkey",
+        label: "Open it with my passkey",
+        // THE HONEST SENTENCE for this rung (PERSISTENCE.md, "The PRF
+        // rung: passkey unseal"), in the same register as the two above.
+        hint:
+          "The key that opens this device is derived from a passkey this browser " +
+          "asks for every time. Nothing stored here can open it. Lose the passkey " +
+          "and this device's state is gone.",
+      });
+    }
     let chosen: UnsealPolicy = "until-reseal";
     const passWrap = field("Your passphrase for this device");
     const passInput = document.createElement("input");
@@ -970,6 +1061,9 @@ async function startApp(
       radio.checked = r.value === chosen;
       radio.onchange = () => {
         chosen = r.value;
+        // THE PASSPHRASE FIELD STAYS HIDDEN FOR `passkey`: promotion
+        // always has the platform rung to authorize the re-wrap
+        // (worker.ts's `enablePrf`), so no passphrase is needed here.
         passWrap.hidden = chosen !== "every-session";
       };
       label.append(radio, document.createTextNode(` ${r.label}`));
@@ -980,6 +1074,15 @@ async function startApp(
       rungField.append(line);
     }
     body.append(rungField, passWrap);
+    if (prfCap === "no") {
+      // THE PLAIN SENTENCE the degrade owes the user, instead of a
+      // choice that would break when taken.
+      const noPrf = document.createElement("div");
+      noPrf.className = "hint";
+      noPrf.id = "device-passkey-unavailable";
+      noPrf.textContent = "this browser cannot open devices with a passkey";
+      body.append(noPrf);
+    }
 
     const problem = document.createElement("div");
     problem.className = "hint";
@@ -996,6 +1099,36 @@ async function startApp(
       problem.hidden = true;
       void (async () => {
         try {
+          if (chosen === "passkey") {
+            // ENROLL FIRST. A failure here (an authenticator declining,
+            // a cancelled ceremony) leaves the device exactly as it was
+            // — nothing below has run — and the message already says
+            // whether a credential the authenticator minted needs
+            // deleting there (passkey.ts's `enrollPasskey`).
+            const grant = await enrollPasskey(conn.deviceId, nameInput.value);
+            // THE WORKER FIRST, THE INDEX LAST, exactly as the other
+            // arms: a failed re-wrap must never leave a row claiming a
+            // rung the device does not have.
+            await conn.promote({
+              policy: "passkey",
+              prf: { kek: grant.kek, ...grant.enrollment },
+            });
+            const { persisted } = await promoteDevice(conn.deviceId, {
+              petname: nameInput.value,
+              unsealPolicy: "passkey",
+            });
+            note("promoted:passkey");
+            await refreshDeviceLabel();
+            if (deviceTenant.isOpen()) deviceTenant.close();
+            announce(
+              persisted
+                ? "this device is kept on this browser"
+                : "this device is kept, but this browser would not promise to keep it — " +
+                  "it may be cleared when space runs short",
+              !persisted,
+            );
+            return;
+          }
           // THE WORKER FIRST, THE INDEX LAST (client.ts's `promote`): a
           // failed re-wrap must never leave a row claiming a rung the
           // device does not have.
@@ -1036,7 +1169,7 @@ async function startApp(
   };
 
   /** THE KEPT DEVICE: what was chosen, and the way back out. */
-  const renderKept = (body: HTMLElement, row: DeviceRecord | undefined, st: DeviceStatus) => {
+  const renderKept = async (body: HTMLElement, row: DeviceRecord | undefined, st: DeviceStatus) => {
     const lead = document.createElement("p");
     lead.className = "cred-note";
     lead.textContent = row === undefined
@@ -1044,6 +1177,9 @@ async function startApp(
       : st.policy === "every-session"
       ? `This device is kept on this browser as "${row.petname}", and asks for its ` +
         `passphrase every session.`
+      : st.policy === "passkey"
+      ? `This device is kept on this browser as "${row.petname}", and opens with ` +
+        `your passkey.`
       : `This device is kept on this browser as "${row.petname}", and opens itself ` +
         `until you seal it again.`;
     body.append(lead);
@@ -1060,19 +1196,23 @@ async function startApp(
     // Destroying a device is a separate, explicit act; reseal must not
     // do it by omission.
     //
-    // WHICH SHAPE IS `rungs.userPassphrase`, NOT THE POLICY TAG. The tag
-    // says which ceremony to offer at unseal; it does not say whether
-    // anybody knows a passphrase, and a device can be on `until-reseal`
-    // AND have the user's own (`enableUntilReseal` is additive). The
-    // durable answer is seal.ts's `PassphraseWrap.origin`.
+    // WHICH SHAPE IS `rungs.userPassphrase` OR `rungs.prf`, NOT THE
+    // POLICY TAG. The tag says which ceremony to offer at unseal; it
+    // does not say whether anybody holds a reachable rung, and a device
+    // can be on `until-reseal` AND have the user's own passphrase, or a
+    // passkey rung (both additive — `enableUntilReseal`, `enablePrf`).
+    // A PASSKEY RUNG IS ALWAYS WALKABLE (rpc.ts's `rungs.prf`: "a
+    // passkey rung only exists because a person enrolled a credential
+    // they hold"), which is why it joins `userPassphrase` here exactly
+    // as the worker's own reseal guard generalized.
     //
     // So on that device reseal ASKS, and the sentence is the plain one:
     // sealing this device means choosing what unseals it. The worker
     // re-keys from the platform rung — which is still there, which is
     // exactly why reseal time is when this is possible at all — and the
     // device comes back an `every-session` one. A device that already
-    // has the user's own passphrase reseals with no extra ceremony.
-    const upgrades = !st.rungs.userPassphrase && st.rungs.untilReseal;
+    // has a reachable rung reseals with no extra ceremony.
+    const upgrades = !st.rungs.userPassphrase && !st.rungs.prf && st.rungs.untilReseal;
 
     const warn = document.createElement("div");
     warn.className = "hint";
@@ -1081,6 +1221,9 @@ async function startApp(
       ? "Sealing this device means choosing what unseals it. This device opens itself " +
         "today, so there is nothing yet that you know and it does not — pick a " +
         "passphrase now, and from here on it asks for that."
+      : st.policy === "passkey"
+      ? "Sealing it again drops the keys held here and returns you to the device " +
+        "picker. You open it again with your passkey."
       : "Sealing it again drops the keys held here and returns you to the device " +
         "picker. You open it again with your passphrase.";
     body.append(warn);
@@ -1149,6 +1292,72 @@ async function startApp(
       })();
     };
     body.append(seal);
+
+    // SWITCH TO PASSKEY (PERSISTENCE.md, "Enrollment placement": "On a
+    // kept device"). Offered only for a device not already on this rung,
+    // and only when the browser might do it at all — the same capability
+    // probe the promotion sheet asks.
+    if (st.policy !== "passkey" && await prfCapability() !== "no") {
+      const switchWrap = document.createElement("div");
+      switchWrap.className = "cred-field";
+      // NO PLATFORM WRAP TO AUTHORIZE FROM: the switch needs an
+      // authorizing secret and the worker's `enablePrf` refuses without
+      // one, so a device on `every-session` (whose platform wrap did not
+      // survive promotion) is asked for its passphrase FIRST — which is
+      // that device's login anyway.
+      const needsPassphrase = !st.rungs.untilReseal;
+      const switchPassField = field(
+        "Your passphrase for this device",
+        "your current passphrase authorizes the switch",
+      );
+      const switchPassInput = document.createElement("input");
+      switchPassInput.type = MASKED.type;
+      switchPassInput.id = "device-switch-passkey-pass";
+      switchPassField.append(switchPassInput);
+      switchPassField.hidden = !needsPassphrase;
+
+      const switchProblem = document.createElement("div");
+      switchProblem.className = "hint";
+      switchProblem.id = "device-switch-passkey-problem";
+      switchProblem.hidden = true;
+
+      const switchBtn = document.createElement("button");
+      switchBtn.type = "button";
+      switchBtn.id = "device-switch-passkey";
+      switchBtn.textContent = "switch to passkey unseal";
+      switchBtn.onclick = () => {
+        switchBtn.disabled = true;
+        switchProblem.hidden = true;
+        void (async () => {
+          try {
+            const grant = await enrollPasskey(conn.deviceId, row?.petname ?? "");
+            // WORKER FIRST, INDEX LAST — the worker's re-wrap order
+            // guarantees nothing partial: a failure below leaves the
+            // device on its old rung, still openable exactly as before.
+            await conn.promote({
+              policy: "passkey",
+              passphrase: needsPassphrase ? switchPassInput.value : undefined,
+              prf: { kek: grant.kek, ...grant.enrollment },
+            });
+            await promoteDevice(conn.deviceId, { unsealPolicy: "passkey" });
+            note("switched:passkey");
+            await refreshDeviceLabel();
+            // THE RE-RENDER READS THE DEVICE AGAIN rather than patching
+            // this screen by hand: the platform wrap is now gone (the
+            // worker deletes it), so the copy above must reflect the new
+            // policy, and `deviceState()` is the one place that already
+            // knows how to say so.
+            await renderBody(body);
+          } catch (e) {
+            switchBtn.disabled = false;
+            switchProblem.textContent = err(e);
+            switchProblem.hidden = false;
+          }
+        })();
+      };
+      switchWrap.append(switchPassField, switchBtn, switchProblem);
+      body.append(switchWrap);
+    }
   };
 
   // --- cross-page sync ------------------------------------------------------

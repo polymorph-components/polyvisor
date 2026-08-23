@@ -952,6 +952,7 @@
 .device-pick { font-weight: 600; }
 .device-when { font-size: 11px; opacity: .7; }
 .cred-sheet #device-pass[hidden], .cred-sheet #device-problem[hidden],
+.cred-sheet #device-passkey[hidden],
 .cred-sheet .entry-problem[hidden] { display: none; }
 .cred-sheet #device-pass { display: flex; flex-direction: column;
                            gap: .25em; margin: .6em 0; }
@@ -969,6 +970,32 @@
                                  border: 1px solid rgba(255,255,255,.4);
                                  background: transparent; color: inherit; }
 .cred-sheet #device-new { margin-top: .7em; }
+/* THE PASSKEY CEREMONY BLOCK (entry.ts's askForPasskey): the same
+   furniture as the passphrase block — a labelled control in the sheet's
+   alpha-on-anchor idiom — with a button where the input would be,
+   because the secret lives in the authenticator and the visor's only
+   job is to offer the door. */
+.cred-sheet #device-passkey { display: flex; flex-direction: column;
+                              gap: .25em; margin: .6em 0; }
+.cred-sheet #device-passkey label { font-size: 11px; opacity: .85; }
+.cred-sheet #device-passkey button { align-self: flex-start; font: inherit;
+                                     font-size: 13px; cursor: pointer;
+                                     padding: .45em .9em; border-radius: 5px;
+                                     border: 1px solid rgba(255,255,255,.4);
+                                     background: transparent; color: inherit; }
+/* THE FALLBACK IS DELIBERATELY SECONDARY: the policy tag named the
+   passkey ceremony, so the other door is quieter — a link-weight
+   control, not a rival button. Still a control, so it keeps a visible
+   focus ring; the underline is what carries "this is the other way in". */
+.cred-sheet .entry-secondary { align-self: flex-start; font: inherit;
+                               font-size: 11px; cursor: pointer;
+                               padding: .1em 0; margin-top: .1em;
+                               border: none; background: transparent;
+                               color: inherit; opacity: .75;
+                               text-decoration: underline; }
+.cred-sheet .entry-secondary:focus-visible {
+                               outline: 2px solid rgba(255,255,255,.7);
+                               outline-offset: 2px; }
 /* THE REFUSAL LINE. Warm, not alarming, and the same colour the sheets
    already use for a consequence the user has to read (.cred-warning) —
    a picker refusal is a fact about a device, not an error state. */

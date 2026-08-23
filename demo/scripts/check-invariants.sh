@@ -390,7 +390,7 @@ fi
 # The markup half. These ids/classes ARE the entry ceremonies; a page
 # that spells one is a page that has grown an account-lifecycle surface
 # of its own, below the strip, where nothing vouches for it.
-ENTRY_MARKUP='first-run|device-picker|solo-join|solo-new-account|solo-join-account|device-pick'
+ENTRY_MARKUP='first-run|device-picker|solo-join|solo-new-account|solo-join-account|device-pick|device-passkey'
 pagemarkup=$(grep -nE "$ENTRY_MARKUP" web/index.html web/solo.html 2>/dev/null)
 if [ -n "$pagemarkup" ]; then
   bad "an embedder page carries account-lifecycle markup (these are the visor's drawer sheets — ../visor/ui/entry.ts):"

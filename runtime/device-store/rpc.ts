@@ -27,6 +27,7 @@
 
 import type { Driver, Tasks } from "../engine.ts";
 import type { Posture, Tier, UnsealPolicy } from "./index.ts";
+import type { PrfEnrollment } from "./seal.ts";
 
 // --- how a rejection crosses -----------------------------------------------
 //
@@ -77,8 +78,8 @@ import type { Posture, Tier, UnsealPolicy } from "./index.ts";
  *
  * `code` is the contract; `message` is for a human and `hostName` is a
  * breadcrumb. The closed set of codes comes from the modules that raise
- * them: `SealError.code` ("wrong-passphrase", "no-rung",
- * "already-sealed", "tampered", "unsupported"),
+ * them: `SealError.code` ("wrong-passphrase", "wrong-passkey",
+ * "no-rung", "already-sealed", "tampered", "unsupported"),
  * `SealedFsError.fsCode` ("io"), `IdentityKeyError.code`
  * ("extractable", "algorithm", "unavailable"), plus this module's own
  * "timeout", "closed" and "unclonable".
@@ -182,12 +183,38 @@ export function hostErrorOf(e: unknown, code?: string): HostError {
 //     `Array<[Uint8Array, string]>`. Arrays.
 //   * `undefined` — `option<T>` lowers to `T | undefined`; clone carries it.
 //
-// NOTHING IS EXCLUDED. There is no method here that moves a function, a
-// CryptoKey, a resource handle, a stream or a class instance, so there is
-// no method that needed to be left out. The two places where the engine
-// DOES hand out non-clonable things — the `EngineNet` fetch/sign seams
-// and the mounted state root — are not on this surface: they are wired
-// INSIDE the worker at instantiation and never named across the port.
+// THE DRIVER AND TASKS SURFACES MOVE NOTHING ELSE. There is no method on
+// either that moves a function, a resource handle, a stream or a class
+// instance, so there is no method that needed to be left out. The two
+// places where the engine DOES hand out non-clonable things — the
+// `EngineNet` fetch/sign seams and the mounted state root — are not on
+// those surfaces: they are wired INSIDE the worker at instantiation and
+// never named across the port.
+//
+// THE HOST SURFACE MOVES EXACTLY TWO CryptoKeys, DELIBERATELY, and this
+// note used to claim otherwise — it said no method here moves a
+// CryptoKey at all, which was true until the passkey rung and would be
+// papering over the change now. They are `UnsealOptions.prfKek` and
+// `PromoteOptions.prf.kek`. Three facts make that a design rather than
+// a leak:
+//
+//   * CryptoKey is ON the structured-clone list, and the spike measured
+//     this exact crossing (spikes/prf-unseal, row 9: a derived KEK
+//     handle clones through `postMessage` into a worker and unwraps
+//     there) — it is not a value squeezed through a hole.
+//   * BOTH ARE NON-EXTRACTABLE, so neither is a bearer secret in the way
+//     a passphrase string is: the receiver can ask the platform to
+//     unwrap with it and can do nothing else with it, and seal.ts
+//     validates that property on arrival rather than trusting it
+//     (`requirePrfKek`).
+//   * THE CEREMONY HAS NOWHERE ELSE TO RUN. `navigator.credentials` is
+//     window-only, so the assertion happens on the page; handing the
+//     worker anything LESS derived would mean handing it the raw PRF
+//     output, and handing it anything more would mean handing it the
+//     DEK. The KEK handle is the narrowest thing that crosses.
+//
+// Neither is persisted by the worker and neither is echoed back in
+// `status()`.
 //
 // The consequence worth stating: `createEnginePairingDriver`
 // (runtime/pairing-engine.ts) is constructible over the remote driver
@@ -329,6 +356,19 @@ export interface UnsealOptions {
    * `enableUntilReseal`). Ignored on a device that already has rungs —
    * arming after the fact is a separate ceremony the UI owns. */
   untilReseal?: boolean;
+  /**
+   * THE PASSKEY RUNG'S INPUT: a NON-EXTRACTABLE AES-KW handle the page
+   * derived (HKDF-SHA-256) from a fresh assertion's PRF output —
+   * device-store/passkey.ts's `assertPasskey`.
+   *
+   * It is one of the two CryptoKeys that cross this surface by design
+   * (see the serialization-discipline note above); the ceremony cannot
+   * run in the worker, because `navigator.credentials` is window-only.
+   * seal.ts validates the handle on arrival rather than trusting it.
+   * Never persisted by the worker, never logged, never echoed back in
+   * `status()`.
+   */
+  prfKek?: CryptoKey;
 }
 
 /**
@@ -346,11 +386,26 @@ export interface PromoteOptions {
   /** The rung the user chose. `every-session` re-wraps the DEK under
    * `passphrase` and then DELETES the platform wrap (a rung the user
    * asked to be asked past must not be left standing). `until-reseal`
-   * keeps or arms the platform wrap. */
+   * keeps or arms the platform wrap. `passkey` enrolls the credential
+   * the page just ceremonied and then deletes the platform wrap, for
+   * `every-session`'s reason. */
   policy: UnsealPolicy;
   /** Required for `every-session`. Never persisted, never logged, never
    * echoed back in `status()`. */
   passphrase?: string;
+  /**
+   * REQUIRED FOR `passkey`: the enrollment the PAGE just ran, plus the
+   * KEK it derived from it (device-store/passkey.ts's `enrollPasskey`).
+   * The worker re-wraps the DEK under that handle and then deletes the
+   * platform wrap, for the `every-session` arm's reason.
+   *
+   * The metadata half is what lands in the wrap record so a later unseal
+   * can name the credential again; the `kek` half is the second of the
+   * two CryptoKeys this surface moves (see the serialization-discipline
+   * note). `passphrase` remains the authorizing secret when the device
+   * has no platform rung to re-wrap from — the kept-device switch path.
+   */
+  prf?: { kek: CryptoKey } & PrfEnrollment;
 }
 
 /**
@@ -418,9 +473,16 @@ export interface DeviceStatus {
    * question, answerable without opening anything. `userPassphrase` is
    * the one a reseal ceremony branches on: a passphrase rung EXISTS on
    * every sealed device, but only a `user` one is a door anybody can
-   * walk through. */
-  rungs: { passphrase: boolean; userPassphrase: boolean; untilReseal: boolean };
-  /** True when the next `unseal()` cannot succeed without one. */
+   * walk through. `prf` needs no such companion bit — a passkey rung
+   * only exists because a person enrolled a credential they hold, so it
+   * is always walkable (seal.ts's `PrfWrap`). */
+  rungs: { passphrase: boolean; userPassphrase: boolean; untilReseal: boolean; prf: boolean };
+  /** True when the next `unseal()` cannot succeed without one.
+   *
+   * A `passkey`-policy device does NOT need a passphrase: it needs its
+   * ceremony, which the picker offers off the `policy` tag (and it may
+   * additionally offer a passphrase fallback when `rungs.userPassphrase`
+   * says one exists — rungs are additive). */
   needsPassphrase: boolean;
   /**
    * How the engine came up: `null` while sealed, `true` when
