@@ -90,6 +90,27 @@ const params = new URLSearchParams(location.search);
 // (the e2e harness points every page at its own ephemeral one).
 const RELAY = params.get("relay") ?? "https://use1-1.relay.n0.iroh.link";
 
+// --- the OAuth redirect landing (visor-owned; DRIVE.md §3 × #7) -----------
+//
+// Google's consent redirects the popup back to THIS page with
+// ?code=&state=. That window's only job is to relay the code to the
+// opener and go away: it must not boot a second solo device (a fresh
+// engine, a fresh worker attach, a fresh picker). Navigation and
+// redirect handling are visor capabilities; the popup's ONLY job is to
+// relay the one-shot code (DRIVE.md §3) — the worker holds the verifier
+// and does the exchange, so this window never sees a token.
+const relayedCode = params.get("code");
+const isAuthPopup = !!relayedCode && !!window.opener;
+if (isAuthPopup) {
+  window.opener.postMessage(
+    { pmGdriveCode: relayedCode, state: params.get("state") },
+    location.origin,
+  );
+  const el = document.getElementById("banner");
+  if (el) el.textContent = "authorization relayed — close this window";
+  window.close();
+}
+
 // --- storage keys -----------------------------------------------------------
 //
 // `pm-solo-*`, NOT `pm-demo-*`. The two pages are served from one origin
@@ -231,6 +252,21 @@ function poll(everyMs: number, f: () => Promise<unknown>): number {
 // at a login must still be drivable at that pause.
 const hooks: Record<string, unknown> = {};
 (globalThis as unknown as Record<string, unknown>).__solo = hooks;
+
+/** ADDRESSING OVERRIDES for the Google Drive ceremony — the same reason
+ * `gdrive-config` carries an `api-base` (DRIVE.md §2): a self-hosted or
+ * FAKE backend is ordinary addressing, not a probe hack. Defaults are
+ * Google's own endpoints; the e2e harness's fake Drive points this at
+ * itself before driving the ceremony (DRIVE.md's Gates, `solo-gdrive`). */
+let gdriveEndpoints: { apiBase?: string; authUrl?: string; tokenUrl?: string } = {};
+hooks.setGdriveEndpoints = (v: { apiBase?: string; authUrl?: string; tokenUrl?: string }) => {
+  gdriveEndpoints = v;
+};
+
+/** Same deadline as demo.ts's Dropbox `authorize()`: long enough for a
+ * human to actually complete a consent screen, short enough that a
+ * forgotten popup does not wedge the connect ceremony forever. */
+const AUTH_TIMEOUT_MS = 5 * 60_000;
 
 /**
  * WHAT THE BOOT DID, in order, as short machine-readable tokens.
@@ -1130,20 +1166,24 @@ async function startApp(
 
   // --- storage: connect this device to a bucket it can sync through --------
   //
-  // v1 IS S3 ONLY, CHROME ONLY (STORAGE-EGRESS.md §5): one visor drawer
-  // tenant, chrome-owned fields, no picker and no provider panels — with
-  // one worker-side provider there is nothing to pick. The invariant
-  // holds by construction rather than by review: the secret is typed in
-  // VISOR PIXELS, and no component is ever present on this path (there
-  // is no panel here at all, unlike demo.ts's credential drawer, which
-  // exists only because a PANEL asks the visor to collect on its
-  // behalf).
+  // TWO PROVIDERS, ONE SHEET, CHROME-OWNED FIELDS (DRIVE.md §6 /
+  // STORAGE-EGRESS.md §5): a provider choice, no picker of pickers and
+  // no provider panels — with only two worker-side providers there is
+  // nothing to delegate to a component. The invariant holds by
+  // construction rather than by review: every secret is typed in VISOR
+  // PIXELS, and no component is ever present on this path (there is no
+  // panel here at all, unlike demo.ts's credential drawer, which exists
+  // only because a PANEL asks the visor to collect on its behalf).
   //
-  // THE ONE MOMENT OF CLEARTEXT is the connect handler below, straight
-  // off this sheet's own input, into `putSigningKey` and out of scope
-  // (§2). Nothing else in this file ever sees the secret key, and this
-  // sheet does not hold it either — the input's value is read once and
-  // the field is cleared in the same tick.
+  // THE ONE MOMENT OF CLEARTEXT, twice over: the S3 secret key and the
+  // Drive OAuth client secret are both read out of this sheet's input
+  // and the field is cleared IN THE SAME TICK — before either value is
+  // used — exactly like the passphrase fields elsewhere in this file
+  // (DRIVE.md §3: the client secret is an APP identifier, not a user
+  // secret, but it still does not linger). A local variable carries the
+  // value into the ceremony from there, so a thrown `oauthStart`, a
+  // blocked or closed popup, a timeout, or a failed exchange all leave
+  // the field empty rather than sitting on a typed secret.
 
   const storageTenant = visor.drawer.tenant<{ container: HTMLElement }>({
     name: "storage",
@@ -1154,7 +1194,8 @@ async function startApp(
 
   /** The connect ceremony's own busy-guard, mirroring `setupInFlight` in
    * demo.ts's `setupBucket`: a duplicate click while one binding is in
-   * flight would race the same escrow write and the same bind. */
+   * flight would race the same escrow write (or the same OAuth
+   * ceremony) and the same bind. */
   let storageConnectInFlight = false;
 
   openStorage = () => {
@@ -1182,42 +1223,78 @@ async function startApp(
     });
   };
 
-  /** THE UNBOUND VIEW: the connect ceremony. `prefill` re-shows a known
-   * destination when this is reached from "Change…" (endpoint/bucket/
-   * access carried over; the secret field always starts blank — it is
-   * never read back, because it is never held here to read). */
+  /** THE UNBOUND VIEW: the provider choice and the connect ceremony.
+   * `prefill` re-shows a known destination when this is reached from
+   * "Change…" — whichever provider it names is the one selected and
+   * pre-filled; the OTHER provider's fields start at their defaults,
+   * and no secret is ever carried into a prefill (neither the S3 secret
+   * key nor the Drive client secret is held here to read back). */
   const renderUnbound = (body: HTMLElement, prefill?: StoreBinding) => {
     const lead = document.createElement("p");
     lead.className = "cred-note";
     lead.textContent =
-      "This device can sync through an S3-compatible bucket. The secret key you enter " +
-      "is escrowed on this browser as a non-extractable key — it is never stored as text, " +
-      "and this device does not hold it either.";
+      "This device can sync through a bucket it reaches directly. Whichever provider you " +
+      "choose, the secret half of the ceremony is typed here and never stored as text.";
     body.append(lead);
+
+    // THE PROVIDER CHOICE (DRIVE.md §6). S3 is the default — it is the
+    // provider this sheet has always offered — and choosing Drive shows
+    // its own fields in place of S3's rather than beside them: the two
+    // providers are alternatives, not a combined form.
+    let chosenKind: StoreBinding["kind"] = prefill?.kind ?? "s3";
+    const kindField = field("Where do you want this device to sync?");
+    const kindChoices: { value: StoreBinding["kind"]; id: string; label: string }[] = [
+      { value: "s3", id: "storage-kind-s3", label: "S3-compatible object storage" },
+      { value: "gdrive", id: "storage-kind-gdrive", label: "Google Drive" },
+    ];
+    for (const k of kindChoices) {
+      const line = document.createElement("div");
+      line.className = "cred-field";
+      const label = document.createElement("label");
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "storage-kind";
+      radio.id = k.id;
+      radio.value = k.value;
+      radio.checked = k.value === chosenKind;
+      radio.onchange = () => {
+        chosenKind = k.value;
+        s3Group.hidden = chosenKind !== "s3";
+        gdriveGroup.hidden = chosenKind !== "gdrive";
+      };
+      label.append(radio, document.createTextNode(` ${k.label}`));
+      line.append(label);
+      kindField.append(line);
+    }
+    body.append(kindField);
+
+    // --- the S3 fields (unchanged ids: this is the existing sheet) ---------
+    const s3Group = document.createElement("div");
+    s3Group.hidden = chosenKind !== "s3";
 
     const endpointField = field("Endpoint");
     const endpointInput = document.createElement("input");
     endpointInput.type = "text";
     endpointInput.id = "storage-endpoint";
-    endpointInput.value = prefill?.endpoint ?? "";
+    endpointInput.value = prefill?.kind === "s3" ? prefill.endpoint : "";
     endpointField.append(endpointInput);
-    body.append(endpointField);
+    s3Group.append(endpointField);
 
     const bucketField = field("Bucket");
     const bucketInput = document.createElement("input");
     bucketInput.type = "text";
     bucketInput.id = "storage-bucket";
-    bucketInput.value = prefill?.bucket ?? "";
+    bucketInput.value = prefill?.kind === "s3" ? prefill.bucket : "";
     bucketField.append(bucketInput);
-    body.append(bucketField);
+    s3Group.append(bucketField);
 
     const accessField = field("Access key ID");
     const accessInput = document.createElement("input");
     accessInput.type = "text";
     accessInput.id = "storage-access";
-    accessInput.value = prefill?.accessKey ?? "";
+    accessInput.value = prefill?.kind === "s3" ? prefill.accessKey : "";
     accessField.append(accessInput);
-    body.append(accessField);
+    s3Group.append(accessField);
 
     const secretField = field(
       "Secret key",
@@ -1227,7 +1304,58 @@ async function startApp(
     passInput.type = MASKED.type;
     passInput.id = "storage-secret";
     secretField.append(passInput);
-    body.append(secretField);
+    s3Group.append(secretField);
+    body.append(s3Group);
+
+    // --- the Drive fields (DRIVE.md §6) -------------------------------------
+    const gdriveGroup = document.createElement("div");
+    gdriveGroup.hidden = chosenKind !== "gdrive";
+
+    const rootField = field(
+      "Drive folder",
+      "The folder this device syncs through — created in your Drive if it does not exist yet.",
+    );
+    const gdRootInput = document.createElement("input");
+    gdRootInput.type = "text";
+    gdRootInput.id = "storage-gd-root";
+    // Dev prefill: the manual live beat and the e2e harness both pass
+    // ?gdroot=… as test convenience (DRIVE.md's Gates); a real "Change…"
+    // prefill takes precedence over it.
+    gdRootInput.value = prefill?.kind === "gdrive"
+      ? prefill.root
+      : (params.get("gdroot") ?? "polyvisor");
+    rootField.append(gdRootInput);
+    gdriveGroup.append(rootField);
+
+    const clientField = field("OAuth client id");
+    const gdClientInput = document.createElement("input");
+    gdClientInput.type = "text";
+    gdClientInput.id = "storage-gd-client";
+    gdClientInput.value = prefill?.kind === "gdrive"
+      ? prefill.clientId
+      : (params.get("gdclient") ?? "");
+    clientField.append(gdClientInput);
+    gdriveGroup.append(clientField);
+
+    const gdSecretField = field(
+      "OAuth client secret",
+      // THE ONE HONEST SENTENCE (DRIVE.md §3): this identifies the APP
+      // to Google, not you. It is not your account's secret, and Google's
+      // own documentation says an installed app's client secret is "not
+      // treated as a secret" — but it is still masked, because it is
+      // still not something to paint on a screen.
+      "This identifies the app to Google, not you — it is not your account's secret.",
+    );
+    const gdSecretInput = document.createElement("input");
+    gdSecretInput.type = MASKED.type;
+    gdSecretInput.id = "storage-gd-secret";
+    // Never prefilled from a binding — the secret is not part of
+    // `StoreBinding` and this sheet never holds one to read back. The
+    // dev URL param is test convenience only (DRIVE.md's Gates).
+    gdSecretInput.value = params.get("gdsecret") ?? "";
+    gdSecretField.append(gdSecretInput);
+    gdriveGroup.append(gdSecretField);
+    body.append(gdriveGroup);
 
     const problem = document.createElement("div");
     problem.className = "hint";
@@ -1249,14 +1377,27 @@ async function startApp(
       storageConnectInFlight = true;
       connect.disabled = true;
       problem.hidden = true;
+      const kind = chosenKind;
+      // s3's fields, read once regardless of which provider is chosen —
+      // harmless, since only the chosen branch below uses them.
       const endpoint = endpointInput.value;
       const bucket = bucketInput.value;
       const access = accessInput.value;
-      // THE ONE MOMENT OF CLEARTEXT: read straight off the input, used
-      // once, and the field is cleared in the same tick regardless of
-      // outcome — nothing here holds it a moment longer than it must.
+      // THE ONE MOMENT OF CLEARTEXT (s3 half): read straight off the
+      // input, used once, and the field is cleared in the same tick
+      // regardless of outcome.
       const secret = passInput.value;
       passInput.value = "";
+      // gdrive's fields. THE CLIENT SECRET IS READ HERE AND CLEARED IN
+      // THE SAME TICK, exactly like the s3 secret above: the local
+      // variable carries it into the ceremony below, so a thrown
+      // `oauthStart`, a blocked or closed popup, a timeout, or a failed
+      // exchange all leave the field empty rather than sitting on a
+      // typed secret.
+      const root = gdRootInput.value;
+      const client = gdClientInput.value;
+      const gdSecret = gdSecretInput.value;
+      gdSecretInput.value = "";
       void enqueue(async () => {
         let step = "init";
         const at = (s: string) => {
@@ -1264,38 +1405,144 @@ async function startApp(
           stepNote.textContent = `configuring storage: ${s}…`;
         };
         try {
-          at("destination");
-          const origin = normalizeOrigin(endpoint);
-          if (origin === null) {
-            throw new Error(`storage endpoint is not a usable origin: ${endpoint}`);
+          let bound: DeviceStatus;
+          if (kind === "s3") {
+            at("destination");
+            const origin = normalizeOrigin(endpoint);
+            if (origin === null) {
+              throw new Error(`storage endpoint is not a usable origin: ${endpoint}`);
+            }
+            if (secret !== "") {
+              at("escrow");
+              await putSigningKey(origin, access, secret);
+            }
+            at("binding");
+            const st = await conn.bindStore({ kind: "s3", endpoint, bucket, accessKey: access });
+            const part = await tasks.partition();
+            const self = st.agentId === null ? null : unhex(st.agentId);
+            if (self === null) {
+              throw new Error("this device has no agent id yet — bring it up before connecting");
+            }
+            at("bucket + policy");
+            await driver.ensureBucket();
+            at("grants");
+            await driver.storeGrant(part, self);
+            at("first sync");
+            await driver.bucketFlush(part);
+            note("storage:bound");
+            bound = await conn.status();
+            announce("this device now syncs through your bucket");
+          } else {
+            at("destination");
+            if (root.trim() === "") throw new Error("a Drive folder name is required");
+            if (client.trim() === "") throw new Error("an OAuth client id is required");
+            // BIND-WITHOUT-CEREMONY (DRIVE.md §5): a consent already
+            // sealed for this device is reused rather than asked for
+            // twice. `gdriveConsent` says nothing about WHICH client id
+            // it was minted for — `bindStore` is where a mismatch is
+            // caught, by name, as `no-credential` (the access-key
+            // mismatch rule's exact analog).
+            const already = (await conn.status()).gdriveConsent;
+            if (already) {
+              step = "consent";
+              stepNote.textContent =
+                "configuring storage: consent (using the consent this device already holds)…";
+            } else {
+              at("consent");
+              // THE WORKER OWNS THE VERIFIER; THE PAGE OWNS THE POPUP
+              // (DRIVE.md §3). What crosses here is app identity and
+              // addressing; what comes back is a URL, never a token.
+              const { authorizeUrl } = await conn.oauthStart({
+                provider: "gdrive",
+                clientId: client,
+                clientSecret: gdSecret || undefined,
+                redirectUri: location.origin + location.pathname,
+                authUrl: gdriveEndpoints.authUrl,
+                tokenUrl: gdriveEndpoints.tokenUrl,
+              });
+              // THE STATE BINDING: the worker minted the state and
+              // embedded it in the URL it handed back; a relay from
+              // some other ceremony (a stale popup, a second sheet) is
+              // ignored rather than trusted (mirrors demo.ts's
+              // `authorize()`).
+              const expectedState = new URL(authorizeUrl).searchParams.get("state");
+              const popup = window.open(authorizeUrl, "pm-gdrive-auth", "width=680,height=760");
+              if (!popup) {
+                throw new Error("could not open the authorization window (popup blocked)");
+              }
+              const relay = await new Promise<{ code: string; state: string }>(
+                (resolve, reject) => {
+                  const done = (f: () => void) => {
+                    globalThis.removeEventListener("message", onMessage);
+                    clearInterval(closedTimer);
+                    clearTimeout(deadline);
+                    f();
+                  };
+                  const onMessage = (e: MessageEvent) => {
+                    if (e.origin !== location.origin) return;
+                    const d = e.data as { pmGdriveCode?: unknown; state?: unknown } | null;
+                    if (!d || typeof d.pmGdriveCode !== "string") return;
+                    if (expectedState !== null && d.state !== expectedState) return;
+                    done(() =>
+                      resolve({
+                        code: d.pmGdriveCode as string,
+                        state: typeof d.state === "string" ? d.state : "",
+                      })
+                    );
+                  };
+                  globalThis.addEventListener("message", onMessage);
+                  const closedTimer = setInterval(() => {
+                    if (popup.closed) done(() => reject(new Error("authorization window closed")));
+                  }, 500);
+                  const deadline = setTimeout(
+                    () => done(() => reject(new Error("authorization timed out"))),
+                    AUTH_TIMEOUT_MS,
+                  );
+                },
+              );
+              try {
+                popup.close();
+              } catch { /* already gone */ }
+              await conn.oauthComplete(relay.code, relay.state);
+              note("storage:consented");
+            }
+            at("binding");
+            const st = await conn.bindStore({
+              kind: "gdrive",
+              root,
+              apiBase: gdriveEndpoints.apiBase ?? "https://www.googleapis.com",
+              clientId: client,
+            });
+            const part = await tasks.partition();
+            const self = st.agentId === null ? null : unhex(st.agentId);
+            if (self === null) {
+              throw new Error("this device has no agent id yet — bring it up before connecting");
+            }
+            at("bucket + policy");
+            await driver.ensureBucket();
+            at("grants");
+            await driver.storeGrant(part, self);
+            at("first sync");
+            await driver.bucketFlush(part);
+            note("storage:bound");
+            bound = await conn.status();
+            announce("this device now syncs through your Drive folder");
           }
-          if (secret !== "") {
-            at("escrow");
-            await putSigningKey(origin, access, secret);
-          }
-          at("binding");
-          const st = await conn.bindStore({ kind: "s3", endpoint, bucket, accessKey: access });
-          const part = await tasks.partition();
-          const self = st.agentId === null ? null : unhex(st.agentId);
-          if (self === null) {
-            throw new Error("this device has no agent id yet — bring it up before connecting");
-          }
-          at("bucket + policy");
-          await driver.ensureBucket();
-          at("grants");
-          await driver.storeGrant(part, self);
-          at("first sync");
-          await driver.bucketFlush(part);
-          note("storage:bound");
           storageConnectInFlight = false;
-          const bound = await conn.status();
           body.replaceChildren();
           if (bound.storage) renderBound(body, bound.storage);
-          announce("this device now syncs through your bucket");
         } catch (e) {
           storageConnectInFlight = false;
           connect.disabled = false;
-          problem.textContent = err(e);
+          // A STALE-CONSENT MISMATCH (DRIVE.md §5) names its own fix:
+          // the worker's `no-credential` here means either no S3
+          // signing key is escrowed, or a Drive consent is missing or
+          // was minted for a different client id — either way, advice
+          // beats a bare refusal.
+          const code = (e as { code?: string }).code;
+          problem.textContent = code === "no-credential"
+            ? `${err(e)} — enter the secret key, or connect and consent again`
+            : err(e);
           problem.hidden = false;
           stepNote.textContent = "";
         }
@@ -1305,15 +1552,18 @@ async function startApp(
   };
 
   /** THE BOUND VIEW: what this device syncs through, sync-now, and the
-   * way out. */
+   * way out — for either provider. */
   const renderBound = (body: HTMLElement, storage: StoreBinding) => {
     const lead = document.createElement("p");
     lead.className = "cred-note";
-    // These are the user's own configuration — endpoint and bucket they
-    // typed into this very sheet, never a component's — so no plating
-    // applies here (the three-voices rule is about FOREIGN prose; this
-    // is the visor reporting the user's own words back to them).
-    lead.textContent = `This device syncs through ${storage.bucket} at ${storage.endpoint}.`;
+    // These are the user's own configuration — typed into this very
+    // sheet, never a component's — so no plating applies here (the
+    // three-voices rule is about FOREIGN prose; this is the visor
+    // reporting the user's own words back to them).
+    lead.textContent = storage.kind === "s3"
+      ? `This device syncs through ${storage.bucket} at ${storage.endpoint}.`
+      : `This device syncs through the "${storage.root}" folder in your Google Drive, ` +
+        `using client ${storage.clientId}.`;
     body.append(lead);
 
     const stepNote = document.createElement("div");
@@ -1361,6 +1611,11 @@ async function startApp(
       renderUnbound(body, storage);
     };
 
+    // DISCONNECT VS. FORGET — THE SAME SPLIT AS STORAGE-EGRESS.md §6,
+    // now with a second thing that can be forgotten: disconnecting the
+    // DESTINATION is not forgetting the ACCOUNT, and (for Drive) forgetting
+    // the ACCOUNT is not forgetting the DESTINATION either. The two acts
+    // stay separate controls on purpose.
     const disconnect = document.createElement("button");
     disconnect.type = "button";
     disconnect.id = "storage-disconnect";
@@ -1371,11 +1626,12 @@ async function startApp(
       void (async () => {
         try {
           // THE HONEST SENTENCE (STORAGE-EGRESS.md §6): disconnect
-          // forgets THIS DEVICE's binding. The escrowed secret key stays
-          // on this browser for any device that still names it — it is
-          // profile-tier escrow, not device-tier, and deleting it here
-          // would take every other device's signing with it. The erase
-          // ceremony is what deletes it.
+          // forgets THIS DEVICE's binding. For S3 the escrowed secret
+          // key stays on this browser for any device that still names
+          // it (profile-tier escrow); for Drive the sealed consent
+          // stays too (device-tier, but a separate act — DRIVE.md §4).
+          // Either way, a separate ceremony is what deletes the
+          // credential; disconnect only forgets the destination.
           await conn.unbindStore();
           note("storage:disconnected");
           body.replaceChildren();
@@ -1388,7 +1644,59 @@ async function startApp(
       })();
     };
 
-    body.append(sync, change, disconnect, stepNote, problem);
+    body.append(sync, change, disconnect);
+
+    if (storage.kind === "gdrive") {
+      // FORGET THIS GOOGLE ACCOUNT: the mirror of disconnect, and a
+      // control S3 has no analog for (there is no standing consent to
+      // forget — the escrowed secret key lives in the keystore, and its
+      // ceremony is the profile-wide erase). Two clicks, arming exactly
+      // as the reseal button does (`renderKept`'s `seal.onclick`): the
+      // first click states what is about to happen, the second commits.
+      let forgetArmed = false;
+      const forget = document.createElement("button");
+      forget.type = "button";
+      forget.id = "storage-gd-forget";
+      forget.textContent = "Forget this Google account…";
+      forget.onclick = () => {
+        if (!forgetArmed) {
+          forgetArmed = true;
+          forget.textContent = "Yes — forget this Google account";
+          return;
+        }
+        forget.disabled = true;
+        problem.hidden = true;
+        void (async () => {
+          try {
+            // THE HONEST SENTENCE, THE OTHER HALF (DRIVE.md §4): this
+            // revokes the consent at Google (best effort) and deletes
+            // the sealed tokens here. THE BINDING SURVIVES — the folder
+            // and its contents remain in your Drive, and re-consenting
+            // on the same client id puts this device back to work with
+            // nothing re-addressed. A sync attempted before that
+            // happens fails at the seam, honestly, in the problem div
+            // below rather than silently.
+            await conn.forgetOauth();
+            note("storage:forgotten");
+            announce(
+              "the consent for this Google account is revoked where possible and deleted " +
+                "from this device — the folder and its contents remain in your Drive",
+            );
+            body.replaceChildren();
+            renderBound(body, storage);
+          } catch (e) {
+            forget.disabled = false;
+            forgetArmed = false;
+            forget.textContent = "Forget this Google account…";
+            problem.textContent = err(e);
+            problem.hidden = false;
+          }
+        })();
+      };
+      body.append(forget);
+    }
+
+    body.append(stepNote, problem);
   };
 
   // --- cross-page sync ------------------------------------------------------
@@ -1902,11 +2210,16 @@ async function startApp(
     /** The device's own claim about where it syncs — `null` sealed or
      * unbound (`DeviceStatus.storage`'s own ambiguity; see rpc.ts). */
     storageStatus: async () => (await conn.status()).storage,
+    /** Whether this device already holds a sealed Drive consent — the
+     * bind-without-ceremony condition (DRIVE.md §5). */
+    gdriveConsent: async () => (await conn.status()).gdriveConsent,
   });
 }
 
-boot().catch((e) => {
-  console.error(e);
-  const banner = document.getElementById("banner")!.querySelector(".bar-inner")!;
-  banner.textContent = `boot failed: ${err(e)}`;
-});
+if (!isAuthPopup) {
+  boot().catch((e) => {
+    console.error(e);
+    const banner = document.getElementById("banner")!.querySelector(".bar-inner")!;
+    banner.textContent = `boot failed: ${err(e)}`;
+  });
+}

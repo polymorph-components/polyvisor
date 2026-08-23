@@ -144,7 +144,7 @@ resume: compose relay-bin
 
 check:
     cargo clippy --target wasm32-wasip2 \
-        -p provider-common -p provider-s3 -p provider-dropbox -- -D warnings
+        -p provider-common -p provider-s3 -p provider-dropbox -p provider-gdrive -- -D warnings
     cargo clippy --target wasm32-wasip2 -p engine-fetcher -- -D warnings
     cargo clippy --target wasm32-wasip2 -p engine-guest -- -D warnings
     cargo clippy -p engine-host -- -D warnings

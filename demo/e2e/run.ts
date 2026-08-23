@@ -58,6 +58,7 @@ import soloPairing from "./scenarios/solo-pairing.ts";
 import soloPersistence from "./scenarios/solo-persistence.ts";
 import soloEphemeral from "./scenarios/solo-ephemeral.ts";
 import soloStorage from "./scenarios/solo-storage.ts";
+import soloGdrive from "./scenarios/solo-gdrive.ts";
 import visorReset from "./scenarios/visor-reset.ts";
 
 // Re-exported so a scenario imports its whole contract from one place:
@@ -130,6 +131,14 @@ const SCENARIOS: Scenario[] = [
   // because a failure here with solo-persistence green says the fault is
   // in the store-egress wiring, not in the device store underneath it.
   soloStorage,
+  // GOOGLE DRIVE FROM THE WORKER HOST (runtime/DRIVE.md's e2e gate): the
+  // same solo page, the same fresh context, but this one needs no MinIO
+  // at all — it drives its own in-process fake Drive instead, and runs
+  // right after the S3 storage scenario without disturbing the
+  // harness's MinIO (which stays up regardless, for everything after
+  // it). The real popup path is the point: the worker mints PKCE, the
+  // page only ever opens a window and relays a one-shot code.
+  soloGdrive,
   // The erase ceremony: seeds a name, a petname and a storage sentinel,
   // then reloads the page (twice) as part of its own claim. It runs
   // after the other identity/naming scenarios and before the one that

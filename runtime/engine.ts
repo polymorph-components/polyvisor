@@ -33,7 +33,17 @@ export type StoreConfig =
   | {
     kind: "dropbox";
     value: { root: string };
+  }
+  | {
+    kind: "gdrive";
+    value: { root: string; apiBase: string };
   };
+// gdrive: addressing only, exactly like every other arm (DRIVE.md §2)
+// — this is the user-only provider (DRIVE.md §1), so there is no
+// credential here at all, not even a public identifier like S3's
+// access key. `apiBase` is config for the same reason S3's `endpoint`
+// is: a self-hosted (or fake) backend is ordinary addressing, not a
+// probe hack.
 
 // WIT `result<T, string>` returns resolve T / throw ComponentException.
 export interface Driver {

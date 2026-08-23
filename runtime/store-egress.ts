@@ -52,21 +52,37 @@ function err(e: unknown): string {
 // needs no re-instantiation, and why an instance wired without authority
 // can never acquire it by a later save.
 export interface EgressGrant {
-  provider: "s3" | "dropbox" | null;
+  provider: "s3" | "dropbox" | "gdrive" | null;
   /** Origins reachable AS THE USER. */
   origins: Set<string>;
-  /** Origins reachable anonymously. */
+  /** Origins reachable anonymously. gdrive: always empty — no capability
+   * is ever minted for this provider (DRIVE.md §1). */
   publicOrigins: Set<string>;
-  /** Origins reachable as the APP (app auth, never user identity). */
+  /** Origins reachable as the APP (app auth, never user identity).
+   * gdrive: always empty, same reason as above — there is no app tier
+   * to reach. */
   sharedOrigins: Set<string>;
-  /** Dropbox owner tier only; never in a config, never in a component. */
+  /** Dropbox/gdrive owner tier only; never in a config, never in a
+   * component. */
   bearer?: string;
   refresh?: string;
   /** The app identifiers. Public by nature, and held by EVERY tier's
    * grant including the recipient's — app auth is the link tier's only
-   * credential, and it says nothing about who is reading. */
+   * credential, and it says nothing about who is reading.
+   *
+   * For gdrive these fields carry the OAuth CLIENT id/secret —
+   * installed-app identifiers, the same public-by-nature class as
+   * Dropbox's appKey/appSecret (DRIVE.md §3: Google's own docs say an
+   * installed app's client secret is "not treated as a secret"). Bearer
+   * and refresh carry the user's own tokens, exactly as for Dropbox. */
   appKey?: string;
   appSecret?: string;
+  /** The token endpoint the owner seam refreshes against. Defaults per
+   * provider (DROPBOX_TOKEN_URL / GOOGLE_TOKEN_URL) when unset; set by
+   * embedders whose backend is self-hosted or fake (the devstore
+   * harness's fake Drive, DRIVE.md's Gates section). Ordinary
+   * addressing, the same reason gdrive-config carries `api-base`. */
+  tokenUrl?: string;
 }
 
 export function emptyGrant(): EgressGrant {
@@ -145,6 +161,10 @@ async function sendRequest(
 }
 
 const DROPBOX_TOKEN_URL = "https://api.dropboxapi.com/oauth2/token";
+/** Google's OAuth2 token endpoint — the refresh target for the gdrive
+ * provider (DRIVE.md §3/§4). Overridable per-grant via `tokenUrl` for
+ * self-hosted/fake backends (the devstore harness's fake Drive). */
+const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
 /** Percent-encode one `application/x-www-form-urlencoded` value — the
  * refresh body the guest used to build for itself. */
@@ -163,21 +183,27 @@ function formEncode(value: string): string {
  *   SIGNER — the guest built the x-amz headers and an Authorization
  *   value out of public parts plus a signature it had to ask for. There
  *   is nothing here to inject.
- * - Dropbox: a bearer token is disclosed to the destination by design
- *   (the SigV4-vs-bearer asymmetry recorded on #22), so this seam owns
- *   it: any component-supplied `authorization` is DROPPED — it could
- *   only be a guess or an attempt to echo something to the wire — and
- *   the visor attaches the token it holds, on the way out.
+ * - Dropbox/gdrive: a bearer token is disclosed to the destination by
+ *   design (the SigV4-vs-bearer asymmetry recorded on #22), so this seam
+ *   owns it: any component-supplied `authorization` is DROPPED — it
+ *   could only be a guess or an attempt to echo something to the wire —
+ *   and the visor attaches the token it holds, on the way out. The
+ *   401→refresh→retry shape is the same for both providers; the refresh
+ *   sub-request's shape differs (DRIVE.md §4: "the Dropbox shape,
+ *   generalized per provider").
  *
  * `onBearerRefreshed` mirrors CONTRACT: this used to be a module-scoped
  * `let` the embedder assigned after instantiation (the demo installs it
  * late, in `boot`, once its own local state exists to forward into); as
  * a factory parameter it is now an ordinary optional callback instead of
- * mutable module state shared across embedders.
+ * mutable module state shared across embedders. It takes a second,
+ * optional argument: a rotated refresh token, when the provider issued
+ * one (DRIVE.md §4 — Google may rotate; Dropbox's refresh response never
+ * has, so that path passes `undefined`).
  */
 export function makeOwnerFetch(
   grant: EgressGrant,
-  onBearerRefreshed?: (token: string) => void,
+  onBearerRefreshed?: (token: string, refreshToken?: string) => void,
 ): StoreFetch {
   return async (method, url, headers, body) => {
     if (grant.provider === null) {
@@ -214,8 +240,18 @@ export function makeOwnerFetch(
     // Authorization header at all. The conservative reading is to
     // reproduce the code path that is known to have worked; a PKCE
     // public client cannot use an app secret anyway.
-    const refreshBody =
-      `grant_type=refresh_token&refresh_token=${formEncode(grant.refresh)}&client_id=${
+    const isGdrive = grant.provider === "gdrive";
+    const refreshUrl = grant.tokenUrl ?? (isGdrive ? GOOGLE_TOKEN_URL : DROPBOX_TOKEN_URL);
+    const refreshBody = isGdrive
+      // gdrive: Google's installed-app exchange. `client_secret` rides
+      // along when the grant holds one (DRIVE.md §3: an installed app's
+      // secret "is not treated as a secret", so including it here is not
+      // a confidentiality claim, just matching Google's own token-
+      // endpoint shape for this client class).
+      ? `grant_type=refresh_token&refresh_token=${formEncode(grant.refresh)}&client_id=${
+        formEncode(grant.appKey)
+      }${grant.appSecret ? `&client_secret=${formEncode(grant.appSecret)}` : ""}`
+      : `grant_type=refresh_token&refresh_token=${formEncode(grant.refresh)}&client_id=${
         formEncode(grant.appKey)
       }`;
     // The refresh sub-request is transport too: a token endpoint that is
@@ -229,7 +265,7 @@ export function makeOwnerFetch(
       res = await sendRequest(
         "store-owner-fetch: refresh",
         "POST",
-        DROPBOX_TOKEN_URL,
+        refreshUrl,
         [["content-type", "application/x-www-form-urlencoded"]],
         new TextEncoder().encode(refreshBody),
       );
@@ -238,14 +274,25 @@ export function makeOwnerFetch(
     }
     if (res.status !== 200) return first;
     let fresh = "";
+    let rotatedRefresh: string | undefined;
     try {
-      fresh = (JSON.parse(new TextDecoder().decode(res.body)) as { access_token?: string })
-        .access_token ?? "";
+      const parsed = JSON.parse(new TextDecoder().decode(res.body)) as {
+        access_token?: string;
+        refresh_token?: string;
+      };
+      fresh = parsed.access_token ?? "";
+      // REFRESH-TOKEN ROTATION (DRIVE.md §4): Google may return a new
+      // refresh_token alongside the access token. When present, it
+      // replaces the one this grant holds — the old one may no longer
+      // be valid — and is handed to the callback so the caller can
+      // re-seal it.
+      rotatedRefresh = parsed.refresh_token;
     } catch { /* an unparseable refresh answer is just a failed refresh */ }
     if (fresh === "") return first;
     // Rebind: the grant's CONTENTS change, the wiring does not.
     grant.bearer = fresh;
-    onBearerRefreshed?.(fresh);
+    if (rotatedRefresh) grant.refresh = rotatedRefresh;
+    onBearerRefreshed?.(fresh, rotatedRefresh);
     // Exactly ONE retry: a second 401 is an answer, not a race.
     return await sendRequest("store-owner-fetch", method, url, outbound(fresh), body);
   };
@@ -273,8 +320,11 @@ export function makeSharedFetch(grant: EgressGrant): StoreFetch {
       witErr("store-shared-fetch: no storage grant configured yet");
     }
     if (grant.provider !== "dropbox") {
-      // S3 has no app tier at all: a request here would be a call site
-      // asking for an identity this provider cannot mint.
+      // S3 has no app tier at all, and gdrive mints NOTHING a
+      // non-credentialed party could use (DRIVE.md §1: "no shared
+      // links, no anonymous reads, no app-auth tier" — structural, not
+      // a checked flag). A request here on either provider is a call
+      // site asking for an identity this provider cannot mint.
       witErr("store-shared-fetch: no app tier on this provider");
     }
     const target = requestOriginOf(url, "store-shared-fetch");

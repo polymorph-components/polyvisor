@@ -1,0 +1,15 @@
+[package]
+name = "provider-gdrive"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+provider-common = { path = "../../common" }
+hex = "0.4"
+# JSON metadata bodies and Drive's JSON responses (the bearer and its
+# refresh are the wired owner seam's business, never the guest's).
+serde_json = "1"

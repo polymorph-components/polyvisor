@@ -67,6 +67,10 @@ use provider_dropbox::{
     dbx_list_folder, dbx_mint_link, dbx_pickup_path, dbx_revoke_link, dbx_upload, DbxCfg,
     DbxSource,
 };
+use provider_gdrive::{
+    gd_child, gd_delete, gd_doc_name, gd_ensure_folder, gd_fetch_child,
+    gd_list_children, gd_pickup_name, gd_upload, GdSource, GdriveCfg,
+};
 use provider_s3::{
     delete_object, get_object_unsigned, kp_location, object_name, put_object, s3_signed, S3Cfg,
 };
@@ -494,6 +498,10 @@ struct Partition {
 enum StoreCfg {
     S3(S3Cfg),
     Dropbox(DbxCfg),
+    /// Google Drive: Dropbox's layout over an id-addressed API with the
+    /// entire link tier removed — owner route only, no capability ever
+    /// minted (runtime/DRIVE.md §1).
+    Gdrive(GdriveCfg),
 }
 
 /// One partition's bucket-side state (the #19 pull layer).
@@ -555,6 +563,12 @@ struct State {
     kh_nudge: u32,
     store: Option<StoreCfg>,
     buckets: HashMap<Vec<u8>, BucketState>,
+    /// Google Drive folder-id cache: `"<root>/docs/<hex(doc)>"` -> id.
+    /// Drive is id-addressed and every path segment costs a `files.list`,
+    /// so the walk is paid once per folder per instance (DRIVE.md §2).
+    /// Instance memory only: ids are public addressing, never persisted
+    /// and never a capability.
+    gd_folders: HashMap<String, String>,
     /// Device pairing (#10).
     pair: pairing::PairState,
     /// The user-system partition (#36).
@@ -782,6 +796,19 @@ struct DbxPickup {
     devices: Vec<[u8; 32]>,
 }
 
+/// The Google Drive pickup payload, sealed to the member exactly as K_p
+/// is. NO capability inside, and that is the ruling rather than an
+/// omission (DRIVE.md §1): this store mints nothing a link could carry,
+/// so the standing secret a member needs is nothing at all. What remains
+/// is the bootstrap the pull layer wants — the device set — for the
+/// ACCOUNT'S OWN DEVICES, each of which is its own agent with its own
+/// prekeys and reads the store with the user's own OAuth.
+#[derive(Serialize, Deserialize)]
+struct GdrivePickup {
+    /// Devices whose oplogs/manifests to fetch (absent ones are skipped).
+    devices: Vec<[u8; 32]>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct BucketManifest {
     doc: Vec<u8>,
@@ -910,6 +937,7 @@ fn store() -> Result<S3Cfg, String> {
             access: c.access.clone(),
         }),
         Some(StoreCfg::Dropbox(_)) => Err("s3 path called on a dropbox store".to_string()),
+        Some(StoreCfg::Gdrive(_)) => Err("s3 path called on a gdrive store".to_string()),
         None => Err("store not configured (init-store first)".to_string()),
     })?
 }
@@ -1161,6 +1189,7 @@ fn dbx() -> Result<DbxCfg, String> {
             root: c.root.clone(),
         }),
         Some(StoreCfg::S3(_)) => Err("dropbox path called on an s3 store".to_string()),
+        Some(StoreCfg::Gdrive(_)) => Err("dropbox path called on a gdrive store".to_string()),
         None => Err("store not configured (init-store first)".to_string()),
     })?
 }
@@ -1217,6 +1246,96 @@ async fn dbx_publish_pickup(cfg: &DbxCfg, kh: &Kh, doc: &[u8], member: &[u8]) ->
     .await
 }
 
+// --- the Google Drive provider ---
+//
+// The protocol itself (files.list resolution, multipart create / media
+// update, alt=media reads, deletes, child naming) lives in
+// `provider-gdrive`; what stays here is the part entangled with engine
+// state and group crypto: the config snapshot, the folder-id cache, and
+// the sealed pickup object.
+
+fn gd() -> Result<GdriveCfg, String> {
+    with_state(|s| match s.store.as_ref() {
+        Some(StoreCfg::Gdrive(c)) => Ok(GdriveCfg {
+            root: c.root.clone(),
+            api_base: c.api_base.clone(),
+        }),
+        Some(StoreCfg::S3(_)) => Err("gdrive path called on an s3 store".to_string()),
+        Some(StoreCfg::Dropbox(_)) => Err("gdrive path called on a dropbox store".to_string()),
+        None => Err("store not configured (init-store first)".to_string()),
+    })?
+}
+
+/// Resolve-or-create a folder path under My Drive, one `files.list` per
+/// segment, memoized in instance state. Drive has no paths (DRIVE.md
+/// §2), so this walk IS the path; the cache is what keeps a flush from
+/// re-walking it per object.
+async fn gd_folder_path(cfg: &GdriveCfg, segments: &[String]) -> Result<String, String> {
+    let mut parent = "root".to_string();
+    let mut key = String::new();
+    for seg in segments {
+        key.push('/');
+        key.push_str(seg);
+        if let Some(id) = with_state(|s| s.gd_folders.get(&key).cloned())? {
+            parent = id;
+            continue;
+        }
+        let id = gd_ensure_folder(cfg, &EngineFetch, &parent, seg).await?;
+        with_state(|s| s.gd_folders.insert(key.clone(), id.clone()))?;
+        parent = id;
+    }
+    Ok(parent)
+}
+
+/// The per-doc object folder: `<root>/docs/<hex(doc)>`.
+async fn gd_doc_folder(cfg: &GdriveCfg, doc: &[u8]) -> Result<String, String> {
+    gd_folder_path(
+        cfg,
+        &[cfg.root.clone(), "docs".to_string(), gd_doc_name(doc)],
+    )
+    .await
+}
+
+/// The per-doc pickup folder: `<root>/pickup/<hex(doc)>`.
+async fn gd_pickup_folder(cfg: &GdriveCfg, doc: &[u8]) -> Result<String, String> {
+    gd_folder_path(
+        cfg,
+        &[cfg.root.clone(), "pickup".to_string(), gd_doc_name(doc)],
+    )
+    .await
+}
+
+/// Write one member's pickup object: the device set, sealed to their
+/// prekey exactly as K_p is. Overwrite in place, so a re-grant refreshes
+/// the contents without disturbing anything else.
+async fn gd_publish_pickup(
+    cfg: &GdriveCfg,
+    kh: &Kh,
+    doc: &[u8],
+    member: &[u8],
+) -> Result<(), String> {
+    let folder = gd_pickup_folder(cfg, doc).await?;
+    let payload = GdrivePickup {
+        devices: grantee_devices(doc)?,
+    };
+    let obj = seal_to_member(
+        kh,
+        doc,
+        member,
+        b"pickup-wrap",
+        &bincode::serialize(&payload).map_err(|e| e.to_string())?,
+    )
+    .await?;
+    gd_upload(
+        cfg,
+        &EngineFetch,
+        &folder,
+        &gd_pickup_name(member),
+        bincode::serialize(&obj).map_err(|e| e.to_string())?,
+    )
+    .await
+}
+
 /// Ensure bucket-side state exists for a partition.
 fn ensure_bucket_state(doc: &[u8]) -> Result<(), String> {
     with_state(|s| {
@@ -1236,12 +1355,14 @@ fn ensure_bucket_state(doc: &[u8]) -> Result<(), String> {
 enum Provider {
     S3,
     Dropbox,
+    Gdrive,
 }
 
 fn provider() -> Result<Provider, String> {
     with_state(|s| match s.store.as_ref() {
         Some(StoreCfg::S3(_)) => Ok(Provider::S3),
         Some(StoreCfg::Dropbox(_)) => Ok(Provider::Dropbox),
+        Some(StoreCfg::Gdrive(_)) => Ok(Provider::Gdrive),
         None => Err("store not configured (init-store first)".to_string()),
     })?
 }
@@ -1254,6 +1375,9 @@ enum PutSink {
     S3 { st: S3Cfg, nk: [u8; 32] },
     /// Dropbox: plain `{kind}-{hex}` children of the doc folder.
     Dbx { cfg: DbxCfg, folder: String },
+    /// Google Drive: the same `{kind}-{hex}` child names, under a doc
+    /// folder named by its ID (Drive has no paths to write to).
+    Gd { cfg: GdriveCfg, folder_id: String },
 }
 
 impl PutSink {
@@ -1271,6 +1395,9 @@ impl PutSink {
                     body,
                 )
                 .await
+            }
+            PutSink::Gd { cfg, folder_id } => {
+                gd_upload(cfg, &EngineFetch, folder_id, &gd_child(kind, id), body).await
             }
         }
     }
@@ -1497,6 +1624,109 @@ async fn dbx_pull(doc_id: Vec<u8>, pickup: Option<String>) -> Result<String, Str
     }
     Ok(format!(
         "pulled dropbox({tier}) devices={} events={ingested} chunks={fetched}",
+        devices.len()
+    ))
+}
+
+/// The Google Drive pull: OWNER TIER ONLY (DRIVE.md §1). A `pickup`
+/// argument is refused BY NAME rather than ignored — on Dropbox its
+/// presence selects the link tier, and this provider has no link tier to
+/// select, so silently ignoring it would answer a question the caller
+/// asked with a different question's answer. Past the tier decision the
+/// ingest pipeline is the Dropbox one, which is the S3 one: op streams
+/// into keyhive, signed manifests into entries, chunks into the
+/// sedimentree, apply.
+async fn gd_pull(doc_id: Vec<u8>, pickup: Option<String>) -> Result<String, String> {
+    if pickup.is_some() {
+        return Err(
+            "bucket-pull(pickup): this store mints no pickup capability (gdrive is owner-tier \
+             only); pull as the owner instead"
+                .to_string(),
+        );
+    }
+    let cfg = gd()?;
+    let (kh, sd) = with_state(|s| (s.kh.clone(), s.sd.clone()))?;
+    let tree = tree_id(&doc_id)?;
+    ensure_bucket_state(&doc_id)?;
+
+    // The doc folder's own listing is the device set — the same shape as
+    // Dropbox's owner arm, and the only shape here.
+    let folder = gd_doc_folder(&cfg, &doc_id).await?;
+    let mut devices: Vec<[u8; 32]> = Vec::new();
+    for name in gd_list_children(&cfg, &EngineFetch, &folder).await? {
+        for prefix in ["manifest-", "oplog-"] {
+            let Some(id_hex) = name.strip_prefix(prefix) else {
+                continue;
+            };
+            let Ok(raw) = hex::decode(id_hex) else { continue };
+            let Ok(device) = arr32(&raw, "device") else {
+                continue;
+            };
+            if !devices.contains(&device) {
+                devices.push(device);
+            }
+        }
+    }
+    let src = GdSource::Owner(folder);
+
+    // 1. Op streams into keyhive.
+    let mut ingested = 0usize;
+    for device in &devices {
+        let Some(blob) = gd_fetch_child(&cfg, &EngineFetch, &src, &gd_child("oplog", device)).await?
+        else {
+            continue;
+        };
+        let events: Vec<StaticEvent<T>> =
+            bincode::deserialize(&blob).map_err(|e| format!("oplog decode: {e}"))?;
+        ingested += events.len();
+        kh.ingest_unsorted_static_events(events).await;
+    }
+
+    // 2. Manifests -> union of entries.
+    let mut entries: Vec<Entry> = Vec::new();
+    for device in &devices {
+        let Some(blob) =
+            gd_fetch_child(&cfg, &EngineFetch, &src, &gd_child("manifest", device)).await?
+        else {
+            continue;
+        };
+        let manifest = verify_manifest(&blob, device).await?;
+        for e in manifest.entries {
+            if !entries.iter().any(|(c, _, _)| *c == e.0) {
+                entries.push(e);
+            }
+        }
+    }
+    adopt_entries(&doc_id, &entries)?;
+
+    // 3. Chunks -> the sedimentree (envelope bytes verbatim), then the
+    // normal apply path.
+    let have: HashSet<[u8; 32]> = sd
+        .get_commits(tree)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|c| *c.head().as_bytes())
+        .collect();
+    let mut fetched = 0u32;
+    for (cref, parents, _epoch) in &entries {
+        if have.contains(cref) {
+            continue;
+        }
+        let blob = gd_fetch_child(&cfg, &EngineFetch, &src, &gd_child("chunk", cref))
+            .await?
+            .ok_or("chunk object missing")?;
+        let parent_set: BTreeSet<CommitId> = parents.iter().map(|p| CommitId::new(*p)).collect();
+        sd.add_commit(tree, CommitId::new(*cref), parent_set, Blob::new(blob))
+            .await
+            .map_err(|e| format!("add_commit: {e:?}"))?;
+        fetched += 1;
+    }
+    if with_state(|s| s.partitions.contains_key(&doc_id))? {
+        apply_new_chunks(&doc_id).await?;
+    }
+    Ok(format!(
+        "pulled gdrive(owner) devices={} events={ingested} chunks={fetched}",
         devices.len()
     ))
 }
@@ -2410,6 +2640,7 @@ fn finish_init(
             kh_nudge: 0,
             store: None,
             buckets: HashMap::new(),
+            gd_folders: HashMap::new(),
             pair: pairing::PairState::default(),
             us: usdoc::UsDoc::default(),
             fetches: 0,
@@ -2559,6 +2790,14 @@ impl DriverGuest for Component {
             StoreConfig::Dropbox(c) => StoreCfg::Dropbox(DbxCfg {
                 root: c.root.trim_matches('/').to_string(),
             }),
+            // Same rule, and here there is not even an access key to
+            // carry: no credential of any kind crosses this boundary
+            // (DRIVE.md §2). `api-base` is addressing, exactly like
+            // S3's endpoint.
+            StoreConfig::Gdrive(c) => StoreCfg::Gdrive(GdriveCfg {
+                root: c.root.trim_matches('/').to_string(),
+                api_base: c.api_base.trim_end_matches('/').to_string(),
+            }),
         };
         with_state(|s| s.store = Some(cfg))
     }
@@ -2610,6 +2849,18 @@ impl DriverGuest for Component {
                 dbx_create_folder(&cfg, &EngineFetch, &format!("/{}/docs", cfg.root), true).await?;
                 dbx_create_folder(&cfg, &EngineFetch, &format!("/{}/pickup", cfg.root), true)
                     .await?;
+                Ok(())
+            }
+            Provider::Gdrive => {
+                // Only the roots. Doc folders are resolved-or-created
+                // lazily on the first grant or flush, and nothing is
+                // minted here or anywhere else on this provider
+                // (DRIVE.md §1). Resolve-then-create makes this
+                // idempotent without a tolerated-conflict status.
+                let cfg = gd()?;
+                gd_folder_path(&cfg, std::slice::from_ref(&cfg.root)).await?;
+                gd_folder_path(&cfg, &[cfg.root.clone(), "docs".to_string()]).await?;
+                gd_folder_path(&cfg, &[cfg.root.clone(), "pickup".to_string()]).await?;
                 Ok(())
             }
         }
@@ -2668,6 +2919,21 @@ impl DriverGuest for Component {
                     }
                 })?;
                 Ok(Some(link))
+            }
+            Provider::Gdrive => {
+                let cfg = gd()?;
+                // Same reason as the other two: every pickup carries the
+                // device set, which may have grown since it was written.
+                for g in &grantees {
+                    gd_publish_pickup(&cfg, &kh, &doc_id, g).await?;
+                }
+                // NONE, and the none is the ruling (DRIVE.md §1): this
+                // store mints no capability, so there is no link to hand
+                // back — there is nothing a link could grant. The pickup
+                // object exists for the ACCOUNT'S OWN DEVICES, which
+                // read it with the user's own OAuth at a location they
+                // derive from public ids.
+                Ok(None)
             }
         }
     }
@@ -2762,6 +3028,33 @@ impl DriverGuest for Component {
                 }
                 Ok("revoked server-side (hard, retroactive); container link re-minted".into())
             }
+            Provider::Gdrive => {
+                let cfg = gd()?;
+                // The pickup object goes away (cooperative immediacy,
+                // as on S3), and that is the whole server-side story.
+                let folder = gd_pickup_folder(&cfg, &doc_id).await?;
+                gd_delete(&cfg, &EngineFetch, &folder, &gd_pickup_name(&member)).await?;
+                let remaining = with_state(|s| {
+                    let b = s
+                        .buckets
+                        .get_mut(&doc_id)
+                        .ok_or("no bucket state".to_string())?;
+                    b.grantees.retain(|g| g != &member);
+                    Ok::<_, String>(b.grantees.clone())
+                })??;
+                for g in remaining {
+                    gd_publish_pickup(&cfg, &kh, &doc_id, &g).await?;
+                }
+                // The honest note, verbatim from DRIVE.md §1: no
+                // capability was ever minted, so there is nothing
+                // server-side to revoke, and a party holding the user's
+                // own Drive credential is outside this store's reach.
+                Ok("pickup deleted; this store never minted a capability, so there is nothing \
+                    server-side to revoke — a holder of the user's own Drive credential is \
+                    outside this store's reach, and credential rotation at Google is the real \
+                    lever"
+                    .into())
+            }
         }
     }
 
@@ -2791,6 +3084,16 @@ impl DriverGuest for Component {
                 let folder = dbx_doc_folder(&cfg.root, &doc_id);
                 PutSink::Dbx { cfg, folder }
             }
+            Provider::Gdrive => {
+                // Same non-gate as Dropbox: the guest cannot know
+                // whether the wired seam holds a token, and refusing
+                // early would be guessing. Attempt the write; an
+                // uncredentialed instance's own refusal surfaces
+                // through the existing error paths.
+                let cfg = gd()?;
+                let folder_id = gd_doc_folder(&cfg, &doc_id).await?;
+                PutSink::Gd { cfg, folder_id }
+            }
         };
         flush_to(&sink, &doc_id, epoch).await
     }
@@ -2805,6 +3108,9 @@ impl DriverGuest for Component {
             // owner-tier pulls by path. Both ignore `pickup`.
             Provider::S3 => s3_pull(doc_id, owner).await,
             Provider::Dropbox => dbx_pull(doc_id, pickup).await,
+            // Google Drive is owner tier only and REFUSES a `pickup` by
+            // name rather than ignoring it (DRIVE.md §1).
+            Provider::Gdrive => gd_pull(doc_id, pickup).await,
         }
     }
 

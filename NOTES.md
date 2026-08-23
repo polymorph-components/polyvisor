@@ -2052,6 +2052,62 @@ the sealed binding alone; disconnect leaves the escrow standing),
 invariants 8/8 with no scan widened, pairing-bringup and
 resume-bringup green, engine and WIT untouched.
 
+**Google Drive: the user-only store** (2026-08-22, the round after
+storage egress; design record [runtime/DRIVE.md](runtime/DRIVE.md)).
+The engine's third provider strategy and the worker host's second
+bindable one — and the first with NO SHARING TIER by design: it mints
+no capability a non-credentialed party could use (no links, no
+anonymous reads, no app tier — the unused seams are wired over EMPTY
+origin sets, refusing by construction), so the only readers are holders
+of the user's own OAuth. The provider is a statically-linked guest
+crate (providers/gdrive/store) modeled on Dropbox's plain-derivable-path
+strategy with the link machinery removed: everything runs Route::Owner;
+`drive.file` scope, whose per-app confinement makes the CLIENT ID part
+of the store's identity (every device of an account must use the same
+one); name→id resolution over Drive's id-addressed API with
+resolve-then-create-or-update uploads; `gdrive-config` carries `{root,
+api-base}` — addressing only, the api-base being config for the same
+reason S3's endpoint is, which is what lets a fake Drive gate the whole
+path as ordinary addressing. `store-grant` writes the K_p pickup record
+and returns NONE (nothing a link could grant); `store-revoke` returns
+the honest note (nothing server-side to revoke was ever minted;
+credential rotation at Google is the real lever); `bucket-pull` refuses
+a pickup by name. Because Drive is bearer-based, the round BUILT the
+OAuth shape the egress record had parked as v2: the WORKER mints the
+PKCE verifier and runs the token exchange with its own fetch; the PAGE
+owns only the popup and relays the one-shot, verifier-bound
+authorization code (ruled crossable: it is not a standing credential);
+tokens are born in worker memory, rest DEK-sealed in the device
+namespace — DEVICE-scoped, deliberately unlike the origin-shared SigV4
+escrow, since there is no platform handle for a bearer and sharing one
+across devices would be credential sharing between agents — and the
+401→refresh→retry seam re-seals rotated tokens so a respawned worker
+resumes on the newest ones (made falsifiable by a two-kill matrix row
+against a rotating fake). `bindStore` grew the gdrive arm with the same
+fail-at-bind discipline (no consent, or a consent under a different
+client id, refuses `no-credential` — the access-key-mismatch analog);
+`forgetOauth` is the honest disconnect (best-effort revoke at the
+provider, sealed row deleted, grant dropped; the BINDING stays —
+forgetting the account is not forgetting the destination, the mirror of
+unbind keeping the escrow). The solo sheet grew the provider choice
+(chrome-owned fields; the client secret masked and named for what it
+is — an installed-app identifier, not the user's secret); the demo page
+deliberately did not (its storage theatre exists to show the sharing
+tiers). Gates, all against demo/host/fake-drive.ts — a minimal Drive
+files API plus an OAuth half that VERIFIES OUR PKCE (S256 only, one-shot
+codes, rotation invalidating predecessors) and serves CORS because real
+googleapis.com does: a new headless `just bringup gdrive` (owner beat
+plus a cold engine reconstructing from the fake alone), devstore matrix
+29→36 rows (ceremony seals tokens the port never sees; refusals by
+code; egress carries the consent; kill-survival with no re-ceremony;
+rotation sealed; forget revokes; reseal seals the consent), e2e 17→18
+with solo-gdrive driving the REAL popup path headless, invariants 8/8,
+engine clippy + native pair/resume acts + all four bringups green. The
+LIVE beat against real Google is manual and the operator's, with a
+picked-up published client id (rclone's, with the recorded caveat that
+Google is retiring it during 2026; any registered installed-app pair
+slots into the same fields) — nothing baked into source or bundles.
+
 ## Parked and candidate non-goals
 
 - **Metadata privacy**: relays, push services, and origins see traffic

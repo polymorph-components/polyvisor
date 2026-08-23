@@ -109,6 +109,8 @@ import {
   type DeviceStatus,
   DRIVER_METHODS,
   type Hello,
+  type OauthStartResult,
+  type OauthStartSpec,
   type PromoteOptions,
   READONLY_METHODS,
   type ResealOptions,
@@ -610,19 +612,103 @@ async function readBinding(key: CryptoKey): Promise<StoreBinding | undefined> {
 }
 
 /**
+ * THE SEALED OAUTH ROW — the user's own Google tokens, at rest
+ * (DRIVE.md §4).
+ *
+ * DEVICE-scoped, deliberately unlike the SigV4 escrow, which is
+ * origin-shared: there is no platform handle for a bearer, so the DEK
+ * seal is the best rest available, and sharing one across devices would
+ * be credential sharing between agents. Multi-device is the same client
+ * id and the same root with SEPARATE consents.
+ *
+ * THE ROW NEVER LEAVES THIS FILE'S CONTROL. It is never logged, never
+ * reported in `status()` (which carries only the boolean
+ * `gdriveConsent`), and never crosses the port in either direction. The
+ * only shapes derived from it that go anywhere are the grant's in-memory
+ * bearer/refresh and the outbound Authorization header the owner seam
+ * attaches.
+ */
+const OAUTH_KEY = "oauth-gdrive";
+
+interface OauthRow {
+  access: string;
+  refresh?: string;
+  /** The client id the consent was granted TO. The `drive.file` scope
+   * confines visibility per client id (DRIVE.md §2), so a binding naming
+   * a different one is a mismatch to refuse at bind. */
+  clientId: string;
+  clientSecret?: string;
+  /** The token endpoint this consent was obtained from, kept so the
+   * refresh behind the owner seam goes back to the SAME backend a
+   * self-hosted/fake deployment used. */
+  tokenUrl?: string;
+  obtainedAt: number;
+}
+
+async function readOauth(key: CryptoKey): Promise<OauthRow | undefined> {
+  const bytes = await sealedGet(ns, key, OAUTH_KEY);
+  if (!bytes) return undefined;
+  return JSON.parse(new TextDecoder().decode(bytes)) as OauthRow;
+}
+
+async function writeOauth(key: CryptoKey, row: OauthRow): Promise<void> {
+  await sealedPut(ns, key, OAUTH_KEY, new TextEncoder().encode(JSON.stringify(row)));
+}
+
+/**
  * Point the grant and the signer at `b`'s destination.
  *
  * THE GRANT IS DERIVED FROM THE DESTINATION, NEVER ACCEPTED AS AN
  * ALLOWLIST (STORAGE-EGRESS.md §4). Nothing on the wire says where this
- * device may go: the origin is computed from the endpoint it was told to
- * use, so a client cannot widen the reach by asking. The population is
- * demo.ts's `setupBucket` S3 arm verbatim in effect (demo.ts:1285-1292) —
- * owner and public both the one origin, the shared set EMPTY because S3
- * has no app tier and the shim refuses that seam by name.
+ * device may go: the origin is computed from the address it was told to
+ * use, so a client cannot widen the reach by asking.
  *
- * Returns the normalized origin, or null when the endpoint is not one.
+ * S3: the population is demo.ts's `setupBucket` S3 arm verbatim in
+ * effect (demo.ts:1285-1292) — owner and public both the one origin, the
+ * shared set EMPTY because S3 has no app tier and the shim refuses that
+ * seam by name.
+ *
+ * GDRIVE (DRIVE.md §1/§5): owner is the one API origin and the public
+ * and shared sets are EMPTY — the unused tiers refuse BY CONSTRUCTION
+ * rather than by a checked flag, which is what "user-only" means here.
+ * The authority is the user's own sealed consent, so this arm ARMS ONLY
+ * WHEN ONE RESTS: with no consent the grant is left EMPTY and every seam
+ * refuses, while the binding's `initStore` still applies — addressing is
+ * not authority. There is no SigV4 on this provider, so the signer stays
+ * null and `wiredSigner` refuses by name.
+ *
+ * ASYNC because the gdrive arm reads the sealed oauth row.
+ *
+ * Returns the normalized origin, or null when the address is not one.
  */
-function applyBinding(b: StoreBinding): string | null {
+async function applyBinding(b: StoreBinding): Promise<string | null> {
+  if (b.kind === "gdrive") {
+    const origin = normalizeOrigin(b.apiBase);
+    if (origin === null) return null;
+    const row = dek ? await readOauth(dek) : undefined;
+    if (!row) {
+      // No consent rests: leave the grant EMPTY. The device knows where
+      // its store is and has no authority to reach it, which is the
+      // honest state and the one the seams already have words for.
+      clearGrant();
+      return origin;
+    }
+    // Rebind: contents, not wiring.
+    storeGrant.provider = "gdrive";
+    storeGrant.origins = new Set([origin]);
+    storeGrant.publicOrigins = new Set();
+    storeGrant.sharedOrigins = new Set();
+    storeGrant.bearer = row.access;
+    if (row.refresh !== undefined) storeGrant.refresh = row.refresh;
+    else delete storeGrant.refresh;
+    storeGrant.appKey = row.clientId;
+    if (row.clientSecret !== undefined) storeGrant.appSecret = row.clientSecret;
+    else delete storeGrant.appSecret;
+    if (row.tokenUrl !== undefined) storeGrant.tokenUrl = row.tokenUrl;
+    else delete storeGrant.tokenUrl;
+    storeSigner = null;
+    return origin;
+  }
   const origin = normalizeOrigin(b.endpoint);
   if (origin === null) return null;
   // Rebind: contents, not wiring.
@@ -653,6 +739,7 @@ function clearGrant(): void {
   delete storeGrant.refresh;
   delete storeGrant.appKey;
   delete storeGrant.appSecret;
+  delete storeGrant.tokenUrl;
   storeSigner = null;
 }
 
@@ -680,6 +767,270 @@ class StoreError extends Error {
   }
 }
 
+// --- the OAuth ceremony -----------------------------------------------------
+//
+// THE WORKER RUNS THE OAUTH; THE PAGE RUNS THE POPUP (DRIVE.md §3) —
+// the v2 shape STORAGE-EGRESS.md §5 parked, now built. The split falls
+// on capability lines rather than on convenience: a window is a PAGE
+// capability (the consent has to render in the provider's own pixels),
+// while the verifier, the exchange and the tokens are the WORKER's,
+// because a bearer must never exist in page memory or cross this port.
+//
+// WHAT CROSSES, THEREFORE: a URL out, and a one-shot authorization code
+// plus its state back in. The code is allowed across and §3 says exactly
+// why — it is a one-shot artifact, bound to a verifier that never left
+// this global, consumed inside the ceremony. The bearer ban is about
+// STANDING credentials, which a code is not.
+
+/**
+ * AN OAUTH CEREMONY REFUSAL — the worker's own condition, in the same
+ * shape and for the same reason as `StoreError` above: an own `code`
+ * property is what rpc.ts's `hostCodeOf` reads structurally, so it
+ * crosses the port as a typed `{form:"host"}` failure and the client
+ * branches on the code rather than on a message.
+ *
+ *   bad-ceremony     `oauthComplete` with no pending ceremony, or with a
+ *                    state that is not the one this worker minted. Both
+ *                    are the same finding — this answer does not belong
+ *                    to this ceremony — and neither is retryable without
+ *                    starting over.
+ *   exchange-failed  the provider's token endpoint refused, or answered
+ *                    without an access token. THE MESSAGE NAMES THE HTTP
+ *                    STATUS AND NOTHING ELSE: a token-endpoint body can
+ *                    echo the request it was sent, so quoting one into a
+ *                    message — which is a thing that gets logged — could
+ *                    put credential-shaped material somewhere it was
+ *                    never meant to rest.
+ */
+class OauthError extends Error {
+  constructor(readonly code: "bad-ceremony" | "exchange-failed", message: string) {
+    super(message);
+    this.name = "OauthError";
+  }
+}
+
+const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke";
+/** The minimal honest scope: files this app created, and nothing else
+ * in the user's Drive (DRIVE.md §2). */
+const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+
+/**
+ * THE ONE PENDING CEREMONY, in memory only.
+ *
+ * One at a time, and a new `oauthStart` OVERWRITES it: two concurrent
+ * consents are not a thing a user does, and when a second start arrives
+ * it is because the first one was abandoned — the user closed the popup,
+ * or the redirect never came back — so the NEWEST wins. Keeping the old
+ * one alive instead would mean a restarted ceremony answering with a
+ * state the worker has already replaced, which is the confusing
+ * direction.
+ *
+ * It dies with the global, which is correct: a verifier that outlived
+ * the worker would have to rest somewhere, and there is nothing to gain
+ * from persisting half a ceremony.
+ */
+let pendingCeremony: { verifier: string; state: string; spec: OauthStartSpec } | null = null;
+
+function base64url(bytes: Uint8Array): string {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function randomHex(n: number): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(n)), (b) =>
+    b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Percent-encode one `application/x-www-form-urlencoded` value. */
+function formEncode(value: string): string {
+  return encodeURIComponent(value).replace(
+    /[!'()*]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+}
+
+/**
+ * BEGIN THE CONSENT (DRIVE.md §3). Mints the PKCE verifier, its S256
+ * challenge and the state, keeps all three here, and hands back only the
+ * authorization URL.
+ *
+ * THE URL IS PUBLIC DATA. Every parameter in it is app identity,
+ * addressing, or the CHALLENGE — a hash, from which the verifier that
+ * stays in this global cannot be recovered. That is what makes it safe
+ * to hand to a page whose job is to open a popup on it.
+ */
+async function oauthStart(spec: OauthStartSpec): Promise<OauthStartResult> {
+  // A ceremony that succeeded on a sealed device would end holding
+  // tokens with nowhere sealed to put them, so it refuses at the front
+  // rather than at the seal.
+  if (!dek) {
+    throw new SealError("no-rung", "the device is sealed; open it before connecting an account");
+  }
+  const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const state = randomHex(16);
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier) as BufferSource),
+  );
+  const challenge = base64url(digest);
+  pendingCeremony = { verifier, state, spec };
+  const url = new URL(spec.authUrl ?? GOOGLE_AUTH_URL);
+  url.searchParams.set("client_id", spec.clientId);
+  url.searchParams.set("redirect_uri", spec.redirectUri);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", DRIVE_SCOPE);
+  url.searchParams.set("code_challenge", challenge);
+  url.searchParams.set("code_challenge_method", "S256");
+  // `offline` + `consent` together are what make Google issue a REFRESH
+  // token rather than an access token alone — without one a device would
+  // silently stop syncing an hour after its ceremony (DRIVE.md §4's
+  // lazy-401 refresh has to have something to refresh WITH).
+  url.searchParams.set("access_type", "offline");
+  url.searchParams.set("prompt", "consent");
+  url.searchParams.set("state", state);
+  return { authorizeUrl: url.toString() };
+}
+
+/**
+ * FINISH THE CONSENT: exchange the page-relayed code, sealed the tokens
+ * it buys (DRIVE.md §3).
+ *
+ * The exchange is THIS GLOBAL'S OWN `fetch` — the code and the verifier
+ * meet here and nowhere else, and what comes back never leaves. Binding
+ * is still `bindStore`'s job: consent and commitment stay two acts.
+ */
+async function oauthComplete(code: string, state: string): Promise<DeviceStatus> {
+  if (!dek) {
+    throw new SealError("no-rung", "the device is sealed; open it before connecting an account");
+  }
+  const pending = pendingCeremony;
+  if (!pending) {
+    throw new OauthError("bad-ceremony", "no consent ceremony is pending on this device");
+  }
+  if (state !== pending.state) {
+    // Not the ceremony this worker minted. The two cases — a stale popup
+    // answering after a restart, and a redirect that was never ours —
+    // are indistinguishable from here and take the same refusal.
+    throw new OauthError("bad-ceremony", "this consent answer does not match the pending ceremony");
+  }
+  const spec = pending.spec;
+  const tokenUrl = spec.tokenUrl ?? GOOGLE_TOKEN_URL;
+  const body = [
+    `code=${formEncode(code)}`,
+    `client_id=${formEncode(spec.clientId)}`,
+    ...(spec.clientSecret ? [`client_secret=${formEncode(spec.clientSecret)}`] : []),
+    `redirect_uri=${formEncode(spec.redirectUri)}`,
+    "grant_type=authorization_code",
+    `code_verifier=${formEncode(pending.verifier)}`,
+  ].join("&");
+  const res = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  if (res.status !== 200) {
+    // THE STATUS, AND NOT ONE BYTE OF THE BODY. See `OauthError`.
+    throw new OauthError("exchange-failed", `the token endpoint refused: HTTP ${res.status}`);
+  }
+  let parsed: { access_token?: string; refresh_token?: string };
+  try {
+    parsed = await res.json();
+  } catch {
+    throw new OauthError("exchange-failed", "the token endpoint answered with unreadable JSON");
+  }
+  const access = parsed.access_token ?? "";
+  if (access === "") {
+    throw new OauthError("exchange-failed", "the token endpoint answered without an access token");
+  }
+  const row: OauthRow = {
+    access,
+    clientId: spec.clientId,
+    obtainedAt: Date.now(),
+  };
+  if (parsed.refresh_token) row.refresh = parsed.refresh_token;
+  if (spec.clientSecret !== undefined) row.clientSecret = spec.clientSecret;
+  if (spec.tokenUrl !== undefined) row.tokenUrl = spec.tokenUrl;
+  await writeOauth(dek, row);
+  // The code was one-shot and is now spent; the verifier has nothing
+  // left to be bound to.
+  pendingCeremony = null;
+  return await status();
+}
+
+/**
+ * REFRESH WRITE-BACK (DRIVE.md §4): the owner seam refreshed behind our
+ * back, so the sealed row has to catch up or a worker respawn would
+ * resume on a token Google has already superseded.
+ *
+ * FIRE-AND-FORGET WITH A SWALLOWED CATCH, and both halves are
+ * deliberate. `makeOwnerFetch` calls this synchronously in the middle of
+ * a 401→refresh→retry, which is not a place to await IndexedDB and
+ * certainly not a place to fail a storage call over a bookkeeping write.
+ * The `if (dek)` guard is the reseal race stated rather than left to be
+ * discovered: a refresh that lands while the device is being resealed
+ * has nowhere sealed to write, and losing that write costs nothing —
+ * the grant already carries the new token for this instance's lifetime,
+ * and a device that has been resealed is going to re-read the row (or
+ * refresh again) at its next unseal anyway.
+ *
+ * IT MERGES RATHER THAN OVERWRITES: the row is re-read first so the
+ * clientId/clientSecret/tokenUrl the ceremony sealed survive, and a
+ * ROTATED refresh token replaces the old one only when the provider
+ * actually issued one.
+ */
+function onTokenRefreshed(token: string, refreshToken?: string): void {
+  const key = dek;
+  if (!key) return;
+  void (async () => {
+    const row = await readOauth(key);
+    if (!row) return;
+    row.access = token;
+    if (refreshToken) row.refresh = refreshToken;
+    row.obtainedAt = Date.now();
+    await writeOauth(key, row);
+  })().catch(() => {});
+}
+
+/**
+ * DISCONNECT THE ACCOUNT (DRIVE.md §4) — the honest disconnect, and the
+ * only place revocation belongs.
+ *
+ * THE REVOKE IS BEST-EFFORT BY DESIGN AND GOES FIRST. The DELETION is
+ * the act; telling the provider is courtesy, and a courtesy that cannot
+ * be completed (offline, an already-invalid token, a fake with no such
+ * endpoint) must never leave the row sitting here undeleted. So every
+ * failure is swallowed, and it is attempted first only because a token
+ * that has already been deleted cannot be revoked afterwards.
+ *
+ * THE BINDING ROW STAYS. Forgetting the account is not forgetting the
+ * destination — the exact mirror of `unbindStore` keeping the escrow
+ * (STORAGE-EGRESS.md §6). What does go immediately is the in-memory
+ * grant: a bearer must not outlive the consent it came from.
+ */
+async function forgetOauth(): Promise<DeviceStatus> {
+  if (!dek) {
+    throw new SealError("no-rung", "the device is sealed; open it before disconnecting an account");
+  }
+  const row = await readOauth(dek);
+  if (row) {
+    const revokeUrl = row.tokenUrl
+      ? new URL("/revoke", row.tokenUrl).toString()
+      : GOOGLE_REVOKE_URL;
+    try {
+      await fetch(revokeUrl, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: `token=${formEncode(row.refresh ?? row.access)}`,
+      });
+    } catch { /* best-effort: see the doc comment */ }
+  }
+  await sealedDelete(ns, OAUTH_KEY);
+  clearGrant();
+  return await status();
+}
+
 /**
  * BIND THIS DEVICE TO A BUCKET — the worker half of the storage
  * ceremony (STORAGE-EGRESS.md §§2-4). The page half escrowed the secret
@@ -700,12 +1051,17 @@ async function bindStore(binding: StoreBinding): Promise<DeviceStatus> {
   if (!dek || !engine) {
     throw new SealError("no-rung", "the device is sealed; open it before binding storage");
   }
+  if (binding?.kind === "gdrive") {
+    return await bindGdrive(binding, dek, engine);
+  }
   if (binding?.kind !== "s3") {
-    // v1 is S3 only, and the reason is recorded rather than pending:
-    // a Dropbox bearer is a disclosed string with no platform escrow, so
-    // handing one across this port is the cleartext crossing the design
-    // bans (§5, "Dropbox is PARKED for the worker").
-    throw new StoreError("bad-destination", "this host binds s3 destinations only");
+    // The two arms this host binds are S3 and Google Drive. DROPBOX is
+    // still parked for the worker and the reason is unchanged
+    // (STORAGE-EGRESS.md §5): its bearer would have to cross this port
+    // at deposit. Drive is not the exception to that rule — it is the
+    // rule honoured, because the worker runs the ceremony itself and the
+    // bearer is born on this side (DRIVE.md §3).
+    throw new StoreError("bad-destination", "this host binds s3 or gdrive destinations only");
   }
   const origin = normalizeOrigin(binding.endpoint);
   if (origin === null) {
@@ -754,7 +1110,7 @@ async function bindStore(binding: StoreBinding): Promise<DeviceStatus> {
     accessKey: binding.accessKey,
   };
   await sealedPut(ns, dek, STORE_BINDING_KEY, new TextEncoder().encode(JSON.stringify(stored)));
-  applyBinding(stored);
+  await applyBinding(stored);
   // A THROW FROM HERE LEAVES THE BINDING SEALED AND THE GRANT ARMED
   // while the live instance still has no addressing — self-consistent
   // rather than half-open (the seams refuse or the engine does, and
@@ -765,6 +1121,71 @@ async function bindStore(binding: StoreBinding): Promise<DeviceStatus> {
   await engine.driver.initStore({
     kind: "s3",
     value: { endpoint: stored.endpoint, bucket: stored.bucket, accessKey: stored.accessKey },
+  });
+  return await status();
+}
+
+/**
+ * BIND THIS DEVICE TO A DRIVE FOLDER (DRIVE.md §5).
+ *
+ * The refusals mirror the S3 arm's one-for-one, because they are the
+ * same rule wearing this provider's vocabulary: everything that can be
+ * known at bind time is settled at bind time, never discovered as a
+ * provider 403 twenty calls later (STORAGE-EGRESS.md §4).
+ *
+ *   bad-destination  an empty root or client id, or an apiBase that is
+ *                    not a usable origin.
+ *   no-credential    no sealed consent rests on this device, or the one
+ *                    that does was granted to a DIFFERENT client id.
+ *                    That second case is the access-key-mismatch rule's
+ *                    exact analog (§4, and the S3 arm above): the
+ *                    `drive.file` scope confines visibility PER CLIENT
+ *                    ID (DRIVE.md §2), so binding a root under a client
+ *                    id the consent was not granted to would produce a
+ *                    store whose own objects are invisible to it.
+ */
+async function bindGdrive(
+  binding: Extract<StoreBinding, { kind: "gdrive" }>,
+  key: CryptoKey,
+  live: Engine,
+): Promise<DeviceStatus> {
+  if (binding.root.trim() === "" || binding.clientId.trim() === "") {
+    throw new StoreError("bad-destination", "a Drive binding needs a root folder and a client id");
+  }
+  const origin = normalizeOrigin(binding.apiBase);
+  if (origin === null) {
+    throw new StoreError(
+      "bad-destination",
+      `the Drive API base is not a usable origin: ${binding.apiBase}`,
+    );
+  }
+  const row = await readOauth(key);
+  if (!row) {
+    throw new StoreError(
+      "no-credential",
+      "no Google account is connected on this device — run the Google Drive consent first",
+    );
+  }
+  if (row.clientId !== binding.clientId) {
+    throw new StoreError(
+      "no-credential",
+      `the consent this device holds was granted to a different client id — ` +
+        `run the consent again for ${binding.clientId}`,
+    );
+  }
+  const stored: StoreBinding = {
+    kind: "gdrive",
+    root: binding.root,
+    apiBase: binding.apiBase,
+    clientId: binding.clientId,
+  };
+  await sealedPut(ns, key, STORE_BINDING_KEY, new TextEncoder().encode(JSON.stringify(stored)));
+  await applyBinding(stored);
+  // Addressing only, exactly like every other arm (DRIVE.md §2): the
+  // guest gets no credential here, not even a public identifier.
+  await live.driver.initStore({
+    kind: "gdrive",
+    value: { root: stored.root, apiBase: stored.apiBase },
   });
   return await status();
 }
@@ -783,6 +1204,11 @@ async function bindStore(binding: StoreBinding): Promise<DeviceStatus> {
  * shared with every other device on this origin, and deleting it here
  * would take their signing with it. Erasing it is the erase ceremony's
  * job (keystore.ts's `eraseKeystore`).
+ *
+ * NEITHER IS THE SEALED DRIVE CONSENT, for the same shape of reason
+ * (DRIVE.md §4): forgetting the destination is not forgetting the
+ * account. Deleting that row is `forgetOauth`'s job, and it is a
+ * ceremony a user asks for by name.
  */
 async function unbindStore(): Promise<DeviceStatus> {
   if (!dek) {
@@ -920,7 +1346,7 @@ async function bringUpEngine(): Promise<void> {
   // leave it half open, and a binding that has been altered underneath
   // the DEK is a finding worth surfacing at the ceremony that touched it.
   const binding = await readBinding(dek);
-  if (binding) applyBinding(binding);
+  if (binding) await applyBinding(binding);
   // The cast is the one engine.ts, sealed-fs.ts and the spike all
   // document: the DOM's `FileSystemDirectoryHandle` does not
   // STRUCTURALLY satisfy the published handle interfaces (writer
@@ -936,7 +1362,7 @@ async function bringUpEngine(): Promise<void> {
     // seams plus the signer, over this global's one grant. While the
     // grant is empty every one of them refuses by name.
     {
-      ownerFetch: makeOwnerFetch(storeGrant),
+      ownerFetch: makeOwnerFetch(storeGrant, onTokenRefreshed),
       publicFetch: makePublicFetch(storeGrant),
       sharedFetch: makeSharedFetch(storeGrant),
       signer: wiredSigner,
@@ -988,14 +1414,18 @@ async function bringUpEngine(): Promise<void> {
   // its address. A device therefore returns to its bucket on every
   // unseal with no page-side state and nothing re-entered (§3).
   if (binding) {
-    await e.driver.initStore({
-      kind: "s3",
-      value: {
-        endpoint: binding.endpoint,
-        bucket: binding.bucket,
-        accessKey: binding.accessKey,
-      },
-    });
+    await e.driver.initStore(
+      binding.kind === "gdrive"
+        ? { kind: "gdrive", value: { root: binding.root, apiBase: binding.apiBase } }
+        : {
+          kind: "s3",
+          value: {
+            endpoint: binding.endpoint,
+            bucket: binding.bucket,
+            accessKey: binding.accessKey,
+          },
+        },
+    );
   }
   engine = e;
 
@@ -1108,6 +1538,12 @@ async function status(): Promise<DeviceStatus> {
     // ruling — swallowing it in `status()` would hide a real finding
     // from the one call everything makes.
     storage: dek === null ? null : ((await readBinding(dek)) ?? null),
+    // EXISTENCE ONLY, and the same cannot-know semantics as `storage`
+    // above: the oauth row rests under the DEK, so `false` on a sealed
+    // device means unreadable rather than absent. Nothing else about
+    // the row — no token, no expiry, no account name — is derivable
+    // from this field, which is the whole design of it (DRIVE.md §3).
+    gdriveConsent: dek !== null && (await readOauth(dek)) !== undefined,
   };
 }
 
@@ -1150,6 +1586,12 @@ async function callHost(method: string, args: unknown[]): Promise<unknown> {
       return await bindStore(args[0] as StoreBinding);
     case "unbindStore":
       return await unbindStore();
+    case "oauthStart":
+      return await oauthStart(args[0] as OauthStartSpec);
+    case "oauthComplete":
+      return await oauthComplete(args[0] as string, args[1] as string);
+    case "forgetOauth":
+      return await forgetOauth();
     case "status":
       return await status();
     case "__die":

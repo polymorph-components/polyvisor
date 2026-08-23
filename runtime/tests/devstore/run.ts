@@ -23,6 +23,13 @@
 import { chromium } from "npm:playwright@1.57.0";
 import type { Browser, BrowserContext, Page } from "npm:playwright@1.57.0";
 import { serveDir } from "jsr:@std/http@1.0.13/file-server";
+// The fake Google Drive: one module shared with the bringup phase and
+// the e2e suite (DRIVE.md's Gates section). This harness holds the
+// handle directly and asserts against it run.ts-side — no HTTP
+// inspection endpoint needed, unlike the S3 recorder, because the fake
+// already exposes `requests()`/`files()`/`childNames()`/`expireNow()`
+// in-process.
+import { startFakeDrive } from "../../../demo/host/fake-drive.ts";
 
 const here = new URL(".", import.meta.url).pathname;
 const SERVE = `${here}serve`;
@@ -153,6 +160,40 @@ const s3LogClear = (port: number): Promise<void> =>
 const S3_ACCESS_KEY = "SYNTHETIC-TEST-KEY";
 const S3_SECRET = "synthetic-test-secret-0000";
 
+// Synthetic labeled Google Drive installed-app identifiers. Not user
+// secrets (DRIVE.md §3: an installed app's "client secret" is not
+// treated as one) — but still never realistic-looking, per the
+// dispatch's own rule.
+const GD_CLIENT_ID = "SYNTHETIC-CLIENT";
+const GD_CLIENT_SECRET = "synthetic-client-secret-0000";
+
+/**
+ * Run one consent ceremony against the fake, entirely from the harness
+ * side — this IS the popup's job, done without a popup: `oauthStart`
+ * hands back a URL that is public data (app identity, addressing, and a
+ * PKCE CHALLENGE a fetch cannot reverse), the fake's `/auth` 302s
+ * straight back to `redirectUri` with `?code&state` (headless consent,
+ * fake-drive.ts's own doc comment), and `oauthComplete` relays both. The
+ * e2e suite drives the real popup; this harness only needs what a popup
+ * would produce.
+ */
+async function startAndFetchAuth(
+  page: Page,
+  id: string,
+  spec: { clientId: string; clientSecret?: string; redirectUri: string; authUrl: string; tokenUrl: string },
+  // deno-lint-ignore no-explicit-any
+): Promise<{ start: any; code: string; state: string }> {
+  const start = await probe(page, "gd-oauth-start", {
+    id,
+    spec: { provider: "gdrive", ...spec },
+  });
+  if (!start.ok) return { start, code: "", state: "" };
+  const res = await fetch(start.value.authorizeUrl, { redirect: "manual" });
+  const loc = res.headers.get("location") ?? "";
+  const locUrl = new URL(loc, spec.authUrl);
+  return { start, code: locUrl.searchParams.get("code") ?? "", state: locUrl.searchParams.get("state") ?? "" };
+}
+
 async function openPage(ctx: BrowserContext, port: number): Promise<Page> {
   const page = await ctx.newPage();
   page.on("pageerror", (e) => console.log(`      · pageerror: ${e.message}`));
@@ -207,6 +248,15 @@ async function main() {
   await new Promise((r) => setTimeout(r, 50));
   const s3Origin = `http://127.0.0.1:${s3Port}`;
   console.log(`s3 recorder: ${s3Origin}`);
+
+  const fake = await startFakeDrive();
+  // The fake now serves its own CORS (access-control-allow-origin: *,
+  // OPTIONS preflights answered 204 with authorization/content-type
+  // allowed — demo/host/fake-drive.ts), so the SharedWorker's
+  // `fetch(tokenUrl)`/files-API calls work directly against its origin;
+  // no fronting proxy needed.
+  const gdOrigin = fake.url;
+  console.log(`fake drive: ${gdOrigin}`);
 
   const browser: Browser = await chromium.launch({
     args: ["--no-sandbox", "--disable-dev-shm-usage"],
@@ -1481,9 +1531,373 @@ async function main() {
           `${j(r.notGranted.error.message)} (structural, the platform URL parser — never a ` +
           `prefix test); makePublicFetch(grant) carrying a guest-supplied Authorization header ` +
           `reached the recorder with it STRIPPED — hasAuthorization=${stripped?.hasAuthorization} ` +
-          `on the logged request; makeSharedFetch(grant) on an s3 provider (no app tier at all) ` +
+           `on the logged request; makeSharedFetch(grant) on an s3 provider (no app tier at all) ` +
           `→ ${j(r.sharedRefused.error.message)}`,
       );
+    });
+
+    // --- 30: the consent ceremony seals tokens the port never sees --------
+    //
+    // The v2 shape DRIVE.md §3 builds: the WORKER mints the PKCE
+    // verifier and the state and hands back only a URL (public data —
+    // app identity, addressing, and a CHALLENGE a fetch cannot reverse);
+    // the harness stands in for the popup by fetching that URL with
+    // `redirect: "manual"` against the fake's headless `/auth` and
+    // relaying `code`+`state` to `oauthComplete`. No token ever crosses
+    // this port in either direction.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "gdrive-consent",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const id = made.id as string;
+      await probe(page, "hc-open", { id, unseal: { passphrase: PASS, untilReseal: true } });
+
+      const spec = {
+        clientId: GD_CLIENT_ID,
+        clientSecret: GD_CLIENT_SECRET,
+        redirectUri: `http://127.0.0.1:${port}/probe.html`,
+        authUrl: `${gdOrigin}/auth`,
+        tokenUrl: `${gdOrigin}/token`,
+      };
+      const { start, code, state } = await startAndFetchAuth(page, id, spec);
+      const authorizeUrl = String(start.value?.authorizeUrl ?? "");
+      const urlCarriesChallenge = authorizeUrl.includes("code_challenge=") &&
+        authorizeUrl.includes("state=") && authorizeUrl.includes(`client_id=${GD_CLIENT_ID}`);
+      const urlCarriesNoSecret = !authorizeUrl.includes(GD_CLIENT_SECRET) &&
+        !authorizeUrl.includes("client_secret");
+
+      // WRONG STATE, WHILE THE CEREMONY IS STILL PENDING: the real code
+      // paired with a state the worker did not mint — refused by name,
+      // and the pending ceremony is UNTOUCHED by the refusal (worker.ts
+      // only clears it on success), so the correct pair still works
+      // right after.
+      const wrongState = await probe(page, "gd-oauth-complete", {
+        id,
+        code,
+        state: `${state}-wrong`,
+      });
+
+      const completed = await probe(page, "gd-oauth-complete", { id, code, state });
+      const status = await probe(page, "hc-status", { id });
+      const serialized = j(status);
+      const noTokenLeaked = !serialized.includes("synthetic-access") &&
+        !serialized.includes("synthetic-refresh");
+
+      // SECOND COMPLETE AFTER SUCCESS: the slot is cleared, so even the
+      // SAME code+state now finds no pending ceremony at all.
+      const again = await probe(page, "gd-oauth-complete", { id, code, state });
+
+      const ok = start.ok && urlCarriesChallenge && urlCarriesNoSecret &&
+        wrongState.ok === false && wrongState.error.code === "bad-ceremony" &&
+        completed.ok && completed.value.gdriveConsent === true &&
+        status.gdriveConsent === true && noTokenLeaked &&
+        again.ok === false && again.error.code === "bad-ceremony";
+      record(
+        "30 gdrive",
+        "the consent ceremony seals tokens the port never sees",
+        ok,
+        `oauthStart's authorizeUrl carries a PKCE challenge and state and the client id, no ` +
+          `client secret anywhere in it (${j(authorizeUrl.slice(0, 90))}…); a real code paired ` +
+          `with the WRONG state is refused (${j(wrongState.ok ? "accepted" : wrongState.error.code)}) ` +
+          `and does not consume the pending ceremony; the CORRECT pair (via the harness's own ` +
+          `fetch of that URL with redirect:"manual", standing in for the popup) completes ` +
+          `(gdriveConsent=${completed.value?.gdriveConsent}); the FULL serialized status contains ` +
+          `no "synthetic-access"/"synthetic-refresh" substring (${noTokenLeaked}) — no token ever ` +
+          `crossed this port; a SECOND complete after success finds the slot cleared ` +
+          `(${j(again.ok ? "accepted" : again.error.code)})`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
+    // --- 31: bindStore gdrive refuses by code ------------------------------
+    //
+    // The same rule as the S3 arm, wearing this provider's vocabulary
+    // (DRIVE.md §5): everything knowable at bind time settles at bind
+    // time. Four distinct destinations that must never be accepted.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "gdrive-bind-refusals",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const id = made.id as string;
+      await probe(page, "hc-open", { id, unseal: { passphrase: PASS, untilReseal: true } });
+
+      // (1) no-credential: no ceremony at all on this device yet.
+      const noConsent = await probe(page, "hc-bind", {
+        id,
+        binding: { kind: "gdrive", root: "pm-devstore", apiBase: gdOrigin, clientId: GD_CLIENT_ID },
+      });
+
+      // Run a real ceremony under GD_CLIENT_ID, so the next sub-case has
+      // a consent to MISMATCH against.
+      const spec = {
+        clientId: GD_CLIENT_ID,
+        clientSecret: GD_CLIENT_SECRET,
+        redirectUri: `http://127.0.0.1:${port}/probe.html`,
+        authUrl: `${gdOrigin}/auth`,
+        tokenUrl: `${gdOrigin}/token`,
+      };
+      const { code, state } = await startAndFetchAuth(page, id, spec);
+      const consented = await probe(page, "gd-oauth-complete", { id, code, state });
+
+      // (2) no-credential, the mismatch analog: a consent rests, but for
+      // a DIFFERENT client id than the one this bind names.
+      const mismatch = await probe(page, "hc-bind", {
+        id,
+        binding: {
+          kind: "gdrive",
+          root: "pm-devstore",
+          apiBase: gdOrigin,
+          clientId: "SYNTHETIC-OTHER",
+        },
+      });
+
+      // (3) bad-destination: an unusable apiBase.
+      const badBase = await probe(page, "hc-bind", {
+        id,
+        binding: { kind: "gdrive", root: "pm-devstore", apiBase: "not a url at all", clientId: GD_CLIENT_ID },
+      });
+
+      // (4) bad-destination: an empty root.
+      const emptyRoot = await probe(page, "hc-bind", {
+        id,
+        binding: { kind: "gdrive", root: "", apiBase: gdOrigin, clientId: GD_CLIENT_ID },
+      });
+
+      const ok = noConsent.attempt.refused && noConsent.attempt.error.code === "no-credential" &&
+        consented.ok && consented.value.gdriveConsent === true &&
+        mismatch.attempt.refused && mismatch.attempt.error.code === "no-credential" &&
+        badBase.attempt.refused && badBase.attempt.error.code === "bad-destination" &&
+        emptyRoot.attempt.refused && emptyRoot.attempt.error.code === "bad-destination";
+      record(
+        "31 gdrive",
+        "bindStore gdrive refuses by CODE",
+        ok,
+        `a fresh device with NO ceremony → ${j(noConsent.attempt.error.code)}; after a ceremony ` +
+          `under ${j(GD_CLIENT_ID)}, binding with a DIFFERENT client id → ` +
+          `${j(mismatch.attempt.error.code)} (the access-key-mismatch rule's exact analog — the ` +
+          `\`drive.file\` scope confines visibility per client id); an unusable apiBase → ` +
+          `${j(badBase.attempt.error.code)}; an empty root → ${j(emptyRoot.attempt.error.code)}`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
+    /** Row 32 carries its device into rows 33, 34, 35, 36. */
+    let gdriveDevice = "";
+    const gdriveBinding = { kind: "gdrive", root: "pm-devstore", apiBase: gdOrigin, clientId: GD_CLIENT_ID };
+    const gdriveSpec = {
+      clientId: GD_CLIENT_ID,
+      clientSecret: GD_CLIENT_SECRET,
+      get redirectUri() {
+        return `http://127.0.0.1:${port}/probe.html`;
+      },
+      authUrl: `${gdOrigin}/auth`,
+      tokenUrl: `${gdOrigin}/token`,
+    };
+
+    // --- 32: bind wires the derived grant; egress carries the consent -----
+    //
+    // Addressing plus app identifiers, nothing user-secret (DRIVE.md
+    // §5); the fake's request log is the observable that the OWNER
+    // seam actually carried the consent's Bearer.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "gdrive-bound",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const id = made.id as string;
+      gdriveDevice = id;
+      await probe(page, "hc-open", { id, unseal: { passphrase: PASS, untilReseal: true } });
+
+      const { code, state } = await startAndFetchAuth(page, id, gdriveSpec);
+      const consent = await probe(page, "gd-oauth-complete", { id, code, state });
+
+      const bound = await probe(page, "hc-bind", { id, binding: gdriveBinding });
+      const ensure = await probe(page, "hc-ensure-bucket", { id });
+      const authedCalls = fake.requests().filter((r) => r.hasAuth && !r.refused);
+      const root = fake.childNames("");
+      const rootChildren = fake.childNames("pm-devstore");
+
+      const ok = consent.ok && consent.value.gdriveConsent === true &&
+        bound.attempt.refused === false && j(bound.status.storage) === j(gdriveBinding) &&
+        ensure.attempt.refused === false &&
+        authedCalls.length > 0 &&
+        root.includes("pm-devstore") &&
+        rootChildren.includes("docs") && rootChildren.includes("pickup");
+      record(
+        "32 gdrive",
+        "bind wires the derived grant; egress carries the consent",
+        ok,
+        `bindStore accepted and status().storage echoes the addressing: ${j(bound.status.storage)}; ` +
+          `ensureBucket() succeeded (${!ensure.attempt.refused}) and produced ` +
+          `${authedCalls.length} Bearer-authorized files-API call(s); the fake's own tree now has ` +
+          `${j(root)} at the root and ${j(rootChildren)} inside it — the root/docs/pickup layout ` +
+          `DRIVE.md §2 describes — and nothing crossed the port but addressing plus app ` +
+          `identifiers: no token is on \`StoreBinding\` or anywhere in \`status()\``,
+      );
+    });
+
+    // --- 33: consent and binding survive the host's death ------------------
+    //
+    // `__die`, reconnect, unseal with NO ceremony — the sealed oauth row
+    // AND the sealed binding both come back re-applied at bring-up, not
+    // re-entered (persist.rs's "embedder-supplied addressing, re-applied
+    // by the embedder", engine/guest/src/persist.rs — the same claim
+    // STORAGE-EGRESS.md's row 27 pins for S3, now for the OAuth row too).
+    await guard(async () => {
+      const id = gdriveDevice;
+      await probe(page, "hc-die", { id });
+      const back = await probe(page, "hc-open", { id, unseal: {} });
+
+      const before = fake.requests().length;
+      const ensure = await probe(page, "hc-ensure-bucket", { id });
+      const after = fake.requests().length;
+
+      const ok = back.unseal.refused === false &&
+        back.status.gdriveConsent === true &&
+        back.status.storage !== null && back.status.storage.apiBase === gdOrigin &&
+        ensure.attempt.refused === false && after > before;
+      record(
+        "33 gdrive",
+        "consent and binding survive the host's death",
+        ok,
+        `after a KILL and a fresh worker, an unseal with NO passphrase auto-unseals from the ` +
+          `platform wrap and status() reports gdriveConsent=${back.status.gdriveConsent} AND the ` +
+          `binding (${j(back.status.storage)}) — both sealed rows survived. With NO ceremony and ` +
+          `NO \`bindStore\` call anywhere in this row, \`ensureBucket()\` still reached the fake ` +
+          `(${after - before} new request(s)) — \`bringUpEngine\` re-armed the grant from the ` +
+          `sealed oauth row and re-applied \`initStore\`, exactly as persist.rs's comment ` +
+          `describes and row 27 already pinned for the S3 arm.`,
+      );
+    });
+
+    // --- 34: 401 → refresh → retry, and the ROTATION is SEALED -------------
+    //
+    // DRIVE.md §4's write-back, made falsifiable: `fake.expireNow()`
+    // invalidates every access token, so the next bucket op must refresh
+    // behind the owner seam to succeed at all. The row then kills the
+    // worker, re-unseals with NO ceremony, and expires AGAIN — if the
+    // rotated refresh token from the FIRST refresh had not been
+    // re-sealed, the second refresh would present the fake with a
+    // refresh token it already deleted at rotation, and this op would
+    // fail.
+    await guard(async () => {
+      const id = gdriveDevice;
+
+      fake.expireNow();
+      const first = await probe(page, "hc-ensure-bucket", { id });
+
+      await probe(page, "hc-die", { id });
+      await probe(page, "hc-open", { id, unseal: {} });
+      fake.expireNow();
+      const second = await probe(page, "hc-ensure-bucket", { id });
+
+      const ok = first.attempt.refused === false && second.attempt.refused === false;
+      record(
+        "34 gdrive",
+        "401 → refresh → retry, and the rotation is SEALED",
+        ok,
+        `expireNow() invalidates every live access token; a bucket op still succeeds ` +
+          `(${!first.attempt.refused}) — the owner seam refreshed behind the seam and retried. ` +
+          `The worker is then KILLED, re-unsealed with NO ceremony, and expireNow() runs AGAIN: ` +
+          `the fake deleted the FIRST refresh token at rotation (rotation is what makes this a ` +
+          `real assertion rather than a no-op), so a worker holding only the stale sealed row ` +
+          `would fail this second refresh — it instead succeeds (${!second.attempt.refused}), ` +
+          `proving the ROTATED token from the first refresh was written back into the sealed ` +
+          `row and re-read at bring-up.`,
+      );
+    });
+
+    // --- 35: forget is the honest disconnect --------------------------------
+    //
+    // `forgetOauth` deletes the sealed consent and best-effort revokes
+    // it at the provider; the BINDING survives (forgetting the account
+    // is not forgetting the destination — the exact mirror of
+    // `unbindStore` keeping the S3 escrow, STORAGE-EGRESS.md §6).
+    await guard(async () => {
+      const id = gdriveDevice;
+      const before = fake.requests().length;
+      const forgotten = await probe(page, "gd-forget", { id });
+      const afterReqs = fake.requests().slice(before);
+      const revoked = afterReqs.some((r) => r.path === "/revoke" && r.method === "POST");
+
+      const statusAfter = await probe(page, "hc-status", { id });
+      // `ensureBucket` is idempotent on an already-created root (the
+      // guest caches resolved folder ids in instance memory, DRIVE.md
+      // §2), so a repeat call could succeed with NO network at all and
+      // pass this refusal for the wrong reason. `bucketFlush` on this
+      // device's own task partition has never been flushed anywhere in
+      // this matrix, so it always attempts the write and is the genuine
+      // probe of the (now-cleared) owner seam.
+      const ensureRefused = await probe(page, "gd-flush", { id });
+
+      // A fresh ceremony under the SAME client id, then the SAME bind:
+      // ops work again with nothing re-addressed.
+      const { code, state } = await startAndFetchAuth(page, id, gdriveSpec);
+      const reconsent = await probe(page, "gd-oauth-complete", { id, code, state });
+      const rebound = await probe(page, "hc-bind", { id, binding: gdriveBinding });
+      const ensureAgain = await probe(page, "gd-flush", { id });
+
+      const ok = forgotten.ok && forgotten.value.gdriveConsent === false && revoked &&
+        statusAfter.gdriveConsent === false && statusAfter.storage !== null &&
+        ensureRefused.attempt.refused === true &&
+        reconsent.ok && reconsent.value.gdriveConsent === true &&
+        rebound.attempt.refused === false &&
+        ensureAgain.attempt.refused === false;
+      record(
+        "35 gdrive",
+        "forget is the honest disconnect",
+        ok,
+        `forgetOauth() reports gdriveConsent=${forgotten.value?.gdriveConsent} and the fake's log ` +
+          `shows the /revoke POST (${revoked}); status() agrees (gdriveConsent=` +
+          `${statusAfter.gdriveConsent}) while storage stays non-null (${j(statusAfter.storage)}) ` +
+          `— forgetting the account is not forgetting the destination; a bucket op now refuses ` +
+          `at the owner seam (${ensureRefused.attempt.refused}: ` +
+          `${j(ensureRefused.attempt.error?.message)}). A FRESH ceremony under the same client id ` +
+          `plus the SAME bind (nothing re-addressed) puts it back to work: ` +
+          `gdriveConsent=${reconsent.value?.gdriveConsent}, rebind refused=` +
+          `${rebound.attempt.refused}, ensureBucket refused=${ensureAgain.attempt.refused}`,
+      );
+    });
+
+    // --- 36: reseal seals the consent with everything else ------------------
+    //
+    // Reseal drops the in-worker egress authority with everything else
+    // (STORAGE-EGRESS.md §6, DRIVE.md §4): the same upgrade-ceremony
+    // shape row 28 pins for S3, now checked for the oauth row too.
+    await guard(async () => {
+      const id = gdriveDevice;
+      const resealed = await probe(page, "hc-reseal", { id, passphrase: PASS, upgrade: true });
+      const sealedStatus = await probe(page, "hc-status", { id });
+
+      const back = await probe(page, "hc-unseal", { id, opts: { passphrase: PASS } });
+      const ensure = await probe(page, "hc-ensure-bucket", { id });
+
+      const ok = resealed.attempt.refused === false && resealed.status.sealed === true &&
+        sealedStatus.gdriveConsent === false && sealedStatus.storage === null &&
+        sealedStatus.sealed === true &&
+        back.attempt.refused === false && back.status.gdriveConsent === true &&
+        back.status.storage !== null &&
+        ensure.attempt.refused === false;
+      record(
+        "36 gdrive",
+        "reseal seals the consent with everything else",
+        ok,
+        `reseal() (an upgrade ceremony, refused=${resealed.attempt.refused}) leaves the device ` +
+          `sealed; a FRESH status() reports gdriveConsent=${sealedStatus.gdriveConsent} and ` +
+          `storage=${j(sealedStatus.storage)} — both unreadable while sealed, read together with ` +
+          `sealed=${sealedStatus.sealed}; unseal brings BOTH back (gdriveConsent=` +
+          `${back.status.gdriveConsent}, storage=${j(back.status.storage)}) and a bucket op works ` +
+          `(refused=${ensure.attempt.refused})`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
     });
 
     await ctx.close();
@@ -1491,7 +1905,9 @@ async function main() {
     await browser.close();
     await server.shutdown();
     await s3Server.shutdown();
+    await fake.close();
   }
+
 
   console.log(`\n=== DEVICE STORE MATRIX ===`);
   for (const r of rows) console.log(`${r.n.padEnd(16)} ${r.verdict.padEnd(6)} ${r.title}`);

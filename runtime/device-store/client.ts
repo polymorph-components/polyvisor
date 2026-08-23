@@ -46,6 +46,8 @@ import {
   DeviceHostError,
   DRIVER_METHODS,
   type Hello,
+  type OauthStartResult,
+  type OauthStartSpec,
   type PromoteOptions,
   type ResealOptions,
   type Req,
@@ -57,7 +59,15 @@ import {
 } from "./rpc.ts";
 
 export { DeviceHostError };
-export type { DeviceStatus, PromoteOptions, ResealOptions, StoreBinding, UnsealOptions };
+export type {
+  DeviceStatus,
+  OauthStartResult,
+  OauthStartSpec,
+  PromoteOptions,
+  ResealOptions,
+  StoreBinding,
+  UnsealOptions,
+};
 
 /** Which device this tab wants. */
 export type DeviceChoice =
@@ -197,6 +207,62 @@ export interface DeviceConnection {
    * (`eraseKeystore`), not to one device's unbind.
    */
   unbindStore(): Promise<DeviceStatus>;
+  /**
+   * BEGIN THE GOOGLE CONSENT — and note which half of it this is.
+   *
+   * THE PAGE OWNS THE POPUP; THE WORKER OWNS THE VERIFIER (DRIVE.md §3).
+   * A window is a page capability, so opening the consent is this side's
+   * job — but the PKCE verifier, the token exchange and the tokens
+   * themselves stay in the worker, which is what keeps a bearer out of
+   * page memory entirely.
+   *
+   * So what crosses on this call is app identity and addressing (the
+   * client id and secret are INSTALLED-APP identifiers, the same public
+   * class as the Dropbox appKey/appSecret the demo already holds in page
+   * memory — DRIVE.md §3), and what comes back is a URL. Open a popup on
+   * it; the redirect lands back on `spec.redirectUri` with `?code&state`
+   * and both go to `oauthComplete`.
+   *
+   * Refused with `code: "no-rung"` while sealed: a ceremony that
+   * succeeded on a sealed device would end holding tokens with nowhere
+   * sealed to put them.
+   */
+  oauthStart(spec: OauthStartSpec): Promise<OauthStartResult>;
+  /**
+   * FINISH THE CONSENT by relaying what the popup came back with.
+   *
+   * THE CODE MAY CROSS THIS WIRE AND THE RULING SAYS WHY (DRIVE.md §3):
+   * it is a one-shot artifact, bound to a verifier that never left the
+   * worker, consumed inside the ceremony. It is not a standing
+   * credential, and the bearer ban is about standing credentials. NO
+   * TOKEN EVER TRAVELS BACK — what returns is the ordinary
+   * `DeviceStatus`, whose only word on the subject is the boolean
+   * `gdriveConsent`.
+   *
+   * Refusals: `"no-rung"` while sealed; `"bad-ceremony"` when no
+   * ceremony is pending or the state does not match the one the worker
+   * minted; `"exchange-failed"` when the token endpoint refused (named
+   * by HTTP status only — a token-endpoint body can echo the request).
+   *
+   * It does NOT bind anything. Consent and commitment stay two acts;
+   * `bindStore` is the second one.
+   */
+  oauthComplete(code: string, state: string): Promise<DeviceStatus>;
+  /**
+   * DISCONNECT THE ACCOUNT: delete the sealed consent and best-effort
+   * revoke it at the provider (DRIVE.md §4) — the honest disconnect, and
+   * the only place revocation belongs.
+   *
+   * The revoke is courtesy and its failure is swallowed; the DELETION is
+   * the act. The device's in-memory bearer goes with it, so every
+   * storage seam refuses from the next call onward.
+   *
+   * THE BINDING SURVIVES, deliberately: forgetting the account is not
+   * forgetting the destination — the mirror image of `unbindStore`
+   * keeping the escrow. Re-consenting on the same client id puts the
+   * device back to work with nothing re-addressed.
+   */
+  forgetOauth(): Promise<DeviceStatus>;
   status(): Promise<DeviceStatus>;
   /** The worker's identity as this client first saw it. */
   readonly hello: Hello;
@@ -430,6 +496,11 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
     bindStore: (binding: StoreBinding) =>
       send("host", "bindStore", [binding]) as Promise<DeviceStatus>,
     unbindStore: () => send("host", "unbindStore", []) as Promise<DeviceStatus>,
+    oauthStart: (spec: OauthStartSpec) =>
+      send("host", "oauthStart", [spec]) as Promise<OauthStartResult>,
+    oauthComplete: (code: string, state: string) =>
+      send("host", "oauthComplete", [code, state]) as Promise<DeviceStatus>,
+    forgetOauth: () => send("host", "forgetOauth", []) as Promise<DeviceStatus>,
     status: () => send("host", "status", []) as Promise<DeviceStatus>,
     close,
     __die: async () => {

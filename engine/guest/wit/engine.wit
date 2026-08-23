@@ -98,9 +98,36 @@ interface driver {
         root: string,
     }
 
+    /// Google Drive: the USER-ONLY store (runtime/DRIVE.md). Addressing
+    /// only, like every other arm — and here there is no credential at
+    /// all, not even a public identifier like S3's access key: the
+    /// user's OAuth tokens and their refresh live in the wired
+    /// `store-owner-fetch` instance. `api-base` defaults to
+    /// `https://www.googleapis.com` and is config for the same reason
+    /// S3's `endpoint` is: a self-hosted (or fake) backend is ordinary
+    /// addressing, not a probe hack (§2).
+    ///
+    /// THE CLIENT ID IS DELIBERATELY NOT HERE. Auth is entirely the
+    /// wired seam's; the guest has no use for an app identity it must
+    /// never wield itself — though note that `drive.file` scope confines
+    /// per client id, so every device of an account must consent with
+    /// the SAME one to see the same store (§2).
+    ///
+    /// USER-ONLY, structurally (§1): this provider mints NO capability —
+    /// no shared links, no anonymous tier, no app tier. The only readers
+    /// are holders of the user's own OAuth, wired to
+    /// `store-owner-fetch`; `store-public-fetch` and
+    /// `store-shared-fetch` are wired over empty origin sets and the
+    /// gdrive paths never call them.
+    record gdrive-config {
+        root: string,
+        api-base: string,
+    }
+
     variant store-config {
         s3(s3-config),
         dropbox(dropbox-config),
+        gdrive(gdrive-config),
     }
 
     /// Addressing only — no credentials cross this boundary. Which
@@ -110,6 +137,8 @@ interface driver {
 
     /// S3: create the bucket + public-read-no-list policy. Dropbox:
     /// ensure the root folders (doc folders + links are minted lazily).
+    /// Google Drive: ensure the root / `docs` / `pickup` folders (doc
+    /// folders are resolved-or-created lazily; nothing is ever minted).
     ensure-bucket: async func() -> result<_, string>;
 
     /// Publish/refresh the member's pickup object, sealed to a keyhive
@@ -118,6 +147,11 @@ interface driver {
     /// the sealed pickup file (doc folder link + device list), plus the
     /// file's own minted link, returned — the member's standing
     /// capability, carried by the caller in lieu of the E2E channel.
+    /// Google Drive: the sealed pickup object at a derivable location —
+    /// returns NONE, and the none is a ruling, not an omission
+    /// (DRIVE.md §1): the account's own devices need the pickup to
+    /// bootstrap, and there is no link to carry because there is nothing
+    /// a link could grant.
     store-grant: async func(doc-id: list<u8>, member-id: list<u8>) -> result<option<string>, string>;
 
     /// Revoke the member's pickup and rotate the pull tier. S3: delete
@@ -127,6 +161,11 @@ interface driver {
     /// rewrite remaining pickups in place (hard + retroactive,
     /// server-side). Returns a human-readable guarantee note for the UI
     /// — the blobstore draft's guarantee class, as prose for now.
+    /// Google Drive: delete the pickup object and return the honest note
+    /// (DRIVE.md §1) — this store never minted a capability, so there is
+    /// nothing server-side to revoke; a party holding the user's own
+    /// Drive credential is outside this store's reach, and credential
+    /// rotation at Google is the real lever.
     store-revoke: async func(doc-id: list<u8>, member-id: list<u8>) -> result<string, string>;
 
     /// Push new chunks (envelope bytes), the op-stream blob, and the
@@ -140,7 +179,9 @@ interface driver {
     /// pickup link for link-tier recipients, and on Dropbox its PRESENCE
     /// is what selects the link tier (the guest can no longer see whether
     /// it holds a token, and must not infer authority from state); S3
-    /// derives the K_p location instead and ignores it.
+    /// derives the K_p location instead and ignores it. Google Drive is
+    /// OWNER TIER ONLY and REFUSES a `pickup` BY NAME (DRIVE.md §1): a
+    /// link-tier pull is not a thing this provider has.
     bucket-pull: async func(doc-id: list<u8>, owner-id: list<u8>, pickup: option<string>) -> result<string, string>;
 
     // --- the identity bundle (#20 G5; #11's persistence slice) ---

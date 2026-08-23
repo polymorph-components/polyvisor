@@ -82,8 +82,13 @@ import type { Posture, Tier, UnsealPolicy } from "./index.ts";
  * `SealedFsError.fsCode` ("io"), `IdentityKeyError.code`
  * ("extractable", "algorithm", "unavailable"), the worker's own storage
  * binding refusals ("bad-destination", "no-credential" — worker.ts's
- * `StoreError`), plus this module's own "timeout", "closed" and
- * "unclonable".
+ * `StoreError`), the worker's OAuth-ceremony refusals ("bad-ceremony" —
+ * a complete with no pending ceremony, or a state that does not match
+ * the one the worker minted; "exchange-failed" — the provider's token
+ * endpoint refused the exchange, named by HTTP status and never by body
+ * content, since a token-endpoint body can echo the request back —
+ * worker.ts's `OauthError`), plus this module's own "timeout", "closed"
+ * and "unclonable".
  */
 export interface HostError {
   message: string;
@@ -418,12 +423,73 @@ export interface AttachSpec {
  *
  * It is also the shape the engine's `StoreConfig` "s3" arm carries, on
  * purpose: the worker re-applies it as `initStore` at every bring-up.
+ *
+ * THE GDRIVE ARM SAYS THE SAME THING IN ITS OWN PROVIDER'S VOCABULARY
+ * (DRIVE.md §5). `root` and `apiBase` are addressing — `apiBase` for
+ * exactly the reason S3's `endpoint` is config, because a self-hosted or
+ * fake backend is ordinary addressing rather than a probe hack — and
+ * `clientId` is an APP IDENTIFIER, not a user secret: an installed-app
+ * OAuth client id, public by nature (DRIVE.md §3, where Google's own
+ * documentation is quoted saying an installed app's client secret is
+ * "not treated as a secret"). It rides on the binding because the
+ * `drive.file` scope confines visibility PER CLIENT ID (§2), so the
+ * client id is part of the store's identity beside the root folder.
+ *
+ * What still never appears on this type: the user's own tokens. The
+ * access and refresh tokens are born in the worker, rest sealed there,
+ * and have no path across this wire in either direction (§3).
  */
-export interface StoreBinding {
-  kind: "s3";
-  endpoint: string;
-  bucket: string;
-  accessKey: string;
+export type StoreBinding =
+  | {
+    kind: "s3";
+    endpoint: string;
+    bucket: string;
+    accessKey: string;
+  }
+  | {
+    kind: "gdrive";
+    root: string;
+    apiBase: string;
+    clientId: string;
+  };
+
+/**
+ * WHAT THE WORKER NEEDS IN ORDER TO RUN THE OAUTH CEREMONY (DRIVE.md
+ * §3, "The worker runs the OAuth; the page runs the popup").
+ *
+ * The page owns the popup because a window is a page capability; the
+ * worker owns the verifier, the exchange and the tokens. So what crosses
+ * on the way IN is app identity plus addressing, and what crosses on the
+ * way BACK is a URL — never a token.
+ */
+export interface OauthStartSpec {
+  provider: "gdrive";
+  /** The installed-app client id. Public by nature (DRIVE.md §3). */
+  clientId: string;
+  /**
+   * The installed-app client secret, when the registered client class
+   * has one. IT IS AN APP IDENTIFIER, NOT A USER SECRET (DRIVE.md §3):
+   * it identifies the app, gates nothing without the user's consent, and
+   * is the same class as the Dropbox appKey/appSecret the demo's grant
+   * already carries in page memory. That is why it may cross this wire
+   * when the bearer never may.
+   */
+  clientSecret?: string;
+  /** Where the provider sends the consent result. A loopback URI for a
+   * desktop-client pair; the page's own URL in a deployment. */
+  redirectUri: string;
+  /** ADDRESSING OVERRIDES for a self-hosted or fake backend (the
+   * devstore harness's fake Drive, DRIVE.md's Gates section). Absent,
+   * Google's own endpoints are used. */
+  authUrl?: string;
+  tokenUrl?: string;
+}
+
+/** What comes back out: a URL for the page to open a popup on. Public
+ * data — every parameter in it is either app identity or a PKCE
+ * challenge, and the verifier it was derived from stays in the worker. */
+export interface OauthStartResult {
+  authorizeUrl: string;
 }
 
 /** Everything a picker or a strip needs to know, and nothing secret. */
@@ -486,6 +552,20 @@ export interface DeviceStatus {
    * sealed device's storage is unknown, not absent.
    */
   storage: StoreBinding | null;
+  /**
+   * Whether a sealed Google Drive consent rests in this namespace
+   * (DRIVE.md §5), so a sheet can offer bind-without-ceremony.
+   *
+   * FALSE MEANS THE SAME TWO THINGS `storage` NULL DOES, for the same
+   * structural reason: the oauth row rests under the DEK, so a SEALED
+   * host genuinely cannot know whether one is there. Read it together
+   * with `sealed`.
+   *
+   * IT IS A BOOLEAN AND IT WILL STAY ONE. No token, no expiry, no
+   * account name — nothing derived from the sealed row beyond its
+   * existence ever appears on this type (DRIVE.md §3/§4).
+   */
+  gdriveConsent: boolean;
 }
 
 export type HostMethod =
@@ -498,6 +578,9 @@ export type HostMethod =
   | "status"
   | "bindStore"
   | "unbindStore"
+  | "oauthStart"
+  | "oauthComplete"
+  | "forgetOauth"
   | "__die";
 
 export interface Req {
