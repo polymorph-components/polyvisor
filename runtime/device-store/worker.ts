@@ -948,6 +948,56 @@ class OauthError extends Error {
   }
 }
 
+/**
+ * A PLATFORM REFUSAL — this browser cannot run the engine at all.
+ *
+ * Same shape and reason as `StoreError` and `OauthError` above: an own
+ * `code` property is what rpc.ts's `hostCodeOf` reads structurally, so
+ * it crosses the port as a typed `{form:"host"}` failure with its
+ * sentence intact.
+ *
+ *   no-jspi   the global has no WebAssembly JS Promise Integration.
+ */
+class PlatformError extends Error {
+  constructor(readonly code: "no-jspi", message: string) {
+    super(message);
+    this.name = "PlatformError";
+  }
+}
+
+/**
+ * THE ONE PLATFORM FACT THE ENGINE CANNOT DO WITHOUT, asked BEFORE the
+ * engine is built rather than discovered halfway through instantiating
+ * it.
+ *
+ * The engine's kernel parks WebAssembly frames on host promises through
+ * JSPI (runtime/engine.ts's note; engine/guest/src/persist.rs:24), and
+ * JSPI availability is PER-GLOBAL (spikes/worker-host/README.md Q1) —
+ * which is why the question is asked here, inside the SharedWorker that
+ * actually instantiates, and not on the page that spawned it.
+ *
+ * WITHOUT THIS CHECK the absence is still fatal, but it surfaces as the
+ * runtime's own mid-instantiation complaint: "needs JSPI (M2 phase 3):
+ * synchronous lower of import 'wasi:filesystem/types@0.2.9/[method]
+ * descriptor.open-at', whose host implementation returned a Promise".
+ * True, and unreadable — it names the first import that happened to
+ * suspend rather than the capability the browser is missing. Measured
+ * 2026-08-23 against Playwright 1.57.0's Firefox 144 build, where JSPI
+ * is off by default (see demo/e2e/run.ts's `FIREFOX_PREFS`).
+ *
+ * The sentence is written to read correctly with the boot path's own
+ * `boot failed: ` prefix in front of it (demo/host/solo.ts).
+ */
+function requireJspi(): void {
+  if (typeof (WebAssembly as { Suspending?: unknown }).Suspending === "function") return;
+  throw new PlatformError(
+    "no-jspi",
+    "this browser cannot run the engine: it has no WebAssembly JS Promise " +
+      "Integration (WebAssembly.Suspending), which the engine's kernel needs " +
+      "in order to park a guest call on a host promise",
+  );
+}
+
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke";
@@ -1543,6 +1593,7 @@ function deviceIdentityFragment(): DeviceIdentityFragment {
  */
 async function bringUpEngine(): Promise<void> {
   if (engine) return;
+  requireJspi();
   if (!attached) throw new Error("device-store: the host was never attached (no engine artifacts)");
   if (!dek) throw new SealError("no-rung", "the device is sealed");
 

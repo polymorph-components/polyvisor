@@ -88,8 +88,10 @@ import type { PrfEnrollment } from "./seal.ts";
  * the one the worker minted; "exchange-failed" — the provider's token
  * endpoint refused the exchange, named by HTTP status and never by body
  * content, since a token-endpoint body can echo the request back —
- * worker.ts's `OauthError`), plus this module's own "timeout", "closed"
- * and "unclonable".
+ * worker.ts's `OauthError`), the worker's platform refusal ("no-jspi" —
+ * the global has no WebAssembly JS Promise Integration, so the engine
+ * cannot be instantiated at all; worker.ts's `PlatformError`), plus this
+ * module's own "timeout", "closed" and "unclonable".
  */
 export interface HostError {
   message: string;

@@ -3540,7 +3540,15 @@ async function startApp(
 
 if (!isAuthPopup) {
   boot().catch((e) => {
-    console.error(e);
+    // THE MESSAGE FIRST, THE OBJECT SECOND. `console.error(e)` alone is
+    // a legible stack in a devtools console and NOTHING ANYWHERE ELSE:
+    // an out-of-process observer sees whatever the browser chose to
+    // serialise, and Playwright's Firefox (Juggler) renders an Error
+    // argument as the bare word "Error" — which is how a JSPI-less boot
+    // read as an opaque failure for a whole round of debugging while
+    // the banner three lines below carried the full sentence all along.
+    // A string argument survives every observer there is.
+    console.error(`[solo] boot failed: ${err(e)}`, e);
     const banner = document.getElementById("banner")!.querySelector(".bar-inner")!;
     banner.textContent = `boot failed: ${err(e)}`;
   });
