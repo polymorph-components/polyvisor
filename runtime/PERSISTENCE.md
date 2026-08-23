@@ -353,7 +353,20 @@ it is designed here.
   pickable, not merely active. One device: no label, it is noise.
 - Reseal: an explicit control (settings sheet); deletes the persisted
   KEK wrap, tells the worker to drop key material, returns to the
-  picker.
+  picker. **It saves first, and it may refuse — AMENDED 2026-08-23.**
+  Sealing drops the engine, so a mutation inside the 500 ms debounce
+  window had a checkpoint armed that would never fire: every seal
+  silently discarded up to half a second of work. Reseal now clears that
+  timer and takes a FINAL CHECKPOINT before dropping anything, and a
+  failed checkpoint REFUSES the ceremony with the device left open —
+  the erase ceremony's fallible-half-first discipline, and the sibling
+  of `destroy`'s drain of the checkpoint chain. What raised the stakes
+  was #93: the lost window used to cost a keystroke, and now costs the
+  doc's name-key chain, which a respawned engine re-mints into a
+  complete duplicate of the store. An open device with an untouched
+  engine reseals cleanly — a checkpoint of an unmutated engine is an
+  ordinary generation, not an error — and an already-sealed device has
+  no engine to checkpoint.
 
 ## Engine contract additions (the engine track owns the details)
 
@@ -379,6 +392,37 @@ it is designed here.
 - **Checkpoint semantics**: crash-consistent, not write-through-perfect:
   a checkpoint the engine can be restored from after `worker.terminate()`
   at any moment. The acts battery gains a kill-and-resume act.
+- **Bucket state joins the checkpoint — AMENDED 2026-08-23 (#93)**. The
+  original note in `persist.rs` classified `store` AND `buckets` together
+  as "embedder-supplied addressing, re-applied by the embedder". Half
+  right, and the elision was the bug:
+  - **ADDRESSING stays the embedder's.** `init-store`'s config — the
+    endpoint/bucket/root/apiBase and the public access-key identifier —
+    is never checkpointed and is re-applied at every bring-up. The
+    worker host already does exactly that from the sealed `StoreBinding`
+    (STORAGE-EGRESS.md).
+  - **STATE joins the checkpoint.** `State.buckets` — per-doc name-key
+    chains, the flushed-chunk dedup map, manifest entries, grantees, the
+    Dropbox pickup/container links — is GENERATED INSIDE the engine and
+    cannot be re-supplied by anyone. It rides the same sealed state root
+    as a new generation member (`buckets.bin`, digested in the manifest
+    like every other), because `name_keys` is secret material comparable
+    in kind to the keyhive archive already there.
+  - **What it cost while it was missing**: a respawn re-minted the
+    keychain, so every derived object name changed and the next flush
+    wrote a complete duplicate store (on Drive the doc FOLDER is keyed
+    too, so the duplicate was a whole second folder); a lost `flushed`
+    map re-uploaded every chunk even at stable names; and losing
+    `pickup_links` made `store_revoke` take its unknown-grantee path —
+    a silent revocation gap on Dropbox. On the deployed page a reload is
+    a respawn.
+  - **Back-compat is absence-tolerated, and it is the ordinary path.**
+    A checkpoint that lists no `buckets.bin` restores no bucket state and
+    is never an error — the device resumes exactly as it did pre-fix and
+    mints a fresh keychain on next use. `checkpoint` skips the member
+    entirely when the map is empty, so every device that never touched a
+    bucket keeps writing pre-#93-shaped generations, and the absence path
+    is exercised by every act and row that checkpoints without a store.
 
 ## Eviction and degradation
 

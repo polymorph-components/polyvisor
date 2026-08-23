@@ -40,6 +40,7 @@
 //! /gen-<n>/identity.bin
 //! /gen-<n>/keyhive.bin
 //! /gen-<n>/content.bin
+//! /gen-<n>/buckets.bin
 //! /gen-<n>/tree-<hex>.bin
 //! ```
 //!
@@ -95,6 +96,10 @@ const MANIFEST: &str = "MANIFEST";
 const IDENTITY_FILE: &str = "identity.bin";
 const KEYHIVE_FILE: &str = "keyhive.bin";
 const CONTENT_FILE: &str = "content.bin";
+/// Per-doc bucket STATE (#93). A generation written before that issue
+/// has no such member, and its absence is "no bucket state" — never an
+/// error (see `resume`).
+const BUCKETS_FILE: &str = "buckets.bin";
 
 /// Manifest magic + format version. A future layout change bumps this and
 /// old generations simply stop validating, which is the right outcome:
@@ -404,6 +409,40 @@ pub(crate) async fn checkpoint() -> Result<(), String> {
         &bincode::serialize(&content).map_err(|e| format!("content encode: {e}"))?,
     )?;
 
+    // --- bucket STATE (#93) ---
+    //
+    // THE CONFIG/STATE DISTINCTION. `State::store` is not here and never
+    // will be: it is the embedder's `init-store` addressing, re-applied
+    // at every bring-up (the worker host does exactly that). `State::
+    // buckets` is the opposite — per-doc name-key chains, the flushed
+    // dedup map, manifest entries, grantees and the Dropbox links, all
+    // MINTED INSIDE THE ENGINE. No embedder can hand them back, so
+    // leaving them out meant every respawn re-minted a keychain, renamed
+    // every object (on Drive, the doc folder too) and re-uploaded the
+    // whole store.
+    //
+    // The keychain is secret material, comparable in kind to the keyhive
+    // archive two members up: same sealed state root, same digested
+    // manifest, same embedder obligation to encrypt it at rest.
+    //
+    // WRITTEN ONLY WHEN NON-EMPTY, deliberately: a device that never
+    // touched a bucket leaves a generation shaped exactly like every
+    // pre-#93 one, which is the shape `resume` must tolerate — so the
+    // back-compat path is the ordinary path, exercised by every act and
+    // row that checkpoints without a store.
+    let buckets = crate::with_state(|s| {
+        if s.buckets.is_empty() {
+            Ok(None)
+        } else {
+            bincode::serialize(&s.buckets)
+                .map(Some)
+                .map_err(|e| format!("buckets encode: {e}"))
+        }
+    })??;
+    if let Some(bytes) = buckets {
+        write(BUCKETS_FILE, &bytes)?;
+    }
+
     // --- the manifest, LAST: this is the commit point ---
     let manifest = Manifest {
         generation: n,
@@ -608,9 +647,47 @@ pub(crate) async fn resume() -> Result<bool, String> {
         crate::usdoc::set_baseline()?;
     }
 
+    // --- bucket state (#93) ---
+    //
+    // ABSENCE IS NOT AN ERROR, and that is the whole back-compat claim.
+    // A generation written before #93 lists no `buckets.bin` at all, and
+    // so does any generation from a device that never touched a bucket
+    // (checkpoint skips the member when the map is empty). Both land
+    // here identically and leave `s.buckets` as `finish_init` built it —
+    // an empty map — which is precisely the pre-fix behaviour: the next
+    // `ensure_bucket_state` mints a fresh keychain. Nothing degrades
+    // that did not already degrade; what changes is that a generation
+    // which DOES carry the member restores it instead.
+    //
+    // ABSENT AND UNREADABLE ARE DIFFERENT QUESTIONS, and the MANIFEST is
+    // what separates them. `read_member` answers `None` for both, so
+    // asking it alone would silently turn a member that validated a
+    // moment ago and then vanished into "this device never had bucket
+    // state" — a fresh keychain and a duplicated store, arrived at
+    // quietly. The manifest's file list is the record of what this
+    // generation CLAIMS to hold: unlisted is absent, listed-but-
+    // unreadable raises, exactly as the identity/keyhive/content
+    // members do.
+    let listed = manifest.files.iter().any(|(f, _, _)| f == BUCKETS_FILE);
+    if listed {
+        let bytes = read_member(n, BUCKETS_FILE, &manifest)
+            .ok_or("checkpoint validated but buckets member vanished")?;
+        let buckets: HashMap<Vec<u8>, crate::BucketState> =
+            bincode::deserialize(&bytes).map_err(|e| format!("buckets decode: {e}"))?;
+        crate::with_state(|s| s.buckets = buckets)?;
+    }
+
     // Deliberately left empty (see engine.wit): `pending` — a partition
-    // created but never sealed was never committed; `store`/`buckets` —
-    // embedder-supplied addressing, re-applied by the embedder; and every
-    // wire handle, because a resumed device has no live connections.
+    // created but never sealed was never committed; `store` — the
+    // embedder's `init-store` ADDRESSING, re-applied by the embedder at
+    // every bring-up; and every wire handle, because a resumed device
+    // has no live connections.
+    //
+    // `buckets` USED TO BE ON THAT LIST and no longer is (#93). The
+    // config/state elision was the bug: addressing is the embedder's and
+    // is re-applied, but per-doc bucket STATE — name-key chains, the
+    // flushed dedup map, manifest entries, grantees, the Dropbox links —
+    // is generated inside the engine and cannot be re-supplied by
+    // anyone. It rides `BUCKETS_FILE` above, restored a few lines up.
     Ok(true)
 }

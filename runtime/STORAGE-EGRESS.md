@@ -26,9 +26,21 @@ origin can read directly — so NOTHING SECRET CROSSES THE PORT, in either
 direction. What crosses is a `StoreBinding`: addressing plus the public
 access-key identifier, as data. The binding persists in the device's
 SEALED namespace and the worker re-applies it at every engine bring-up,
-because the engine's checkpoint deliberately excludes store config
-("embedder-supplied addressing, re-applied by the embedder" —
+because the engine's checkpoint deliberately excludes store CONFIG
+("the embedder's `init-store` ADDRESSING, re-applied by the embedder" —
 engine/guest/src/persist.rs) and the worker IS the embedder.
+
+AMENDED 2026-08-23 (#93): that sentence is about the ADDRESSING, and for
+a while it was doing double duty. Per-doc bucket STATE — the name-key
+chain, the flushed-chunk map, manifest entries, grantees, the Dropbox
+links — is minted inside the engine, cannot be re-supplied by any
+embedder, and now rides the checkpoint beside the keyhive archive. Until
+that change it was instance memory, so every worker respawn (a page
+reload included) re-minted a keychain and the next flush re-uploaded the
+whole store under all-new names. The worker's job is unchanged: re-apply
+the binding, and let `stateResume()` bring back everything else. One
+consequence lands in rpc.ts: `storeGrant` left `READONLY_METHODS`,
+because a grant now mutates checkpointed state.
 
 ## Rulings
 

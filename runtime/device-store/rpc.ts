@@ -329,7 +329,13 @@ export const READONLY_METHODS: ReadonlySet<string> = new Set([
   "connStatus",
   "syncStatus",
   "chunkStats",
-  "storeGrant",
+  // `storeGrant` USED TO BE HERE and no longer is (#93). It was a pure
+  // remote write while bucket state lived only in instance memory:
+  // nothing it changed was in the checkpoint, so scheduling one bought
+  // nothing. Now `State.buckets` IS checkpointed — a grant appends to
+  // the doc's `grantees` list, and on S3 it republishes K_p against the
+  // current name-key epoch — so it mutates persisted state and must
+  // schedule a checkpoint like any other mutation.
   "stateCheckpoint",
   "stateResume",
   "pairJoinStatus",
@@ -424,6 +430,14 @@ export interface PromoteOptions {
  * the device with no rung anybody knows (see the worker's `reseal`), in
  * which case it becomes the device's new `every-session` rung and the
  * INDEX's policy tag must be flipped to match by the caller.
+ */
+/**
+ * `reseal`'s input.
+ *
+ * Reseal is not a pure discard: it takes a FINAL CHECKPOINT before it
+ * drops the engine, and a checkpoint that fails REFUSES the ceremony
+ * and leaves the device open (worker.ts's `reseal`). So a rejection
+ * here can mean "could not save", not only "could not re-key".
  */
 export interface ResealOptions {
   /** Required when the device's only usable rung is the platform wrap.
