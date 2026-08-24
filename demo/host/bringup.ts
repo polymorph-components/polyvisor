@@ -453,6 +453,91 @@ async function gdriveBeat(
         `no name among ${everyName.length} carries the doc id`,
     );
 
+    // THE CHANGE BOARD (runtime/SYNC.md §2): the doc folder's
+    // `appProperties`, one key per device, patched at FLUSH COMMIT.
+    //
+    // The key is the first 16 hex characters of this device's verifying
+    // key — a truncated PUBLIC identifier — and the value is this
+    // device's flush sequence number. Both halves are asserted, because
+    // the seqno is the entire mechanism: a board key that appeared but
+    // never moved would short-circuit every sibling poll forever.
+    const ownerBoardKey = hex(ownerId).slice(0, 16);
+    const board1 = fake.appProperties(docFolder, fakeSpace);
+    if (board1[ownerBoardKey] !== "1") {
+      throw new Error(
+        `after one flush the board should read {${ownerBoardKey}: "1"}, got ` +
+          JSON.stringify(board1),
+      );
+    }
+    // NOTHING BUT COUNTERS GOES ON THE BOARD. `appProperties` are
+    // plaintext Drive metadata, so this asserts the shape of every value
+    // and not just the one it expects: a decimal integer, nothing that
+    // could be a key, a hash or a signature.
+    for (const [k, v] of Object.entries(board1)) {
+      if (!/^[0-9]+$/.test(v)) {
+        throw new Error(`board value for ${k} is not a plain counter: ${JSON.stringify(v)}`);
+      }
+      if (k.length + v.length > 124) {
+        throw new Error(`board pair ${k} exceeds Drive's 124-byte budget`);
+      }
+    }
+
+    await owner.tasks.add("third drive task");
+    console.log("  flush #2:", await owner.driver.bucketFlush(part));
+    const board2 = fake.appProperties(docFolder, fakeSpace);
+    if (board2[ownerBoardKey] !== "2") {
+      throw new Error(
+        `the seqno must advance on every committed flush; after two it reads ` +
+          JSON.stringify(board2),
+      );
+    }
+    step(`change board: ${ownerBoardKey}=1 after one flush, =2 after the second`);
+
+    // THE FAKE'S OWN TRIPWIRES, probed directly rather than trusted.
+    // Drive's documented caps (124 bytes per key+value pair, 30
+    // properties per file) are the reason the board carries a truncated
+    // tag and a counter and nothing else; a fake that accepted anything
+    // would let a bloated board pass here and fail at Google. Probed
+    // over plain HTTP because no engine path is allowed to produce
+    // either shape — which is the point.
+    const folderId = fake.byPath(docFolder, fakeSpace)?.id;
+    if (!folderId) throw new Error("the doc folder vanished from the fake");
+    const patch = (props: Record<string, string | null>) =>
+      fetch(`${fake.url}/drive/v3/files/${folderId}?fields=appProperties`, {
+        method: "PATCH",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${ownerToken}`,
+        },
+        body: JSON.stringify({ appProperties: props }),
+      });
+    const tooBig = await patch({ bloat: "x".repeat(200) });
+    await tooBig.body?.cancel();
+    if (tooBig.status !== 400) {
+      throw new Error(`a 200-byte board value should be a 400, got ${tooBig.status}`);
+    }
+    const crowd: Record<string, string> = {};
+    for (let i = 0; i < 30; i++) crowd[`dev${i}`] = String(i);
+    const tooMany = await patch(crowd);
+    await tooMany.body?.cancel();
+    if (tooMany.status !== 400) {
+      throw new Error(`crossing the 30-property cap should be a 400, got ${tooMany.status}`);
+    }
+    // MERGE, then DELETE: a disjoint key lands beside the owner's
+    // without disturbing it (the per-key-merge model the single-writer
+    // invariant rests on), and a null value takes it back off.
+    await (await patch({ sibling: "7" })).body?.cancel();
+    const merged = fake.appProperties(docFolder, fakeSpace);
+    if (merged[ownerBoardKey] !== "2" || merged.sibling !== "7") {
+      throw new Error(`appProperties did not MERGE per key: ${JSON.stringify(merged)}`);
+    }
+    await (await patch({ sibling: null })).body?.cancel();
+    const pruned = fake.appProperties(docFolder, fakeSpace);
+    if ("sibling" in pruned || pruned[ownerBoardKey] !== "2") {
+      throw new Error(`a null value should delete just that key: ${JSON.stringify(pruned)}`);
+    }
+    step("board caps enforced (124 B pair, 30 keys -> 400); per-key merge and null-delete hold");
+
     await cold.driver.initStore(store);
     await cold.driver.adoptPartition(part);
     // A pickup argument is refused BY NAME, not ignored (DRIVE.md §1).
@@ -469,7 +554,120 @@ async function gdriveBeat(
     console.log("  pull:", await cold.driver.bucketPull(part, ownerId, undefined));
     const snap = await cold.tasks.items();
     step(`cold pull: rev=${snap.revision} items=${snap.items.length}`);
-    if (snap.items.length !== 2) throw new Error("cold boot incomplete");
+    if (snap.items.length !== 3) throw new Error("cold boot incomplete");
+
+    // CHEAP WHEN IDLE (runtime/SYNC.md §2). Nothing has flushed since
+    // the pull above, so the SECOND pull must answer out of the change
+    // board alone — and the proof is a REQUEST COUNT, not the summary
+    // string, because a pull that did all the work and then reported
+    // "unchanged" would read identically from the outside.
+    //
+    // Exactly one request is expected: the metadata `files.get` on the
+    // doc folder. The folder-id walk is free because this instance
+    // resolved it during the pull above and caches ids; the pickup, the
+    // oplogs, the manifests and the chunks are the requests that must
+    // NOT appear. The scheduler that will drive this on a 45s cadence
+    // is a dumb timer, so this number is the entire idle cost.
+    const beforeIdle = fake.requests().length;
+    const idle = await cold.driver.bucketPull(part, ownerId, undefined);
+    console.log("  idle pull:", idle);
+    const during = fake.requests().slice(beforeIdle).filter((r) => !r.preflight);
+    if (!idle.includes("unchanged")) {
+      throw new Error(`an idle pull should short-circuit on the board, got: ${idle}`);
+    }
+    if (during.length !== 1 || during[0].method !== "GET") {
+      throw new Error(
+        `the idle pull made ${during.length} request(s), expected exactly one metadata get: ` +
+          JSON.stringify(during.map((r) => `${r.method} ${r.path}`)),
+      );
+    }
+    if (!during[0].path.startsWith("/drive/v3/files/")) {
+      throw new Error(`the idle pull's one request was not a files.get: ${during[0].path}`);
+    }
+    const idleItems = await cold.tasks.items();
+    if (idleItems.items.length !== 3) {
+      throw new Error("the short-circuit lost state it should not have touched at all");
+    }
+    step(`idle pull: 1 request (${during[0].method} ${during[0].path}), no manifest, no chunk`);
+
+    // AND THE BOARD IS A HINT, NOT A LATCH: a sibling flush moves the
+    // seqno and the next pull does the full work again.
+    await owner.tasks.add("fourth drive task");
+    console.log("  flush #3:", await owner.driver.bucketFlush(part));
+    const woken = await cold.driver.bucketPull(part, ownerId, undefined);
+    console.log("  woken pull:", woken);
+    if (woken.includes("unchanged")) {
+      throw new Error(`a moved sibling seqno must defeat the short-circuit, got: ${woken}`);
+    }
+    const wokenItems = await cold.tasks.items();
+    if (wokenItems.items.length !== 4) {
+      throw new Error(
+        `the woken pull should have brought the sibling's new change, got ` +
+          `${wokenItems.items.length} items`,
+      );
+    }
+    step("board moved -> the next pull is full again (4 items)");
+
+    // STRUCTURAL DEDUPE (runtime/SYNC.md §1): the cold device now
+    // FLUSHES the history it just pulled, and the store must not grow a
+    // second copy of it.
+    //
+    // WHICH CHANNEL CARRIED THE CHAIN HERE. These two engines are
+    // separate agents with no account between them — neither runs
+    // `userCreate`, so neither has a user-system document, and the
+    // account-sync channel that carries the chain between a paired
+    // laptop and phone (the engine's pairing acts) does not exist in
+    // this topology. What the cold device holds is what the PICKUP
+    // object handed it during the pull above, which is why the pickup
+    // keeps carrying the chain (SYNC.md §1: unchanged for non-account
+    // readers). The dedupe claim is the same either way, and asserting
+    // it here is what shows the two channels agree on their result.
+    const beforeCold = fake.childNames(docFolder, fakeSpace);
+    console.log("  cold flush:", await cold.driver.bucketFlush(part));
+    const docsAfter = fake.childNames(`${GDRIVE_ROOT}/docs`, fakeSpace);
+    if (docsAfter.length !== 1 || docsAfter[0] !== docsChildren[0]) {
+      throw new Error(
+        `the cold device's flush created a SECOND doc folder — it derived the folder name ` +
+          `from a chain of its own instead of the one the pickup carried: ` +
+          `${JSON.stringify(docsAfter)}`,
+      );
+    }
+    const afterCold = fake.childNames(docFolder, fakeSpace);
+    const addedByCold = afterCold.filter((n) => !beforeCold.includes(n));
+    const lostByCold = beforeCold.filter((n) => !afterCold.includes(n));
+    if (lostByCold.length > 0) {
+      throw new Error(`the cold flush removed objects: ${JSON.stringify(lostByCold)}`);
+    }
+    // Exactly two: the cold device's own oplog and manifest, which are
+    // keyed by device on purpose (single-writer-per-name). Every chunk
+    // it re-uploaded had to land on a name the owner had already
+    // written — that is the dedupe.
+    //
+    // HOW STRONG THIS COUNT IS, precisely. The cold device's `flushed`
+    // dedup map was filled by the pull it just did, so its flush sends
+    // ZERO chunks and the count above cannot, by itself, distinguish
+    // "named them identically" from "did not send them". What IS
+    // load-bearing here is the doc-folder identity checked just above:
+    // that name derives from the founding epoch of the chain, so a
+    // device flushing under a private chain lands in a folder of its
+    // own — which is exactly what the old per-device minting did. The
+    // unbounded form of the chunk-name claim (a flusher with an EMPTY
+    // dedup map re-uploading history and landing on names another
+    // device already wrote) is pinned in the engine's pairing acts,
+    // where the second device has never pulled.
+    if (addedByCold.length !== 2) {
+      throw new Error(
+        `the cold device's flush added ${addedByCold.length} objects to the doc folder; ` +
+          `exactly 2 are expected (its own device-keyed oplog and manifest). The extras are ` +
+          `duplicate chunks under names the owner never derived, i.e. the chain did not ` +
+          `reach this device: ${JSON.stringify(addedByCold)}`,
+      );
+    }
+    step(
+      `structural dedupe: cold flush added ${addedByCold.length} objects ` +
+        `(${beforeCold.length} -> ${afterCold.length}), ONE doc folder, zero duplicate chunks`,
+    );
+
 
     // Every request the engines made carried a bearer, and every one of
     // them went to the fake's files API: no tier but the owner's exists.

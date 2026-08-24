@@ -41,7 +41,22 @@ export interface FakeFile {
    * a space, which is why a create in the hidden space needs no
    * parameter beyond the `appDataFolder` alias in `parents`. */
   space: FakeSpace;
+  /** The file's `appProperties` — the private-to-this-client-id string
+   * map that runtime/SYNC.md §2 makes the CHANGE BOARD on a doc folder.
+   *
+   * Modelled with the two behaviours the design leans on and one it must
+   * not be allowed to outgrow: PER-KEY MERGE on `files.update` (each
+   * device owns its key, so disjoint patches do not clobber), null-value
+   * DELETE, and Drive's documented caps enforced as a 400. */
+  appProperties: Record<string, string>;
 }
+
+/** Drive's documented `appProperties` limits, enforced by this fake so
+ * that a regression which bloats the change board fails in a test rather
+ * than against the real API. Mirrors
+ * `provider_gdrive::APP_PROPERTY_PAIR_BYTES` / `APP_PROPERTIES_MAX`. */
+export const APP_PROPERTY_PAIR_BYTES = 124;
+export const APP_PROPERTIES_MAX = 30;
 
 export interface FakeRequest {
   method: string;
@@ -74,6 +89,10 @@ export interface FakeDrive {
    * different files in the two spaces — which is the case the
    * isolation assertions turn on. */
   byPath(path: string, space?: FakeSpace): FakeFile | undefined;
+  /** The change board on a `/`-separated folder path — a convenience
+   * over `byPath(...).appProperties` for the assertions that only care
+   * about the board (SYNC.md §2). Empty for an absent path. */
+  appProperties(path: string, space?: FakeSpace): Record<string, string>;
   /** Child names of a `/`-separated folder path within one space
    * (default `drive`); empty if the path is absent in that space. An
    * empty path means the space's own root. */
@@ -84,6 +103,32 @@ export interface FakeDrive {
    * call with one gets a 401, which is what drives the seam's
    * refresh-and-retry (DRIVE.md §4). Refresh tokens survive. */
   expireNow(): void;
+  /**
+   * REFUSE THE NEXT `n` FILES-API REQUESTS WITH A 503 — an injected
+   * provider outage, for the rows that are about what the worker's sync
+   * scheduler does when a flush FAILS (runtime/SYNC.md §3's backoff and
+   * its announcement threshold).
+   *
+   * WHY 503 AND NOT 401: a 401 is the one refusal the seam has a
+   * recovery for (DRIVE.md §4's refresh-and-retry), so it would test the
+   * token dance instead of the backoff. A 5xx is the untriaged
+   * background failure the design deliberately does not string-match.
+   *
+   * SCOPE IS THE FILES API ONLY. `/auth`, `/token` and `/revoke` keep
+   * answering, so an outage cannot be mistaken for a consent that fell
+   * over — and a row can heal the store without re-running a ceremony.
+   *
+   * `n` is a COUNT rather than a boolean because "fail the next request"
+   * and "fail until I say stop" are different experiments; pass
+   * `Infinity` for the second and `refuseNextFiles(0)` to heal. Requests
+   * refused this way are still LOGGED (a fake that hid them would make
+   * the request log lie about what the worker attempted).
+   */
+  refuseNextFiles(n: number): void;
+  /** How many of the injected refusals are still owed — 0 once the
+   * store has healed, so a row can assert its outage was actually
+   * consumed rather than slept through. */
+  refusalsPending(): number;
   /** Access tokens currently accepted (labels only, for assertions like
    * "the engine is on the SECOND token now"). */
   liveAccessTokens(): string[];
@@ -208,6 +253,8 @@ export async function startFakeDrive(opts: FakeDriveOptions = {}): Promise<FakeD
   const codes = new Map<string, { challenge: string; method: string }>();
   const accessTokens = new Set<string>();
   const refreshTokens = new Set<string>();
+  /** Injected files-API refusals still owed — see `refuseNextFiles`. */
+  let refusalsOwed = 0;
   if (opts.seedAccessToken) accessTokens.add(opts.seedAccessToken);
 
   /** A file's space is its PARENT's space, and the two root aliases are
@@ -228,6 +275,7 @@ export async function startFakeDrive(opts: FakeDriveOptions = {}): Promise<FakeD
       mimeType,
       bytes,
       space: spaceOfParent(parents[0] ?? "root"),
+      appProperties: {},
     };
     store.set(f.id, f);
     return f;
@@ -353,6 +401,16 @@ export async function startFakeDrive(opts: FakeDriveOptions = {}): Promise<FakeD
     }
 
     // --- the files API --------------------------------------------------
+    //
+    // THE INJECTED OUTAGE COMES FIRST, before the bearer gate: a provider
+    // that is down is down for a valid credential too, and a refusal
+    // that depended on the token would be testing the wrong thing (see
+    // `refuseNextFiles`). Everything above this line — the OAuth
+    // endpoints — keeps working throughout.
+    if (refusalsOwed > 0) {
+      refusalsOwed--;
+      return driveError(503, "The service is currently unavailable.");
+    }
     if (requireAuth) {
       const token = auth.replace(/^Bearer\s+/i, "");
       if (!token || !accessTokens.has(token)) {
@@ -446,11 +504,74 @@ export async function startFakeDrive(opts: FakeDriveOptions = {}): Promise<FakeD
     }
 
     const one = path.match(/^\/drive\/v3\/files\/([^/]+)$/);
+    // files.update, METADATA-ONLY (no `/upload` prefix, no media part):
+    // the change-board patch (SYNC.md §2). PER-KEY MERGE is the whole
+    // semantic — the body's `appProperties` are folded INTO the existing
+    // map, key by key, so two devices patching their own keys both
+    // survive; a null value deletes the key, which is Drive's own
+    // convention and the only way off the board.
+    //
+    // THE CAPS ARE ENFORCED WITH A 400, deliberately. A board that quietly
+    // grew past 124 bytes a pair or 30 properties would work here and fail
+    // at Google, which is the exact class of drift this fake exists to
+    // catch — SYNC.md parks ">30 devices per board" as a known edge, and
+    // parked is only honest if crossing it is loud.
+    if (one && req.method === "PATCH") {
+      const f = store.get(decodeURIComponent(one[1]));
+      if (!f) return driveError(404, "File not found");
+      const meta = await req.json().catch(() => null) as
+        | { appProperties?: Record<string, string | null>; name?: string }
+        | null;
+      if (!meta) return driveError(400, "update: metadata body is not JSON");
+      const keys = Object.keys(meta);
+      const unsupported = keys.filter((k) => k !== "appProperties");
+      if (unsupported.length > 0) {
+        return driveError(
+          400,
+          `fake-drive: metadata update supports appProperties only, got ${unsupported.join(",")}`,
+        );
+      }
+      const merged = { ...f.appProperties };
+      for (const [k, v] of Object.entries(meta.appProperties ?? {})) {
+        if (v === null) {
+          delete merged[k];
+          continue;
+        }
+        const pair = new TextEncoder().encode(k + v).length;
+        if (pair > APP_PROPERTY_PAIR_BYTES) {
+          return driveError(
+            400,
+            `Invalid value for appProperties: key+value is ${pair} bytes, the maximum is ` +
+              `${APP_PROPERTY_PAIR_BYTES}`,
+          );
+        }
+        merged[k] = v;
+      }
+      if (Object.keys(merged).length > APP_PROPERTIES_MAX) {
+        return driveError(
+          400,
+          `The limit of ${APP_PROPERTIES_MAX} properties per file has been reached`,
+        );
+      }
+      f.appProperties = merged;
+      return json({ id: f.id, appProperties: { ...f.appProperties } });
+    }
     if (one && req.method === "GET") {
       const f = store.get(decodeURIComponent(one[1]));
       if (!f) return driveError(404, "File not found");
       if (url.searchParams.get("alt") !== "media") {
-        return json({ id: f.id, name: f.name, mimeType: f.mimeType });
+        // The metadata read. `appProperties` is OMITTED when empty, as
+        // the real API omits an empty map — which is why the provider
+        // treats its absence as "no board" rather than as an error.
+        const meta: Record<string, unknown> = {
+          id: f.id,
+          name: f.name,
+          mimeType: f.mimeType,
+        };
+        if (Object.keys(f.appProperties).length > 0) {
+          meta.appProperties = { ...f.appProperties };
+        }
+        return json(meta);
       }
       return new Response(f.bytes.slice() as unknown as BodyInit, {
         status: 200,
@@ -488,11 +609,21 @@ export async function startFakeDrive(opts: FakeDriveOptions = {}): Promise<FakeD
   return {
     url: `http://127.0.0.1:${port}`,
     port,
-    files: () => [...store.values()].map((f) => ({ ...f, bytes: f.bytes.slice() })),
+    files: () =>
+      [...store.values()].map((f) => ({
+        ...f,
+        bytes: f.bytes.slice(),
+        appProperties: { ...f.appProperties },
+      })),
     byPath: (p: string, space: FakeSpace = "drive") => {
       const f = resolvePath(p, space);
-      return f ? { ...f, bytes: f.bytes.slice() } : undefined;
+      return f
+        ? { ...f, bytes: f.bytes.slice(), appProperties: { ...f.appProperties } }
+        : undefined;
     },
+    appProperties: (p: string, space: FakeSpace = "drive") => ({
+      ...(resolvePath(p, space)?.appProperties ?? {}),
+    }),
     childNames: (p: string, space: FakeSpace = "drive") => {
       const parent = p.split("/").filter((s) => s.length).length === 0
         ? { id: rootId(space) }
@@ -504,6 +635,10 @@ export async function startFakeDrive(opts: FakeDriveOptions = {}): Promise<FakeD
     },
     requests: () => log.map((r) => ({ ...r })),
     expireNow: () => accessTokens.clear(),
+    refuseNextFiles: (n: number) => {
+      refusalsOwed = Math.max(0, n);
+    },
+    refusalsPending: () => refusalsOwed,
     liveAccessTokens: () => [...accessTokens],
     pendingCodes: () => [...codes.keys()],
     close: () => server.shutdown(),

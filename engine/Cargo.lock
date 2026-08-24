@@ -1310,6 +1310,7 @@ dependencies = [
 name = "engine-host"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "hex",
  "hmac",
  "polymorph-webcrypto-wasmtime",

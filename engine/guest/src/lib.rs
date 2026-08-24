@@ -68,8 +68,9 @@ use provider_dropbox::{
     DbxSource,
 };
 use provider_gdrive::{
-    gd_child, gd_delete, gd_doc_name, gd_download, gd_ensure_folder, gd_fetch_child,
-    gd_pickup_name, gd_upload, GdSource, GdSpace, GdriveCfg,
+    gd_board_key, gd_board_patch, gd_board_read, gd_child, gd_delete, gd_doc_name, gd_download,
+    gd_ensure_folder, gd_fetch_child, gd_pickup_name, gd_resolve, gd_upload, GdSource, GdSpace,
+    GdriveCfg,
 };
 use provider_s3::{
     delete_object, get_object_unsigned, kp_location, object_name, put_object, s3_signed, S3Cfg,
@@ -511,14 +512,39 @@ enum StoreCfg {
 /// GENERATED INSIDE THE ENGINE and cannot be re-supplied by an embedder
 /// — unlike `State::store`, which is pure addressing the embedder
 /// re-applies at every bring-up. Losing this map across a respawn
-/// re-mints the keychain (every derived name changes, so a flush writes
-/// a complete duplicate store) and forgets the upload dedup map and the
-/// standing Dropbox links. It rides the checkpoint's sealed state root
-/// with the keyhive archive: `name_keys` is secret material of the same
-/// kind. See persist.rs's `BUCKETS_FILE`.
+/// forgets the upload dedup map and the standing Dropbox links. It rides
+/// the checkpoint's sealed state root with the keyhive archive:
+/// `name_keys` is secret material of the same kind. See persist.rs's
+/// `BUCKETS_FILE`.
+///
+/// `name_keys` IS NO LONGER THE SOURCE OF TRUTH (SYNC.md §1, amended).
+/// The chain lives in the user-system document, syncs to the account's
+/// other devices, and this field is the working copy `ensure_bucket_state`
+/// reconciles against it before any name is derived. It stays in the
+/// checkpoint anyway, for the case that has no account to ask.
+///
+/// GROWING THIS STRUCT IS A DECODE BREAK, AND THAT IS THE COMPAT RULE.
+/// The checkpoint's `buckets.bin` is bincode, which is NOT
+/// self-describing: `#[serde(default)]` cannot rescue a missing field,
+/// because there is no field-name framing to notice it is missing —
+/// bincode simply reads the next struct's bytes as this one's and fails
+/// (or, worse, succeeds on garbage). So a member written by a build with
+/// fewer fields does not decode here.
+///
+/// THE RULE, ruled once so every future field can be added without a
+/// migration ladder: a `buckets.bin` that fails to DECODE is treated as
+/// an EMPTY MAP, with the same honest logging absence gets (persist.rs's
+/// resume). It is affordable precisely because SYNC.md §1 moved the name
+/// chain into the us-doc: the account re-supplies the chain, so the only
+/// thing actually lost is the `flushed` dedup map and the entry list,
+/// and the cost is ONE re-flush that re-uploads under the SAME names
+/// (the chain being unchanged) rather than a forked store. Bump fields
+/// freely; do not build a versioned decoder for this.
 #[derive(Serialize, Deserialize)]
 struct BucketState {
-    /// Per-epoch name-keys; index = epoch. Rotated on store-revoke.
+    /// Per-epoch name-keys; index = epoch. CACHE of the account's chain
+    /// (`usdoc::BUCKET_CHAINS`), which wins on every disagreement.
+    /// Rotated on store-revoke, through the account.
     name_keys: Vec<[u8; 32]>,
     /// cref -> epoch it was flushed under.
     flushed: HashMap<[u8; 32], u32>,
@@ -533,6 +559,28 @@ struct BucketState {
     /// The pickup file is rewritten in place across rotations, so these
     /// links never change once minted.
     pickup_links: Vec<(Vec<u8>, String)>,
+    /// THIS device's flush sequence number: how many flushes of this doc
+    /// have COMMITTED from this device, ever. Monotonic per device, and
+    /// the only thing this device ever writes to the change board
+    /// (SYNC.md §2). A counter, never key material — see
+    /// `provider_gdrive`'s board section for why that is a rule and not
+    /// a habit.
+    ///
+    /// Persisted because the board is a comparison against what SIBLINGS
+    /// last saw: a counter that reset on every respawn would publish
+    /// seqno 1 twice and a sibling holding 1 would read "nothing moved"
+    /// on a flush that did move something. It self-heals at the next
+    /// flush (2 > 1), but the delay is real, so it rides the checkpoint.
+    flush_seq: u64,
+    /// The board as this device last saw it, sorted, INCLUDING its own
+    /// key (which the comparison excludes; storing it whole keeps the
+    /// stored value a faithful record of what was read). Empty means
+    /// "never read a board for this doc", which is what disables the
+    /// short-circuit until one full pull has established a baseline.
+    ///
+    /// A HINT'S CACHE, not state anything is correct because of: losing
+    /// it costs one full pull.
+    board_seen: Vec<(String, String)>,
 }
 
 struct State {
@@ -1160,6 +1208,46 @@ async fn unseal_from_owner(
 
 /// The grantee set as 32-byte device ids (the devices whose oplogs and
 /// manifests a recipient should fetch).
+/// Is `owner` one of THIS account's own devices? — the fork SYNC.md §2's
+/// account-pull path turns on.
+///
+/// THE SOURCE IS THE ACCOUNT DEVICE DIRECTORY, read in-guest through the
+/// same path `us-devices-list` serves from (`usdoc::devices_list`, whose
+/// keys are the `devices` map of the user-system document). No new
+/// surface and no new state: the directory is already synced account
+/// state, and the WIT call is a thin projection of it.
+///
+/// THE IDENTITY BRIDGE, CHECKED RATHER THAN ASSUMED. The directory hands
+/// out `agent_id`, and the objects this decision unlocks are named by
+/// the flusher's DEVICE VERIFYING KEY (`flush_to`'s `device_vk`). These
+/// are the same 32 bytes, and the chain is short enough to state:
+/// `finish_init` sets `my_peer = PeerId::from(verifying)`;
+/// `own_agent_id()` is `my_peer.as_bytes()` and is what
+/// `usdoc::device_entry` keys the directory by; `flush_to` reads
+/// `device_vk` from `*s.my_peer.as_bytes()`. The corroboration is
+/// `verify_manifest`, which feeds the manifest's child id straight into
+/// `ed25519::import_verifying_key_raw` — an id that were not a verifying
+/// key could not verify a manifest, and manifests verify today. So there
+/// is NO mapping gap between the directory and the names.
+///
+/// A REVOKED sibling still counts. Its past flushes are this account's
+/// own history, the manifests are signature-verified regardless, and a
+/// pull is read-only — refusing to read them would discard content
+/// rather than protect anything. (Revocation's forward boundary is the
+/// chain rotation in §1, not a read filter here.)
+async fn account_sibling(owner: &[u8]) -> Result<bool, String> {
+    if !usdoc::has_account()? {
+        return Ok(false);
+    }
+    // A device WITH an account whose directory it cannot read right now
+    // propagates the error rather than answering "not a sibling": that
+    // wrong answer would route the pull to the pickup path and produce
+    // exactly the "never granted to this device" refusal this fork
+    // exists to remove — a misdiagnosis dressed as a result.
+    let devices = usdoc::devices_list().await?;
+    Ok(devices.iter().any(|d| d.agent_id == owner))
+}
+
 fn grantee_devices(doc: &[u8]) -> Result<Vec<[u8; 32]>, String> {
     with_state(|s| {
         let b = s.buckets.get(doc).ok_or("no bucket state".to_string())?;
@@ -1231,7 +1319,7 @@ fn dbx() -> Result<DbxCfg, String> {
 /// caching the link in per-doc bucket state. Called on the first grant
 /// or flush for a doc.
 async fn dbx_ensure_doc_container(cfg: &DbxCfg, doc: &[u8]) -> Result<String, String> {
-    ensure_bucket_state(doc)?;
+    ensure_bucket_state(doc).await?;
     if let Some(link) = with_state(|s| s.buckets.get(doc).and_then(|b| b.doc_link.clone()))? {
         return Ok(link);
     }
@@ -1334,6 +1422,41 @@ async fn gd_folder_path(cfg: &GdriveCfg, segments: &[String]) -> Result<String, 
     Ok(parent)
 }
 
+/// The same walk, RESOLVE-ONLY: absent is `None`, never a create.
+///
+/// It exists for the change board's short-circuit, and the distinction
+/// is the whole reason for a second function. The board is consulted
+/// BEFORE the pull has learned anything, so the folder name it derives
+/// comes from whatever chain this device happens to hold; if that chain
+/// is wrong (or the store is empty), `gd_folder_path` would CREATE a
+/// tree under a name nobody else derives — an empty forked store minted
+/// by a read. A hint must not be able to write. Resolve-only cannot.
+///
+/// Shares `gd_folders` with the creating walk: an id is an id, and a
+/// resolve that populates the cache is what makes the idle poll cost one
+/// request instead of one per path segment.
+async fn gd_folder_path_existing(
+    cfg: &GdriveCfg,
+    segments: &[String],
+) -> Result<Option<String>, String> {
+    let mut parent = cfg.space.root_parent().to_string();
+    let mut key = String::new();
+    for seg in segments {
+        key.push('/');
+        key.push_str(seg);
+        if let Some(id) = with_state(|s| s.gd_folders.get(&key).cloned())? {
+            parent = id;
+            continue;
+        }
+        let Some(id) = gd_resolve(cfg, &EngineFetch, &parent, seg, true).await? else {
+            return Ok(None);
+        };
+        with_state(|s| s.gd_folders.insert(key.clone(), id.clone()))?;
+        parent = id;
+    }
+    Ok(Some(parent))
+}
+
 /// This doc's name-key keychain, oldest epoch first, from bucket state.
 /// `ensure_bucket_state` must have run.
 fn doc_keychain(doc: &[u8]) -> Result<Vec<(u32, [u8; 32])>, String> {
@@ -1367,6 +1490,60 @@ fn doc_founding_key(doc: &[u8]) -> Result<[u8; 32], String> {
 async fn gd_doc_folder(cfg: &GdriveCfg, doc: &[u8]) -> Result<String, String> {
     let name = gd_doc_name(&doc_founding_key(doc)?, doc).await?;
     gd_folder_path(cfg, &[cfg.root.clone(), "docs".to_string(), name]).await
+}
+
+/// The doc folder if it already exists, `None` otherwise — the
+/// resolve-only twin, for the board (see `gd_folder_path_existing`).
+async fn gd_doc_folder_existing(cfg: &GdriveCfg, doc: &[u8]) -> Result<Option<String>, String> {
+    let name = gd_doc_name(&doc_founding_key(doc)?, doc).await?;
+    gd_folder_path_existing(cfg, &[cfg.root.clone(), "docs".to_string(), name]).await
+}
+
+// --- the change board (SYNC.md §2), engine side --------------------------
+//
+// The provider owns the two requests (`gd_board_patch` / `gd_board_read`
+// in providers/gdrive/store); what lives here is the DISCIPLINE around
+// them, which is the part a wrong reading would break:
+//
+//   * a board write NEVER fails a flush that already committed;
+//   * a board read NEVER answers a question the manifests answer, and an
+//     absent, empty or unreadable board falls through to the full pull;
+//   * the device's OWN key is excluded from the comparison — this device
+//     wrote it, so it moving is not news.
+
+/// This device's board key. Public material, truncated: see
+/// `provider_gdrive::gd_board_key`.
+fn board_key() -> Result<String, String> {
+    with_state(|s| gd_board_key(s.my_peer.as_bytes()))
+}
+
+/// Has any SIBLING's seqno moved since `seen` was recorded?
+///
+/// Conservative in both directions on purpose: a key that appeared, a
+/// key whose value changed, AND a key that vanished all count as
+/// "changed", because the only cost of a false "changed" is one full
+/// pull that finds nothing, while the cost of a false "unchanged" is a
+/// sibling's work staying invisible until something else moves. A hint
+/// that guesses wrong must guess toward doing the work.
+fn board_moved(seen: &[(String, String)], now: &[(String, String)], mine: &str) -> bool {
+    let strip = |b: &[(String, String)]| -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> =
+            b.iter().filter(|(k, _)| k != mine).cloned().collect();
+        v.sort();
+        v
+    };
+    strip(seen) != strip(now)
+}
+
+/// Record what the board said at the moment a pull STARTED (not
+/// finished): anything a sibling wrote after that read is change this
+/// pull did not see, and storing the later value would swallow it.
+fn board_remember(doc: &[u8], board: Vec<(String, String)>) -> Result<(), String> {
+    with_state(|s| {
+        if let Some(b) = s.buckets.get_mut(doc) {
+            b.board_seen = board;
+        }
+    })
 }
 
 /// The pickup folder: `<root>/pickup`, FLAT — no per-doc subfolder.
@@ -1417,18 +1594,181 @@ async fn gd_publish_pickup(
     .await
 }
 
-/// Ensure bucket-side state exists for a partition.
-fn ensure_bucket_state(doc: &[u8]) -> Result<(), String> {
+/// Ensure bucket-side state exists for a partition, and that its
+/// name-key chain agrees with the account's.
+///
+/// THE CHAIN'S SOURCE OF TRUTH IS THE US-DOC (SYNC.md §1, amended):
+/// `BucketState::name_keys` is a working CACHE of it, and this function
+/// is the one place the two are reconciled. Every bucket entry point
+/// calls it before touching a name, so "reconciled" means "before any
+/// object is addressed", on every path — flush, grant, revoke, pull.
+///
+/// Four cases, in the order they are decided:
+///
+///  1. THE ACCOUNT HAS A CHAIN -> it wins, unconditionally, over
+///     whatever the cache holds. This is where the checkpoint is
+///     reconciled: #93 restores `buckets` from the state root, and a
+///     restored chain can be stale (a sibling rotated while this device
+///     was dead) but never authoritative. Same line covers a device that
+///     minted locally before it had an account and then joined one.
+///  2. NO CHAIN, BUT A CACHE -> publish the cache. This is the DEFERRED
+///     WRITE-THROUGH for case 4: nothing schedules it, because every
+///     bucket operation already comes through here.
+///  3. NO CHAIN, NO CACHE -> mint one epoch and publish it. Mint-once-
+///     if-absent; the race when two devices do this concurrently is
+///     SYNC.md §1's recorded first-mint race, resolved by the register's
+///     LWW merge and costing one flush's worth of orphans.
+///  4. NO ACCOUNT AT ALL -> mint into the cache alone and carry on. A
+///     device that has not run `user-create` yet still has a working
+///     bucket; its chain joins the account the first time case 2 runs.
+async fn ensure_bucket_state(doc: &[u8]) -> Result<(), String> {
+    // The structural half, minus the chain: unchanged, infallible, and
+    // deliberately still synchronous so the entry below cannot race the
+    // await that follows it.
     with_state(|s| {
         s.buckets.entry(doc.to_vec()).or_insert_with(|| BucketState {
-            name_keys: vec![rand::random()],
+            name_keys: Vec::new(),
             flushed: HashMap::new(),
             entries: Vec::new(),
             grantees: Vec::new(),
             doc_link: None,
             pickup_links: Vec::new(),
+            flush_seq: 0,
+            board_seen: Vec::new(),
         });
-    })
+    })?;
+
+    let cached = with_state(|s| {
+        s.buckets
+            .get(doc)
+            .map(|b| b.name_keys.clone())
+            .unwrap_or_default()
+    })?;
+
+    if !usdoc::has_account()? {
+        // Case 4.
+        if cached.is_empty() {
+            let minted: [u8; 32] = rand::random();
+            with_state(|s| {
+                if let Some(b) = s.buckets.get_mut(doc) {
+                    b.name_keys = vec![minted];
+                }
+            })?;
+        }
+        return Ok(());
+    }
+
+    // A device WITH an account whose us-doc it cannot read right now
+    // (mid-join, before the partition is held) is a REFUSAL, not a
+    // fallback to case 4. Minting locally here would fork the namespace
+    // against the account's own chain — the precise defect SYNC.md §1
+    // exists to remove — so the bucket operation fails and is retried.
+    let account_chain = usdoc::bucket_chain_get(doc).await.map_err(|e| {
+        format!(
+            "cannot reach the account's name-key chain ({e}); refusing to mint a private one, \
+             which would publish objects under names this account's other devices never derive"
+        )
+    })?;
+    match account_chain {
+        // Case 1.
+        Some(chain) => {
+            if chain != cached {
+                with_state(|s| {
+                    if let Some(b) = s.buckets.get_mut(doc) {
+                        b.name_keys = chain;
+                    }
+                })?;
+            }
+        }
+        None => {
+            // Cases 2 and 3 differ only in where the chain comes from.
+            //
+            // THIS IS THE FALLBACK, NOT THE PRIMARY PATH. The chain for
+            // an account's doc is normally SEEDED at pointer publication
+            // (`usdoc::partition_put`), in the same atomic automerge
+            // change as the pointer itself. That is what closes the
+            // first-mint race (SYNC.md §1, amended): a device cannot
+            // flush a doc whose pointer it has not seen, and seeing the
+            // pointer means holding the chain, so there is no window in
+            // which a second device of the account mints a fork.
+            //
+            // What still reaches this arm is the recorded RESIDUE:
+            //
+            //  - LEGACY DOCS — a pointer published by a build older than
+            //    the seeding, so the account carries a pointer with no
+            //    chain beside it. The first device to flush mints, and
+            //    the seed-shaped guarantee does not apply retroactively.
+            //  - ACCOUNT-LESS DEVICES arriving here via case 4's cache,
+            //    which have no pointer and no us-doc to have seeded.
+            //
+            // Both cost at most one flush's worth of orphans, once, and
+            // self-heal on the next flush. Minting rather than refusing
+            // is deliberate: a device that will never have an account
+            // must still be able to use its bucket.
+            let chain = if cached.is_empty() {
+                vec![rand::random::<[u8; 32]>()]
+            } else {
+                cached
+            };
+            usdoc::bucket_chain_put(doc, &chain).await?;
+            with_state(|s| {
+                if let Some(b) = s.buckets.get_mut(doc) {
+                    b.name_keys = chain;
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Take a chain handed over by a PICKUP object as this device's chain
+/// for `doc` (S3's link tier, and any reader outside the owner's
+/// account).
+///
+/// The pickup is the channel for readers the account sync cannot reach,
+/// so what it carries is authoritative for the reader: a locally minted
+/// chain would publish to names the owner never derives. Written through
+/// to this device's OWN account document when it has one, so the
+/// adoption survives a checkpoint and reaches this reader's siblings —
+/// and so `ensure_bucket_state`'s case 1 does not hand the adopted chain
+/// straight back to a locally minted one on the next call.
+async fn adopt_bucket_chain(doc: &[u8], chain: Vec<[u8; 32]>) -> Result<(), String> {
+    if chain.is_empty() {
+        return Err("a pickup carried an empty name-key chain".into());
+    }
+    with_state(|s| {
+        if let Some(b) = s.buckets.get_mut(doc) {
+            b.name_keys = chain.clone();
+        }
+    })?;
+    if usdoc::has_account()? {
+        usdoc::bucket_chain_put(doc, &chain).await?;
+    }
+    Ok(())
+}
+
+/// Append a fresh epoch to this doc's chain and publish the result.
+///
+/// The rotation path (`store_revoke`). Wholesale replacement, because
+/// that is how the register merges: the new chain is the old one plus
+/// one epoch, written as a unit.
+async fn rotate_bucket_chain(doc: &[u8]) -> Result<(), String> {
+    let mut chain = with_state(|s| {
+        s.buckets
+            .get(doc)
+            .map(|b| b.name_keys.clone())
+            .unwrap_or_default()
+    })?;
+    chain.push(rand::random());
+    with_state(|s| {
+        if let Some(b) = s.buckets.get_mut(doc) {
+            b.name_keys = chain.clone();
+        }
+    })?;
+    if usdoc::has_account()? {
+        usdoc::bucket_chain_put(doc, &chain).await?;
+    }
+    Ok(())
 }
 
 // --- provider dispatch: one bucket surface, two strategies ---
@@ -1618,7 +1958,7 @@ async fn dbx_pull(doc_id: Vec<u8>, pickup: Option<String>) -> Result<String, Str
     let cfg = dbx()?;
     let (kh, sd) = with_state(|s| (s.kh.clone(), s.sd.clone()))?;
     let tree = tree_id(&doc_id)?;
-    ensure_bucket_state(&doc_id)?;
+    ensure_bucket_state(&doc_id).await?;
 
     let (src, devices, tier) = if let Some(pickup) = pickup {
         let blob = dbx_link_fetch(&cfg, &EngineFetch, &pickup, None)
@@ -1751,45 +2091,158 @@ async fn gd_pull(doc_id: Vec<u8>, owner: Vec<u8>, pickup: Option<String>) -> Res
     let (kh, sd) = with_state(|s| (s.kh.clone(), s.sd.clone()))?;
     let my_id = with_state(|s| s.my_peer.as_bytes().to_vec())?;
     let tree = tree_id(&doc_id)?;
-    ensure_bucket_state(&doc_id)?;
+    ensure_bucket_state(&doc_id).await?;
 
-    // 1. The pickup object: located by public ids, unwrapped by prekey
-    //    DH, exactly as `s3_pull` does with K_p.
-    let pickup_folder = gd_pickup_folder(&cfg).await?;
-    let name = gd_pickup_name(&doc_id, &owner, &my_id).await?;
-    let blob = gd_download(&cfg, &EngineFetch, &pickup_folder, &name)
-        .await?
-        .ok_or("pickup object missing: revoked, or never granted to this device")?;
-    let obj: KpObject = bincode::deserialize(&blob).map_err(|e| format!("pickup decode: {e}"))?;
-    let pairs = my_prekey_pairs(&kh).await?;
-    let sk = pairs
-        .get(&obj.member_pk)
-        .ok_or("pickup not sealed to any of my prekeys")?;
-    let ikm = sk.derive_new_secret_key(&obj.owner_pk).to_bytes();
-    let aead = ikm_aead(&ikm, b"pickup-wrap").await?;
-    let payload: GdrivePickup =
-        bincode::deserialize(&aead_open(&aead, &doc_id, &obj.sealed).await?)
-            .map_err(|e| format!("pickup payload decode: {e}"))?;
-    let mut keychain: Vec<(u32, [u8; 32])> = payload.name_keys.clone();
-    keychain.sort_by_key(|(e, _)| *e);
-    if keychain.is_empty() {
-        return Err("pickup carried no name-key keychain".to_string());
+    // --- 0. THE CHANGE BOARD: the cheap answer, when there is one -----
+    //
+    // SYNC.md §2's "cheapness-when-idle lives INSIDE the provider
+    // strategy": the scheduler is a dumb timer, so an idle poll has to
+    // become cheap HERE or not at all. One metadata `files.get` (5 quota
+    // units) against a doc folder resolved out of the instance's folder
+    // cache, versus a full pull's pickup + oplog + manifest per device.
+    //
+    // GATED ON HAVING A BASELINE, and that gate is doing real work. An
+    // empty `board_seen` means this device has never completed a pull of
+    // this doc, so the chain it holds is its own until the pickup hands
+    // it the right one — and a folder name derived from the wrong chain
+    // names a folder that does not exist. Deriving it is harmless (the
+    // resolve-only walk never creates); trusting its ABSENCE would not
+    // be, so the whole step is skipped rather than reasoned about.
+    //
+    // EVERY FAILURE HERE FALLS THROUGH TO THE FULL PULL. Absent folder,
+    // unreadable properties, transport error: the board is a hint, never
+    // truth, and the only correct answer to a hint that will not speak
+    // is to do the work.
+    let my_board_key = board_key()?;
+    let seen = with_state(|s| {
+        s.buckets
+            .get(&doc_id)
+            .map(|b| b.board_seen.clone())
+            .unwrap_or_default()
+    })?;
+    let mut board_now: Option<Vec<(String, String)>> = None;
+    if !seen.is_empty() {
+        let folder = match gd_doc_folder_existing(&cfg, &doc_id).await {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[board] doc folder resolve failed, pulling in full: {e}");
+                None
+            }
+        };
+        if let Some(folder) = folder {
+            match gd_board_read(&cfg, &EngineFetch, &folder).await {
+                Ok(now) => {
+                    if !board_moved(&seen, &now, &my_board_key) {
+                        return Ok(format!(
+                            "pulled gdrive(owner) unchanged (board) events=0 chunks=0 siblings={}",
+                            now.iter().filter(|(k, _)| *k != my_board_key).count()
+                        ));
+                    }
+                    board_now = Some(now);
+                }
+                Err(e) => eprintln!("[board] unreadable, pulling in full (hint only): {e}"),
+            }
+        }
     }
+
+    // 1. THE BOOTSTRAP, AND THE FORK (SYNC.md §2, "THE ACCOUNT PULL
+    //    PATH"). Everything downstream needs exactly two things — the
+    //    name-key chain and the set of devices whose oplog/manifest to
+    //    read — and there are two ways to come by them.
+    //
+    //    A pickup exists to bootstrap a reader who cannot DERIVE. An
+    //    account sibling can: it holds the chain as account state (§1)
+    //    and the owner's identity in the device directory, and the
+    //    owner's object names are keyed by exactly that identity. So a
+    //    sibling pull reads nothing out of a pickup at all — which is
+    //    what makes the scheduler's (partition × sibling) fan-out
+    //    possible, since account devices only ever grant pickups to
+    //    THEMSELVES and every sibling pull could previously only refuse.
+    let sibling = account_sibling(&owner).await?;
+    let (keychain, devices, folder) = if sibling {
+        // The chain is already reconciled against the account by the
+        // `ensure_bucket_state` above; no adoption, nothing to unseal.
+        let keychain = doc_keychain(&doc_id)?;
+        let owner_vk = arr32(&owner, "pull owner device id")?;
+
+        // NEVER-FLUSHED IS ABSENCE, NOT FAILURE. No doc folder means no
+        // device of this account has ever flushed this partition, which
+        // is the ORDINARY state a boot-time fan-out hits — every
+        // partition × every sibling, most of them empty. Answered as an
+        // empty pull, in the same "nothing new" shape the board
+        // short-circuit uses, so the scheduler's failure counter (and
+        // the visor's announcement after three) stays reserved for
+        // things that actually went wrong.
+        //
+        // Resolve-only: `gd_doc_folder_existing` never creates. A pull
+        // that conjured the folder it failed to find would leave a
+        // permanent empty folder per never-flushed partition.
+        match gd_doc_folder_existing(&cfg, &doc_id).await? {
+            Some(folder) => (keychain, vec![owner_vk], folder),
+            None => {
+                return Ok(
+                    "pulled gdrive(account) nothing yet: no device of this account has flushed \
+                     this partition events=0 chunks=0"
+                        .to_string(),
+                )
+            }
+        }
+    } else {
+        // NON-ACCOUNT OWNER: the pickup path, unchanged. This is the
+        // bootstrap for a reader the account sync does not reach — the
+        // bring-up's cold engine here, S3's link tier there.
+        let pickup_folder = gd_pickup_folder(&cfg).await?;
+        let name = gd_pickup_name(&doc_id, &owner, &my_id).await?;
+        let blob = gd_download(&cfg, &EngineFetch, &pickup_folder, &name)
+            .await?
+            .ok_or("pickup object missing: revoked, or never granted to this device")?;
+        let obj: KpObject =
+            bincode::deserialize(&blob).map_err(|e| format!("pickup decode: {e}"))?;
+        let pairs = my_prekey_pairs(&kh).await?;
+        let sk = pairs
+            .get(&obj.member_pk)
+            .ok_or("pickup not sealed to any of my prekeys")?;
+        let ikm = sk.derive_new_secret_key(&obj.owner_pk).to_bytes();
+        let aead = ikm_aead(&ikm, b"pickup-wrap").await?;
+        let payload: GdrivePickup =
+            bincode::deserialize(&aead_open(&aead, &doc_id, &obj.sealed).await?)
+                .map_err(|e| format!("pickup payload decode: {e}"))?;
+        let mut keychain: Vec<(u32, [u8; 32])> = payload.name_keys.clone();
+        keychain.sort_by_key(|(e, _)| *e);
+        if keychain.is_empty() {
+            return Err("pickup carried no name-key keychain".to_string());
+        }
+
+        // Adopt the shared keychain BEFORE resolving any folder — the
+        // same reason `s3_pull` adopts it before touching a name. This
+        // instance's own chain came from its own account (or was minted
+        // locally when it has none) and is nobody else's; flushing or
+        // reading under it would address names the owner cannot derive.
+        adopt_bucket_chain(&doc_id, keychain.iter().map(|(_, nk)| *nk).collect()).await?;
+
+        let folder = gd_doc_folder(&cfg, &doc_id).await?;
+        (keychain, payload.devices.clone(), folder)
+    };
     let name_keys: HashMap<u32, [u8; 32]> = keychain.iter().copied().collect();
 
-    // Adopt the shared keychain BEFORE resolving any folder — the same
-    // reason `s3_pull` adopts it before touching a name. This instance's
-    // own keychain was minted locally at `ensure_bucket_state` and is
-    // nobody else's; flushing or reading under it would address names no
-    // other device can derive.
-    with_state(|s| {
-        let b = s.buckets.get_mut(&doc_id).expect("bucket state");
-        b.name_keys = keychain.iter().map(|(_, nk)| *nk).collect();
-    })?;
-
-    let folder = gd_doc_folder(&cfg, &doc_id).await?;
+    // THE BASELINE FOR THE NEXT POLL, read HERE — before a single
+    // manifest — and recorded only if this pull SUCCEEDS.
+    //
+    // The ordering is the correctness argument. A board read taken after
+    // the manifests would cover a sibling flush that landed in between,
+    // and recording it would tell the next poll "you have seen this"
+    // about work this pull never fetched: change lost until something
+    // else moves. Read first, fetch second, remember last, and the worst
+    // case becomes a redundant full pull instead of a missed one.
+    if board_now.is_none() {
+        match gd_board_read(&cfg, &EngineFetch, &folder).await {
+            Ok(now) => board_now = Some(now),
+            // No baseline recorded means no short-circuit next time.
+            // Slower, never wrong.
+            Err(e) => eprintln!("[board] baseline read failed (hint only): {e}"),
+        }
+    }
     let src = GdSource::Owner(folder);
-    let devices = payload.devices.clone();
 
     // 2. Op streams into keyhive (newest epoch first: a device's oplog
     //    lives under the newest name-key it flushed with — S3's rule,
@@ -1858,8 +2311,12 @@ async fn gd_pull(doc_id: Vec<u8>, owner: Vec<u8>, pickup: Option<String>) -> Res
     if with_state(|s| s.partitions.contains_key(&doc_id))? {
         apply_new_chunks(&doc_id).await?;
     }
+    if let Some(now) = board_now {
+        board_remember(&doc_id, now)?;
+    }
     Ok(format!(
-        "pulled gdrive(owner) epochs={} devices={} events={ingested} chunks={fetched}",
+        "pulled gdrive({}) epochs={} devices={} events={ingested} chunks={fetched}",
+        if sibling { "account" } else { "owner" },
         keychain.len(),
         devices.len()
     ))
@@ -1868,44 +2325,89 @@ async fn gd_pull(doc_id: Vec<u8>, owner: Vec<u8>, pickup: Option<String>) -> Res
 /// The S3 pull: K_p at the derivable location, unwrapped by prekey
 /// DH, yields the name-key keychain and the device set; everything
 /// after that rides name-keyed unsigned GETs.
+///
+/// NO CHANGE BOARD HERE, and SYNC.md §2 offers that as one of the two
+/// acceptable answers for this provider ("or nothing at all — an idle
+/// S3 pull is cheap enough to just run"). Taken, with the measurement:
+///
+///   * There is no metadata surface to patch. S3 object metadata is
+///     fixed at PUT, so the Drive board's shape has no S3 equivalent; a
+///     sibling-manifest HEAD is the only candidate.
+///   * That candidate saves almost nothing. An IDLE pull here is already
+///     `1 + 2×devices` GETs (K_p, then oplog and manifest per device) —
+///     the chunk loop is skipped entirely because `have` already covers
+///     every cref. A HEAD-per-manifest short-circuit is `devices`
+///     requests to avoid `1 + 2×devices`: the same order of magnitude,
+///     for a second staleness heuristic to keep correct.
+///   * And it would need per-device ETag/Last-Modified state in
+///     `BucketState` plus a signing decision (`get_object_unsigned` is
+///     the public path; a HEAD on a private bucket wants SigV4 through
+///     the escrowed signer), which is real surface for that non-saving.
+///
+/// So S3 pulls stay full-fat. If the object count per doc ever grows a
+/// decimal place, this is where to revisit.
 async fn s3_pull(doc_id: Vec<u8>, owner: Vec<u8>) -> Result<String, String> {
     let st = store()?;
     let (kh, sd) = with_state(|s| (s.kh.clone(), s.sd.clone()))?;
     let my_id = with_state(|s| s.my_peer.as_bytes().to_vec())?;
     let tree = tree_id(&doc_id)?;
 
-    // 1. K_p: locate by ids, unwrap by prekey DH.
-    let loc = kp_location(&doc_id, &owner, &my_id).await?;
-    let blob = get_object_unsigned(&st, &EngineFetch, &loc)
-        .await?
-        .ok_or("kp missing (404): revoked or never granted")?;
-    let obj: KpObject = bincode::deserialize(&blob).map_err(|e| format!("kp decode: {e}"))?;
-    let pairs = my_prekey_pairs(&kh).await?;
-    let sk = pairs
-        .get(&obj.member_pk)
-        .ok_or("K_p not sealed to any of my prekeys")?;
-    let ikm = sk.derive_new_secret_key(&obj.owner_pk).to_bytes();
-    let aead = ikm_aead(&ikm, b"kp-wrap").await?;
-    let payload: KpPayload =
-        bincode::deserialize(&aead_open(&aead, &doc_id, &obj.sealed).await?)
-            .map_err(|e| format!("kp payload decode: {e}"))?;
-    let mut keychain: Vec<(u32, [u8; 32])> = payload.name_keys.clone();
-    keychain.sort_by_key(|(e, _)| *e);
-    let name_keys: HashMap<u32, [u8; 32]> = keychain.iter().copied().collect();
+    // 1. THE BOOTSTRAP, AND THE FORK — the same one `gd_pull` makes,
+    //    and it belongs here for the same reason: S3 account devices
+    //    also grant K_p only to THEMSELVES, so a sibling pull could
+    //    previously only refuse (SYNC.md §2, "THE ACCOUNT PULL PATH":
+    //    "Both providers get the fork").
+    ensure_bucket_state(&doc_id).await?;
+    let sibling = account_sibling(&owner).await?;
+    let (keychain, devices) = if sibling {
+        // Chain from the account, device set from the owner's own
+        // identity. No K_p fetched, none needed.
+        //
+        // ABSENCE NEEDS NO SPECIAL CASE HERE. S3 has no folder to
+        // resolve, so a sibling that has never flushed simply 404s on
+        // its oplog and its manifest, the entries stay empty, and the
+        // pull answers events=0 chunks=0 — the ordinary "nothing new"
+        // the boot-time fan-out will hit for most (partition, sibling)
+        // pairs.
+        (doc_keychain(&doc_id)?, vec![arr32(&owner, "pull owner device id")?])
+    } else {
+        // NON-ACCOUNT OWNER — the link tier. Unchanged, byte for byte:
+        // K_p at the derivable location, unwrapped by prekey DH, and the
+        // carried chain adopted because this reader cannot derive it.
+        let loc = kp_location(&doc_id, &owner, &my_id).await?;
+        let blob = get_object_unsigned(&st, &EngineFetch, &loc)
+            .await?
+            .ok_or("kp missing (404): revoked or never granted")?;
+        let obj: KpObject = bincode::deserialize(&blob).map_err(|e| format!("kp decode: {e}"))?;
+        let pairs = my_prekey_pairs(&kh).await?;
+        let sk = pairs
+            .get(&obj.member_pk)
+            .ok_or("K_p not sealed to any of my prekeys")?;
+        let ikm = sk.derive_new_secret_key(&obj.owner_pk).to_bytes();
+        let aead = ikm_aead(&ikm, b"kp-wrap").await?;
+        let payload: KpPayload = bincode::deserialize(
+            &aead_open(&aead, &doc_id, &obj.sealed).await?,
+        )
+        .map_err(|e| format!("kp payload decode: {e}"))?;
+        let mut keychain: Vec<(u32, [u8; 32])> = payload.name_keys.clone();
+        keychain.sort_by_key(|(e, _)| *e);
 
-    // Adopt the shared keychain: any flush from this instance must
-    // place objects under the DOC's name-keys (a privately minted
-    // keychain would publish to names nobody else can derive).
-    ensure_bucket_state(&doc_id)?;
-    with_state(|s| {
-        let b = s.buckets.get_mut(&doc_id).expect("bucket state");
-        b.name_keys = keychain.iter().map(|(_, nk)| *nk).collect();
-    })?;
+        // Adopt the shared keychain: any flush from this instance must
+        // place objects under the DOC's name-keys (a privately minted
+        // keychain would publish to names nobody else can derive). This
+        // is the LINK TIER — a reader the owner's account sync does not
+        // reach — which is exactly why the pickup still carries the
+        // chain at all (SYNC.md §1: "The pickup keeps carrying the chain
+        // for NON-account readers (S3's link tier), unchanged").
+        adopt_bucket_chain(&doc_id, keychain.iter().map(|(_, nk)| *nk).collect()).await?;
+        (keychain, payload.devices.clone())
+    };
+    let name_keys: HashMap<u32, [u8; 32]> = keychain.iter().copied().collect();
 
     // 2. Op streams (newest epoch first; a device's oplog lives under
     // the newest name-key it flushed with).
     let mut ingested = 0usize;
-    for device in &payload.devices {
+    for device in &devices {
         for (_, nk) in keychain.iter().rev() {
             let name = object_name(nk, b"oplog", device).await?;
             if let Some(blob) = get_object_unsigned(&st, &EngineFetch, &name).await? {
@@ -1920,7 +2422,7 @@ async fn s3_pull(doc_id: Vec<u8>, owner: Vec<u8>) -> Result<String, String> {
 
     // 3. Manifests -> union of entries.
     let mut entries: Vec<([u8; 32], Vec<[u8; 32]>, u32)> = Vec::new();
-    for device in &payload.devices {
+    for device in &devices {
         for (_, nk) in keychain.iter().rev() {
             let name = object_name(nk, b"manifest", device).await?;
             let Some(blob) = get_object_unsigned(&st, &EngineFetch, &name).await? else {
@@ -1990,8 +2492,10 @@ async fn s3_pull(doc_id: Vec<u8>, owner: Vec<u8>) -> Result<String, String> {
         apply_new_chunks(&doc_id).await?;
     }
     Ok(format!(
-        "pulled kp epochs={} events={ingested} chunks={fetched}",
-        keychain.len()
+        "pulled s3({}) epochs={} devices={} events={ingested} chunks={fetched}",
+        if sibling { "account" } else { "kp" },
+        keychain.len(),
+        devices.len()
     ))
 }
 
@@ -3022,7 +3526,7 @@ impl DriverGuest for Component {
 
     async fn store_grant(doc_id: Vec<u8>, member: Vec<u8>) -> Result<Option<String>, String> {
         let kh = with_state(|s| s.kh.clone())?;
-        ensure_bucket_state(&doc_id)?;
+        ensure_bucket_state(&doc_id).await?;
         with_state(|s| {
             let b = s.buckets.get_mut(&doc_id).expect("bucket state");
             if !b.grantees.contains(&member) {
@@ -3094,6 +3598,10 @@ impl DriverGuest for Component {
 
     async fn store_revoke(doc_id: Vec<u8>, member: Vec<u8>) -> Result<String, String> {
         let kh = with_state(|s| s.kh.clone())?;
+        // Reconcile before rotating, on every arm: rotation APPENDS, and
+        // appending to a stale cache would drop whatever epochs a sibling
+        // added while this device was elsewhere.
+        ensure_bucket_state(&doc_id).await?;
         match provider()? {
             Provider::S3 => {
                 let st = store()?;
@@ -3109,14 +3617,17 @@ impl DriverGuest for Component {
                 .await?;
 
                 // Hard forward boundary: rotate the name-key epoch alongside
-                // the BeeKEM rotation the keyhive revocation causes.
+                // the BeeKEM rotation the keyhive revocation causes. The new
+                // epoch is appended to the ACCOUNT's chain and syncs from
+                // there (SYNC.md §1), so the owner's other devices flush
+                // under it without being told separately.
+                rotate_bucket_chain(&doc_id).await?;
                 let remaining = with_state(|s| {
                     let b = s
                         .buckets
                         .get_mut(&doc_id)
                         .ok_or("no bucket state".to_string())?;
                     b.grantees.retain(|g| g != &member);
-                    b.name_keys.push(rand::random());
                     Ok::<_, String>(b.grantees.clone())
                 })??;
                 for g in remaining {
@@ -3252,7 +3763,7 @@ impl DriverGuest for Component {
     }
 
     async fn bucket_flush(doc_id: Vec<u8>) -> Result<String, String> {
-        ensure_bucket_state(&doc_id)?;
+        ensure_bucket_state(&doc_id).await?;
         let (nk_current, epoch) = with_state(|s| {
             let b = s.buckets.get(&doc_id).expect("bucket state");
             (
@@ -3260,6 +3771,7 @@ impl DriverGuest for Component {
                 (b.name_keys.len() - 1) as u32,
             )
         })?;
+        let mut gd_board_folder: Option<String> = None;
         let sink = match provider()? {
             Provider::S3 => PutSink::S3 {
                 st: store()?,
@@ -3285,6 +3797,7 @@ impl DriverGuest for Component {
                 // through the existing error paths.
                 let cfg = gd()?;
                 let folder_id = gd_doc_folder(&cfg, &doc_id).await?;
+                gd_board_folder = Some(folder_id.clone());
                 PutSink::Gd {
                     cfg,
                     folder_id,
@@ -3292,7 +3805,45 @@ impl DriverGuest for Component {
                 }
             }
         };
-        flush_to(&sink, &doc_id, epoch).await
+        let summary = flush_to(&sink, &doc_id, epoch).await?;
+
+        // --- FLUSH COMMIT, and the board patch that follows it ---------
+        //
+        // WHERE THIS SITS, precisely: `flush_to` writes the manifest
+        // LAST, and that manifest write IS the commit point (SYNC.md
+        // "What exists going in"). So everything the board could
+        // possibly advertise is already durable in the store by the time
+        // control reaches here, and this patch is a note ABOUT a
+        // finished fact rather than part of it.
+        //
+        // WHICH IS WHY ITS FAILURE IS SWALLOWED HERE AND NOWHERE ELSE.
+        // The flush committed; returning an error now would tell the
+        // caller — and the worker's scheduler, which treats any failed
+        // background flush as backoff-worthy (SYNC.md §3) — that nothing
+        // was written, when in fact everything was. A missed patch costs
+        // exactly one delayed sibling poll and self-heals at the next
+        // flush, because the seqno is monotonic and the NEXT value is
+        // just as different from what the sibling last saw. So: log,
+        // continue, and let the summary say the flush succeeded, because
+        // it did.
+        if let Some(folder_id) = gd_board_folder {
+            let seq = with_state(|s| {
+                let b = s.buckets.get_mut(&doc_id).expect("bucket state");
+                b.flush_seq += 1;
+                b.flush_seq
+            })?;
+            let key = board_key()?;
+            // The value is a decimal COUNTER and the key is 16 hex
+            // characters of a PUBLIC verifying key. Nothing secret has
+            // ever been on this board and nothing may be put on it:
+            // `appProperties` are plaintext Drive metadata (see the
+            // board section in providers/gdrive/store).
+            if let Err(e) = gd_board_patch(&gd()?, &EngineFetch, &folder_id, &key, Some(&seq.to_string())).await
+            {
+                eprintln!("[board] flush committed; board patch failed (hint only): {e}");
+            }
+        }
+        Ok(summary)
     }
 
     async fn bucket_pull(

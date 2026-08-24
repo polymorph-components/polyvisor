@@ -561,6 +561,50 @@ export type StoreBinding =
 export type GdriveSpace = "appdata" | "drive";
 
 /**
+ * WHAT THE WORKER'S SYNC SCHEDULE HAS DONE LATELY (runtime/SYNC.md §3,
+ * "Surface": "`DeviceStatus` grows a `sync` record (last flush, last
+ * pull, backoff state, per the picker-safe rules — timestamps and
+ * booleans, nothing secret)").
+ *
+ * The schedule itself lives in the worker, which is the only thing that
+ * outlives a tab and owns both the engine and the binding; this record
+ * is the whole of what a page may learn about it. Everything on it is a
+ * TIMESTAMP or a COUNT except `lastError`, and that one field carries
+ * the rule with it: it is a SENTENCE — the seam's own refusal text, the
+ * same class of prose the storage sheet already renders beside the
+ * Sync-now button — and never material. No object name, no bearer, no
+ * signed URL, no key: the seams that could produce such a thing are
+ * already forbidden from putting it in a message (the OAuth ceremony's
+ * "the status and not one byte of the body" rule, worker.ts's
+ * `OauthError`), and this field inherits that discipline rather than
+ * relaxing it. It is truncated on the way in, because a sentence is what
+ * a user can read and a page is what gets logged.
+ */
+export interface SyncStatus {
+  /** `Date.now()` of the last SCHEDULED flush cycle in which every
+   * partition succeeded, or null if none has. A user-initiated Sync-now
+   * does not move it: it is not the scheduler's, and reporting it here
+   * would let a button press make a stalled schedule look healthy. */
+  lastFlush: number | null;
+  /** `Date.now()` of the last scheduled pull cycle that got something
+   * through, or null. */
+  lastPull: number | null;
+  /** CONSECUTIVE failed scheduled flush cycles, zeroed by the first
+   * success. Three is where the failure stops being the scheduler's
+   * business and becomes the user's (SYNC.md §3: "a sync that has
+   * silently stopped is a lie of omission"). */
+  flushFailures: number;
+  /** The same count for the pull direction. The two back off
+   * independently — one bucket can be unreachable for writes and
+   * readable, and a shared counter would hide which. */
+  pullFailures: number;
+  /** The most recent background failure, as a sentence for a human, or
+   * null when the last cycle in each direction succeeded. */
+  lastError: string | null;
+}
+
+
+/**
  * WHAT THE WORKER NEEDS IN ORDER TO RUN THE OAUTH CEREMONY (DRIVE.md
  * §3, "The worker runs the OAuth; the page runs the popup").
  *
@@ -701,6 +745,23 @@ export interface DeviceStatus {
    * (DRIVE.md §3/§4).
    */
   gdriveConsent: { space: GdriveSpace } | null;
+  /**
+   * WHAT THE WORKER'S SYNC SCHEDULE HAS DONE LATELY, or null.
+   *
+   * NULL MEANS THE SAME KIND OF THING `storage` NULL MEANS, and it is
+   * worth spelling out because the two nulls have different arms. The
+   * device is SEALED — in which case there is no engine, no timer and
+   * no readable binding, so the schedule does not exist to report on —
+   * or it is unsealed and NOTHING IS BOUND, in which case there is no
+   * destination to sync with and the scheduler deliberately has no
+   * opinion. Read it together with `sealed` and `storage`: a sealed
+   * device's sync state is unknown, an unbound device's is absent, and
+   * neither is "nothing has synced" (which is what
+   * `{lastFlush: null, …}` says, on a device that IS bound).
+   *
+   * It carries no addressing and nothing secret — see `SyncStatus`.
+   */
+  sync: SyncStatus | null;
 }
 
 export type HostMethod =

@@ -1519,6 +1519,131 @@ async function startApp(
    * ceremony) and the same bind. */
   let storageConnectInFlight = false;
 
+  // --- what the worker's sync schedule has done (runtime/SYNC.md §3) -------
+  //
+  // THE PAGE SCHEDULES NOTHING. Everything below is a READER of
+  // `DeviceStatus.sync`: the schedule lives in the worker, which owns
+  // the engine and the binding and outlives this tab. Two facts flow out
+  // of it and both land here — the "last synced" line in the bound view,
+  // and the announcement a repeatedly-failing schedule owes the user.
+
+  /** The bound view's "last synced" element while that view is mounted,
+   * or null. Nulled by every path that replaces the view, so the poll
+   * below never repaints a detached node. */
+  let syncLine: HTMLElement | null = null;
+
+  /** True while an announcement about a failing schedule is standing.
+   * ONE ANNOUNCEMENT PER CROSSING, not one per poll: the poll runs every
+   * second and a sync that is down stays down, so announcing on the
+   * fact rather than on the edge would bury every other sentence the
+   * visor has to say under a metronome. Cleared when the counts come
+   * back under the threshold, which re-arms it for the NEXT outage. */
+  let syncFailureAnnounced = false;
+
+  /** THE THRESHOLD, and it is the worker's own (rpc.ts's `SyncStatus`):
+   * three consecutive failures is where a background failure stops
+   * being the scheduler's business and becomes the user's. */
+  const SYNC_VISIBLE_AFTER = 3;
+
+  /**
+   * "3 minutes ago" — a DURATION, because the question the line answers
+   * is "is my work in the bucket?" and no clock time answers that
+   * without arithmetic.
+   *
+   * Coarse on purpose: a sync that happened 91 seconds ago and one that
+   * happened 110 do not differ in any way the reader cares about, and a
+   * ticking seconds counter would make a settled sheet look busy.
+   */
+  const agoText = (at: number): string => {
+    const secs = Math.max(0, Math.round((Date.now() - at) / 1000));
+    if (secs < 10) return "just now";
+    if (secs < 90) return `${secs} seconds ago`;
+    const mins = Math.round(secs / 60);
+    if (mins < 90) return `${mins} minute${mins === 1 ? "" : "s"} ago`;
+    const hours = Math.round(mins / 60);
+    if (hours < 36) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+    return `${Math.round(hours / 24)} days ago`;
+  };
+
+  /**
+   * The bound view's one sentence about the schedule.
+   *
+   * IT NEVER FABRICATES A TIME. `lastFlush === null` on a bound device
+   * means the schedule has genuinely not completed a flush yet — a
+   * device bound a moment ago, or one whose every attempt has failed —
+   * and saying "not yet" is the honest answer where "never" would sound
+   * like a fault and a made-up timestamp would be a lie. When the
+   * schedule is also FAILING, the sentence says so and carries the
+   * seam's own words, which is the same treatment the Sync-now button's
+   * result already gets.
+   */
+  const paintSyncLine = async (): Promise<void> => {
+    const line = syncLine;
+    if (!line) return;
+    let st: DeviceStatus;
+    try {
+      st = await conn.status();
+    } catch {
+      return; // a status read that failed says nothing; leave the last true thing up
+    }
+    if (line !== syncLine || !line.isConnected) return;
+    const sync = st.sync;
+    if (!sync) {
+      // Sealed, or unbound — neither of which this view should be
+      // mounted over, so it is a transient rather than a state to word.
+      line.textContent = "";
+      return;
+    }
+    const when = sync.lastFlush === null
+      ? "This device has not finished an automatic sync yet."
+      : `Last synced ${agoText(sync.lastFlush)}.`;
+    const failing = sync.flushFailures >= SYNC_VISIBLE_AFTER ||
+      sync.pullFailures >= SYNC_VISIBLE_AFTER;
+    line.textContent = failing && sync.lastError !== null
+      ? `${when} Syncing is failing: ${sync.lastError}`
+      : when;
+  };
+
+  /**
+   * THE ANNOUNCEMENT HALF (SYNC.md §3: "a sync that has silently stopped
+   * is a lie of omission").
+   *
+   * STICKY, because this is not news that scrolls past: the user's work
+   * is not going where they think it is, and the sentence should stay up
+   * until they act or until it comes back. It names the seam's own error
+   * because a bare "syncing is failing" gives them nothing to do with
+   * it.
+   *
+   * A RECOVERY IS ANNOUNCED TOO, and only when a failure was announced
+   * — the visor should not congratulate itself for a sync nobody was
+   * told had stopped.
+   */
+  const watchSyncFailures = async (): Promise<void> => {
+    let st: DeviceStatus;
+    try {
+      st = await conn.status();
+    } catch {
+      return;
+    }
+    const sync = st.sync;
+    if (!sync) return;
+    const failing = sync.flushFailures >= SYNC_VISIBLE_AFTER ||
+      sync.pullFailures >= SYNC_VISIBLE_AFTER;
+    if (failing && !syncFailureAnnounced) {
+      syncFailureAnnounced = true;
+      announce(
+        `this device has stopped syncing with your storage${
+          sync.lastError === null ? "" : ` — ${sync.lastError}`
+        }`,
+        true,
+      );
+    } else if (!failing && syncFailureAnnounced) {
+      syncFailureAnnounced = false;
+      announce("this device is syncing with your storage again");
+    }
+    await paintSyncLine();
+  };
+
   /** THE ACCOUNT'S STORAGE RECORD as this sheet last read it, kept so a
    * bind can tell whether it would be saying anything new. The diverge
    * path (`#storage-diverge`) drops the adopt view but not this
@@ -2266,6 +2391,25 @@ async function startApp(
     problem.id = "storage-sheet-problem";
     problem.hidden = true;
 
+    // WHAT THE SCHEDULE HAS DONE, beside the button that does it by
+    // hand (SYNC.md §3, "Surface": "the sheet renders 'last synced'
+    // beside the Sync-now button it keeps"). The whole point of an
+    // automatic flush is that the user stops pressing the button — so
+    // the sheet owes them the fact that would otherwise have been the
+    // press's receipt.
+    //
+    // RELATIVE, NOT A CLOCK TIME, because the question this line answers
+    // is "is my work in the bucket?" and the answer to that is a
+    // DURATION. It repaints off the same slow poll that watches for a
+    // failing schedule, and is filled in immediately below so the sheet
+    // is not blank for a second on open.
+    const synced = document.createElement("p");
+    synced.className = "cred-note";
+    synced.id = "storage-last-sync";
+    syncLine = synced;
+    paintSyncLine();
+    body.append(synced);
+
     const sync = document.createElement("button");
     sync.type = "button";
     sync.id = "storage-sync";
@@ -2284,6 +2428,13 @@ async function startApp(
           const result = await driver.bucketFlush(part);
           note("storage:synced");
           stepNote.textContent = result;
+          // A HAND FLUSH DOES NOT MOVE `sync.lastFlush` — that field is
+          // the SCHEDULER's, deliberately (rpc.ts's `SyncStatus`), so a
+          // button press cannot make a stalled schedule look healthy.
+          // The line is still repainted, because the poll would repaint
+          // it a second later anyway and a receipt that lags its own
+          // press reads as a bug.
+          void paintSyncLine();
         } catch (e) {
           problem.textContent = err(e);
           problem.hidden = false;
@@ -2299,6 +2450,7 @@ async function startApp(
     change.textContent = "Change…";
     change.onclick = () => {
       body.replaceChildren();
+      syncLine = null;
       renderUnbound(body, storage);
     };
 
@@ -2326,6 +2478,10 @@ async function startApp(
           await conn.unbindStore();
           note("storage:disconnected");
           body.replaceChildren();
+          // The line goes with the view that owned it: a detached node
+          // repainted by the poll would be an invisible timer keeping a
+          // status read alive forever.
+          syncLine = null;
           renderUnbound(body);
         } catch (e) {
           disconnect.disabled = false;
@@ -3268,7 +3424,25 @@ async function startApp(
       await reconcileFromDriver(us, US_CACHE_KEYS, announce, applyProfile, applyMarks);
     }
   };
-  poll(1000, drainAndAdopt);
+  // THE SLOW POLL CARRIES THE SYNC WATCH TOO (SYNC.md §3's announcement
+  // half). It rides here rather than on a timer of its own because it is
+  // the same KIND of work — one cheap read per tick, looking for
+  // something the user has to be told — and a second interval would be a
+  // second thing to clear.
+  //
+  // AT A FIFTH OF THE CADENCE, though: `conn.status()` crosses the port
+  // and reads the sealed binding and the sealed consent row on the other
+  // side, which is not a per-second cost worth paying for a fact that
+  // changes on a 20-45 second schedule. The drain's own tick stays at 1 s
+  // because an announcement it is holding IS per-second news.
+  let syncWatchAt = 0;
+  poll(1000, async () => {
+    await drainAndAdopt();
+    const now = Date.now();
+    if (now - syncWatchAt < 5_000) return;
+    syncWatchAt = now;
+    await watchSyncFailures();
+  });
 
   // --- driving hooks --------------------------------------------------------
   //
@@ -3464,6 +3638,14 @@ async function startApp(
     /** The device's own claim about where it syncs — `null` sealed or
      * unbound (`DeviceStatus.storage`'s own ambiguity; see rpc.ts). */
     storageStatus: async () => (await conn.status()).storage,
+    /** WHAT THE WORKER'S SYNC SCHEDULE HAS DONE — `DeviceStatus.sync`,
+     * or null when sealed or unbound (SYNC.md §3's "Surface"; the two
+     * nulls are told apart in rpc.ts). Read straight off the status for
+     * `storageStatus`'s reason: the schedule is the WORKER's, and a
+     * scenario asserting on the sheet's rendering of it would be
+     * testing the paint rather than the fact. The offline-sync
+     * scenario's boot-pull claim rests on this. */
+    syncStatus: async () => (await conn.status()).sync,
     /** The sealed Drive consent this device holds, or null — the
      * bind-without-ceremony condition (DRIVE.md §5). Its one field is
      * the SPACE it was granted for, which is what makes the skip

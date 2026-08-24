@@ -19,9 +19,10 @@ use wasmtime::component::Accessor;
 use wasmtime::{bail, format_err, Result};
 
 use crate::bindings::exports::polyvisor::engine::driver::{
-    Guest as Driver, PairAddState, PairJoinState, UsEvent, UsMark, UsProfile, UsStorage,
-    UsStorageGdrive, UsStorageS3,
+    Guest as Driver, PairAddState, PairJoinState, S3Config, StoreConfig, UsEvent, UsMark,
+    UsProfile, UsStorage, UsStorageGdrive, UsStorageS3,
 };
+use crate::resume_acts::{flushed_chunks, S3Probe};
 use crate::bindings::exports::polyvisor::tasks::tasks::Guest as Tasks;
 use crate::Ctx;
 
@@ -498,6 +499,7 @@ pub(crate) async fn positive_acts(
     stranger: crate::bindings::Engine,
     rejoin: crate::bindings::Engine,
     relay: String,
+    probe: &S3Probe,
 ) -> Result<()> {
     let l: &Driver = laptop.polyvisor_engine_driver();
     let p: &Driver = phone.polyvisor_engine_driver();
@@ -616,17 +618,24 @@ pub(crate) async fn positive_acts(
         ));
     }
 
+    let mut shared_partition: Option<Vec<u8>> = None;
     if adopted {
+        let outcome = act_partition_pointer(
+            acc,
+            (l, laptop.polyvisor_tasks_tasks(), &l_bytes),
+            (p, phone.polyvisor_tasks_tasks(), &p_bytes),
+            &group,
+        )
+        .await;
         results.push((
             "partition pointer syncs; group-delegated partition is readable by the joiner",
-            act_partition_pointer(
-                acc,
-                (l, laptop.polyvisor_tasks_tasks(), &l_bytes),
-                (p, phone.polyvisor_tasks_tasks(), &p_bytes),
-                &group,
-            )
-            .await
-            .map_err(|e| e.to_string()),
+            match outcome {
+                Ok(id) => {
+                    shared_partition = Some(id);
+                    Ok(())
+                }
+                Err(e) => Err(e.to_string()),
+            },
         ));
     } else {
         results.push((
@@ -634,6 +643,24 @@ pub(crate) async fn positive_acts(
             Err("not reached: the joiner never became a reader of the user-system partition".into()),
         ));
     }
+
+    // SYNC.md §1: the name-key chain is account state, so two devices of
+    // one account address the SAME objects.
+    results.push((
+        "the bucket name-key chain syncs with the account: both devices flush to          identical object names (structural dedupe)",
+        match &shared_partition {
+            Some(partition) => act_bucket_chain(
+                acc,
+                (l, laptop.polyvisor_tasks_tasks(), &l_bytes),
+                (p, phone.polyvisor_tasks_tasks()),
+                partition,
+                probe,
+            )
+            .await
+            .map_err(|e| e.to_string()),
+            None => Err("not reached: the two devices never came to share a partition".into()),
+        },
+    ));
 
     if adopted {
         results.push((
@@ -1001,7 +1028,7 @@ async fn act_partition_pointer(
     l: (&Driver, &Tasks, &[u8]),
     p: (&Driver, &Tasks, &[u8]),
     group: &[u8],
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     let (l, lt, l_bytes) = l;
     let (p, pt, p_bytes) = p;
 
@@ -1070,7 +1097,9 @@ async fn act_partition_pointer(
                         "joined device READS the group-delegated partition (no per-device delegation)",
                         t,
                     );
-                    return Ok(());
+                    // Handed back for the chain act, which needs a
+                    // partition BOTH devices already hold.
+                    return Ok(partition);
                 }
             }
             Err(e) => last = e,
@@ -1083,6 +1112,263 @@ async fn act_partition_pointer(
          delegated to the USER GROUP only; the device is a member of that group \
          by enrollment. Last tasks error on the joiner: {last:?}"
     )
+}
+
+/// THE NAME-KEY CHAIN IS ACCOUNT STATE (runtime/SYNC.md §1).
+///
+/// The defect this pins: the chain used to be minted per DEVICE, from
+/// `rand::random()`, with the pickup object as its only distribution
+/// channel — and nothing on the solo path reads a pickup. Two devices of
+/// ONE account bound to ONE bucket therefore wrote two parallel keyed
+/// namespaces: different derived names for the same content, the whole
+/// history duplicated once per flusher, and neither able to read the
+/// other's objects. The fix moves the chain into the user-system
+/// document, where the account's devices already sync everything else
+/// they must agree on.
+///
+/// WHY THE ASSERTION IS OVER NAMES AND NOT OVER KEYS. A name-key is
+/// secret material and never leaves the guest — there is no WIT call
+/// that returns one, deliberately. What IS observable is the bucket: an
+/// object name is an HMAC of a name-key over a public content ref, so
+/// two devices land on the same name if and only if they hold the same
+/// chain. The store is the oracle, and it is the one that matters —
+/// equal chains that somehow produced unequal names would be a fix that
+/// fixed nothing.
+///
+/// The shape, in three counts:
+///
+///  1. The laptop flushes. The bucket holds its chunks, its oplog, its
+///     manifest.
+///  2. The phone — same account, same partition, content already
+///     received OVER THE WIRE, and with an empty dedup map of its own —
+///     flushes the same history. It really does upload chunks (count
+///     asserted non-zero, from the flush summary, because the bucket
+///     cannot see a re-upload that lands on an existing name).
+///  3. Those uploads add ZERO new chunk objects. The only two objects
+///     that appear are the phone's own oplog and manifest, which are
+///     keyed by device on purpose (the single-writer-per-name invariant).
+///
+/// Count 3 is the claim. Under the old per-device minting it would have
+/// been "every chunk again, under names the laptop cannot derive".
+async fn act_bucket_chain(
+    acc: &Accessor<Ctx>,
+    l: (&Driver, &Tasks, &[u8]),
+    p: (&Driver, &Tasks),
+    partition: &[u8],
+    probe: &S3Probe,
+) -> Result<()> {
+    let (l, lt, l_id) = l;
+    let (p, _pt) = p;
+
+    let store_cfg = || {
+        StoreConfig::S3(S3Config {
+            endpoint: probe.endpoint.clone(),
+            bucket: probe.bucket.clone(),
+            access_key: probe.access.clone(),
+        })
+    };
+
+    // Both devices, one destination. (The account syncs the storage
+    // RECORD, but each device applies its own credentials — DRIVE.md —
+    // so the rig binds both explicitly, exactly as an embedder would.)
+    l.call_init_store(acc, store_cfg())
+        .await?
+        .map_err(|e| format_err!("laptop init-store: {e}"))?;
+    p.call_init_store(acc, store_cfg())
+        .await?
+        .map_err(|e| format_err!("phone init-store: {e}"))?;
+    l.call_ensure_bucket(acc)
+        .await?
+        .map_err(|e| format_err!("ensure-bucket: {e}"))?;
+
+    // A little history to duplicate, if the chains disagree.
+    for title in ["chain: buy milk", "chain: name the objects"] {
+        lt.call_add(acc, title.to_string())
+            .await?
+            .map_err(|e| format_err!("tasks-add: {e}"))?;
+    }
+
+    // NO BARRIER BETWEEN THE TWO FLUSHES, AND THAT IS THE ASSERTION
+    // (SYNC.md §1, amended).
+    //
+    // An earlier draft of this act had to WAIT between the flushes —
+    // write a marker into the account doc after the laptop's flush and
+    // poll until the phone saw it — because the chain was minted at
+    // FIRST FLUSH, so there was a real window in which the phone would
+    // mint a fork of its own. That window is closed at the source:
+    // `us-partition-put` now SEEDS the chain in the same atomic
+    // automerge change as the pointer. A device cannot flush a doc whose
+    // pointer it has not seen, so pointer-visible implies
+    // chain-visible, and no chain-specific waiting can be necessary.
+    //
+    // THE PRECONDITION IS CHECKED HERE, BEFORE THE LAPTOP FLUSHES, and
+    // that placement is the whole discipline. Every driver call pumps
+    // the account document, so a check made BETWEEN the two flushes
+    // would hand the phone exactly the sync opportunity the seeding is
+    // supposed to make unnecessary — the act would pass whether or not
+    // the seed existed (confirmed empirically: it did). Checked here,
+    // nothing at all runs between the laptop's flush and the phone's,
+    // so the only way the phone can hold a matching chain is to have
+    // had it before the laptop ever flushed — which is what the seed
+    // means.
+    let listed = p.call_us_partitions(acc).await?.map_err(|e| format_err!("{e}"))?;
+    if !listed.iter().any(|x| x.id == partition) {
+        bail!(
+            "PRECONDITION: the phone does not hold the pointer for this partition, so the \
+             seeding guarantee does not apply to it and this act would be asserting nothing. \
+             It lists: {:?}",
+            listed.iter().map(|x| x.name.clone()).collect::<Vec<_>>()
+        );
+    }
+    ok(
+        "the phone holds the partition's pointer BEFORE either device flushes — so by \
+         construction it already holds the chain seeded in the pointer's own change",
+        Instant::now(),
+    );
+
+    let empty = probe.keys().await?;
+    if !empty.is_empty() {
+        bail!(
+            "this act's bucket is not empty before it starts ({} object(s)): the counts below \
+             would be measuring someone else's run",
+            empty.len()
+        );
+    }
+
+    // THE TWO FLUSHES RUN CONCURRENTLY, AND THAT IS WHAT MAKES THIS
+    // GATE DISCRIMINATE.
+    //
+    // Sequencing them cannot do it, and the empirics say so plainly: with
+    // the seeding removed, back-to-back sequential flushes still agreed
+    // on names 2 runs in 3, because every driver call pumps the account
+    // document and the laptop's flush-time mint had simply already
+    // arrived over the wire. A gate that passes two thirds of the time
+    // without the mechanism it is gating is measuring the relay, not the
+    // design.
+    //
+    // Concurrency removes the sync opportunity BY CONSTRUCTION rather
+    // than by being quick. Neither device can have observed a chain the
+    // other minted during a flush that has not finished. So:
+    //
+    //  - SEEDED (SYNC.md §1, amended): both already hold the chain that
+    //    came with the pointer, before either call starts. Concurrency
+    //    is irrelevant and the names agree.
+    //  - MINTED AT FIRST FLUSH: both find no chain, both mint, and the
+    //    namespaces fork — not sometimes, but necessarily.
+    let t = Instant::now();
+    let (l_res, p_res) = tokio::join!(
+        l.call_bucket_flush(acc, partition.to_vec()),
+        p.call_bucket_flush(acc, partition.to_vec()),
+    );
+    let laptop_summary = l_res?.map_err(|e| format_err!("laptop bucket-flush: {e}"))?;
+    let phone_summary = p_res?.map_err(|e| format_err!("phone bucket-flush: {e}"))?;
+    let laptop_chunks = flushed_chunks(&laptop_summary)?;
+    let phone_chunks = flushed_chunks(&phone_summary)?;
+    println!("            laptop: {laptop_summary}");
+    println!("            phone:  {phone_summary}");
+
+    if laptop_chunks == 0 {
+        bail!("the laptop's first flush sent no chunks; there is nothing for the phone to match");
+    }
+    if phone_chunks == 0 {
+        bail!(
+            "the phone's flush sent ZERO chunks, so this act proved nothing: it has to upload \
+             under its own chain for the name comparison to mean anything (it holds no dedup \
+             entries of its own — the flush should have re-sent the history it received over \
+             the wire)"
+        );
+    }
+
+    // The whole claim as one count. The bucket started empty, so:
+    // laptop_chunks chunk objects + the laptop's oplog and manifest + the
+    // phone's oplog and manifest. The phone's chunks add NOTHING because
+    // every one of them lands on a name the laptop already wrote.
+    let after_phone = probe.keys().await?;
+    let expected = laptop_chunks as usize + 4;
+    if after_phone.len() != expected {
+        bail!(
+            "the bucket holds {} object(s); {expected} are expected ({laptop_chunks} chunks + \
+             two device-keyed oplog/manifest pairs). The phone uploaded {phone_chunks} chunk(s) \
+             and {} of them landed on names the laptop had not written, so the two devices are \
+             deriving different names for the same content — the chain seeded with the \
+             partition pointer did not reach this device (SYNC.md §1). Names: {:?}",
+            after_phone.len(),
+            after_phone.len().saturating_sub(expected),
+            after_phone
+        );
+    }
+
+    ok(
+        &format!(
+            "phone re-flushed {phone_chunks} chunk(s) of wire-received history and added ZERO \
+             new chunk objects (bucket holds {}, = {laptop_chunks} shared chunks + two \
+             device-keyed oplog/manifest pairs): both devices derived the SAME names, with no \
+             sync opportunity between the flushes",
+            after_phone.len()
+        ),
+        t,
+    );
+
+    // --- THE ACCOUNT PULL PATH (SYNC.md §2) -------------------------------
+    //
+    // The defect this closes: owner-tier pull used to be PICKUP-GATED on
+    // both providers, and an account device grants a pickup only to
+    // ITSELF. So a sibling pull — which is every pull the worker's
+    // (partition × sibling) fan-out makes — could only ever answer "kp
+    // missing (404): revoked or never granted". Nothing in this act has
+    // called `store-grant` for the phone, deliberately: under the old
+    // gating the pull below fails, and under the fork it must not need
+    // a pickup at all.
+    let t = Instant::now();
+    let summary = p
+        .call_bucket_pull(acc, partition.to_vec(), l_id.to_vec(), None)
+        .await?
+        .map_err(|e| {
+            format_err!(
+                "a sibling pull FAILED, and no pickup was ever granted to this device — which \
+                 is the ordinary state of every account device (SYNC.md §2): {e}"
+            )
+        })?;
+    println!("            phone pull: {summary}");
+    // Naming the branch in the summary is what separates "the fork
+    // worked" from "a K_p happened to be lying around".
+    if !summary.contains("s3(account)") {
+        bail!(
+            "the pull did not take the ACCOUNT branch; it answered {summary:?}, so it either \
+             found a pickup or fell through to the link tier"
+        );
+    }
+    ok(
+        &format!("a sibling pull succeeds with no pickup anywhere: {summary}"),
+        t,
+    );
+
+    // A SIBLING THAT HAS NEVER FLUSHED IS ABSENCE, NOT FAILURE — the
+    // state the boot-time fan-out hits for most (partition, sibling)
+    // pairs, and the one that must never reach the scheduler's failure
+    // counter or the visor's three-strikes announcement.
+    let fresh = l
+        .call_create_partition(acc)
+        .await?
+        .map_err(|e| format_err!("create-partition: {e}"))?;
+    l.call_seal_partition(acc, fresh.clone())
+        .await?
+        .map_err(|e| format_err!("seal-partition: {e}"))?;
+    let t = Instant::now();
+    let summary = p
+        .call_bucket_pull(acc, fresh, l_id.to_vec(), None)
+        .await?
+        .map_err(|e| {
+            format_err!("a pull of a never-flushed partition ERRORED instead of reading empty: {e}")
+        })?;
+    if !summary.contains("chunks=0") {
+        bail!("a never-flushed partition pulled {summary:?}, which is not an empty read");
+    }
+    ok(
+        &format!("a sibling that has never flushed reads as absence, not error: {summary}"),
+        t,
+    );
+    Ok(())
 }
 
 /// A code that reaches a second party has leaked, so the offer dies

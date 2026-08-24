@@ -523,6 +523,116 @@ pub async fn gd_delete(
     }
 }
 
+// --- the change board: appProperties as a cheap "has anything moved?" ---
+//
+// SYNC.md §2. The doc folder's `appProperties` carry one key per device;
+// each device PATCHes ITS OWN key at flush commit and reads the whole
+// map at pull entry. That extends the single-writer-per-name invariant
+// this store is built on (§"What exists going in") to the board itself:
+// `appProperties` are PER-KEY MERGE on `files.update`, so two devices
+// patching disjoint keys never clobber each other and no compare-and-set
+// is needed — which matters, because Drive offers none.
+//
+// THE BOARD IS A HINT, NEVER TRUTH. Every function here is allowed to
+// fail without failing its caller: the manifests remain the source, a
+// full pull is complete without the board, and a lost, stale or
+// clobbered property costs one extra or one delayed poll. The callers in
+// engine/guest enforce that discipline; these two just report honestly.
+//
+// WHAT MAY GO ON THE BOARD, and this is a hard rule: COUNTERS AND
+// TRUNCATED PUBLIC IDENTIFIERS ONLY. `appProperties` are plaintext
+// metadata — Drive stores them unencrypted, they are visible to anyone
+// holding the user's OAuth, and they are exactly the metadata surface
+// the keyed names above exist to keep thin. No name-key, no epoch
+// secret, no signature, no key material of any kind is ever written
+// here; a board value is a monotonic flush count and nothing else.
+//
+// Drive's documented caps (both enforced by the fake, so a regression
+// that bloats the board fails in tests rather than in production): 124
+// bytes per key+value pair, 30 properties per file.
+
+/// Drive's documented limit on ONE property: key + value, in bytes.
+pub const APP_PROPERTY_PAIR_BYTES: usize = 124;
+/// Drive's documented limit on the number of properties on one file.
+/// ~30 devices per doc board; SYNC.md parks the overflow explicitly.
+pub const APP_PROPERTIES_MAX: usize = 30;
+
+/// This device's board key: the first 16 hex characters of its verifying
+/// key. Truncated because the pair budget is 124 bytes and the value
+/// (a decimal counter) has to fit beside it; a verifying key is PUBLIC,
+/// and 8 bytes of it is a device tag, not a secret.
+pub fn gd_board_key(device_vk: &[u8; 32]) -> String {
+    hex::encode(&device_vk[..8])
+}
+
+/// PATCH one board key on the doc folder — metadata-only `files.update`
+/// (5 quota units of write, no media part). `value: None` DELETES the
+/// key, which is Drive's own convention for a null property value and
+/// the only way to take an entry off the board.
+///
+/// The pair budget is checked HERE rather than trusted: a caller that
+/// grew the value past the cap would otherwise get a 400 from Drive at
+/// flush commit, and this returns the same refusal with a sentence that
+/// names the budget.
+pub async fn gd_board_patch(
+    cfg: &GdriveCfg,
+    port: &impl FetchPort,
+    folder_id: &str,
+    key: &str,
+    value: Option<&str>,
+) -> Result<(), String> {
+    let pair = key.len() + value.map_or(0, str::len);
+    if pair > APP_PROPERTY_PAIR_BYTES {
+        return Err(format!(
+            "board property {key}: {pair} bytes exceeds Drive's {APP_PROPERTY_PAIR_BYTES}-byte \
+             key+value budget"
+        ));
+    }
+    let body = serde_json::json!({
+        "appProperties": { key: value.map_or(serde_json::Value::Null, |v| v.into()) },
+    });
+    let url = format!(
+        "{}/drive/v3/files/{}?fields={}",
+        cfg.api_base,
+        q_encode(folder_id),
+        q_encode("appProperties"),
+    );
+    gd_json(port, "PATCH", url, json_headers(), body.to_string().into_bytes()).await?;
+    Ok(())
+}
+
+/// Read the whole board off the doc folder — one metadata `files.get`
+/// with `fields=appProperties` (5 quota units), which is the cheapest
+/// question this API answers.
+///
+/// A folder with no properties at all answers an empty map, not an
+/// error: "nobody has ever flushed here" and "the board was cleared" are
+/// the same answer to a hint.
+pub async fn gd_board_read(
+    cfg: &GdriveCfg,
+    port: &impl FetchPort,
+    folder_id: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let url = format!(
+        "{}/drive/v3/files/{}?fields={}",
+        cfg.api_base,
+        q_encode(folder_id),
+        q_encode("appProperties"),
+    );
+    let value = gd_json(port, "GET", url, Vec::new(), Vec::new()).await?;
+    let Some(map) = value.get("appProperties").and_then(|p| p.as_object()) else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<(String, String)> = map
+        .iter()
+        .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+        .collect();
+    // Sorted so a stored board and a freshly read one compare by value
+    // rather than by whatever order the JSON object happened to carry.
+    out.sort();
+    Ok(out)
+}
+
 // --- names: keyed, because on this provider names are the disclosure ---
 //
 // WHAT AN OBSERVER IS PREVENTED FROM LEARNING, and why it is worth the

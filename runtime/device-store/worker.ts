@@ -54,6 +54,7 @@ import {
   newEngine,
   type PersistDir,
   type StoreSign,
+  type UsPartition,
 } from "../engine.ts";
 // THE STORAGE EGRESS SEAMS AND THE ESCROW, both runtime modules and
 // both already inside this file's pin set: keystore.ts and
@@ -123,6 +124,7 @@ import {
   type Req,
   type Res,
   type StoreBinding,
+  type SyncStatus,
   TASKS_METHODS,
   type UnsealOptions,
   type WireFailure,
@@ -342,6 +344,14 @@ async function unseal(opts: UnsealOptions = {}): Promise<DeviceStatus> {
     clearGrant();
     throw e;
   }
+  // THE SCHEDULE STARTS HERE, NOT INSIDE `bringUpEngine`, and the
+  // placement is the contract (SYNC.md §2: the boot pull runs "after the
+  // worker re-applies the binding and the engine is up, BEHIND
+  // readiness"). By this line the engine is published and `status()` is
+  // answerable, and `startSyncSchedule` only arms a timer — so the boot
+  // pull cannot be in front of the answer this call is about to return,
+  // and boot never blocks on the network.
+  startSyncSchedule();
   return await status();
 }
 
@@ -651,6 +661,31 @@ async function reseal(opts: ResealOptions = {}): Promise<DeviceStatus> {
     clearTimeout(debounceTimer);
     debounceTimer = undefined;
   }
+  // THE PRE-RESEAL FLUSH, AND IT IS THE ASYMMETRIC HALF (SYNC.md §3).
+  //
+  // The reseal-saves-first discipline extends to the bucket: sealing
+  // means everything the account should have crossed the wire or the
+  // bucket, and a mutation inside the 20 s flush window has a flush
+  // armed that this ceremony is about to cancel. So one runs here.
+  //
+  // BUT IT IS BEST-EFFORT AND A FAILURE MUST NOT REFUSE THE RESEAL,
+  // unlike the mandatory checkpoint immediately below — SYNC.md §3 says
+  // why in one clause: "reseal must not become hostage to an unreachable
+  // bucket". The two halves fail differently because what is at stake
+  // differs. A failed CHECKPOINT means work would be LOST, and it is
+  // recoverable by trying again on a device that is still open. A failed
+  // FLUSH means work is still safely on this disk and merely not yet in
+  // the bucket — and the user asking to seal may be doing so precisely
+  // because they are about to lose the network, or leave, or hand the
+  // laptop over. Holding a device open against that is refusing a
+  // security act over a durability nicety.
+  //
+  // IT GOES BEFORE THE CHECKPOINT, not after: a flush mutates the
+  // guest's bucket state (the name-key chain and the flushed-chunk map),
+  // and #93's whole finding is that losing that state costs a duplicate
+  // upload of the entire store. Flushing after the final checkpoint
+  // would leave exactly that state uncheckpointed.
+  await syncFlushNow();
   if (engine !== null) await checkpoint();
   await resealNamespace(ns);
   dek = null;
@@ -881,6 +916,12 @@ function clearGrant(): void {
   delete storeGrant.appSecret;
   delete storeGrant.tokenUrl;
   storeSigner = null;
+  // AND THE SCHEDULE, at every one of these sites at once. See
+  // `stopSyncSchedule` for why this is the right place to hang it: a
+  // grant that has been dropped is a destination this device can no
+  // longer reach, and a timer left armed over one would fire into a
+  // device with nothing to sync — or, at the seal sites, with no DEK.
+  stopSyncSchedule();
 }
 
 /**
@@ -1333,6 +1374,12 @@ async function bindStore(binding: StoreBinding): Promise<DeviceStatus> {
     kind: "s3",
     value: { endpoint: stored.endpoint, bucket: stored.bucket, accessKey: stored.accessKey },
   });
+  // A DESTINATION EXISTS AGAIN, SO THE SCHEDULE DOES. `clearGrant` stops
+  // it at every unbind/reseal/erase, so a bind is the matching arm: a
+  // device that has just been pointed at a bucket should sync on its own
+  // without waiting for a reload. At the ORDINARY cadence, never the
+  // boot pull's — see `rearmSyncSchedule`.
+  rearmSyncSchedule();
   return await status();
 }
 
@@ -1420,6 +1467,8 @@ async function bindGdrive(
     kind: "gdrive",
     value: { root: stored.root, apiBase: stored.apiBase, space: stored.space },
   });
+  // The S3 arm's reason verbatim.
+  rearmSyncSchedule();
   return await status();
 }
 
@@ -1775,6 +1824,479 @@ function scheduleCheckpoint(): void {
   }, CHECKPOINT_DEBOUNCE_MS);
 }
 
+// --- the sync schedule ------------------------------------------------------
+//
+// THE WORKER OWNS THE SCHEDULE (runtime/SYNC.md §3), for the reason it
+// owns the checkpoint cadence: it owns the engine and the binding, and
+// it outlives tabs. A page that scheduled its own flushes would stop
+// syncing when the user switched tabs, and two tabs would schedule two.
+//
+// FLUSH is the CHECKPOINT'S SLOWER SIBLING and is armed by exactly the
+// same event — a non-readonly dispatch through `call()` below — with a
+// ~20 s trailing debounce instead of 500 ms. The two timers are
+// INDEPENDENT: a checkpoint is a local write and wants to be prompt, a
+// flush is a network round trip against a provider with rate limits and
+// wants to be far from the hot-file heuristics (SYNC.md §3 records the
+// 2026-08-23 measurement: one flush ≈ 750 quota units against
+// 325k/min/user, so the binding limit is the per-file write rate, not
+// the quota). Plus the two moments the checkpoint already honours:
+// last-client-disconnect, and before reseal — with ONE asymmetry, called
+// out at that call site.
+//
+// PULL is a DUMB TIMER, on purpose (SYNC.md §2: "the scheduler just
+// calls `bucketPull`; cheapness-when-idle lives INSIDE the provider
+// strategy"). One cycle at bring-up behind readiness, then every 45 s
+// while unsealed. Nothing in here inspects a change board, counts
+// requests, or decides a pull is unnecessary — if that logic ever grows
+// a bug, this file is not where it lives.
+//
+// BACKOFF IS PER DIRECTION AND UNTRIAGED. Any failed background cycle
+// backs the direction off (truncated exponential, base 5 s, factor 2,
+// cap 10 min, jittered), because "transient-vs-permanent triage is not
+// worth string-matching error text for a background loop" — Google's
+// 429/403-rate contract is then honoured as a special case of honouring
+// everything. THE USER'S OWN Sync-now IS NOT ROUTED THROUGH HERE AT ALL
+// (the sheet calls `driver.bucketFlush` directly), which is what makes
+// "an explicit act deserves an explicit answer" true by construction
+// rather than by a bypass flag.
+
+const FLUSH_DEBOUNCE_MS = 20_000;
+const PULL_INTERVAL_MS = 45_000;
+const BACKOFF_BASE_MS = 5_000;
+const BACKOFF_CAP_MS = 600_000;
+/** Where a background failure stops being the scheduler's business and
+ * becomes the user's (SYNC.md §3). */
+const SYNC_VISIBLE_AFTER = 3;
+
+/** One direction's consecutive-failure count. The delay is DERIVED from
+ * it rather than stored, so there is one number to reset and no way for
+ * a count and a delay to disagree. */
+let flushFailures = 0;
+let pullFailures = 0;
+let lastFlush: number | null = null;
+let lastPull: number | null = null;
+let lastSyncError: string | null = null;
+
+let flushTimer: number | undefined;
+let pullTimer: number | undefined;
+/** WHEN THE STANDING FLUSH TIMER IS DUE, absolute `Date.now()` ms, and
+ * meaningful only while `flushTimer` is armed. An absolute deadline
+ * rather than a remaining delay because the question a mutation has to
+ * ask mid-backoff is "is the arm I am about to make EARLIER than the one
+ * already standing?", and a remaining delay cannot be compared across
+ * two different moments. See `armFlush`. */
+let flushDueAt = 0;
+
+/**
+ * The two cycles serialize against each other and against nothing else —
+ * the `checkpointChain` idiom, for the same reason and with the same
+ * non-breaking `catch`.
+ *
+ * A flush and a pull overlapping on one engine would be two passes over
+ * the same doc's objects for no gain, and on the flush side the guest's
+ * flushed-chunk map is exactly the kind of state two concurrent passes
+ * would each write a stale copy of. Ordinary driver calls are NOT queued
+ * behind this, for the checkpoint chain's reason.
+ */
+let syncChain: Promise<unknown> = Promise.resolve();
+
+/**
+ * HOW MANY CLIENT-INITIATED BUCKET OPS ARE IN FLIGHT.
+ *
+ * The scheduler must not fight the user, and it must not fight a test.
+ * A page pressing "Sync to storage now", a connect ceremony running
+ * `ensureBucket`/`storeGrant`/`bucketFlush` in sequence, or a gate row
+ * asserting an exact object-name set across a flush all want the store
+ * to themselves for the duration; a background cycle landing in the
+ * middle would at best duplicate work and at worst make an assertion
+ * about "what one flush wrote" false. So a cycle that arrives while a
+ * client op is outstanding DEFERS rather than runs — it re-arms at the
+ * ordinary cadence and tries again later, which is exactly what a
+ * trailing debounce is for.
+ *
+ * It is a COUNTER rather than a boolean because two ports may be calling
+ * at once, and a boolean would be cleared by whichever finished first.
+ */
+const CLIENT_BUCKET_METHODS: ReadonlySet<string> = new Set([
+  "ensureBucket",
+  "storeGrant",
+  "storeRevoke",
+  "bucketFlush",
+  "bucketPull",
+  "initStore",
+]);
+let clientBucketOps = 0;
+
+/** The jittered delay for a direction that has failed `n` times.
+ * Truncated exponential (SYNC.md §3) with full-width jitter around the
+ * nominal delay, clamped to the cap: the jitter is what keeps a fleet of
+ * devices that all lost the same provider from retrying in lockstep. */
+function backoffDelay(n: number): number {
+  const nominal = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * Math.pow(2, Math.max(0, n - 1)));
+  return Math.min(BACKOFF_CAP_MS, Math.round(nominal * (0.5 + Math.random())));
+}
+
+/**
+ * One failure, as a sentence a person can read.
+ *
+ * NEVER MATERIAL, and truncated (rpc.ts's `SyncStatus.lastError` states
+ * the rule). What arrives here is a seam or guest refusal — the same
+ * prose the storage sheet already renders beside the Sync-now button
+ * when the user presses it — so the honest treatment is to keep the
+ * sentence and cut it, not to invent a summary of it.
+ */
+function syncErrorSentence(e: unknown): string {
+  const message = String((e as { message?: unknown } | null)?.message ?? e);
+  return message.length > 300 ? `${message.slice(0, 300)}…` : message;
+}
+
+/** Bytes to lowercase hex — the form `meta`'s agent id already rests in,
+ * so a sibling's `agentId` can be compared against this device's own. */
+function hexOf(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * MAY A BACKGROUND CYCLE RUN AT ALL? Three conditions, and each one is a
+ * different kind of "no".
+ *
+ *   * the device was erased, or is sealed, or has no engine — a timer
+ *     must never fire into a sealed device (the checkpoint's guard, and
+ *     the reason `reseal` clears these timers before it drops the DEK).
+ *   * nothing is BOUND — no destination, so no cycle. The binding is
+ *     read from the sealed namespace each time rather than cached,
+ *     because `bindStore`/`unbindStore` can move it between two ticks
+ *     and a cached answer would sync to a destination the user just
+ *     disconnected.
+ *   * a client bucket op is in flight — defer, see `clientBucketOps`.
+ */
+async function syncMayRun(): Promise<Engine | null> {
+  if (destroyed || dek === null || engine === null) return null;
+  if (clientBucketOps > 0) return null;
+  const live = engine;
+  const key = dek;
+  let binding: StoreBinding | undefined;
+  try {
+    binding = await readBinding(key);
+  } catch {
+    // A binding that will not open is `unseal`'s and `status()`'s
+    // finding to report, not a background timer's to raise: those two
+    // let the `SealError "tampered"` propagate to a caller who asked.
+    // From in here it is simply "no destination this cycle".
+    return null;
+  }
+  if (!binding) return null;
+  // The awaits above are suspension points; re-check that the device did
+  // not seal underneath them.
+  if (destroyed || dek !== key || engine !== live) return null;
+  return live;
+}
+
+/**
+ * THE PARTITIONS A CYCLE COVERS: the ACCOUNT POINTER MAP, re-read every
+ * cycle (SYNC.md §3, "Scope").
+ *
+ * Re-read rather than cached because a partition added on another device
+ * arrives through the account's own sync, and a cached list would keep
+ * this device flushing yesterday's set.
+ *
+ * CONTRACT: `usPartitions()` REFUSES on a device with no user-system
+ * document ("no user-system partition (user-create or pair first)" —
+ * engine/guest/src/usdoc.rs's `doc_id`), and that refusal is NOT counted
+ * as a sync failure. SYNC.md §3 defines the scope of a cycle as the
+ * pointer map; a device that has no map has no scope, which is the same
+ * "nothing to do" an EMPTY map is, and treating it as a failure would
+ * put every account-less device into permanent backoff and announce a
+ * broken sync at a device that was never asked to sync anything. Read
+ * failures of the map are therefore ABSENCE, not error; failures of the
+ * flush/pull calls themselves are what the backoff is about.
+ */
+async function syncScope(live: Engine): Promise<UsPartition[]> {
+  try {
+    return await live.driver.usPartitions();
+  } catch {
+    return [];
+  }
+}
+
+/** Record a cycle's outcome and hand back the delay the direction's next
+ * tick should use. */
+function noteSyncOutcome(direction: "flush" | "pull", failure: unknown | null): number {
+  if (failure === null) {
+    if (direction === "flush") {
+      flushFailures = 0;
+      lastFlush = Date.now();
+    } else {
+      pullFailures = 0;
+      lastPull = Date.now();
+    }
+    // The sentence goes when BOTH directions are healthy — a page that
+    // cleared it on one direction's success would erase the only
+    // description of the other's ongoing failure.
+    if (flushFailures === 0 && pullFailures === 0) lastSyncError = null;
+    return direction === "flush" ? FLUSH_DEBOUNCE_MS : PULL_INTERVAL_MS;
+  }
+  const n = direction === "flush" ? ++flushFailures : ++pullFailures;
+  lastSyncError = syncErrorSentence(failure);
+  return backoffDelay(n);
+}
+
+/**
+ * ONE FLUSH CYCLE: every partition in the pointer map, in order.
+ *
+ * A partition that fails does NOT stop the ones after it — a doc whose
+ * objects a provider is refusing is no reason to leave the others
+ * unwritten — but the cycle as a whole is a FAILURE if any partition
+ * failed, which is the literal reading of SYNC.md §3's "ANY failed
+ * background flush". The first failure is the one whose sentence is
+ * kept, because it is the one with the least other noise in front of it.
+ */
+async function flushCycle(): Promise<void> {
+  const live = await syncMayRun();
+  if (live === null) {
+    armFlush(FLUSH_DEBOUNCE_MS, false);
+    return;
+  }
+  const parts = await syncScope(live);
+  if (parts.length === 0) return; // nothing to do; the next mutation re-arms
+  let failure: unknown | null = null;
+  for (const part of parts) {
+    if (engine !== live || dek === null || destroyed) break;
+    try {
+      await live.driver.bucketFlush(part.id);
+    } catch (e) {
+      failure ??= e;
+    }
+  }
+  const delay = noteSyncOutcome("flush", failure);
+  // A SUCCESSFUL cycle does not re-arm: flush is EVENT-DRIVEN, and a
+  // device nobody is touching should be silent. A FAILED one does, which
+  // is what makes the backoff a retry cadence rather than a mute button.
+  if (failure !== null) armFlush(delay, true);
+}
+
+/**
+ * ONE PULL CYCLE: every partition in the pointer map, from every SIBLING
+ * DEVICE of this account that is not this one.
+ *
+ * WHY A FAN-OUT AT ALL. `bucketPull(docId, ownerId, pickup)` names the
+ * device whose keyed namespace is being read (the bringup's cold pull
+ * passes the flushing engine's own agent id —
+ * demo/host/bringup.ts:221,469), because the object model is
+ * single-writer-per-name: each device writes under ITS OWN verifying key
+ * and there is no "the store's copy" to pull. So "pull whatever my other
+ * devices wrote" is exactly (partition × sibling), and the sibling list
+ * is the account's own device directory (`usDevicesList()`) minus this
+ * device and minus revoked entries.
+ *
+ * PER-PAIR FAILURES ARE TOLERATED INDEPENDENTLY: a sibling that has
+ * never flushed to this store, or has been switched off since before the
+ * bind, refuses its pair (the gdrive arm's "pickup object missing:
+ * revoked, or never granted to this device") and must not cost the
+ * pairs that would have worked.
+ *
+ * CONTRACT — and this is the one place SYNC.md §3's "ANY failed
+ * background pull" and the fan-out's per-pair tolerance pull in
+ * different directions. The conservative reading taken here: a cycle is
+ * a FAILURE only when it attempted at least one pair and EVERY pair
+ * failed. The alternative — any pair's failure fails the cycle — makes a
+ * single never-flushed sibling pin the pull direction in permanent
+ * backoff and announce a broken sync to a user whose sync is working,
+ * which is the "lie of omission" rule inverted into crying wolf. Flagged
+ * in the track report.
+ */
+async function pullCycle(): Promise<void> {
+  const live = await syncMayRun();
+  if (live === null) {
+    armPull(PULL_INTERVAL_MS);
+    return;
+  }
+  const parts = await syncScope(live);
+  const self = (await ns.get<string>("meta", AGENT_KEY)) ?? null;
+  let siblings: { agentId: Uint8Array }[] = [];
+  try {
+    siblings = (await live.driver.usDevicesList())
+      .filter((d) => !d.revoked && (self === null || hexOf(d.agentId) !== self));
+  } catch {
+    // No account directory is the account-less device's ordinary state,
+    // and it is ABSENCE for `syncScope`'s reason: nothing to pull from.
+    siblings = [];
+  }
+  if (parts.length === 0 || siblings.length === 0) {
+    armPull(PULL_INTERVAL_MS);
+    return;
+  }
+  let attempted = 0;
+  let succeeded = 0;
+  let failure: unknown | null = null;
+  for (const part of parts) {
+    for (const sib of siblings) {
+      if (engine !== live || dek === null || destroyed) break;
+      attempted++;
+      try {
+        // `pickup` is the LINK tier's standing capability and this is an
+        // owner-tier pull between two devices of one account, so it is
+        // `undefined` — the same argument the bringup's cold pull
+        // passes, and the gdrive arm refuses a non-undefined one BY NAME
+        // (DRIVE.md §1).
+        await live.driver.bucketPull(part.id, sib.agentId, undefined);
+        succeeded++;
+      } catch (e) {
+        failure ??= e;
+      }
+    }
+  }
+  const total = attempted > 0 && succeeded === 0 ? failure : null;
+  const delay = noteSyncOutcome("pull", total);
+  armPull(delay);
+}
+
+/**
+ * Arm the trailing flush.
+ *
+ * `fromMutation` distinguishes the two arms, and the difference is the
+ * debounce's whole meaning: a MUTATION resets the window (a burst of
+ * typing costs one flush, taken after the burst rather than through it),
+ * while a BACKOFF re-arm must not be pushed further out by every
+ * keystroke — so it only ever moves the deadline LATER when nothing is
+ * already armed sooner.
+ */
+function armFlush(delay: number, fromMutation: boolean): void {
+  if (dek === null || destroyed) return;
+  if (!fromMutation && flushTimer !== undefined) return;
+  const now = Date.now();
+  let due = now + delay;
+  // A MUTATION WHILE THE DIRECTION IS BACKED OFF CHANGES *WHAT* WILL BE
+  // FLUSHED, NEVER *WHEN*: a failing store is retried on the backoff's
+  // schedule no matter how busy the user is, and a recovery resets
+  // everything. Without this the debounce's own re-arm would clobber the
+  // standing backoff deadline on every keystroke — the failure COUNT
+  // would still escalate and the announcement would still fire, but the
+  // retry PRESSURE against a store that is already refusing would stay
+  // at mutation cadence, which is the one thing backoff exists to
+  // prevent. `max` rather than "leave it alone" because a debounce
+  // deadline further out than the backoff's is the quieter of the two,
+  // and quieter always wins here.
+  if (fromMutation && flushFailures > 0 && flushTimer !== undefined) {
+    due = Math.max(flushDueAt, due);
+  }
+  if (flushTimer !== undefined) clearTimeout(flushTimer);
+  flushDueAt = due;
+  flushTimer = setTimeout(() => {
+    flushTimer = undefined;
+    syncChain = syncChain.then(() => flushCycle()).catch(() => {});
+  }, Math.max(0, due - now)) as unknown as number;
+}
+
+function armPull(delay: number): void {
+  if (dek === null || destroyed) return;
+  if (pullTimer !== undefined) clearTimeout(pullTimer);
+  pullTimer = setTimeout(() => {
+    pullTimer = undefined;
+    syncChain = syncChain.then(() => pullCycle()).catch(() => {});
+  }, delay) as unknown as number;
+}
+
+/** The mutation hook's sync half — armed beside `scheduleCheckpoint()`
+ * and by the same event, at the same call site. */
+function scheduleFlush(): void {
+  armFlush(FLUSH_DEBOUNCE_MS, true);
+}
+
+/**
+ * BRING-UP: one pull, then the cadence (SYNC.md §2, "PULL AT BRING-UP").
+ *
+ * BEHIND READINESS, AND THAT IS THE POINT: this is called at the END of
+ * `unseal`, after the engine is published and `status()` is answerable,
+ * and it arms a ZERO-DELAY TIMER rather than awaiting anything. So the
+ * unseal that opened the device returns on its own schedule and the boot
+ * pull happens after it — "boot never blocks on the network", made
+ * structural instead of promised. Idempotent: two tabs unsealing one
+ * already-open device re-arm one timer, they do not start two loops.
+ */
+function startSyncSchedule(): void {
+  if (dek === null || destroyed) return;
+  armPull(0);
+}
+
+/**
+ * RE-ARM AT THE ORDINARY CADENCE — the bind sites' arm, and it is
+ * deliberately NOT `startSyncSchedule`.
+ *
+ * A BIND IS THE FIRST HALF OF A CEREMONY, not the end of one: the page
+ * that just bound goes straight on to `ensureBucket`, `storeGrant` and a
+ * first `bucketFlush` (demo/host/solo.ts's connect ceremony), and those
+ * calls have not been dispatched yet — so `clientBucketOps`, which can
+ * only see an op that is already in flight, would wave a boot pull
+ * through into the middle of them. Measured, not theorised: the
+ * `solo-account-storage` scenario went red on exactly this, with the
+ * binding device's first flush producing no doc folder at all.
+ *
+ * The ordinary cadence is the right answer rather than a workaround. A
+ * freshly bound device has nothing a sibling wrote that it needs in the
+ * next second — SYNC.md's boot pull is the "my other device wrote while
+ * this one was CLOSED" beat, and this device has been open the whole
+ * time — so 45 s later is both safe and sufficient.
+ */
+function rearmSyncSchedule(): void {
+  if (dek === null || destroyed) return;
+  armPull(PULL_INTERVAL_MS);
+}
+
+/**
+ * Stop the schedule and forget everything it learned.
+ *
+ * CALLED FROM `clearGrant()`, which is deliberate rather than
+ * convenient: every site that drops this device's egress authority — the
+ * reseal, the erase, the unseal rollback, an unbind, a forgotten consent
+ * — is exactly a site where a timer that later fired would be firing
+ * into a device with no destination, and in the seal cases into one with
+ * no DEK at all. Putting it there means the list cannot drift out of
+ * sync with the grant's.
+ *
+ * THE COUNTS GO WITH THE TIMERS. Backoff state describes a conversation
+ * with a destination; a device that has just been unbound, resealed or
+ * re-pointed is not in that conversation any more, so carrying a failure
+ * count across would announce an old bucket's outage against a new one.
+ */
+function stopSyncSchedule(): void {
+  if (flushTimer !== undefined) {
+    clearTimeout(flushTimer);
+    flushTimer = undefined;
+  }
+  if (pullTimer !== undefined) {
+    clearTimeout(pullTimer);
+    pullTimer = undefined;
+  }
+  flushDueAt = 0;
+  flushFailures = 0;
+  pullFailures = 0;
+  lastFlush = null;
+  lastPull = null;
+  lastSyncError = null;
+}
+
+/**
+ * FLUSH RIGHT NOW, BEST-EFFORT — the two moments that are not a timer.
+ *
+ * Used at last-client-disconnect (beside the existing best-effort
+ * checkpoint) and before reseal. Returns a promise that never rejects:
+ * both callers are places where a rejection has nobody to go to, and the
+ * reseal caller in particular must NOT be able to refuse the ceremony.
+ */
+function syncFlushNow(): Promise<void> {
+  const next = syncChain.then(() => flushCycle());
+  syncChain = next.catch(() => {});
+  return next.catch(() => {});
+}
+
+/** `status()`'s sync half. Null while sealed or unbound, with the
+ * cannot-know/has-no-opinion split rpc.ts documents. */
+function syncStatusOf(binding: StoreBinding | null): SyncStatus | null {
+  if (dek === null || binding === null) return null;
+  return { lastFlush, lastPull, flushFailures, pullFailures, lastError: lastSyncError };
+}
+
 // --- status -----------------------------------------------------------------
 
 async function status(): Promise<DeviceStatus> {
@@ -1784,6 +2306,11 @@ async function status(): Promise<DeviceStatus> {
   // Read once, reported below: `null` while sealed is UNREADABLE, not
   // absent (see the field's own note).
   const gdriveRow = dek === null ? undefined : await readOauth(dek);
+  // Read once and used TWICE below — by `storage` and by `sync`, whose
+  // null arms are the same two facts (sealed, or nothing bound). Two
+  // reads could straddle a bind and report a destination beside a
+  // "nothing is bound" sync record.
+  const binding = dek === null ? null : ((await readBinding(dek)) ?? null);
   return {
     deviceId: DEVICE_ID,
     tier: record?.tier ?? "t0",
@@ -1817,7 +2344,7 @@ async function status(): Promise<DeviceStatus> {
     // would throw out of here rather than report null, and that is the
     // ruling — swallowing it in `status()` would hide a real finding
     // from the one call everything makes.
-    storage: dek === null ? null : ((await readBinding(dek)) ?? null),
+    storage: binding,
     // THE CONSENT AS A NULLABLE RECORD, with the same cannot-know
     // semantics as `storage` above: the oauth row rests under the DEK,
     // so `null` on a sealed device means unreadable rather than absent.
@@ -1828,6 +2355,10 @@ async function status(): Promise<DeviceStatus> {
     // row — no token, no expiry, no account name — is derivable from
     // this field, which is the whole design of it (DRIVE.md §3).
     gdriveConsent: gdriveConsentOf(gdriveRow),
+    // THE SCHEDULE'S OWN REPORT (SYNC.md §3, "Surface"). Timestamps,
+    // counts and one sentence — nothing addressing, nothing secret; see
+    // rpc.ts's `SyncStatus`.
+    sync: syncStatusOf(binding),
   };
 }
 
@@ -1900,6 +2431,18 @@ async function callHost(method: string, args: unknown[]): Promise<unknown> {
         clearTimeout(debounceTimer);
         debounceTimer = undefined;
       }
+      //    AND THE SYNC TIMERS, for a related but weaker reason: a
+      //    background flush does not write the state root, but it does
+      //    read this engine and mutate the guest's bucket state, and the
+      //    drain below is an await during which an armed timer would
+      //    otherwise fire on a device that is being erased. The RUNNING
+      //    cycle is deliberately NOT drained the way the checkpoint
+      //    chain is: it is a network round trip, so awaiting it would
+      //    let an unreachable provider hold an erasure open — and unlike
+      //    a checkpoint it cannot recreate the namespace's files, so
+      //    there is nothing to be sure of. `destroyed` (set below)
+      //    refuses whatever it tries next.
+      stopSyncSchedule();
       // 2. THE CHAIN. A checkpoint already RUNNING is mid-write into the
       //    state root; draining is the only way to be sure none outlives
       //    the storage. Awaiting the chain (rather than `checkpoint()`)
@@ -1981,8 +2524,29 @@ async function call(target: string, method: string, args: unknown[]): Promise<un
   // arbitrary string from a port must never reach a property lookup on
   // the engine's exports.
   if (!names.includes(method)) throw new Error(`device-store: no ${target} method ${method}`);
-  const value = await surface[method](...args);
-  if (!READONLY_METHODS.has(method)) scheduleCheckpoint();
+  // A CLIENT-INITIATED BUCKET OP OWNS THE STORE WHILE IT RUNS. See
+  // `clientBucketOps`: a background cycle that arrived mid-ceremony
+  // would race the user's own act (and a gate row's own assertion about
+  // what one flush wrote), so it defers instead. The counter is bumped
+  // around the await and released in `finally`, because a REFUSED
+  // bucket op must not leave the scheduler muted for the life of the
+  // worker.
+  const holdsBucket = target === "driver" && CLIENT_BUCKET_METHODS.has(method);
+  if (holdsBucket) clientBucketOps++;
+  let value: unknown;
+  try {
+    value = await surface[method](...args);
+  } finally {
+    if (holdsBucket) clientBucketOps--;
+  }
+  if (!READONLY_METHODS.has(method)) {
+    scheduleCheckpoint();
+    // THE FLUSH IS THE CHECKPOINT'S SLOWER SIBLING, armed by the same
+    // event at the same site and running on its own independent timer
+    // (SYNC.md §3). One hook, two cadences — 500 ms to this disk, ~20 s
+    // to the bucket.
+    scheduleFlush();
+  }
   return value;
 }
 
@@ -2082,6 +2646,19 @@ function serve(port: MessagePort): void {
           debounceTimer = undefined;
         }
         checkpoint().catch(() => {});
+        // AND THE FLUSH, on the same trigger and with the same honesty
+        // about what "best-effort" means (SYNC.md §3 names
+        // last-client-disconnect as one of the two moments the schedule
+        // honours beside the debounce). An armed flush is cancelled by
+        // the cycle this starts, and the cycle no-ops on a device with
+        // nothing bound. Fire-and-forget by construction: there is
+        // nobody left to report to, and this global may be torn down
+        // before it settles.
+        if (flushTimer !== undefined) {
+          clearTimeout(flushTimer);
+          flushTimer = undefined;
+        }
+        void syncFlushNow();
       }
     }
   };

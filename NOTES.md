@@ -2166,6 +2166,61 @@ picked-up published client id (rclone's, with the recorded caveat that
 Google is retiring it during 2026; any registered installed-app pair
 slots into the same fields) — nothing baked into source or bundles.
 
+**Bucket sync: storage moves without being asked** (2026-08-23; design
+record [runtime/SYNC.md](runtime/SYNC.md)). The round that turned the
+bucket from a write-only backup button into the product claim — a solo
+device that syncs through its bucket while its siblings sleep — in
+three pillars whose order was the dependency graph. FIRST, the name
+chain stopped forking: per-device random minting meant two devices on
+one bucket wrote parallel keyed namespaces (the #93 respawn defect made
+cross-device and permanent), and the ruled fix — derive from keyhive
+epoch secrets, G4's old coupling sketch — fired its own feasibility
+caveat (keyhive exposes a current-epoch secret only; historical
+reconstruction is test_utils-gated; no integer epoch indexing exists;
+and the one public epoch-stable value ships in cleartext inside every
+uploaded envelope, so naming with it would hand the provider the name
+key — recorded as the blocked ideal with the two-line upstream unblock
+named). The amended ruling uses the channel the account already had:
+the chain is a guest-internal us-doc register, synced E2E like the
+profile, SEEDED AT POINTER PUBLICATION inside one automerge change so
+pointer-visible ⇒ chain-visible and a device cannot flush a doc whose
+pointer it has not seen — a gate proven non-vacuous by concurrent
+flushes that fork deterministically with seeding disabled. SECOND,
+cheap-when-idle lives in the provider, not the scheduler: each Drive
+doc folder's appProperties are a change board (per-device key, decimal
+flush counter — per-key merge extends single-writer-per-name to
+metadata; hint never truth, correctness survives a lost board), so an
+idle pull is ONE metadata request, measured off the fake's log; S3
+declines the optimization with arithmetic in the comment. BucketState
+growth got its standing rule: bincode is not self-describing, so a
+checkpoint member that validates but no longer decodes reads as empty
+with a loud note — pinned by a resume act that corrupts the element
+count and re-seals both digests, testing decode and not the digest
+path. THIRD, the worker owns the schedule: a 20s trailing flush
+debounce off the same mutation hook as the checkpoint's 500ms (the two
+timers deliberately far apart — the hot-file 429 heuristics are the one
+Drive limit that binds; documented quota is three orders of magnitude
+away), boot pull armed BEHIND readiness at unseal, a 45s cadence,
+truncated-exponential backoff whose deadline a busy user cannot clobber
+(a mutation mid-backoff changes what flushes, never when), and the page
+announcing after three consecutive failures. The round's own money-shot
+scenario went RED as registered and forced the fourth ruling: Drive
+pulls were pickup-gated while no account device grants siblings
+pickups, so sibling pulls could only refuse — the ACCOUNT PULL PATH now
+derives a sibling's oplog/manifest names from the synced chain and the
+device directory with no pickup at all (agent id and object-name key
+verified to be the same 32 bytes, corroborated by manifest signature
+verification), pickups remaining the bootstrap for non-account readers
+only, and a never-flushed sibling reading as absence, never an error —
+the ordinary state of most (partition × sibling) pairs at every boot.
+Gates: solo-offline-sync green end to end (pair, close B, A authors
+with nobody pressing anything, close A, reopen B with no live peer —
+the todo is there via boot pull alone), e2e 25/25, devstore 53 rows
+(a mutation flushes itself; backoff real, announced-shaped, and reset
+by recovery; boot pull never awaited by unseal), the pairing battery's
+chain act asserting zero duplicate chunk names across concurrent
+sibling flushes, resume/pair/check green, invariants 9/9.
+
 ## Parked and candidate non-goals
 
 - **Metadata privacy**: relays, push services, and origins see traffic

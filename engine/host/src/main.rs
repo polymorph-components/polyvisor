@@ -544,7 +544,19 @@ async fn main() -> Result<()> {
         return resume_scenarios(&component, &linker, &make_store_in, relay, &probe).await;
     }
     if acts == "pairing" {
-        return pairing_scenarios(&engine, &component, &linker, &make_store, relay).await;
+        // The chain act (SYNC.md §1) flushes two paired devices into one
+        // real bucket. Its own bucket, named for this process, for the
+        // same reason the resume battery takes one: the act asserts over
+        // the WHOLE key set, so a co-tenant's leftovers would be counted
+        // as ours.
+        let probe = resume_acts::S3Probe {
+            endpoint: s3.endpoint.clone(),
+            bucket: format!("pm-pair-{}", std::process::id()),
+            access: s3.access.clone(),
+            secret: (*egress.secret).clone(),
+            http: reqwest::Client::new(),
+        };
+        return pairing_scenarios(&engine, &component, &linker, &make_store, relay, &probe).await;
     }
     if acts != "full" {
         bail!("unknown act set {acts} (want `full`, `pairing` or `resume`)");
@@ -708,6 +720,33 @@ async fn resume_scenarios(
             .map_err(|e| e.to_string()),
     ));
 
+    // AND THE GROWTH RULE FOR THAT SAME STATE (SYNC.md §2): a
+    // `buckets.bin` that validates but does not DECODE resumes as an
+    // empty map with a note, not as a refusal. Run over the SAME root
+    // and the same bucket the act above just used, deliberately — the
+    // "no new object names" half of the claim is only meaningful against
+    // a store this device already wrote.
+    let spoiled = (async {
+        let before = probe.keys().await?;
+        let (gen, len) = resume_acts::spoil_buckets_member(&bucket_root)?;
+        println!(
+            "[ buckets- ] spoiled gen-{gen}/buckets.bin in place ({len} B, manifest re-sealed):              a member that validates and cannot decode"
+        );
+        let mut store = make_store_in(&[], Some(&bucket_root));
+        let revived = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+        store
+            .run_concurrent(async move |acc| {
+                resume_acts::bucket_decode_tolerance_act(acc, revived, probe, &before).await
+            })
+            .await??;
+        Ok::<(), wasmtime::Error>(())
+    })
+    .await;
+    outcomes.push((
+        "an undecodable buckets member resumes as an empty map (the BucketState growth rule)",
+        spoiled.map_err(|e| e.to_string()),
+    ));
+
     // Crash consistency, staged rather than asserted (resume_acts.rs).
     let torn = std::env::temp_dir().join(format!("pm-engine-torn-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&torn);
@@ -816,6 +855,7 @@ async fn pairing_scenarios(
     linker: &Linker<Ctx>,
     make_store: &StoreFactory<'_>,
     relay: String,
+    probe: &resume_acts::S3Probe,
 ) -> Result<()> {
     let _ = engine;
 
@@ -828,11 +868,13 @@ async fn pairing_scenarios(
     let stranger = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
     let rejoin = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
     let r = relay.clone();
+    let bucket_probe = probe.clone();
     outcomes.push((
         "positive acts",
         store
             .run_concurrent(async move |acc| {
-                pairing_acts::positive_acts(acc, laptop, phone, stranger, rejoin, r).await
+                pairing_acts::positive_acts(acc, laptop, phone, stranger, rejoin, r, &bucket_probe)
+                    .await
             })
             .await?
             .map_err(|e| e.to_string()),
