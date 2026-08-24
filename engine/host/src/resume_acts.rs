@@ -522,6 +522,7 @@ pub(crate) async fn torn_resume_act(
 /// be asking the component under test to grade itself. This is the same
 /// SigV4 the escrowed signer performs (`store_signer::sign` in main.rs),
 /// assembled here over the rig's synthetic MinIO credential.
+#[derive(Clone)]
 pub(crate) struct S3Probe {
     pub endpoint: String,
     pub bucket: String,
@@ -640,7 +641,7 @@ impl S3Probe {
 /// because a re-upload of an already-stored chunk lands on the SAME
 /// name. Parsed strictly: an unrecognised summary is a failure, never a
 /// silently-zero assertion.
-fn flushed_chunks(summary: &str) -> Result<u32> {
+pub(crate) fn flushed_chunks(summary: &str) -> Result<u32> {
     summary
         .split_whitespace()
         .find_map(|w| w.strip_prefix("chunks="))
@@ -865,6 +866,194 @@ pub(crate) async fn bucket_state_act(
             "buckets: one new change added exactly 1 object ({} -> {}), not another whole copy",
             after.len(),
             delta.len()
+        ),
+        Instant::now(),
+    );
+    Ok(())
+}
+
+// --- the BucketState growth rule (SYNC.md §2) --------------------------------
+
+/// Damage one generation's `buckets.bin` into a member that VALIDATES but
+/// does not DECODE, and repair the manifest so the generation still
+/// selects. Host-side surgery, the `torn_write_act` idiom taken one layer
+/// deeper.
+///
+/// WHY THIS SHAPE. `buckets.bin` is bincode, which is not
+/// self-describing, so adding a field to `BucketState` makes every
+/// previously-written member undecodable — and the rig has no old build
+/// to write one with. The honest stand-in is a member whose framing is
+/// wrong in exactly that way: the map's leading `u64` element count is
+/// raised, so the decoder runs off the end of the buffer looking for
+/// entries that were never there. Same class of failure, same error
+/// (unexpected end of file), no old binary required.
+///
+/// 65535 rather than `u64::MAX`: serde caps a size-hinted `reserve` at a
+/// few thousand elements, so this is guaranteed to hit EOF cheaply
+/// instead of asking the allocator for an absurd map first.
+///
+/// The manifest repair is what makes it a DECODE failure rather than a
+/// torn generation: `validate` checks every member's length and BLAKE3,
+/// and a mismatch there makes the whole generation step aside — which is
+/// the OTHER path (`torn_resume_act`), already covered, and not this one.
+/// Length is preserved and the digest is patched in place, so nothing but
+/// the buckets member's CONTENT is different from what the engine wrote.
+pub(crate) fn spoil_buckets_member(root: &std::path::Path) -> Result<(u64, usize)> {
+    const MAGIC: &[u8] = b"POLYVISOR-ENGINE-CHECKPOINT-1\n";
+
+    let mut gens: Vec<u64> = std::fs::read_dir(root)?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix("gen-"))
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .filter(|n| root.join(format!("gen-{n}")).join("buckets.bin").exists())
+        .collect();
+    gens.sort_unstable();
+    let newest = *gens
+        .last()
+        .ok_or_else(|| format_err!("no generation carries a buckets member to spoil"))?;
+    let dir = root.join(format!("gen-{newest}"));
+
+    let mut bytes = std::fs::read(dir.join("buckets.bin"))?;
+    if bytes.len() < 8 {
+        bail!("buckets.bin is {} B — too short to be a bincode map", bytes.len());
+    }
+    let was = blake3::hash(&bytes);
+    bytes[..8].copy_from_slice(&65_535u64.to_le_bytes());
+    let now = blake3::hash(&bytes);
+    std::fs::write(dir.join("buckets.bin"), &bytes)?;
+
+    // Patch the manifest's recorded digest for that member (the length is
+    // unchanged), then re-seal the manifest's own trailing digest.
+    let manifest = dir.join("MANIFEST");
+    let whole = std::fs::read(&manifest)?;
+    let rest = whole
+        .strip_prefix(MAGIC)
+        .ok_or_else(|| format_err!("MANIFEST does not carry the expected magic"))?;
+    if rest.len() < 32 {
+        bail!("MANIFEST is too short to hold a payload and a digest");
+    }
+    let mut payload = rest[..rest.len() - 32].to_vec();
+    let at = payload
+        .windows(32)
+        .position(|w| w == was.as_bytes())
+        .ok_or_else(|| format_err!("the manifest does not record the buckets member's digest"))?;
+    payload[at..at + 32].copy_from_slice(now.as_bytes());
+    let mut out = MAGIC.to_vec();
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(blake3::hash(&payload).as_bytes());
+    std::fs::write(&manifest, &out)?;
+    Ok((newest, bytes.len()))
+}
+
+/// AN UNDECODABLE `buckets.bin` IS ABSENCE, NOT AN ERROR — the compat
+/// rule for growing `BucketState` (SYNC.md §2, and the struct's own
+/// header in engine/guest/src/lib.rs).
+///
+/// The claim under test has two halves, and the second is what makes the
+/// first affordable:
+///
+///  1. RESUME STILL SUCCEEDS. Everything else in the generation —
+///     identity, keyhive, the partitions, the us-doc — restores exactly
+///     as it would have; only the bucket map lands empty, with a note on
+///     stderr. Before this rule, a `BucketState` field addition turned
+///     every existing checkpoint into a device that refuses to start.
+///  2. THE STORE DOES NOT FORK. The name chain is ACCOUNT state now
+///     (SYNC.md §1), so the resumed device re-derives the SAME names from
+///     its us-doc rather than minting a fresh chain. The re-flush is
+///     therefore a re-UPLOAD (the `flushed` dedup map is genuinely gone,
+///     so it sends chunks again) that lands on the key set already
+///     there — one flush's worth of wasted bytes, self-healing, and no
+///     second copy of the store. That is the entire cost this rule
+///     accepts, and it is asserted here as SET EQUALITY over the bucket's
+///     opaque object names.
+pub(crate) async fn bucket_decode_tolerance_act(
+    acc: &Accessor<Ctx>,
+    revived: crate::bindings::Engine,
+    probe: &S3Probe,
+    before: &[String],
+) -> Result<()> {
+    let d: &Driver = revived.polyvisor_engine_driver();
+    let t: &Tasks = revived.polyvisor_tasks_tasks();
+
+    let did = step!(
+        "spoiled-buckets: revived.state-resume",
+        d.call_state_resume(acc)
+    );
+    if !did {
+        bail!(
+            "resume gave up on a generation whose buckets member does not decode — the growth \
+             rule says treat it as absent, not as a broken checkpoint"
+        );
+    }
+    let items = step!("spoiled-buckets: revived.tasks.items", t.call_items(acc));
+    if items.items.is_empty() {
+        bail!("the rest of the generation did not restore: zero todos after resume");
+    }
+    ok(
+        &format!(
+            "spoiled-buckets: resume survived an undecodable buckets member ({} todo(s) intact)",
+            items.items.len()
+        ),
+        Instant::now(),
+    );
+
+    // The bucket map came back EMPTY, which is only observable through
+    // behaviour: the dedup map is gone, so a re-flush with no mutation
+    // sends chunks again. (A device that had kept its map sends zero —
+    // that is `bucket_state_act`'s assertion, three lines from here in
+    // spirit and the exact opposite in expected value.)
+    step!(
+        "spoiled-buckets: revived.init-store(s3) [addressing re-applied]",
+        d.call_init_store(
+            acc,
+            StoreConfig::S3(S3Config {
+                endpoint: probe.endpoint.clone(),
+                bucket: probe.bucket.clone(),
+                access_key: probe.access.clone(),
+            })
+        )
+    );
+    let pointers = step!(
+        "spoiled-buckets: revived.us-partitions",
+        d.call_us_partitions(acc)
+    );
+    let part = pointers
+        .iter()
+        .find(|p| p.name == "tasks")
+        .ok_or_else(|| format_err!("the us-doc pointer map did not survive the resume"))?
+        .id
+        .clone();
+    let summary = step!(
+        "spoiled-buckets: revived.bucket-flush",
+        d.call_bucket_flush(acc, part)
+    );
+    println!("            {summary}");
+    let chunks = flushed_chunks(&summary)?;
+    if chunks == 0 {
+        bail!(
+            "the re-flush sent zero chunks, so the dedup map survived — the buckets member was \
+             not treated as absent and this act is proving nothing"
+        );
+    }
+
+    let after = probe.keys().await?;
+    let new: Vec<&String> = after.iter().filter(|k| !before.contains(k)).collect();
+    if !new.is_empty() {
+        bail!(
+            "the re-flush wrote {} object(s) under names nobody had derived — the chain was \
+             re-minted rather than re-read from the account, i.e. the store FORKED",
+            new.len()
+        );
+    }
+    ok(
+        &format!(
+            "spoiled-buckets: re-flush re-uploaded {chunks} chunk(s) onto the SAME {} names \
+             (self-healing, one flush's cost, no second copy)",
+            after.len()
         ),
         Instant::now(),
     );

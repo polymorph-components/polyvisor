@@ -665,16 +665,41 @@ pub(crate) async fn resume() -> Result<bool, String> {
     // moment ago and then vanished into "this device never had bucket
     // state" — a fresh keychain and a duplicated store, arrived at
     // quietly. The manifest's file list is the record of what this
-    // generation CLAIMS to hold: unlisted is absent, listed-but-
-    // unreadable raises, exactly as the identity/keyhive/content
-    // members do.
+    // generation CLAIMS to hold: unlisted is absent, listed-but-missing
+    // raises. (Listed, present, and UNDECODABLE is a third case with its
+    // own answer — see immediately below.)
+    // A MEMBER THAT DOES NOT DECODE IS TREATED AS ABSENT — the compat
+    // rule for `BucketState` growth (crate::BucketState's header).
+    //
+    // `buckets.bin` is bincode, which is not self-describing: adding a
+    // field to `BucketState` makes every previously-written member
+    // undecodable, and `#[serde(default)]` cannot help because there is
+    // no field framing for it to notice. Raising here would turn every
+    // such addition into a checkpoint this build refuses — the whole
+    // device bricked over a dedup cache.
+    //
+    // It is affordable now, and was not before, because SYNC.md §1 moved
+    // the name chain into the us-doc: the account re-supplies the chain,
+    // so an emptied map costs ONE re-flush that re-uploads under the SAME
+    // names, not a forked store under a freshly minted chain. Self-
+    // healing, once, loudly.
+    //
+    // LOUDLY IS THE POINT of the log: this is the same OUTCOME as
+    // absence but not the same EVENT, and a silent equivalence would
+    // hide a genuine corruption behind a shrug. Note it, then carry on
+    // exactly as the absence path does.
     let listed = manifest.files.iter().any(|(f, _, _)| f == BUCKETS_FILE);
     if listed {
         let bytes = read_member(n, BUCKETS_FILE, &manifest)
             .ok_or("checkpoint validated but buckets member vanished")?;
-        let buckets: HashMap<Vec<u8>, crate::BucketState> =
-            bincode::deserialize(&bytes).map_err(|e| format!("buckets decode: {e}"))?;
-        crate::with_state(|s| s.buckets = buckets)?;
+        match bincode::deserialize::<HashMap<Vec<u8>, crate::BucketState>>(&bytes) {
+            Ok(buckets) => crate::with_state(|s| s.buckets = buckets)?,
+            Err(e) => eprintln!(
+                "[resume] buckets.bin does not decode ({e}); treating it as absent — a \
+                 BucketState layout change, most likely. The name chain comes from the account \
+                 (SYNC.md §1), so this costs one re-flush under unchanged names."
+            ),
+        }
     }
 
     // Deliberately left empty (see engine.wit): `pending` — a partition

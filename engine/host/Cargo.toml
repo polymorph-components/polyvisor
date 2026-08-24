@@ -22,3 +22,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # The escrowed SigV4 signing credential lives here, behind `store-signer`.
 hmac = "0.12"
 sha2 = "0.10"
+# The resume battery's checkpoint surgery: the acts damage a member and
+# re-seal the manifest, which means computing the same BLAKE3 the guest's
+# persist.rs computes. Same major as the guest's pin.
+blake3 = "1.5"

@@ -281,6 +281,39 @@ async function guard(body: () => Promise<void>): Promise<void> {
   }
 }
 
+/** Poll one device's `status().sync` until the predicate holds, or give
+ * up at the deadline and hand back the LAST thing seen so the row's
+ * evidence can say what the schedule was actually doing.
+ *
+ * Polling `hc-status` is safe to do in a tight-ish loop here for a
+ * reason worth writing down: `status` is a HOST method, answered by
+ * worker.ts's `callHost`, so it never runs through `call()` and
+ * therefore never arms the checkpoint or the flush debounce. A poll that
+ * re-armed the very timer it is waiting for would never fire.
+ */
+async function untilSync(
+  page: Page,
+  id: string,
+  what: string,
+  // deno-lint-ignore no-explicit-any
+  pred: (s: any) => boolean,
+  timeout: number,
+  // deno-lint-ignore no-explicit-any
+): Promise<{ sync: any; ok: boolean; waitedMs: number; what: string }> {
+  const started = Date.now();
+  const deadline = started + timeout;
+  // deno-lint-ignore no-explicit-any
+  let last: any = null;
+  while (Date.now() < deadline) {
+    last = (await probe(page, "hc-status", { id })).sync ?? null;
+    if (last !== null && pred(last)) {
+      return { sync: last, ok: true, waitedMs: Date.now() - started, what };
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return { sync: last, ok: false, waitedMs: Date.now() - started, what };
+}
+
 async function main() {
   try {
     await Deno.stat(`${SERVE}/page.js`);
@@ -2645,6 +2678,300 @@ async function main() {
           `store-wide speculative resume gate). af97c13 in v0.5.1 bounds that entry to the ` +
           `sole driver and wakes the incumbent on driver arrival, which is what the drain ` +
           `count recovering measures.`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
+    // === THE WORKER'S SYNC SCHEDULE (runtime/SYNC.md §3) — rows 48-50 ===
+    //
+    // WHAT THESE THREE ROWS ARE FOR, and what they deliberately are not.
+    // SYNC.md's Devstore gate asks for "the scheduler mechanics on ONE
+    // device": a mutation flushing within the debounce window with no
+    // button press, an injected failure backing off far enough to cross
+    // the announcement threshold, and the boot pull running behind
+    // readiness. The ANNOUNCEMENT itself is a page fact and belongs to
+    // the e2e suite (this matrix has no visor in it); what is asked of
+    // the worker here is the STATUS SURFACE the announcement reads —
+    // `DeviceStatus.sync`.
+    //
+    // THEY SHARE ONE DEVICE, in the order 48 → 49 → 50, because the
+    // setup is the expensive part and because the sequence is itself the
+    // story: a schedule that works, then fails, then recovers, then
+    // survives the host's death. Their own root (`pm-sync`) keeps the
+    // change-board assertion in row 48 unambiguous — no other row has
+    // ever flushed into this folder, so a board value of "1" means the
+    // FIRST flush of this doc from this device and nothing else.
+    let syncDevice = "";
+    const SYNC_ROOT = "pm-sync";
+    const syncBinding = {
+      kind: "gdrive",
+      root: SYNC_ROOT,
+      apiBase: gdOrigin,
+      clientId: GD_CLIENT_ID,
+      space: "drive" as const,
+    };
+    /** The doc folders under this row-family's own store root, and the
+     * change board hanging off each (SYNC.md §2). The leaf names are
+     * keyed hashes, so this is as fine-grained as an outside observer
+     * can get. */
+    const syncBoards = (): { folder: string; board: Record<string, string> }[] =>
+      fake.childNames(`${SYNC_ROOT}/docs`).map((folder) => ({
+        folder,
+        board: fake.appProperties(`${SYNC_ROOT}/docs/${folder}`),
+      }));
+
+    // --- 48: a mutation syncs itself, with no button anywhere --------------
+    //
+    // PILLAR 3'S HEADLINE ON ONE DEVICE (SYNC.md §3): the flush is the
+    // checkpoint's slower sibling, armed by the same mutation
+    // notification with a ~20 s trailing debounce, and NOTHING in this
+    // row presses anything. The only acts are: publish the tasks
+    // partition in the account's pointer map (which is what gives the
+    // scheduler a scope at all — worker.ts's `syncScope`), add a todo,
+    // and then WAIT.
+    //
+    // TWO WITNESSES, one on each side of the wire. The worker's own
+    // `status().sync.lastFlush` moving off null says the SCHEDULER
+    // completed a cycle; the fake's change board says the bytes and the
+    // commit note actually landed at the provider. Either alone would be
+    // weaker than it looks — a status field can move without a store
+    // being touched, and a store can be written by a ceremony rather
+    // than by a schedule.
+    //
+    // THE BOARD VALUE IS A COUNTER, and "1" is the whole assertion: this
+    // device's first committed flush of this doc, patched onto the doc
+    // folder's `appProperties` after the manifest write that IS the
+    // commit point (engine/guest/src/lib.rs's flush-commit note). Nothing
+    // secret is on that board and nothing may be — the key is 16 hex
+    // characters of a PUBLIC verifying key and the value is a decimal
+    // count.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "sync-schedule",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const id = made.id as string;
+      syncDevice = id;
+      await probe(page, "hc-open", { id, unseal: { passphrase: PASS, untilReseal: true } });
+
+      const { code, state } = await startAndFetchAuth(page, id, gdriveSpec);
+      const consent = await probe(page, "gd-oauth-complete", { id, code, state });
+      const bound = await probe(page, "hc-bind", { id, binding: syncBinding });
+      const ensure = await probe(page, "hc-ensure-bucket", { id });
+
+      // THE ACCOUNT, and then the SCOPE. Without a user-system document
+      // there is no pointer map; without a pointer map the scheduler's
+      // scope is empty and every cycle is a no-op that would pass a
+      // careless row for the wrong reason.
+      await probe(page, "hc-us-create", { id, displayName: "Synthetic Sync Account" });
+      const scoped = await probe(page, "hc-us-partition-put", { id, name: "tasks" });
+
+      const boardsBefore = syncBoards();
+      const idleStatus = await probe(page, "hc-status", { id });
+
+      // THE ONLY ACT. A todo through the RPC — the same `call()` hook
+      // that arms the 500 ms checkpoint — and then nobody touches this
+      // device again until the schedule has done something.
+      await probe(page, "hc-add", { id, titles: ["a todo that flushes itself"] });
+      const flushed = await untilSync(
+        page,
+        id,
+        "the scheduled flush",
+        (s) => s.lastFlush !== null,
+        45_000,
+      );
+      const boardsAfter = syncBoards();
+      const board = boardsAfter[0]?.board ?? {};
+      const values = Object.values(board);
+
+      const ok = consent.ok && bound.attempt.refused === false &&
+        ensure.attempt.refused === false &&
+        scoped.attempt.refused === false && scoped.names.includes("tasks") &&
+        idleStatus.sync !== null && idleStatus.sync.lastFlush === null &&
+        flushed.ok && flushed.sync.flushFailures === 0 &&
+        boardsBefore.length === 0 && boardsAfter.length === 1 &&
+        Object.keys(board).length === 1 && values[0] === "1";
+      record(
+        "48 sync",
+        "a mutation flushes itself within the debounce window, with no button pressed",
+        ok,
+        `a bound device with an ACCOUNT and its tasks partition published in the pointer map ` +
+          `(usPartitions=${j(scoped.names)} — worker.ts's \`syncScope\` reads exactly this, so a ` +
+          `device without it would have no scope to flush). Before the mutation the store held ` +
+          `${boardsBefore.length} doc folder(s) and status().sync said ` +
+          `${j(idleStatus.sync)} — bound, and nothing synced yet, which is the ` +
+          `\`{lastFlush: null}\` case rpc.ts distinguishes from an unbound device's null. ONE ` +
+          `todo went in through the RPC and NOTHING ELSE was called: ${flushed.waitedMs} ms ` +
+          `later (debounce 20 s + margin, deadline 45 s) status().sync=${j(flushed.sync)} — ` +
+          `lastFlush stamped, flushFailures 0. The provider agrees: ${boardsAfter.length} doc ` +
+          `folder now, carrying the change board ${j(board)} — ONE key (16 hex characters of a ` +
+          `public verifying key) whose value is the decimal counter "1", this device's first ` +
+          `COMMITTED flush of this doc, patched after the manifest write that is the commit ` +
+          `point. A counter and a public tag are the only things that may ever go on that ` +
+          `board (SYNC.md §2).`,
+      );
+    });
+
+    // --- 49: backoff is real, and shaped like the announcement -------------
+    //
+    // SYNC.md §3: "any failed background flush/pull is backoff-with-jitter
+    // (truncated exponential, factor 2, cap 10 min)… after three
+    // consecutive failures the visor ANNOUNCES". This row owns the
+    // WORKER's half of that sentence — the count reaching three, the
+    // sentence available to say, and the reset. The visor's actual
+    // announcement is the e2e suite's (no page in this matrix).
+    //
+    // THE OUTAGE IS A 503 ON THE FILES API ONLY, injected through the
+    // fake's `refuseNextFiles` (added for this row). Not a 401: that is
+    // the one refusal the seam has a recovery for (DRIVE.md §4's
+    // refresh-and-retry), so it would exercise the token dance instead
+    // of the backoff. The OAuth endpoints keep answering throughout, so
+    // nothing here can be mistaken for a consent that fell over.
+    //
+    // THE DEADLINES COME FROM THE CONSTANTS, not from taste. Base 5 s,
+    // factor 2, jitter ×0.5–1.5: the first failure lands one debounce
+    // (20 s) after the mutation, the second up to 7.5 s later, the third
+    // up to 15 s after that — worst case ~43 s, so 90 s is a margin
+    // rather than a guess. The recovery retry is the n=3 delay, up to
+    // 30 s, and the flush that follows it must both zero the count and
+    // stamp `lastFlush`.
+    //
+    // WHAT "A SENTENCE" MEANS is asserted rather than assumed: prose
+    // with the provider's own words in it, no bearer, no object name, no
+    // signed URL — `lastError` inherits the OAuth ceremony's "the status
+    // and not one byte of the body" discipline (rpc.ts's `SyncStatus`).
+    await guard(async () => {
+      const id = syncDevice;
+      const before = (await probe(page, "hc-status", { id })).sync;
+
+      // THE STORE GOES DOWN. `Infinity` rather than a count: the row
+      // heals it explicitly below, and a count would make the number of
+      // requests one flush cycle happens to make into a load-bearing
+      // constant.
+      fake.refuseNextFiles(Infinity);
+      await probe(page, "hc-add", { id, titles: ["a todo nobody can flush"] });
+      const failing = await untilSync(
+        page,
+        id,
+        "three consecutive failed flush cycles",
+        (s) => s.flushFailures >= 3,
+        90_000,
+      );
+      const sentence = String(failing.sync?.lastError ?? "");
+      // NOT MATERIAL, asked negatively. The bearer the fake issues is
+      // labelled, so its label appearing anywhere in the status would be
+      // a leak with a name.
+      const noMaterial = !/synthetic-access|synthetic-refresh|Bearer /i.test(sentence);
+
+      // AND THE STORE COMES BACK. The next retry is the n=3 backoff
+      // (≤30 s jittered); the cycle after it must zero the count AND
+      // stamp lastFlush — a count that reset without a flush landing
+      // would be a mute button rather than a recovery.
+      fake.refuseNextFiles(0);
+      const healed = await untilSync(
+        page,
+        id,
+        "the first successful cycle after the outage",
+        (s) => s.flushFailures === 0 && s.lastFlush !== null,
+        90_000,
+      );
+
+      const ok = before !== null && before.flushFailures === 0 &&
+        failing.ok && failing.sync.flushFailures >= 3 &&
+        sentence.length > 0 && /\s/.test(sentence) && sentence.length <= 301 &&
+        noMaterial &&
+        healed.ok && healed.sync.flushFailures === 0 &&
+        healed.sync.lastFlush !== null &&
+        (before.lastFlush === null || healed.sync.lastFlush > before.lastFlush) &&
+        fake.refusalsPending() === 0;
+      record(
+        "49 sync",
+        "three failed background flushes back off and leave a sentence; a success resets the count",
+        ok,
+        `the fake's files API was put into a 503 outage (the OAuth endpoints kept answering, so ` +
+          `this is a provider outage and not a lost consent) and ONE todo was added. ` +
+          `${failing.waitedMs} ms later — the debounce plus two jittered backoff waits, base ` +
+          `5 s × 2, worst case ~43 s — status().sync reported ` +
+          `flushFailures=${failing.sync?.flushFailures}, which is the threshold at which SYNC.md ` +
+          `§3 says a silently-stopped sync becomes a lie of omission and the visor must speak. ` +
+          `lastError is prose a person can read (${j(sentence.slice(0, 120))}, ` +
+          `${sentence.length} chars, truncated at 300 by the worker) and carries NO material: ` +
+          `no bearer label, no object name (${noMaterial}). The store was then healed and left ` +
+          `alone: ${healed.waitedMs} ms later (the n=3 backoff, ≤30 s jittered, plus the cycle) ` +
+          `status().sync=${j(healed.sync)} — the count is back to 0 AND lastFlush moved, so the ` +
+          `reset is a flush that landed rather than a counter someone cleared. The pull ` +
+          `direction backs off on its own counter beside it, deliberately: one bucket can be ` +
+          `unwritable and readable.`,
+      );
+    });
+
+    // --- 50: the boot pull is armed BEHIND readiness -----------------------
+    //
+    // SYNC.md §2: one pull per partition at bring-up, "BEHIND readiness —
+    // boot never blocks on the network". The claim is STRUCTURAL, and so
+    // is the way it is measured: `unseal` publishes the engine, makes
+    // `status()` answerable, and only then calls `startSyncSchedule`,
+    // which ARMS A ZERO-DELAY TIMER rather than awaiting anything
+    // (worker.ts's `startSyncSchedule`). So at the instant the unseal
+    // returns, the pull has not run yet — `sync.lastPull` is null — and
+    // the ceremony was not made to wait for it.
+    //
+    // WITH THE BUCKET UNREACHABLE, which is what turns "did not wait"
+    // from an inference into an observation: a boot that awaited the
+    // pull would take the outage's full failure path before answering,
+    // and this row would time out rather than return in seconds.
+    //
+    // WHAT THIS ROW DOES NOT CLAIM, deliberately. It does NOT assert
+    // that `lastPull` gets stamped shortly afterwards, because on a
+    // device with no SIBLINGS it does not: worker.ts's `pullCycle` finds
+    // an empty sibling set, re-arms at the ordinary cadence and returns
+    // WITHOUT stamping — a cycle that pulled from nowhere does not get
+    // to claim it pulled. Asserting a stamp here would be inventing a
+    // semantic the worker does not have. The stamp on a device that DOES
+    // have a sibling is the e2e scenario `solo-offline-sync`'s claim,
+    // where there is a second device to have written something.
+    await guard(async () => {
+      const id = syncDevice;
+      // Enough refusals to cover whatever the boot pull attempts; healed
+      // immediately after, and `refusalsPending()` reports what was left.
+      fake.refuseNextFiles(24);
+      await probe(page, "hc-die", { id });
+      const startedAt = Date.now();
+      const back = await probe(page, "hc-open", { id, unseal: {} });
+      const elapsed = Date.now() - startedAt;
+      const atReturn = back.status.sync;
+      // A beat later, still under the outage: the schedule may have
+      // failed a cycle by now, but a boot pull must not by itself drive
+      // the device over the announcement threshold.
+      await new Promise((r) => setTimeout(r, 3_000));
+      const settled = (await probe(page, "hc-status", { id })).sync;
+      const leftover = fake.refusalsPending();
+      fake.refuseNextFiles(0);
+
+      const ok = back.unseal.refused === false && back.status.sealed === false &&
+        back.status.storage !== null && atReturn !== null &&
+        atReturn.lastPull === null && elapsed < 30_000 &&
+        settled !== null && settled.pullFailures < 3;
+      record(
+        "50 sync",
+        "the boot pull is ARMED behind readiness — the unseal that opened the device did not wait for it",
+        ok,
+        `the worker was KILLED and reopened with the store REFUSING every files-API call, so a ` +
+          `bring-up that awaited its pull would have to walk the whole failure path before ` +
+          `answering. It answered in ${elapsed} ms (deadline 30 s), unrefused, with the binding ` +
+          `re-applied (${j(back.status.storage?.kind)}) — and at the instant it returned ` +
+          `status().sync=${j(atReturn)}: lastPull is NULL because the pull is a zero-delay TIMER ` +
+          `armed after the engine is published, never an await in front of the answer ` +
+          `(worker.ts's \`startSyncSchedule\`). Three seconds later, still under the outage, ` +
+          `sync=${j(settled)} — pullFailures below the announcement threshold, so a boot against ` +
+          `an unreachable bucket does not by itself become news. NOTE, and it is a contract ` +
+          `rather than an omission: this device has NO SIBLINGS, and worker.ts's \`pullCycle\` ` +
+          `returns without stamping lastPull when the sibling set is empty — a cycle that ` +
+          `pulled from nowhere does not claim to have pulled. The stamp itself is asserted ` +
+          `where there IS a sibling: the e2e scenario \`solo-offline-sync\`. ` +
+          `${leftover} injected refusal(s) went unused and were cleared.`,
       );
       await probe(page, "hc-close", { id });
       await probe(page, "hc-forget", { ids: [id] });

@@ -56,6 +56,7 @@ import {
   type Req,
   type Res,
   type StoreBinding,
+  type SyncStatus,
   TASKS_METHODS,
   type UnsealOptions,
   type WireFailure,
@@ -70,6 +71,11 @@ export type {
   PromoteOptions,
   ResealOptions,
   StoreBinding,
+  /** The worker's sync schedule, as `DeviceStatus.sync` carries it
+   * (SYNC.md §3). Re-exported beside `StoreBinding` for the same reason
+   * that one is: a page rendering the storage sheet reads it off a
+   * status and should not have to reach past this module for its type. */
+  SyncStatus,
   UnsealOptions,
 };
 

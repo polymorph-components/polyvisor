@@ -1276,6 +1276,34 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
   },
 
   /**
+   * PUBLISH THIS DEVICE'S TASKS PARTITION IN THE ACCOUNT'S POINTER MAP —
+   * which is what gives the worker's sync scheduler a SCOPE at all
+   * (runtime/SYNC.md §3, "Scope": "the partitions flushed/pulled are the
+   * account pointer map's (`usPartitions`)"). A device whose map is
+   * empty has nothing to sync, and worker.ts's `syncScope` treats both
+   * an empty map and the account-less refusal as absence rather than as
+   * failure — so a row about the SCHEDULE has to go through here first
+   * or it would be measuring a no-op.
+   *
+   * `us-partition-put` is also T-S1's seeding site (SYNC.md §1: the
+   * pointer publication seeds the doc's name chain, mint-if-absent,
+   * BEFORE the pointer, in the same us-doc), which is the ordinary path
+   * a real device takes — solo.ts's account ceremony puts the pointer
+   * the same way.
+   */
+  "hc-us-partition-put": async (arg: { id: string; name?: string }) => {
+    const conn = conns.get(arg.id)!;
+    const part = await conn.tasks.partition();
+    const attempt = await refuses(() => conn.driver.usPartitionPut(arg.name ?? "tasks", part));
+    const parts = await conn.driver.usPartitions();
+    return {
+      attempt,
+      names: parts.map((p) => p.name),
+      n: parts.length,
+    };
+  },
+
+  /**
    * Put the account's storage record, then WAIT OUT THE CHECKPOINT
    * DEBOUNCE and report `lastCheckpoint` either side of it.
    *

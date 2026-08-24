@@ -64,6 +64,7 @@ import soloStorage from "./scenarios/solo-storage.ts";
 import soloGdrive from "./scenarios/solo-gdrive.ts";
 import drawerOverflow from "./scenarios/drawer-overflow.ts";
 import soloAccountStorage from "./scenarios/solo-account-storage.ts";
+import soloOfflineSync from "./scenarios/solo-offline-sync.ts";
 import soloPasskey from "./scenarios/solo-passkey.ts";
 import visorReset from "./scenarios/visor-reset.ts";
 import firefoxSmoke from "./scenarios/firefox-smoke.ts";
@@ -185,6 +186,16 @@ const SCENARIOS: Scenario[] = [
   // here with that one green says the fault is in the SYNC of the
   // config, not in the Drive ceremony it reuses wholesale.
   soloAccountStorage,
+  // AND THE ROUND'S PRODUCT CLAIM (runtime/SYNC.md's Gates, "the money
+  // shot — OFFLINE SYNC): the same two-context account and the same
+  // fake, but this time both pages CLOSE and a todo still crosses. It
+  // runs directly after solo-account-storage because it uses that
+  // scenario's ceremony as its precondition — A binds, B adopts with a
+  // consent click — and a failure here with that one green says the
+  // fault is in the SCHEDULE (the worker's debounced flush, the boot
+  // pull) rather than in anything about pairing, adoption or the Drive
+  // ceremony underneath it.
+  soloOfflineSync,
   // THE PRF RUNG (passkey unseal, PERSISTENCE.md). Follows the device
   // store's other two for the same reason they follow solo-pairing: a
   // failure here with those two green says the fault is in the passkey

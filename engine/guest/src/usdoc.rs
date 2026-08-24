@@ -113,6 +113,40 @@ const STORAGE: &str = "storage";
 /// ROOT beside the app's own keys and is invisible to the app — the
 /// tasks service reads `ROOT."todos"` and nothing else (lib.rs:2270).
 const ENROLLED: &str = "_enrolled";
+/// THE PER-DOC BUCKET NAME-KEY CHAINS (runtime/SYNC.md §1, the amended
+/// ruling). `doc id (hex) -> the whole chain as ONE bytes register`:
+/// epoch `e` is bytes `[32*e .. 32*e+32)` of that register's value.
+///
+/// GUEST-INTERNAL AND NEVER WIT. Every other family here has a `us-*`
+/// call behind it; this one deliberately has none. It is secret material
+/// (the same kind as `BucketState::name_keys`, which it is now the
+/// source of truth for), it is plumbing rather than user-facing state,
+/// and the visor has no use it could put a name-key to. It rides the
+/// account's E2E sync for exactly one reason: the account's devices are
+/// precisely the set that must agree on object names, and the us-doc is
+/// already the channel between exactly that set.
+///
+/// ONE REGISTER PER DOC, REPLACED WHOLESALE. The chain is NOT a list
+/// object and NOT a submap of per-epoch registers, and the difference is
+/// the whole safety argument: an automerge list/submap merges
+/// element-wise, so two devices appending concurrently produce a chain
+/// no single writer ever wrote, and a reader mid-write can observe a
+/// half-built one. A single `ScalarValue::Bytes` register merges
+/// last-writer-wins on the WHOLE value — a reader sees some writer's
+/// complete chain, always, and a rotation either lands entire or not at
+/// all. The cost is SYNC.md §1's recorded first-mint race: two devices
+/// minting for one doc before they sync, one chain wins, and the loser's
+/// flush is orphaned — one flush's worth, self-healing on the next.
+///
+/// ADDITIVE, like `partitions` and `storage`: a document written before
+/// this key existed simply has no `bucket-chains` entry, and a missing
+/// entry reads as "no chain yet", never as an error.
+///
+/// NOT IN `Snap`, so not in `diff`, so never an event: a chain change is
+/// plumbing, and `us-events` is the user's channel. Nothing in the pump
+/// forces otherwise — `snapshot` reads the families it announces and
+/// this key is not one of them.
+const BUCKET_CHAINS: &str = "bucket-chains";
 
 fn map_at(am: &AutoCommit, key: &str) -> Option<ObjId> {
     match am.get(ROOT, key) {
@@ -1180,10 +1214,34 @@ pub(crate) async fn contact_put(card: Vec<u8>, petname: String) -> Result<(), St
     .await
 }
 
-/// Upsert the pointer under `name`. Names are short UTF-8 strings and
-/// are the map key; ids are raw bytes stored as an automerge `Bytes`
-/// scalar, so a concurrent re-publish of the same name is an ordinary
+/// Upsert the pointer under `name`, SEEDING the doc's bucket name-key
+/// chain in the same breath. Names are short UTF-8 strings and are the
+/// map key; ids are raw bytes stored as an automerge `Bytes` scalar, so
+/// a concurrent re-publish of the same name is an ordinary
 /// last-writer-wins register merge rather than a structural conflict.
+///
+/// THE SEED IS THE FIRST-MINT RACE'S CLOSURE (SYNC.md §1, amended). A
+/// device cannot flush a doc whose pointer it has not seen — the pointer
+/// is how a partition becomes known to the account at all — so seeding
+/// the chain no later than the pointer makes "has the pointer" imply
+/// "has the chain", and the window in which a second device could mint a
+/// fork of its own closes.
+///
+/// THE ORDERING SHAPE: SAME CHANGE, not merely an earlier one. Both puts
+/// happen inside ONE `write` closure, and `crate::author` commits a
+/// closure as exactly one automerge change, carried as one encrypted
+/// chunk. So a peer either applies both keys or neither — atomicity,
+/// which needs no argument about how faithfully causal order is
+/// preserved end to end. (An earlier SEPARATE change would also have
+/// worked, by causal precedence: automerge cannot apply a change before
+/// its dependencies. Atomicity is the stronger of the two and costs
+/// nothing here, so it is what is implemented. It also removes the
+/// question of what a reader sees if the two changes are ever split
+/// across a sync boundary, because they cannot be.)
+///
+/// MINT-IF-ABSENT, never overwrite: a doc that already has a chain has
+/// objects under it, and replacing the chain here would orphan them.
+/// Re-publishing a pointer is therefore a no-op for the chain.
 pub(crate) async fn partition_put(name: String, id: Vec<u8>) -> Result<(), String> {
     if name.is_empty() {
         return Err("a partition pointer needs a name".into());
@@ -1191,7 +1249,26 @@ pub(crate) async fn partition_put(name: String, id: Vec<u8>) -> Result<(), Strin
     if id.is_empty() {
         return Err("a partition pointer needs an id".into());
     }
+    let doc_hex = hex::encode(&id);
+    // Minted OUTSIDE the closure because the closure is not the place to
+    // decide anything: it draws the random bytes only if the read below
+    // says there is no chain yet.
+    let fresh: [u8; 32] = rand::random();
     write(move |am| {
+        // The chain FIRST within the change. Order inside a single
+        // automerge change is not itself observable — the change is
+        // atomic — but writing it first keeps the code honest about
+        // which of the two is the precondition for the other.
+        if read_bucket_chain(am, &doc_hex).is_none() {
+            let chains = match map_at(am, BUCKET_CHAINS) {
+                Some(c) => c,
+                None => am
+                    .put_object(ROOT, BUCKET_CHAINS, ObjType::Map)
+                    .map_err(|e| format!("bucket-chains map: {e}"))?,
+            };
+            am.put(&chains, doc_hex.as_str(), fresh.to_vec())
+                .map_err(|e| format!("seed bucket chain: {e}"))?;
+        }
         let partitions = match map_at(am, PARTITIONS) {
             Some(p) => p,
             None => am
@@ -1260,6 +1337,80 @@ pub(crate) async fn storage_get() -> Result<Option<UsStorage>, String> {
     Ok(read_us(read_storage)?
         .as_ref()
         .and_then(storage_to_wit))
+}
+
+// --- the per-doc bucket name-key chains (SYNC.md §1) ---
+//
+// No WIT surface: see `BUCKET_CHAINS`. The two functions below are the
+// entire interface, and `crate::bucket_chain_sync` is their only caller.
+
+/// One doc's chain out of the document, or `None` for "no chain yet".
+///
+/// A register whose length is not a whole number of 32-byte epochs is
+/// treated as absent rather than truncated to fit. Nothing this build
+/// writes can produce one, so it means either corruption or a future
+/// encoding — and inventing a chain out of either would silently publish
+/// objects under names no other device derives, which is the exact
+/// failure this map exists to remove. "No chain yet" is the honest read:
+/// the caller mints, writes through, and the register is well-formed
+/// again.
+fn read_bucket_chain(am: &AutoCommit, doc_hex: &str) -> Option<Vec<[u8; 32]>> {
+    let chains = map_at(am, BUCKET_CHAINS)?;
+    let packed = get_bytes(am, &chains, doc_hex)?;
+    if packed.is_empty() || packed.len() % 32 != 0 {
+        return None;
+    }
+    Some(
+        packed
+            .chunks_exact(32)
+            .map(|c| crate::arr32(c, "a chain epoch").expect("chunks_exact(32) yields 32 bytes"))
+            .collect(),
+    )
+}
+
+/// This account's chain for `doc`, after taking in whatever synced.
+pub(crate) async fn bucket_chain_get(doc: &[u8]) -> Result<Option<Vec<[u8; 32]>>, String> {
+    pump().await?;
+    let doc_hex = hex::encode(doc);
+    read_us(|am| read_bucket_chain(am, &doc_hex))
+}
+
+/// Publish `chain` as this doc's chain, replacing whatever is there.
+///
+/// Wholesale replacement is the merge story (see `BUCKET_CHAINS`), so
+/// callers pass the COMPLETE chain — a rotation passes epochs 0..=n, not
+/// just the new one.
+pub(crate) async fn bucket_chain_put(doc: &[u8], chain: &[[u8; 32]]) -> Result<(), String> {
+    if chain.is_empty() {
+        return Err("a bucket chain needs at least one epoch".into());
+    }
+    let doc_hex = hex::encode(doc);
+    let mut packed = Vec::with_capacity(chain.len() * 32);
+    for nk in chain {
+        packed.extend_from_slice(nk);
+    }
+    write(move |am| {
+        let chains = match map_at(am, BUCKET_CHAINS) {
+            Some(c) => c,
+            None => am
+                .put_object(ROOT, BUCKET_CHAINS, ObjType::Map)
+                .map_err(|e| format!("bucket-chains map: {e}"))?,
+        };
+        // ONE put of the whole chain: the register is the unit of merge.
+        am.put(&chains, doc_hex.as_str(), packed)
+            .map_err(|e| format!("bucket chain: {e}"))?;
+        Ok(())
+    })
+    .await
+}
+
+/// Whether this device has an account document at all.
+///
+/// The bucket paths ask before reaching for a chain: a device that has
+/// not run `user-create` (or paired) yet is the bring-up ordering case
+/// in SYNC.md §1, not an error.
+pub(crate) fn has_account() -> Result<bool, String> {
+    with_state(|s| s.us.doc.is_some())
 }
 
 pub(crate) async fn devices_list() -> Result<Vec<UsDevice>, String> {
