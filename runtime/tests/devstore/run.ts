@@ -4558,6 +4558,249 @@ async function main() {
     await probe(page, "hc-close", { id: rcDevice });
     await probe(page, "hc-close", { id: rcRestored });
 
+    // --- 65: an erased device STAYS erased, and 65b: the mechanism ---------
+    //
+    // #112 reported the erased device's IndexedDB database EXISTING
+    // again after the solo-erase ceremony (~2 runs in 6 under the full
+    // suite; green in isolation), with the OPFS directory still gone.
+    //
+    // THE MECHANISM IS REAL AND 65b PINS IT: `takeLock` starts a lease
+    // heartbeat that renews every 5 s by writing `meta.lease`, that
+    // write is an `ns.put`, namespace.ts holds no live connection (open,
+    // transact, close — its header says why), and an IndexedDB open of a
+    // missing database CREATES it. A tick after an erasure therefore
+    // brings the database back carrying a lease and nothing else — and
+    // ONLY the database, because `touchLease` writes IndexedDB and
+    // touches nothing else, which is exactly the asymmetry the field
+    // report shows.
+    //
+    // WHAT 65 MEASURED, AND IT IS NOT WHAT THE DIAGNOSIS ASSUMED. The
+    // worker global does NOT outlive `conn.destroy()`: `serve()` treats
+    // `destroy` exactly like `__die` and closes the global one task
+    // after the reply (worker.ts's `dying`). Measured here rather than
+    // reasoned about — immediately after the ceremony the device LOCK IS
+    // ALREADY FREE, which only a dead global can do — and measured again
+    // with the fix's `lease.stop()` NEUTERED, where the database stayed
+    // gone at +1s, +3s, +6s and +9s. So through this path the heartbeat
+    // dies with the global a millisecond after the delete, and the
+    // window it could resurrect through is that millisecond, not the
+    // seconds a 2-in-6 flake needs. #112's field trigger is therefore
+    // NOT accounted for by this path; see the track report, which names
+    // the two candidates this measurement leaves standing.
+    //
+    // THE STOP STAYS ANYWAY, and 65 is its guarantee stated as an
+    // outcome rather than as a mechanism: after an erasure the database
+    // is gone and STAYS gone across a full lease interval, whichever
+    // half of the belt-and-braces does the work. The close is
+    // best-effort by construction — `serve()` schedules it only on the
+    // fulfilled branch, so a destroy that REJECTS part-way (database
+    // deleted, index row not) leaves a live global whose heartbeat is
+    // pointed at a deleted database — and the stop closes that window
+    // structurally, before the delete, where the close cannot.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "erase-me",
+        policy: "while-open",
+        promote: false,
+      });
+      const id = made.id as string;
+      // A T0 device opened the T0 way — no ceremony, `sealT0`'s platform
+      // wrap — which is the tier the solo page's erase is reached from
+      // and the tier whose lease the sweep reads.
+      await probe(page, "hc-open", { id, unseal: {} });
+      // The heartbeat is RUNNING, established rather than assumed: a
+      // fresh mark, well inside one interval, with the lock held.
+      const lease = await probe(page, "lease-read", { id });
+      const erased = await probe(page, "hc-destroy", { id });
+      // Past one full renewal interval, plus margin. 5 s is the period;
+      // 8 s means at least one tick has certainly come due.
+      const later = await probe(page, "db-present", { id, waitMs: 8_000 });
+
+      const ok = lease.at !== null && lease.ageMs < lease.intervalMs &&
+        lease.lockHeld === true &&
+        erased.attempt.refused === false && erased.dbGone === true &&
+        erased.indexRowGone === true &&
+        later.present === false;
+      record(
+        "65 erase",
+        "an erased device stays erased across a full lease interval (#112, the outcome)",
+        ok,
+        `a T0 device was opened (lease mark ${lease.ageMs} ms old, well inside the ` +
+          `${lease.intervalMs} ms renewal interval, device lock held: ${lease.lockHeld}) and ` +
+          `then ERASED through the ceremony's own path — the host \`destroy\`, with NO ` +
+          `\`__die\` and NO reload, so nothing in this row hurries the worker along. ` +
+          `Immediately after: database gone ${erased.dbGone}, index row gone ` +
+          `${erased.indexRowGone}. Then ${later.waitedMs} ms of nothing at all — past a full ` +
+          `${later.intervalMs} ms lease interval, so at least one renewal has certainly come ` +
+          `due — and \`indexedDB.databases()\` (an ENUMERATION: asking through the namespace ` +
+          `would CREATE the database being asked about) reports present=${later.present} among ` +
+          `${later.databases}. MEASURED BESIDE IT, and it corrects the premise this row was ` +
+          `written from: the device LOCK IS ALREADY FREE the instant the erase returns ` +
+          `(lockHeld=${erased.lockHeld}), which only a dead global can do — \`serve()\` treats ` +
+          `\`destroy\` exactly as it treats \`__die\` and closes the worker one task after ` +
+          `the reply. So this row does NOT go red with the fix's \`lease.stop()\` removed: run ` +
+          `first as the negative control, it passed, with the database absent at +1s, +3s, +6s ` +
+          `and +9s and the lock free throughout. The heartbeat cannot resurrect anything here ` +
+          `because it dies with the global a millisecond after the delete. The mechanism ITSELF ` +
+          `is real and 65b pins it deterministically; what this row guarantees is the OUTCOME, ` +
+          `by whichever half of the belt-and-braces gets there first.`,
+      );
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
+    // --- 65b: the resurrection mechanism, isolated -------------------------
+    //
+    // The two arms differ in ONE act — the heartbeat's `stop()` — over
+    // the shipped `startLease` and `destroyNamespace`, with the interval
+    // passed in short so the row costs a second instead of eleven. This
+    // is what the worker's erase-time stop is FOR, made observable
+    // without depending on how long a SharedWorker global happens to
+    // live.
+    await guard(async () => {
+      const r = await probe(page, "lease-vs-erase", { intervalMs: 300 });
+      const ok = r.running.before === true && r.running.atDelete === false &&
+        r.running.later === true && r.stopped.later === false;
+      record(
+        "65b erase",
+        "a lease heartbeat left running over a destroyed namespace RECREATES its database",
+        ok,
+        `two namespaces, one act apart. WITH THE HEARTBEAT RUNNING: the database existed ` +
+          `(${r.running.before}), \`destroyNamespace\` deleted it (present right after: ` +
+          `${r.running.atDelete}), and ${r.settleMs} ms later — several ${r.intervalMs} ms ` +
+          `renewals — it was BACK: present=${r.running.later}. WITH THE HEARTBEAT STOPPED ` +
+          `FIRST, the same erasure and the same wait leaves present=${r.stopped.later}. The ` +
+          `resurrection is not exotic: \`touchLease\` is an \`ns.put\`, namespace.ts holds no ` +
+          `live connection (open, transact, close — its header says why this is required for ` +
+          `\`destroyNamespace\` to complete at all), and an IndexedDB open of a missing ` +
+          `database CREATES it. What comes back carries a lease and NOTHING else, and the OPFS ` +
+          `directory does not come back at all, because \`touchLease\` writes IndexedDB and ` +
+          `touches nothing else — which is #112's exact field signature (database present, ` +
+          `directory NotFoundError). This is the hazard worker.ts's erase-time \`lease.stop()\` ` +
+          `removes at the source, and it is reachable by ANY path that destroys a namespace ` +
+          `while a live host still leases it.`,
+      );
+    });
+
+    // --- 66: a worker constructed for an ERASED device leaves no trace -----
+    //
+    // #112's CLASS, closed at the source. A SharedWorker is keyed by
+    // (origin, script URL, NAME) and the name IS the device id — so
+    // naming an erased device is all it takes to evaluate worker.ts in a
+    // fresh global, and that global used to recreate the device's
+    // database three different ways before any human intent was
+    // involved:
+    //
+    //   1. MODULE EVALUATION. `bootSeq` bumps a counter in the
+    //      namespace's `meta` store, at import time, before any client
+    //      has said a word. The construction WAS the resurrection: no
+    //      timer, no race, nothing to lose.
+    //   2. `status`, the first RPC every client sends, which reads the
+    //      namespace — and an IndexedDB READ creates just as a write
+    //      does, because `indexedDB.open` of a missing database creates
+    //      it whatever the transaction mode.
+    //   3. `attach`, whose `takeLock()` starts the LEASE, whose first
+    //      act is an `ns.put`.
+    //
+    // ALL THREE NOW CONSULT THE INDEX ROW, which is the existence oracle
+    // this store already named as such — anchor.ts's `anchorIsLive`:
+    // "THE INDEX ROW IS THE ANSWER, and the namespace deliberately is
+    // not". Reading it creates nothing that matters (the index database
+    // is origin-global and outlives every device in it).
+    //
+    // A RAW PORT IS THE ONLY WAY TO ASK THE WORKER THIS, and the row
+    // asks the ordinary client path separately: `connectDevice` refuses
+    // a missing row before it constructs anything, so an application
+    // never reaches these guards — they answer a stale tab, a picker
+    // holding a collected id, or a reconnect racing an erase.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "erased-then-named",
+        policy: "while-open",
+        promote: false,
+      });
+      const id = made.id as string;
+      await probe(page, "hc-open", { id, unseal: {} });
+      const erased = await probe(page, "hc-destroy", { id });
+      const r = await probe(page, "erase-reconnect", { id });
+
+      const ok = erased.dbGone === true && erased.indexRowGone === true &&
+        r.booted === true && r.bootSeq === 0 &&
+        r.afterConstruct === false &&
+        r.status.ok === false && r.status.code === "no-rung" && r.afterStatus === false &&
+        r.attach.ok === false && r.attach.code === "no-rung" && r.afterAttach === false &&
+        r.viaClient.refused === true && r.afterClient === false &&
+        r.lockHeld === false;
+      record(
+        "66 erase",
+        "constructing a worker for an ERASED device recreates nothing (#112's class, at the source)",
+        ok,
+        `a T0 device was erased through the host \`destroy\` (database gone ${erased.dbGone}, ` +
+          `index row gone ${erased.indexRowGone}) and then a RAW SharedWorker was constructed ` +
+          `under its name — which is all a stale tab or a picker holding a collected id has to ` +
+          `do. The global genuinely BOOTED (it posted its hello: ${r.booted}) and its counter ` +
+          `read bootSeq=${r.bootSeq} — ZERO, the "I counted nothing" value, because the index ` +
+          `row is consulted before the namespace is touched. Database after the construction: ` +
+          `present=${r.afterConstruct}. Then the two RPCs a client sends first, over that same ` +
+          `raw port: \`status\` refused ${j(r.status.code)} (${j(r.status.message)}), database ` +
+          `present=${r.afterStatus}; \`attach\` refused ${j(r.attach.code)}, database ` +
+          `present=${r.afterAttach} after a further 6 s — past a full lease interval, so an ` +
+          `attach that had taken the lock would have written by now (lock held: ${r.lockHeld}). ` +
+          `THE ORDINARY CLIENT PATH never gets that far: \`connectDevice\` refused ` +
+          `(${j(r.viaClient.message)}) before constructing anything, database ` +
+          `present=${r.afterClient}. NEGATIVE CONTROL, with the three guards removed: the ` +
+          `database is back after step ONE — the construction alone — with a boot counter in ` +
+          `it and nothing else, no client call and no timer required; \`status\` and ` +
+          `\`attach\` each recreate it on their own too (a read opens, and an open of a ` +
+          `missing database creates). That is why the fix is three gates on one oracle rather ` +
+          `than one gate on the door CI happened to catch.`,
+      );
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
+    // --- 66b: tearing down a LIVE device leaves no database behind ---------
+    //
+    // The same hazard from the other side, and the harness was the one
+    // committing it: deleting a namespace from the PAGE while its host
+    // is alive leaves the host's lease heartbeat pointed at a deleted
+    // database, and a tick brings it back. Measured before the fix as
+    // ~31 stray `pm-device-*` databases in a full run — every row that
+    // tore down a device it still held a connection to.
+    //
+    // The teardown helper now goes THROUGH THE WORKER when one is live
+    // (client.ts's rule: "It has to be the worker's own hand"), falling
+    // back to the page-side removal for the rows that hold no
+    // connection. This asserts the outcome across a full lease interval.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "forgotten-while-live",
+        policy: "while-open",
+        promote: false,
+      });
+      const id = made.id as string;
+      await probe(page, "hc-open", { id, unseal: {} });
+      const lease = await probe(page, "lease-read", { id });
+      const forgotten = await probe(page, "hc-forget", { ids: [id] });
+      const later = await probe(page, "db-present", { id, waitMs: 7_000 });
+
+      const ok = lease.lockHeld === true && lease.at !== null &&
+        forgotten.cleanup === "ok" && later.present === false;
+      record(
+        "66b erase",
+        "a live device torn down by the harness leaves no resurrected database",
+        ok,
+        `a T0 device with a LIVE host (lock held: ${lease.lockHeld}, lease mark ` +
+          `${lease.ageMs} ms old) was torn down through the matrix's ordinary cleanup helper ` +
+          `(${j(forgotten.cleanup)}), then left alone for ${later.waitedMs} ms — past a full ` +
+          `${later.intervalMs} ms lease interval. Its database is present=${later.present}. ` +
+          `BEFORE the fix this teardown deleted the namespace from the PAGE while the host was ` +
+          `still running, and the host's next heartbeat recreated it: the helper now asks the ` +
+          `WORKER to erase itself when a connection is live (client.ts: "It has to be the ` +
+          `worker's own hand" — only the host can drain its checkpoint chain, stop its lease ` +
+          `and drop its engine before the storage goes), and falls back to the page-side ` +
+          `removal only where no worker exists. Rows 1-10 take that fallback and are unchanged.`,
+      );
+    });
+
     await ctx.close();
 
   } finally {
