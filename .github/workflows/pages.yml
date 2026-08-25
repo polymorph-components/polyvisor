@@ -108,8 +108,8 @@ jobs:
         run: just pages
 
       - name: Assemble the site
-        # docs/ is the site root: the index and the todomvc spike are
-        # committed builds; docs/demo is the one this workflow rebuilds.
+        # docs/ is the site root: docs/index.html is the only committed
+        # build; docs/demo is the one this workflow rebuilds.
         run: |
           test -f docs/demo/engine.component.wasm
           test -f docs/demo/panel-dropbox.component.wasm
