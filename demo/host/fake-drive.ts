@@ -123,11 +123,43 @@ export interface FakeDrive {
    * `Infinity` for the second and `refuseNextFiles(0)` to heal. Requests
    * refused this way are still LOGGED (a fake that hid them would make
    * the request log lie about what the worker attempted).
+   *
+   * A thin alias for `failFiles({ n, status: 503 })` — kept as its own
+   * name because it is the common case and every existing caller
+   * (runtime/tests/devstore/run.ts) already spells it this way.
    */
   refuseNextFiles(n: number): void;
+  /**
+   * FAIL THE NEXT MATCHING FILES-API REQUESTS with a targeted rule,
+   * for partial-failure and crash-consistency experiments that
+   * `refuseNextFiles`'s blanket 503 can't express (e.g. "only the
+   * upload PATCH fails, everything else keeps working" — a device
+   * dying mid-write, not a wholesale outage).
+   *
+   * `n` (default `Infinity`) counts down only on requests that MATCH
+   * `method` (exact) and `path` (tested against the same path the
+   * request log records); non-matching requests pass through untouched
+   * and do not spend the budget — otherwise "fail just the uploads"
+   * would be impossible to express without racing unrelated list calls.
+   *
+   * `status` defaults to 503, same as `refuseNextFiles`, for the same
+   * reason (see its doc comment): the untriaged background failure the
+   * design does not string-match. `retryAfterS`, when given, is sent
+   * as a `Retry-After` header — for 429 experiments, where the worker's
+   * backoff is deliberately untriaged today; the header is here so a
+   * future triage has something honest to read rather than nothing.
+   *
+   * ONE RULE SLOT. Calling `failFiles` or `refuseNextFiles` REPLACES
+   * whatever rule was standing — two overlapping fault rules is an
+   * experiment nobody has asked for, and "which one wins" is exactly
+   * the kind of ambiguity a fake should refuse to have an opinion on.
+   * `failFiles({ n: 0 })` heals, exactly as `refuseNextFiles(0)` does.
+   */
+  failFiles(rule: { n?: number; status?: number; method?: string; path?: RegExp; retryAfterS?: number }): void;
   /** How many of the injected refusals are still owed — 0 once the
-   * store has healed, so a row can assert its outage was actually
-   * consumed rather than slept through. */
+   * store has healed, `Infinity` if the standing rule is unbounded, so
+   * a row can assert its outage was actually consumed rather than
+   * slept through. */
   refusalsPending(): number;
   /** Access tokens currently accepted (labels only, for assertions like
    * "the engine is on the SECOND token now"). */
@@ -184,8 +216,11 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-function driveError(status: number, message: string): Response {
-  return json({ error: { code: status, message } }, status);
+function driveError(status: number, message: string, extraHeaders?: Record<string, string>): Response {
+  return new Response(JSON.stringify({ error: { code: status, message } }), {
+    status,
+    headers: { "content-type": "application/json", ...extraHeaders },
+  });
 }
 
 function base64url(bytes: Uint8Array): string {
@@ -253,8 +288,10 @@ export async function startFakeDrive(opts: FakeDriveOptions = {}): Promise<FakeD
   const codes = new Map<string, { challenge: string; method: string }>();
   const accessTokens = new Set<string>();
   const refreshTokens = new Set<string>();
-  /** Injected files-API refusals still owed — see `refuseNextFiles`. */
-  let refusalsOwed = 0;
+  /** The one standing fault rule — see `failFiles`. `undefined` means
+   * healed. Exactly one slot: a new rule (from either `failFiles` or
+   * `refuseNextFiles`) REPLACES it rather than stacking. */
+  let faultRule: { n: number; status: number; method?: string; path?: RegExp; retryAfterS?: number } | undefined;
   if (opts.seedAccessToken) accessTokens.add(opts.seedAccessToken);
 
   /** A file's space is its PARENT's space, and the two root aliases are
@@ -405,11 +442,27 @@ export async function startFakeDrive(opts: FakeDriveOptions = {}): Promise<FakeD
     // THE INJECTED OUTAGE COMES FIRST, before the bearer gate: a provider
     // that is down is down for a valid credential too, and a refusal
     // that depended on the token would be testing the wrong thing (see
-    // `refuseNextFiles`). Everything above this line — the OAuth
-    // endpoints — keeps working throughout.
-    if (refusalsOwed > 0) {
-      refusalsOwed--;
-      return driveError(503, "The service is currently unavailable.");
+    // `refuseNextFiles`/`failFiles`). Everything above this line — the
+    // OAuth endpoints — keeps working throughout.
+    //
+    // MATCH BEFORE SPEND: `method`/`path` are checked before the budget
+    // is decremented, so a rule scoped to (say) only PATCH requests does
+    // not get eaten by unrelated GETs racing past it — "fail just the
+    // uploads" has to mean that literally.
+    if (
+      faultRule &&
+      (faultRule.method === undefined || faultRule.method === req.method) &&
+      (faultRule.path === undefined || faultRule.path.test(path))
+    ) {
+      const { status, retryAfterS } = faultRule;
+      if (faultRule.n > 0) {
+        faultRule.n--;
+        if (faultRule.n === 0) faultRule = undefined;
+      }
+      entry.refused = true;
+      const headers: Record<string, string> = {};
+      if (retryAfterS !== undefined) headers["retry-after"] = String(retryAfterS);
+      return driveError(status, "The service is currently unavailable.", headers);
     }
     if (requireAuth) {
       const token = auth.replace(/^Bearer\s+/i, "");
@@ -636,9 +689,29 @@ export async function startFakeDrive(opts: FakeDriveOptions = {}): Promise<FakeD
     requests: () => log.map((r) => ({ ...r })),
     expireNow: () => accessTokens.clear(),
     refuseNextFiles: (n: number) => {
-      refusalsOwed = Math.max(0, n);
+      // A thin alias — see the doc comment on `failFiles`/`refuseNextFiles`
+      // in the FakeDrive interface for why they share one slot.
+      if (n <= 0) {
+        faultRule = undefined;
+        return;
+      }
+      faultRule = { n, status: 503 };
     },
-    refusalsPending: () => refusalsOwed,
+    failFiles: (rule) => {
+      const n = rule.n ?? Infinity;
+      if (n <= 0) {
+        faultRule = undefined;
+        return;
+      }
+      faultRule = {
+        n,
+        status: rule.status ?? 503,
+        method: rule.method,
+        path: rule.path,
+        retryAfterS: rule.retryAfterS,
+      };
+    },
+    refusalsPending: () => faultRule?.n ?? 0,
     liveAccessTokens: () => [...accessTokens],
     pendingCodes: () => [...codes.keys()],
     close: () => server.shutdown(),

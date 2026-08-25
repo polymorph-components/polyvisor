@@ -60,6 +60,140 @@ const PASS_WRONG = "definitely-not-the-passphrase-TEST";
 const TODOS = ["buy milk", "write the worker host"];
 /** Row 17 writes exactly this and never asks for a checkpoint. */
 const DEBOUNCED = "never explicitly checkpointed";
+/** Rows 51-53's mutation in the final debounce window — added and then
+ * immediately orphaned by the eviction, so whether it survives is a
+ * MEASUREMENT of the checkpoint discipline rather than an assertion. */
+const IN_FLIGHT = "written into the last debounce window";
+/**
+ * The RPC timeout rows 51-53 connect with. client.ts's default is 120 s
+ * — the right production number, and far too long for a row whose whole
+ * job is to measure how a pending call ends when the worker under it is
+ * gone. Shortening it does not change WHAT is measured (the port is
+ * silent either way, row 52); it bounds how long this harness waits to
+ * say so.
+ */
+const EVICTION_TIMEOUT_MS = 6_000;
+
+// --- CDP: killing a SharedWorker, and freezing a page ----------------------
+//
+// COPIED, NOT IMPORTED. `demo/e2e/cdp.ts` holds the same two helpers for
+// the e2e suite, and this harness deliberately has no import edge into
+// demo/e2e — the devstore matrix stands on the runtime and its own
+// probe page. The lines below are lifted from demo/e2e/cdp.ts:43-133
+// (`listSharedWorkers`, `killSharedWorker`, `setWebLifecycleState`),
+// with one addition: the SELECTOR IS THE TARGET'S TITLE rather than its
+// URL. Every device in this matrix runs the same `./worker.js`, so the
+// URL cannot tell two devices' hosts apart; the title is the
+// SharedWorker's NAME, which client.ts sets to `nsDbName(deviceId)` —
+// measured here 2026-08-24 as `pm-device-<id>` on the shared_worker
+// target info.
+//
+// THE KILL SEQUENCE ITSELF IS THAT FILE'S SPIKE FINDING, relied on and
+// re-confirmed by row 51: `Target.closeTarget` on a `shared_worker`
+// target terminates it, no attach/evaluate fallback needed.
+
+interface WorkerTarget {
+  targetId: string;
+  title: string;
+  url: string;
+}
+
+/** Every `shared_worker` target hosting THIS device (browser-wide —
+ * `Target.getTargets` is not scoped to a page). Detaches its own
+ * browser-level session in a `finally`, cdp.ts's reason: a row that
+ * polls this must not accumulate one CDP session per call. */
+async function sharedWorkersFor(browser: Browser, deviceId: string): Promise<WorkerTarget[]> {
+  const cdp = await browser.newBrowserCDPSession();
+  try {
+    const { targetInfos } = await cdp.send("Target.getTargets") as {
+      targetInfos: WorkerTarget[] & { type: string }[];
+    };
+    return (targetInfos as unknown as (WorkerTarget & { type: string })[])
+      .filter((t) => t.type === "shared_worker" && t.title === `pm-device-${deviceId}`)
+      .map((t) => ({ targetId: t.targetId, title: t.title, url: t.url }));
+  } finally {
+    await cdp.detach().catch(() => {/* already gone */});
+  }
+}
+
+/** Terminate the SharedWorker hosting this device. Throws, naming what
+ * IS live, when none matches: a row asserting "the host died" must fail
+ * loudly rather than quietly kill nothing. */
+async function killWorkerFor(browser: Browser, deviceId: string): Promise<WorkerTarget> {
+  const targets = await sharedWorkersFor(browser, deviceId);
+  const target = targets[0];
+  if (!target) {
+    const all = await browser.newBrowserCDPSession();
+    let live = "";
+    try {
+      const { targetInfos } = await all.send("Target.getTargets") as {
+        targetInfos: { type: string; title: string }[];
+      };
+      live = j(targetInfos.filter((t) => t.type === "shared_worker").map((t) => t.title));
+    } finally {
+      await all.detach().catch(() => {});
+    }
+    throw new Error(`no shared worker for device ${deviceId} — live shared workers: ${live}`);
+  }
+  const cdp = await browser.newBrowserCDPSession();
+  try {
+    await cdp.send("Target.closeTarget", { targetId: target.targetId });
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
+  return target;
+}
+
+/** `Page.setWebLifecycleState`. THE SESSION IS DELIBERATELY LEFT
+ * ATTACHED — demo/e2e/cdp.ts:88-124 measured that detaching the very
+ * session that issued the override REVERTS the freeze, so a caller that
+ * wants the page to stay frozen needs a session to stay open. Its other
+ * hazard applies here in full and row 55 is built around it: a frozen
+ * page cannot answer `page.evaluate`, so everything about it is observed
+ * from a SECOND page. */
+async function setWebLifecycleState(page: Page, state: "frozen" | "active"): Promise<void> {
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Page.setWebLifecycleState", { state });
+  // NO detach() — see above.
+}
+
+/** A short content digest, for "these bytes are the SAME bytes" claims
+ * about stored objects the harness cannot and should not decode. */
+async function shortDigest(bytes: Uint8Array): Promise<string> {
+  const d = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource));
+  return Array.from(d, (b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+}
+
+/**
+ * WAIT FOR THE PLATFORM TO RELEASE A DEAD HOLDER'S LOCK, and report how
+ * long it took.
+ *
+ * NOT A FIXED SLEEP. Web Locks release when the holding agent is torn
+ * down, and nothing in the spec bounds the latency between
+ * `Target.closeTarget` returning and the lock manager noticing — a
+ * constant beat is a guess that becomes a flaky row on a loaded machine
+ * (and, worse, a row that could pass for the wrong reason by sleeping
+ * past a real regression in the other direction). So: poll, take the
+ * first free reading, and hand the OBSERVED latency back for the
+ * evidence line, because that number is itself the interesting part of
+ * "released by death".
+ */
+async function untilLockFree(
+  page: Page,
+  id: string,
+  timeout = 5_000,
+): Promise<{ free: boolean; waitedMs: number; polls: number }> {
+  const started = Date.now();
+  const deadline = started + timeout;
+  let polls = 0;
+  for (;;) {
+    polls++;
+    const held = (await probe(page, "lock-probe", { id })).held === true;
+    if (!held) return { free: true, waitedMs: Date.now() - started, polls };
+    if (Date.now() >= deadline) return { free: false, waitedMs: Date.now() - started, polls };
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
 
 function serveSite(): { server: Deno.HttpServer; port: number } {
   let port = 0;
@@ -2977,7 +3111,613 @@ async function main() {
       await probe(page, "hc-forget", { ids: [id] });
     });
 
+    // === WORKER EVICTION, TABS STILL ATTACHED — rows 51-53 =============
+    //
+    // WHAT IS NEW HERE, next to every `hc-die` row above. `__die` is a
+    // COOPERATIVE crash: the worker answers the RPC and only then closes
+    // its own global, so the client learns the host is gone at the same
+    // instant the host does. A browser EVICTING a SharedWorker tells
+    // nobody. These rows use CDP's `Target.closeTarget` on the worker's
+    // own target — the eviction with no goodbye — and ask the three
+    // questions that follow from it: does the PLATFORM release the lock
+    // (locks.ts's entire design rides on it), what does a tab holding a
+    // live connection OBSERVE, and what comes back on respawn.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "evicted host",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const id = made.id as string;
+      const open = await probe(page, "hc-open", {
+        id,
+        timeoutMs: EVICTION_TIMEOUT_MS,
+        unseal: { passphrase: PASS, untilReseal: true },
+      });
+      await probe(page, "hc-add", { id, titles: TODOS });
+      await probe(page, "hc-checkpoint", { id });
+
+      // A RAW SECOND PORT to the same host (same origin, same script,
+      // same name ⇒ the same global — client.ts's "THE NAME IS THE
+      // DEVICE"), listening for the events a port could conceivably
+      // fire when its peer dies. Row 52 reads back what it heard.
+      const listening = await probe(page, "port-listen", { id });
+
+      const before = await sharedWorkersFor(browser, id);
+      const leaseBefore = await probe(page, "lease-read", { id });
+
+      // ONE MUTATION AND NOTHING ELSE, immediately before the kill: the
+      // 500 ms trailing debounce (row 17's subject) is armed and the
+      // eviction is deliberately racing it. Nothing below asserts the
+      // outcome — row 53 REPORTS which way it fell.
+      await probe(page, "hc-add", { id, titles: [IN_FLIGHT] });
+      const killed = await killWorkerFor(browser, id);
+      // BOUNDED, NOT SLEPT: the platform releases a dead holder's lock on
+      // its own schedule and the wait is the measurement (see
+      // `untilLockFree`).
+      const release = await untilLockFree(page, id);
+
+      const lockAfter = await probe(page, "lock-probe", { id });
+      const leaseAfter = await probe(page, "lease-read", { id });
+      const after = await sharedWorkersFor(browser, id);
+
+      const lockOk = before.length === 1 && open.status.lockHeld === true &&
+        after.length === 0 && release.free && lockAfter.held === false &&
+        leaseAfter.lockHeld === false;
+      record(
+        "51 eviction",
+        "an EVICTED SharedWorker releases the device lock — the platform's promise, measured in this build",
+        lockOk,
+        `the device was open and unsealed with one tab attached and the host holding its lock ` +
+          `(status().lockHeld=${open.status.lockHeld}, one shared_worker target titled ` +
+          `${j(killed.title)}). CDP \`Target.closeTarget\` on that target — an eviction with NO ` +
+          `cooperation, unlike every \`hc-die\` row above, where the worker answers first and ` +
+          `closes its own global second — leaves ${after.length} target(s) for this device, and ` +
+          `the lock read FREE from the page after ${release.waitedMs} ms ` +
+          `(${release.polls} poll(s) at 50 ms, deadline 5 s; free=${release.free}, and a fresh ` +
+          `read agrees: held=${lockAfter.held}). THE LATENCY IS PART OF THE FINDING: nothing ` +
+          `specifies how promptly a dead agent's lock comes back, so this row polls for it ` +
+          `rather than sleeping a constant, and what it measures is that the release is ` +
+          `effectively immediate on this build rather than something a respawning host would ` +
+          `have to wait out. THAT IS THE PROPERTY THE WHOLE ` +
+          `SWEEP RIDES ON (locks.ts's banner: "locks are released by the platform when the holder ` +
+          `dies, with no cooperation from the holder, which is the one thing a crashed tab cannot ` +
+          `fake") — row 8 pins it for a closed PAGE, this pins it for a killed SHARED WORKER, ` +
+          `which is what actually hosts a device. The lease is left behind exactly as designed: ` +
+          `last written ${leaseAfter.ageMs} ms ago and therefore still FRESH ` +
+          `(stale=${leaseAfter.stale}, staleAfterMs=${leaseAfter.staleAfterMs}) — a dead host's ` +
+          `lease going stale is a clock's job, not a corpse's, and the grace window between the ` +
+          `two is precisely what row 56 measures. (Before the kill: ${leaseBefore.ageMs} ms old.)`,
+      );
+
+      const heard = await probe(page, "port-heard", { id });
+      const raced = await probe(page, "hc-race", {
+        id,
+        ms: EVICTION_TIMEOUT_MS + 6_000,
+      });
+      const timedOut = raced.outcome === "rejected" && raced.error?.code === "timeout" &&
+        // NOT EARLY EITHER: a rejection well before the deadline would
+        // mean something OTHER than the timer ended the call, which is
+        // the opposite finding wearing the same code.
+        raced.waitedMs >= EVICTION_TIMEOUT_MS - 250;
+      record(
+        "52 eviction",
+        "INFO: the port says NOTHING when its host dies — there is no peer-death event to hear",
+        "info",
+        `a raw second port to the same host, opened before the kill with \`close\` and ` +
+          `\`messageerror\` listeners attached, heard ${j(heard.seen)} across the eviction — and ` +
+          `\`"onclose" in port\` is ${listening.closeEventSupported} in this Chromium ` +
+          `(${browser.version()}), so there is no peer-death event being missed: there is none to ` +
+          `miss. THIS IS INFO BECAUSE IT IS PLATFORM-GIVEN, not a claim device-store makes. ` +
+          `client.ts listens for \`message\` and nothing else, and the record here is that there ` +
+          `is currently nothing else to listen for — which is what makes 52b's deadline the ONLY ` +
+          `thing that can end a pending call, rather than one of two ways it might.`,
+      );
+      record(
+        "52b eviction",
+        "a pending RPC against an evicted host ends at the CLIENT'S OWN deadline, with the timeout code",
+        timedOut,
+        `with the host gone underneath it, an ordinary \`tasks.items()\` on the SAME live ` +
+          `connection ${
+            timedOut
+              ? `rejected after ${raced.waitedMs} ms against the ${EVICTION_TIMEOUT_MS} ms ` +
+                `deadline this connection was opened with, as ${raced.error?.name} ` +
+                `code=${j(raced.error?.code)}: ${j(raced.error?.message)}`
+              : `${raced.outcome} after ${raced.waitedMs} ms — ${j(raced.error)}, which is NOT ` +
+                `the contract`
+          }. THAT IS THE DEVICE STORE'S OWN CONTRACT and it is what this row pins, separately ` +
+          `from 52's platform fact: client.ts arms one timer per request ` +
+          `(\`spec.timeoutMs ?? 120_000\`) and its expiry rejects with a \`DeviceHostError\` ` +
+          `whose code is \`"timeout"\` — deliberately NOT a \`ComponentException\`, because "the ` +
+          `call may still be running in the worker" and a timeout "says nothing about what the ` +
+          `guest did or did not do" (client.ts's own comment at the timer). An embedder branches ` +
+          `on that code to offer a reconnect; had the seam degraded it into an engine error, an ` +
+          `app would handle a host condition as a guest err arm. The 120 s default is the right ` +
+          `production number and useless in a gate, so this connection was opened with ` +
+          `${EVICTION_TIMEOUT_MS} ms — the knob changes how long the row waits, not what it ` +
+          `measures, and 52 is the reason the deadline is the only exit: nothing else was ever ` +
+          `going to arrive.`,
+      );
+
+      // RESPAWN. `close()` on the dead connection is what lets the page
+      // ask for a new one (the conns map is keyed by device id); the
+      // detach it posts into a closed port is the case that call is
+      // best-effort for.
+      await probe(page, "hc-close", { id });
+      const back = await probe(page, "hc-open", { id, unseal: {} });
+      const items = await probe(page, "hc-items", { id });
+      const respawned = await sharedWorkersFor(browser, id);
+      const inFlightKept = items.titles.includes(IN_FLIGHT);
+
+      const respawnOk = back.unseal.refused === false && back.status.resumed === true &&
+        back.status.sealed === false &&
+        back.hello.bootSeq > open.hello.bootSeq &&
+        back.hello.instanceNonce !== open.hello.instanceNonce &&
+        respawned.length === 1 && back.status.lockHeld === true &&
+        TODOS.every((t: string) => items.titles.includes(t));
+      record(
+        "53 eviction",
+        "a fresh connect respawns the host, and the CHECKPOINTED state is intact",
+        respawnOk,
+        `a new \`connectDevice\` after the eviction spawns a new host (boot ` +
+          `${open.hello.bootSeq}→${back.hello.bootSeq}, new nonce: ` +
+          `${back.hello.instanceNonce !== open.hello.instanceNonce}, ` +
+          `${respawned.length} shared_worker target), auto-unseals from the platform wrap with NO ` +
+          `passphrase (refused=${back.unseal.refused}, sealed=${back.status.sealed}), takes the ` +
+          `lock the dead host left free (lockHeld=${back.status.lockHeld}) and stateResume() ` +
+          `answers ${back.status.resumed}. THE CHECKPOINTED STATE IS ALL THERE: ${j(TODOS)}. THE ` +
+          `LAST DEBOUNCE WINDOW, reported and NOT asserted: one further mutation went in ` +
+          `immediately before the kill with nothing waited for, and the trailing 500 ms ` +
+          `checkpoint (row 17's subject) was racing an eviction that takes a CDP round trip — it ` +
+          `${
+            inFlightKept
+              ? "LANDED, so the write is present"
+              : "did NOT land, so the write is gone"
+          } (titles now ${j(items.titles)}). Either way the discipline is the one row 17 states: ` +
+          `what is checkpointed survives a crash and what is inside the open window may not, ` +
+          `which is why \`reseal\` and last-client-disconnect checkpoint FIRST rather than trust ` +
+          `the timer.`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
+    // --- 54: EVICTION AT THE COMMIT POINT leaves no torn store ------------
+    //
+    // CRASH CONSISTENCY AT THE PROVIDER, and the layout is what makes it
+    // cheap: "The manifest is written LAST per flush: the layout already
+    // has a commit point" (SYNC.md, "What exists going in"), with the
+    // change-board patch after it at flush commit (§2). So the
+    // experiment is: fail exactly the manifest's own write, let a flush
+    // run into that failure, kill the host before it can retry or
+    // checkpoint anything, and ask the STORE what a reader would see.
+    //
+    // THE FAULT IS AIMED, not blanket. `refuseNextFiles`'s 503-everything
+    // would stop the chunk uploads too and prove nothing about a torn
+    // state; `failFiles({method, path})` fails ONLY the manifest object's
+    // media update, so the chunks beside it really do land and really
+    // are garbage nothing follows. The manifest's id is not guessed: it
+    // is read out of the BASELINE flush's request log as the last
+    // `/upload` write of that flush, which is SYNC.md's sentence turned
+    // into a measurement.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "evicted mid-flush",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const id = made.id as string;
+      await probe(page, "hc-open", {
+        id,
+        timeoutMs: 30_000,
+        unseal: { passphrase: PASS, untilReseal: true },
+      });
+      const { code, state } = await startAndFetchAuth(page, id, gdriveSpec);
+      const consent = await probe(page, "gd-oauth-complete", { id, code, state });
+      const EVICT_ROOT = "pm-evict";
+      const bound = await probe(page, "hc-bind", {
+        id,
+        binding: {
+          kind: "gdrive",
+          root: EVICT_ROOT,
+          apiBase: gdOrigin,
+          clientId: GD_CLIENT_ID,
+          space: "drive" as const,
+        },
+      });
+      await probe(page, "hc-ensure-bucket", { id });
+
+      // TWO CLEAN FLUSHES. The first CREATES the objects (so every write
+      // in it is a POST and no id is learnable); the second is the
+      // baseline, where the manifest is a media PATCH against a known
+      // id.
+      await probe(page, "hc-add", { id, titles: ["the first committed todo"] });
+      await probe(page, "gd-flush", { id });
+      await probe(page, "hc-add", { id, titles: ["the second committed todo"] });
+      const mark = fake.requests().length;
+      const baseline = await probe(page, "gd-flush", { id });
+      const baselineLog = fake.requests().slice(mark);
+      const mediaWrites = baselineLog.filter((r) =>
+        r.method === "PATCH" && r.path.startsWith("/upload/drive/v3/files/")
+      );
+      const manifestPath = mediaWrites[mediaWrites.length - 1]?.path ?? "";
+      const manifestId = manifestPath.split("/").pop() ?? "";
+      const manifestOf = () => fake.files().find((f) => f.id === manifestId);
+      const committedDigest = await shortDigest(manifestOf()?.bytes ?? new Uint8Array());
+      const docFolder = fake.childNames(`${EVICT_ROOT}/docs`)[0] ?? "";
+      const boardBefore = fake.appProperties(`${EVICT_ROOT}/docs/${docFolder}`);
+      const namesBefore = fake.files().length;
+
+      // THE AIMED FAULT, then a mutation, then a flush nobody waits for.
+      fake.failFiles({
+        method: "PATCH",
+        path: new RegExp(`^/upload/drive/v3/files/${manifestId}$`),
+      });
+      await probe(page, "hc-add", { id, titles: ["the todo the commit never carried"] });
+      // EXPLICITLY, so the ENGINE state and the STORE state are two
+      // separate questions: this row is about the provider's bytes, not
+      // about whether the device remembers its own todo.
+      await probe(page, "hc-checkpoint", { id });
+      const flushMark = fake.requests().length;
+      await probe(page, "gd-flush-start", { id });
+
+      // WAIT FOR THE FAILURE TO ACTUALLY HAPPEN, then kill — a kill
+      // timed by a sleep would sometimes land before the commit point
+      // was even reached and would pass for the wrong reason.
+      const failDeadline = Date.now() + 30_000;
+      let sawRefusal = false;
+      while (Date.now() < failDeadline) {
+        if (fake.requests().slice(flushMark).some((r) => r.refused && r.path === manifestPath)) {
+          sawRefusal = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      const settledBeforeKill = await probe(page, "gd-flush-outcome", { id, ms: 0 });
+      await killWorkerFor(browser, id);
+      // The host is gone once its lock is (row 51's instrument, bounded
+      // rather than slept): only then is "what the store holds now" a
+      // reading of a crashed device rather than of a dying one.
+      const release = await untilLockFree(page, id);
+
+      const crashLog = fake.requests().slice(flushMark).filter((r) => !r.preflight);
+      const landedBeside = fake.files().length - namesBefore;
+      const afterCrashDigest = await shortDigest(manifestOf()?.bytes ?? new Uint8Array());
+      const boardAfterCrash = fake.appProperties(`${EVICT_ROOT}/docs/${docFolder}`);
+      const untorn = afterCrashDigest === committedDigest &&
+        j(boardAfterCrash) === j(boardBefore);
+
+      // RESPAWN, HEAL, FLUSH.
+      await probe(page, "hc-close", { id });
+      const back = await probe(page, "hc-open", { id, timeoutMs: 30_000, unseal: {} });
+      fake.failFiles({ n: 0 });
+      const healed = await probe(page, "gd-flush", { id });
+      const healedDigest = await shortDigest(manifestOf()?.bytes ?? new Uint8Array());
+      const boardAfterHeal = fake.appProperties(`${EVICT_ROOT}/docs/${docFolder}`);
+      const counterOf = (b: Record<string, string>) => Number(Object.values(b)[0] ?? "NaN");
+      const monotonic = Object.keys(boardAfterHeal).length === 1 &&
+        j(Object.keys(boardAfterHeal)) === j(Object.keys(boardBefore)) &&
+        Number.isFinite(counterOf(boardBefore)) &&
+        counterOf(boardAfterHeal) > counterOf(boardBefore);
+
+      const ok = consent.ok && bound.attempt.refused === false &&
+        baseline.attempt.refused === false && manifestId !== "" &&
+        sawRefusal && release.free && untorn &&
+        back.unseal.refused === false && back.status.resumed === true &&
+        healed.attempt.refused === false &&
+        healedDigest !== committedDigest && monotonic &&
+        fake.refusalsPending() === 0;
+      record(
+        "54 sync",
+        "an eviction at the COMMIT POINT leaves the store untorn: the readable manifest is still the old one",
+        ok,
+        `a bound device flushed twice cleanly; the BASELINE flush's log names its own commit ` +
+          `point — ${mediaWrites.length} media writes, the LAST of them ${j(manifestPath)}, which ` +
+          `is SYNC.md's "the manifest is written LAST per flush" read off the wire rather than ` +
+          `assumed. A fault aimed at exactly that one object (\`failFiles({method:"PATCH", ` +
+          `path:/…${manifestId}$/})\` — not a blanket outage, so everything BESIDE the manifest ` +
+          `keeps working) plus one more todo, then a flush nobody awaited. It reached the commit ` +
+          `point and was refused there (${sawRefusal}); the ${crashLog.length} non-preflight ` +
+          `requests it made were ${
+            j(crashLog.map((r) => `${r.method} ${r.path.replace(/^\/(upload\/)?drive\/v3\//, "")}${r.refused ? " REFUSED" : ""}`))
+          }, and ${landedBeside} new object(s) DID land beside the manifest. The host was then ` +
+          `EVICTED (CDP, row 51's kill) with its bucket state uncheckpointed` +
+          `${settledBeforeKill.settled ? " — the flush had already rejected at the refusal, so the eviction lands on the failed cycle rather than inside an open request" : " while the call was still outstanding"}, ` +
+          `and the store was read only once the dead host's lock had actually come back ` +
+          `(${release.waitedMs} ms, bounded poll — row 51's instrument). ` +
+          `WHAT A READER SEES IS THE OLD COMMIT: the manifest object's bytes are byte-identical ` +
+          `to the baseline (sha256 prefix ${j(committedDigest)} before, ${j(afterCrashDigest)} ` +
+          `after) and the change board is untouched (${j(boardBefore)} → ${j(boardAfterCrash)}) — ` +
+          `whatever chunks landed are unreferenced by any manifest, which is what "the layout ` +
+          `already has a commit point" buys. AFTER THE HEAL a respawned host ` +
+          `(resumed=${back.status.resumed}) flushes cleanly (refused=${healed.attempt.refused}), ` +
+          `the manifest ADVANCES (${j(healedDigest)}) and the board's decimal counter is ` +
+          `MONOTONIC under the same device key: ${j(boardBefore)} → ${j(boardAfterHeal)} — never ` +
+          `reused, never regressed, which is what makes a sibling's short-circuit safe (SYNC.md ` +
+          `§2: the board is a hint, and a hint that went backwards would be a lie).`,
+      );
+      await probe(page, "hc-close", { id });
+      await probe(page, "hc-forget", { ids: [id] });
+    });
+
+    // === 55: THE SUSPENDED CLIENT AND THE LEASE ===========================
+    //
+    // locks.ts names four quadrants and this matrix had measured three.
+    // The fourth — "lock held, lease stale → a host that is alive but has
+    // not written a lease in a while (a suspended tab, a long GC pause).
+    // Alive is alive." — had never been produced, and the comment's own
+    // example is what made it worth ATTEMPTING rather than stipulating:
+    // the LEASE HEARTBEAT RUNS IN THE WORKER (`takeLock` → `startLease`,
+    // worker.ts), not in the page, so "a suspended tab" only makes a
+    // lease stale if suspending the tab also suspends the SharedWorker.
+    //
+    // THE ATTEMPT AND ITS OUTCOME ARE BOTH THE ROW. Row 55 records what
+    // `Page.setWebLifecycleState("frozen")` actually does to a page in
+    // THIS harness — instrumented, not assumed — and 55b then pins the
+    // sweep RULE by the route that remains available. A question that
+    // turns out to be unreachable from here is written down as
+    // unreachable; it is not quietly dropped.
+    await guard(async () => {
+      // ITS OWN PAGE, because a genuinely frozen page cannot answer a
+      // probe about itself (demo/e2e/cdp.ts's hazard note), and a T0
+      // device, because the sweep only has an opinion about those.
+      const frozen = await openPage(ctx, port);
+      const first = await probe(frozen, "hc-open", {
+        anchorPetname: "frozen client",
+        unseal: {},
+      });
+      const id = first.deviceId as string;
+      await probe(frozen, "hc-add", { id, titles: TODOS });
+      await probe(frozen, "hc-checkpoint", { id });
+      // EVERY OBSERVATION OF THE LEASE COMES FROM `page`, never from
+      // `frozen` — written this way so the row stays correct whether or
+      // not the freeze takes.
+      const leaseBefore = await probe(page, "lease-read", { id });
+      // THE FREEZE'S OWN WITNESS: a 1 s timer plus the document's
+      // `freeze`/`resume`/`visibilitychange` listeners, read back after
+      // the thaw.
+      await probe(frozen, "tick-start", { everyMs: 1_000 });
+
+      await setWebLifecycleState(frozen, "frozen");
+      // COMFORTABLY PAST STALENESS: LEASE_STALE_MS is 30 s against a 5 s
+      // heartbeat, so a worker that stopped renewing when its last
+      // client froze would be unambiguously stale by now, and one that
+      // did not is unambiguously fresh. There is no in-between to
+      // misread.
+      const waitMs = leaseBefore.staleAfterMs + 6_000;
+      await new Promise((r) => setTimeout(r, waitMs));
+      const leaseAfter = await probe(page, "lease-read", { id });
+      const workersDuring = await sharedWorkersFor(browser, id);
+      await setWebLifecycleState(frozen, "active");
+      const ticks = await probe(frozen, "tick-read");
+
+      // DID THE PAGE ACTUALLY FREEZE? Two independent instruments, and
+      // they have to agree: a frozen document runs no timers AND fires
+      // `freeze`. Half the expected ticks is a deliberately generous
+      // threshold — the finding below is not a near miss.
+      const stalled = ticks.count * 1_000 < ticks.elapsedMs / 2;
+      const firedFreeze = (ticks.events as string[]).includes("freeze");
+      const reallyFroze = stalled && firedFreeze;
+      record(
+        "55 locks",
+        "INFO: CDP's page freeze does not take on a harness page in this build — the suspended-client quadrant stays unreached",
+        "info",
+        `THE EXPERIMENT: a T0 device with exactly one tab, that tab put to ` +
+          `\`Page.setWebLifecycleState("frozen")\` for ${waitMs} ms (${leaseBefore.staleAfterMs} ms ` +
+          `of staleness window plus margin, against a ${leaseBefore.intervalMs} ms heartbeat), to ` +
+          `find out whether suspending the only client suspends the SharedWorker with it and so ` +
+          `produces locks.ts's fourth quadrant. THE FREEZE DID NOT TAKE. The CDP command returned ` +
+          `successfully and changed nothing observable: the page's 1 s timer ticked ` +
+          `${ticks.count} times across ${ticks.elapsedMs} ms (stalled=${stalled} — a frozen ` +
+          `document runs no timers) and the document fired ${j(ticks.events)}, with NO \`freeze\` ` +
+          `event (${firedFreeze}); visibilityState was ${j(ticks.visibility)} throughout. ` +
+          `Chromium ${browser.version()} under playwright's headless launch keeps a page visible ` +
+          `and does not freeze it on request; demo/e2e/cdp.ts's own spike measured a real timer ` +
+          `stall under its conditions, so this is a fact about THIS harness's pages, not a ` +
+          `contradiction of that file. CONSEQUENCE, stated rather than papered over: whether a ` +
+          `suspended tab drags its SharedWorker down with it is UNMEASURED here, and the ` +
+          `quadrant's other example (a long GC pause) is not reachable from a test at all. What ` +
+          `the ${waitMs} ms DID establish is that the heartbeat is genuinely live and the sweep's ` +
+          `input is real: with the tab merely idle the lease is ${leaseAfter.ageMs} ms old ` +
+          `(stale=${leaseAfter.stale}) and ${workersDuring.length} host holds the lock ` +
+          `(${leaseAfter.lockHeld}) — the worker renews on its own timer, as worker.ts's ` +
+          `\`takeLock\` intends when it drops the heartbeat's stop handle on purpose. 55b pins ` +
+          `the RULE by the route that is left.`,
+      );
+
+      // THE RULE ITSELF, by the fallback the dispatch names: manufacture
+      // the stale half directly. This is row 15's instrument pointed at
+      // a different question — 15 asks whether a LIVE T0 device survives
+      // the sweep at all, this asks the quadrant as a rule, with the
+      // "alive" side supplied by a worker whose client did nothing for
+      // 36 seconds.
+      // THE HEARTBEAT IS STILL RUNNING while this happens — the worker
+      // renews every LEASE_INTERVAL_MS — so a renewal landing between
+      // the backdate and the read would overwrite the very staleness
+      // this row needs and fail it for a reason that has nothing to do
+      // with the rule. The sweep VERDICT is immune (it tests the lock
+      // first and never reaches the lease), but the evidence line would
+      // read "stale=false", so: backdate, read, and if the heartbeat
+      // beat us to it, do it once more. Two collisions in a row would be
+      // a finding about the heartbeat, not a flake, and are left to fail.
+      let backdated = await probe(page, "lease-backdate", { id, ageMs: 10 * 60_000 });
+      let lease = await probe(page, "lease-read", { id });
+      let retriedBackdate = false;
+      if (lease.stale !== true) {
+        retriedBackdate = true;
+        backdated = await probe(page, "lease-backdate", { id, ageMs: 10 * 60_000 });
+        lease = await probe(page, "lease-read", { id });
+      }
+      const swept = await probe(page, "sweep-now", { id });
+      const ruleOk = backdated.stale === true && lease.stale === true &&
+        lease.lockHeld === true &&
+        swept.swept === false && swept.kept?.because === "lock-held" &&
+        swept.stillIndexed === true && swept.namespaceStillThere === true;
+      record(
+        "55b locks",
+        "a device whose lock is HELD is never swept, however stale its lease",
+        ruleOk,
+        `the freeze that was meant to produce a stale lease did not take (row 55), so the stale ` +
+          `half is arranged the only way left: a lease timestamp written 10 minutes into the ` +
+          `past through the namespace API from the OBSERVING page — the same \`meta\`/\`lease\` ` +
+          `record \`startLease\` writes, so the sweep cannot tell the two apart, and no ` +
+          `production code is touched to get there${
+            retriedBackdate
+              ? ", and the worker's own 5 s heartbeat overwrote the first backdate before it " +
+                "could be read, so it was written once more — the live host renewing its lease " +
+                "underneath a test is the behaviour, not the interference"
+              : ""
+          }. With lease age ${lease.ageMs} ms ` +
+          `(stale=${lease.stale}) and the lock HELD by a live worker (${lease.lockHeld}), ` +
+          `\`sweepT0()\` KEPT the device: swept=${swept.swept}, ` +
+          `because=${j(swept.kept?.because)}, index row still there (${swept.stillIndexed}), ` +
+          `namespace still there (${swept.namespaceStillThere}). locks.ts, verbatim: "lock held, ` +
+          `lease stale → a host that is alive but has not written a lease in a while. Alive is ` +
+          `alive." AND THE MECHANISM IS WHAT MAKES IT SAFE rather than merely polite: the sweep's ` +
+          `freeness test IS the acquisition (\`withLockIfFree\`, \`ifAvailable: true\`), so a ` +
+          `held lock is never consulted-then-raced — the time-of-check/time-of-use bug whose ` +
+          `outcome would be a live host's storage deleted underneath it cannot be written this ` +
+          `way. Row 15 pins the same rule for a T0 device with an ACTIVE client; this device's ` +
+          `client had been idle for ${waitMs} ms and its lease was hours stale.`,
+      );
+
+      // AND THE CONSEQUENCE, from the tab's own side: the sweep declined,
+      // so the tab still finds the host it left.
+      const back = await probe(frozen, "hc-status", { id });
+      const items = await probe(frozen, "hc-items", { id });
+      const sameHost = back.bootSeq === first.hello.bootSeq &&
+        back.instanceNonce === first.hello.instanceNonce &&
+        back.sealed === false && back.lockHeld === true &&
+        TODOS.every((t: string) => items.titles.includes(t));
+      record(
+        "55c locks",
+        "the tab finds the SAME host it left, and its state — what 55b buys, from the user's side",
+        sameHost,
+        `after ${waitMs} ms of an idle tab, a lease backdated to hours old and a sweep that ` +
+          `declined to collect the device, the tab asks its connection again: boot ` +
+          `${back.bootSeq} (unchanged: ${back.bootSeq === first.hello.bootSeq}) and the same ` +
+          `instanceNonce (${back.instanceNonce === first.hello.instanceNonce}) — the identical ` +
+          `global, not a respawn that merely looks alike, which is the distinction bootSeq exists ` +
+          `to make (worker.ts's \`bootSeq\`) — still unsealed (${back.sealed}), still holding its ` +
+          `lock (${back.lockHeld}), with ${j(items.titles)} intact. Had the sweep taken the other ` +
+          `branch this device would have come back EMPTY and SILENTLY through the anchor's ` +
+          `degrade rule (row 10), which is why "sweeping early costs a user their unsaved device" ` +
+          `is the asymmetry locks.ts writes its constants around.`,
+      );
+      await probe(frozen, "hc-close", { id });
+      await probe(frozen, "hc-forget", { ids: [id] });
+      await frozen.close();
+    });
+
+    // --- 56: THE RELOAD STORM ---------------------------------------------
+    //
+    // Rows 12 and 15 each do ONE reload. Five back-to-back, each
+    // reconnecting the moment the document is interactive and reloading
+    // again without waiting for anything to quiesce, is the shape a user
+    // produces by leaning on the key — and it is the shape that would
+    // expose the two failures the design's constants exist to prevent:
+    // TWO hosts for one device (a second worker starting before the
+    // first's lock is released, i.e. split brain), and a T0 device eaten
+    // by the sweep during the zero-client window every reload opens.
+    //
+    // THE CONSTANTS ARE THE CLAIM (locks.ts): the lock's release is what
+    // makes the next host's queued `takeLock` correct, and
+    // LEASE_STALE_MS = 6 × LEASE_INTERVAL_MS = 30 s is the GRACE — "the
+    // lease's staleness window is precisely the grace period for that
+    // gap". A sweep landing inside a reload finds lock FREE, lease
+    // FRESH, and must keep the device on the second half of that rule
+    // alone. This row runs one from a second page after every reload,
+    // which is the only way to catch that window on purpose.
+    await guard(async () => {
+      const storm = await openPage(ctx, port);
+      const first = await probe(storm, "hc-open", {
+        anchorPetname: "reload storm",
+        unseal: {},
+      });
+      const id = first.deviceId as string;
+      await probe(storm, "hc-add", { id, titles: [TODOS[0]] });
+      await probe(storm, "hc-checkpoint", { id });
+
+      const N = 5;
+      const boots: number[] = [];
+      const sweepReasons: string[] = [];
+      const workerCounts: number[] = [];
+      let sameDevice = true;
+      let alwaysResumed = true;
+      let everSwept = false;
+      const LAST = "the last checkpointed todo";
+      for (let i = 0; i < N; i++) {
+        // `domcontentloaded`, NOT `load`: the point is to reload before
+        // anything settles.
+        await storm.reload({ waitUntil: "domcontentloaded" });
+        await ready(storm);
+        const open = await probe(storm, "hc-open", {
+          anchorPetname: "reload storm",
+          unseal: {},
+        });
+        boots.push(open.hello.bootSeq);
+        sameDevice &&= open.deviceId === id;
+        alwaysResumed &&= open.status.resumed === true;
+        if (i === N - 1) {
+          await probe(storm, "hc-add", { id, titles: [LAST] });
+          await probe(storm, "hc-checkpoint", { id });
+        }
+        // FROM THE OTHER PAGE, mid-storm: the sweep must decline, and
+        // WHICH HALF of the rule saves it is the interesting part.
+        const swept = await probe(page, "sweep-now", { id });
+        everSwept ||= swept.swept === true || swept.stillIndexed === false;
+        sweepReasons.push(String(swept.kept?.because ?? (swept.swept ? "SWEPT" : "?")));
+        workerCounts.push((await sharedWorkersFor(browser, id)).length);
+      }
+
+      // THE SETTLE, and only then the census.
+      await new Promise((r) => setTimeout(r, 1_000));
+      const workers = await sharedWorkersFor(browser, id);
+      const status = await probe(storm, "hc-status", { id });
+      const items = await probe(storm, "hc-items", { id });
+      const lease = await probe(page, "lease-read", { id });
+      const finalSweep = await probe(page, "sweep-now", { id });
+
+      const monotonic = boots.every((b, i) => i === 0 || b > boots[i - 1]) &&
+        boots[0] > first.hello.bootSeq;
+      const ok = sameDevice && alwaysResumed && monotonic && !everSwept &&
+        workerCounts.every((n) => n === 1) && workers.length === 1 &&
+        status.sealed === false && status.lockHeld === true &&
+        items.titles.includes(TODOS[0]) && items.titles.includes(LAST) &&
+        finalSweep.swept === false && finalSweep.kept?.because === "lock-held";
+      record(
+        "56 host",
+        "a five-deep RELOAD STORM: one host at the end, no split brain, and the lease grace keeps a mid-reload device",
+        ok,
+        `${N} back-to-back reloads (\`waitUntil:"domcontentloaded"\`, reconnecting immediately ` +
+          `and reloading again without waiting for quiesce) on a T0 device rehydrated from its ` +
+          `sessionStorage anchor every time (same device throughout: ${sameDevice}). The host ` +
+          `really was replaced each time and never doubled: boot ${first.hello.bootSeq} → ` +
+          `${j(boots)} (strictly increasing: ${monotonic}) with ` +
+          `${j(workerCounts)} shared_worker target(s) observed for this device after each one — ` +
+          `never two, so no second host ever started beside a first. That is the lock doing its ` +
+          `job at both ends: the dying global's grant is released by DEATH (row 51) and the new ` +
+          `worker's \`takeLock\` QUEUES rather than refusing (worker.ts: "a host that refused ` +
+          `rather than waited would turn a millisecond of overlap into a failed boot"). Each ` +
+          `reconnect resumed (${alwaysResumed}) rather than coming up empty. THE SWEEP RAN FROM ` +
+          `ANOTHER PAGE AFTER EVERY RELOAD and never collected it (${!everSwept}), keeping it ` +
+          `for ${j(sweepReasons)} — every keep is one half or the other of locks.ts's rule, and ` +
+          `a \`lease-fresh\` keep is the GRACE WINDOW caught in the act: lock free (the old host ` +
+          `is gone, the new one has not taken it yet) but the lease written within ` +
+          `LEASE_STALE_MS = 6 × LEASE_INTERVAL_MS = ${lease.staleAfterMs} ms, which is exactly ` +
+          `what that constant is for ("the lease's staleness window is precisely the grace ` +
+          `period for that gap"). At rest: ${workers.length} host, lockHeld=${status.lockHeld}, ` +
+          `sealed=${status.sealed}, lease ${lease.ageMs} ms old, the sweep keeping it for ` +
+          `${j(finalSweep.kept?.because)} — and the last CHECKPOINTED todo survived the whole ` +
+          `storm along with the first: ${j(items.titles)}.`,
+      );
+      await probe(storm, "hc-close", { id });
+      await probe(storm, "hc-forget", { ids: [id] });
+      await storm.close();
+    });
+
     await ctx.close();
+
   } finally {
     await browser.close();
     await server.shutdown();

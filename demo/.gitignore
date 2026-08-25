@@ -4,4 +4,7 @@ serve/
 node_modules/
 test-results/
 playwright-report/
+# The soak workflow's tee target (.github/workflows/soak.yml); a local
+# run of the same command line leaves it behind.
+soak.log
 
