@@ -70,6 +70,25 @@ export interface FreshOptions {
    * booted the WRONG document fails the wait instead of passing on the
    * other page's marker. */
   bootGlobal?: string;
+  /** WHICH BROWSER this one context is opened in, overriding the
+   * scenario's own `engine` for this call only. Undefined — the normal
+   * case — means "the browser this scenario is being driven by", which
+   * is what every single-engine scenario wants and what the runner's
+   * crash recovery reasons about.
+   *
+   * It exists for the CROSS-ENGINE scenarios: `cross-engine-pairing`
+   * runs its device A as the runner's own Chromium page and opens
+   * device B in Firefox, so the two "devices" are two ENGINES meeting
+   * over the relay rather than two contexts of one browser (which is
+   * what every other multi-device scenario in this suite is). Firefox
+   * is launched LAZILY by the runner and kept for the rest of the run,
+   * exactly as the `engine` scenario field does it — a suite that never
+   * asks for Gecko never pays for a second browser.
+   *
+   * See run.ts's `browserFor` for the resolution, and `recoverBrowser`
+   * for what a crash in a mixed scenario does (and honestly does not)
+   * recover. */
+  engine?: "chromium" | "firefox";
   /** Extra URL query parameters for this scenario's page — e.g.
    * `{ pairing: "mock" }`. MERGED over the harness's own base query (see
    * `pageUrl`), which is how every page in the suite gets the local

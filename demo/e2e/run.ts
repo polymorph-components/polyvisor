@@ -69,6 +69,8 @@ import soloOfflineSync from "./scenarios/solo-offline-sync.ts";
 import soloPasskey from "./scenarios/solo-passkey.ts";
 import visorReset from "./scenarios/visor-reset.ts";
 import firefoxSmoke from "./scenarios/firefox-smoke.ts";
+import crossEnginePairing from "./scenarios/cross-engine-pairing.ts";
+import workerEviction from "./scenarios/worker-eviction.ts";
 import harnessFaults from "./scenarios/harness-faults.ts";
 import storeOutageRecovery from "./scenarios/store-outage-recovery.ts";
 import oneSidedReload from "./scenarios/one-sided-reload.ts";
@@ -243,6 +245,17 @@ const SCENARIOS: Scenario[] = [
   // pull) rather than in anything about pairing, adoption or the Drive
   // ceremony underneath it.
   soloOfflineSync,
+  // THE WORKER THAT DIES WITH NO GOODBYE, at product level: B's whole
+  // engine host (its SharedWorker) is evicted via CDP while A keeps
+  // working, and the user-shaped recovery — reload the tab — brings the
+  // same device back from its checkpoint and the account converges
+  // again. It runs after solo-account-storage and solo-offline-sync
+  // because it uses their ceremony and their channels as preconditions:
+  // a failure here with both of those green says the fault is in the
+  // eviction/recovery path, not in pairing, adoption or the schedule.
+  // The mechanics underneath are pinned one level down in devstore rows
+  // 51-56 (lock release, the silent port, checkpoint intactness).
+  workerEviction,
   // THE PRF RUNG (passkey unseal, PERSISTENCE.md). Follows the device
   // store's other two for the same reason they follow solo-pairing: a
   // failure here with those two green says the fault is in the passkey
@@ -280,6 +293,24 @@ const SCENARIOS: Scenario[] = [
   // suite that is already green is the right place to ask "and does it
   // work under the other engine".
   firefoxSmoke,
+  // AND THE ONE THAT NEEDS BOTH BROWSERS AT ONCE: a Chromium device and
+  // a Firefox device paired over the relay, converging both ways. It
+  // sits here for exactly firefoxSmoke's reason, cited above — Firefox
+  // is launched lazily, so a run that failed earlier must never pay for
+  // a second browser, and a Chromium suite that is already green is the
+  // right place to ask the cross-engine question.
+  //
+  // AFTER firefoxSmoke rather than before it, which is the ordering
+  // argument the solo family uses throughout: firefoxSmoke proves Gecko
+  // can boot the engine and keep a device AT ALL, and solo-pairing
+  // proves the ceremony works between two devices. A failure HERE with
+  // both of those green says the fault is in something only two
+  // DIFFERENT engines can break — a wire format, a transcript, a
+  // subduction across runtimes — rather than in Gecko or in the
+  // ceremony. It also inherits firefoxSmoke's warm Firefox process
+  // (run.ts's `browserFor` keeps the one handle), so the launch is paid
+  // for once.
+  crossEnginePairing,
 ];
 
 const here = new URL(".", import.meta.url).pathname;
@@ -688,9 +719,68 @@ async function main() {
    * a promising export. `firefox-smoke` is written to that rule: it
    * evaluates only FEATURE PROBES (typeof checks, constructor presence),
    * which touch no promising export, and leaves engine instantiation to
-   * the page's own boot. */
+   * the page's own boot.
+   *
+   * WHERE THE RULE'S PRECONDITION NO LONGER HOLDS, measured 2026-08-24.
+   * /solo.html instantiates NO wasm in the document: `conn.driver`
+   * (host/solo.ts:723) is an RPC proxy over the device host's module
+   * SharedWorker, so an evaluate frame awaiting a `__solo` hook is
+   * awaiting a postMessage round trip, and the promising export it
+   * eventually reaches runs in the WORKER's global — a realm the Juggler
+   * evaluate frame is not on the stack of. Spiked before
+   * `cross-engine-pairing` was written: a Firefox solo page driven
+   * through `solo()`/`hookOn` survived 20 consecutive `tick`s, 20
+   * `hasAccount`s (`us-profile-get`), a `newAccount`, a todo typed into
+   * the app and read back through `todos()` (`tasks.items()`), and an
+   * `endpointId` off a live iroh bind — no crash, no renderer silence,
+   * on 3 of 3 runs. So `cross-engine-pairing` drives its whole Gecko
+   * side through ordinary `solo()` calls, and the queue-based command
+   * channel designed to dodge the hazard was never built: there was
+   * nothing left to dodge.
+   *
+   * That is a fact about ONE PAGE, not a repeal. /index.html still
+   * instantiates its engines in the document, and the rule above governs
+   * any Firefox-lane scenario that drives it — as it will govern
+   * /solo.html again the day the device host moves back into the page. */
   let engine: "chromium" | "firefox" = "chromium";
   const current = (): Browser => engine === "firefox" ? firefoxBrowser! : browser;
+  /** Did the scenario ATTEMPT NOW RUNNING actually get a Firefox
+   * context? Reset per attempt, set by `browserFor` the moment it hands
+   * the Gecko handle out — so it covers both ways in: a `firefox`-lane
+   * scenario and a Chromium-lane one that asked for a Gecko context
+   * through `ctx.fresh({ engine })`.
+   *
+   * It exists to SCOPE the dead-secondary crash test below. `firefox
+   * Browser` is a run-lifetime handle: once any scenario has launched
+   * Gecko it stays non-null for every scenario after it, so an
+   * unscoped "is the secondary connected?" would be consulted on
+   * failures that never touched Firefox at all — and a Gecko that died
+   * quietly in the background would then re-label a LATER Chromium
+   * scenario's ordinary assertion failure as crash-shaped. */
+  let usedFirefox = false;
+  /** The browser ONE `ctx.fresh` call gets. Without `opts.engine` this
+   * is just `current()` — the scenario's own lane, unchanged. WITH it,
+   * a scenario may open a context in the OTHER engine, which is what
+   * makes a genuinely cross-browser scenario possible at all:
+   * `cross-engine-pairing` keeps device A on the runner's Chromium page
+   * and asks for device B in Firefox.
+   *
+   * Firefox is launched HERE when first asked for, and kept — the same
+   * laziness the scenario-level `engine` field gets a few lines below,
+   * and for the same reason (a Chromium-only run must never pay for a
+   * Gecko launch). `firefoxBrowser` is the single handle both paths
+   * share, so a mixed scenario following `firefox-smoke` reuses the
+   * browser that scenario already started. */
+  const browserFor = async (want?: "chromium" | "firefox"): Promise<Browser> => {
+    const which = want ?? engine;
+    if (which !== "firefox") return browser;
+    usedFirefox = true;
+    if (!firefoxBrowser) {
+      setPhase("launchFirefox");
+      firefoxBrowser = await launchFirefox();
+    }
+    return firefoxBrowser;
+  };
 
   const openPages: Page[] = [];
   // Every proxy a scenario opens via `ctx.relayProxy()`, closed in the
@@ -733,8 +823,11 @@ async function main() {
       return p;
     },
     fresh: async (opts: FreshOptions = {}) => {
+      // `opts.engine` is the per-context override (util.ts's
+      // FreshOptions.engine); undefined keeps the scenario's own lane.
+      const target = await browserFor(opts.engine);
       setPhase("newContext");
-      const bctx = await newContext(current(), opts);
+      const bctx = await newContext(target, opts);
       setPhase("newPage");
       const page = await bctx.newPage();
       openPages.push(page);
@@ -846,7 +939,38 @@ async function main() {
    * itself is a protocol call and can hang, so it races a short fuse
    * and the old process is abandoned to the OS if it does. Whichever
    * engine the failing scenario was driving is the one replaced — a
-   * relaunched Chromium would do nothing for a wedged Gecko. */
+   * relaunched Chromium would do nothing for a wedged Gecko.
+   *
+   * A MIXED scenario (one that opens a `ctx.fresh({ engine: … })`
+   * context in the OTHER browser — `cross-engine-pairing`) has TWO
+   * browsers in flight, and this recovers them ASYMMETRICALLY, which is
+   * a deliberate choice rather than an oversight:
+   *
+   *   - the scenario's OWN lane (`current()`) is always closed and
+   *     relaunched, because that is the browser the runner will hand to
+   *     the next scenario and a wedged one eats every scenario after it;
+   *   - the SECONDARY browser is relaunched only when it is visibly gone
+   *     (`isConnected()` false). A live secondary is left alone: closing
+   *     a healthy Firefox to recover a wedged Chromium would cost a
+   *     ~5s relaunch on the retry for no evidence at all.
+   *
+   * What this deliberately does NOT solve, in two directions. First: a
+   * secondary browser whose RENDERER wedged without disconnecting the
+   * browser process. In a mixed scenario that shows up as an ordinary
+   * act failure or a scenario deadline — the deadline IS crash-shaped,
+   * so the retry happens, but it happens against the same wedged
+   * secondary and will most likely fail the same way. Second, and
+   * currently unexercised: the MIRROR arrangement, a `firefox`-lane
+   * scenario that opens a CHROMIUM secondary through `ctx.fresh({
+   * engine: "chromium" })`. Nothing here relaunches that one — the
+   * clause above names Firefox specifically, and `browser` is not
+   * re-checked while `engine === "firefox"` — so a dead Chromium
+   * secondary survives until the NEXT Chromium-lane scenario's own
+   * `!current().isConnected()` test catches it, one scenario late.
+   * Fixing either properly means tracking crash events (and handles)
+   * per browser rather than per page, which is more machinery than one
+   * cross-engine scenario has earned; both are written down here rather
+   * than discovered later. */
   const recoverBrowser = async () => {
     const dying = current();
     await Promise.race([
@@ -856,6 +980,11 @@ async function main() {
     if (engine === "firefox") firefoxBrowser = await launchFirefox();
     else browser = await launchBrowser();
     console.log(`         (${engine} relaunched)`);
+    // The secondary, only if it is demonstrably gone (see above).
+    if (engine !== "firefox" && firefoxBrowser && !firefoxBrowser.isConnected()) {
+      firefoxBrowser = await launchFirefox();
+      console.log("         (the secondary firefox was gone; relaunched too)");
+    }
   };
 
   // --- memory watch -------------------------------------------------------
@@ -965,6 +1094,9 @@ async function main() {
     const MAX_ATTEMPTS = 2;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       resetActs();
+      // Per ATTEMPT, not per scenario: the retry re-runs `ctx.fresh`
+      // and will set it again if it really opens a Gecko context.
+      usedFirefox = false;
       scenarioPeakMb = 0;
       recordSample();
       let page: Page | null = null;
@@ -992,10 +1124,7 @@ async function main() {
           // kept for the rest of the run: a suite that is one Gecko beat
           // long should not pay for a second browser it never opens.
           engine = scenario.engine ?? "chromium";
-          if (engine === "firefox") {
-            setPhase("launchFirefox");
-            if (!firefoxBrowser) firefoxBrowser = await launchFirefox();
-          }
+          if (engine === "firefox") await browserFor("firefox");
           page = await ctx.fresh(
             typeof scenario.page === "function" ? scenario.page(ctx) : scenario.page,
           );
@@ -1091,6 +1220,33 @@ async function main() {
         (failure instanceof Error && failure.message.startsWith(DEADLINE_MARK)) ||
         (failure instanceof Error && /has been closed/.test(failure.message)) ||
         !current().isConnected() ||
+        // THE SECONDARY BROWSER of a scenario that used both (ctx.fresh's
+        // `engine` override). `current()` only ever names the scenario's
+        // own lane, so without this a Firefox that died under a
+        // Chromium-lane cross-engine scenario would read as an ordinary
+        // act failure — a claim about the demo — and never be retried.
+        //
+        // SCOPED TO `usedFirefox` ON PURPOSE. `firefoxBrowser` is a
+        // run-lifetime handle, so the unscoped test would fire for EVERY
+        // failed scenario once Gecko had ever launched: a background
+        // Firefox that died quietly would turn a later Chromium
+        // scenario's ordinary assertion failure into a crash-shaped one
+        // — one wasted retry, and worse, an `expected: "red"` scenario
+        // loses its xfail reading on that attempt (crash-shaped failures
+        // are deliberately never folded into the xfail marker). It would
+        // self-heal on attempt 2, since the retry's recoverBrowser
+        // relaunches the dead secondary and MAX_ATTEMPTS bounds the
+        // whole thing — but a correct result reached through a
+        // misdiagnosis is still a misdiagnosis, and this flag costs four
+        // lines. What remains unguarded is narrow and honest: a Gecko
+        // that dies DURING the scenario that is using it, which is
+        // exactly the case this clause exists for.
+        // (The cast is the same one the close block at the end of the
+        // run needs, and for the same reason written there: every
+        // assignment to `firefoxBrowser` happens inside a closure, so
+        // the checker's flow analysis reaches here still believing it
+        // is `null`.)
+        (usedFirefox && (firefoxBrowser as Browser | null)?.isConnected() === false) ||
         crashEventSeen
       );
       if (failed && crashShaped && attempt < MAX_ATTEMPTS) {

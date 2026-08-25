@@ -1,0 +1,185 @@
+# The seeded convergence soak — nightly, and on demand with a seed.
+#
+# WHAT IT RUNS. demo/e2e/scenarios/convergence-soak.ts, through the e2e
+# harness's `--file` loader: the scenario is deliberately NOT registered
+# in demo/e2e/run.ts's SCENARIOS list, because it is a soak (minutes of
+# random interleaving) rather than a per-PR gate. Its banner has the
+# argument; the short version is that the hand-written scenarios each
+# pin ONE fault ordering, and this one draws orderings from a seeded
+# PRNG so a nightly failure is reproducible by one number.
+#
+# THE BUILD HALF IS E2E.YML'S, DELIBERATELY COPIED RATHER THAN
+# RE-DERIVED. Every step from "Checkout" through "Install the browser
+# and the store" is the same step, in the same order, with the same
+# pins, caches and cache keys as .github/workflows/e2e.yml — see that
+# file for WHY each of them is shaped the way it is (the absolute
+# PLAYWRIGHT_BROWSERS_PATH, the shared-key that must match pages.yml,
+# the `-ff` suffix on the browser cache key, the one-place version pins
+# read out of the justfiles). The comments are not repeated here on
+# purpose: two copies of a rationale drift, and the rationale has one
+# home.
+#
+# DRIFT BETWEEN THESE TWO FILES IS THE FAILURE MODE, and it is worth
+# naming because it is silent: if e2e.yml gains a build step, a pin bump
+# or a cache-key change and this file does not, the soak keeps running —
+# against a differently built artifact, or with a cold cache, or with a
+# browser revision the harness's Playwright pin does not match. When you
+# touch e2e.yml's build steps, touch these too.
+#
+# WHAT DIFFERS FROM E2E.YML, and it is only the run half:
+#   * the triggers (nightly schedule + workflow_dispatch with a seed),
+#   * the command (the `--file` loader, not `just e2e`),
+#   * the log is teed and uploaded as an artifact when the run fails,
+#     because a nightly red has no human watching it happen and the
+#     step log IS the reproduction recipe.
+
+name: Soak
+
+on:
+  schedule:
+    # 06:17 UTC daily. Off the hour on purpose: GitHub's scheduler is
+    # busiest (and slowest to dispatch) at :00.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "PM_SOAK_SEED (decimal). Empty = a fresh draw off the clock, printed in the log."
+        required: false
+        type: string
+      steps:
+        description: "PM_SOAK_STEPS. Empty = the scenario's own default (18)."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # A superseded run is cancelled rather than queueing behind itself —
+  # e2e.yml's rule, and it matters more here: a soak is minutes long.
+  group: soak-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    # e2e.yml's budget. A cold cargo cache dominates; the soak itself is
+    # bounded by the scenario's own deadline (derived from the step
+    # count — see DEADLINE_MS in the scenario).
+    timeout-minutes: 60
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.deps/pw-browsers
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Deno (the polyengine host; stock, no flags)
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: "2.9.5"
+
+      - name: Check out pinned siblings
+        run: SIBLINGS_ONLY=1 ./scripts/setup.sh
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            engine
+            examples/todomvc/guest
+            providers/s3/panel
+            providers/dropbox/panel
+          cache-all-crates: true
+          cache-bin: false
+          # MUST MATCH pages.yml and e2e.yml exactly — see e2e.yml's
+          # comment on this key: the Pages build owns the entry and
+          # everyone else restores it.
+          shared-key: demo-${{ hashFiles('scripts/setup.sh', '**/rust-toolchain.toml') }}
+          save-if: false
+
+      - name: Set up tools and the endpoint component
+        run: ./scripts/setup.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Read the pinned Playwright version
+        id: pw
+        working-directory: demo
+        run: |
+          version=$(sed -n 's/^PLAYWRIGHT := "npm:playwright@\(.*\)"$/\1/p' justfile)
+          test -n "$version" || { echo "could not read the Playwright pin from the justfile" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "pinned playwright: $version"
+
+      - name: Cache the Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.deps/pw-browsers
+          key: pw-${{ runner.os }}-${{ runner.arch }}-${{ steps.pw.outputs.version }}-ff
+
+      - name: Cache the MinIO binary
+        uses: actions/cache@v4
+        with:
+          path: engine/.deps/minio
+          key: minio-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Read the pinned iroh-relay version
+        id: relay
+        working-directory: engine
+        run: |
+          version=$(sed -n 's/^IROH_RELAY_VERSION := "\(.*\)"$/\1/p' justfile)
+          test -n "$version" || { echo "could not read the iroh-relay pin from engine/justfile" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "pinned iroh-relay: $version"
+
+      - name: Cache the iroh-relay binary
+        uses: actions/cache@v4
+        with:
+          path: engine/.deps/relay
+          key: relay-${{ runner.os }}-${{ runner.arch }}-${{ steps.relay.outputs.version }}
+
+      - name: Install the browser and the store
+        working-directory: demo
+        run: just e2e-deps
+
+      - name: Build the site
+        # e2e.yml gets this for free: `just e2e` depends on `just site`.
+        # This job invokes the harness directly (the soak is not in
+        # SCENARIOS, so `just e2e` would not run it), so it must build
+        # the artifact itself — the SAME recipe, so the soak exercises
+        # the same bytes the E2E job and Pages deploy do.
+        working-directory: demo
+        run: just site
+
+      - name: Run the soak
+        working-directory: demo
+        env:
+          # Exported only when the dispatch input is non-empty: the
+          # scenario reads an ABSENT or empty variable as "draw a fresh
+          # seed off the clock" / "use the default step count", and it
+          # prints whatever it ended up with. An empty-string export
+          # would be indistinguishable from unset anyway — the scenario
+          # treats both the same — but keeping the shell conditional
+          # means the job log says plainly which knobs were turned.
+          SEED_INPUT: ${{ github.event.inputs.seed }}
+          STEPS_INPUT: ${{ github.event.inputs.steps }}
+          # e2e.yml's reason, unchanged: browser-process lifecycle into
+          # the job log, so a silent wedge leaves something to diagnose.
+          DEBUG: pw:browser
+        run: |
+          set -o pipefail
+          if [ -n "$SEED_INPUT" ]; then export PM_SOAK_SEED="$SEED_INPUT"; echo "seed: $PM_SOAK_SEED"; fi
+          if [ -n "$STEPS_INPUT" ]; then export PM_SOAK_STEPS="$STEPS_INPUT"; echo "steps: $PM_SOAK_STEPS"; fi
+          deno run -A e2e/run.ts --file scenarios/convergence-soak.ts 2>&1 | tee soak.log
+
+      - name: Upload the soak log
+        # ON FAILURE ONLY, and it is the whole point of the tee: the
+        # scenario prints its seed and its per-step action log, which
+        # together are the reproduction recipe for whatever broke.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-log-${{ github.run_id }}
+          path: demo/soak.log
+          if-no-files-found: warn
