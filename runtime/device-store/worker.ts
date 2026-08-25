@@ -109,7 +109,13 @@ import {
   unsealWithPrf,
 } from "./seal.ts";
 import { sealedDirectory } from "./sealed-fs.ts";
-import { type DeviceLock, deviceLockIsHeld, holdDeviceLock, startLease } from "./locks.ts";
+import {
+  type DeviceLock,
+  deviceLockIsHeld,
+  holdDeviceLock,
+  type LeaseHeartbeat,
+  startLease,
+} from "./locks.ts";
 import {
   type AttachSpec,
   type DeviceStatus,
@@ -172,21 +178,83 @@ const ns: DeviceNamespace = openNamespace(DEVICE_ID);
  * respawned) are claims about precisely that difference. It is in `meta`
  * rather than `sealed` because the sweep and the picker read it before
  * anything is unsealed, and it says nothing personal — it is a count.
+ *
+ * IT IS GATED ON THE INDEX ROW, and that gate is the whole of #112's
+ * class (`bootIfIndexed`). CONSTRUCTING A WORKER FOR A DEVICE THAT DOES
+ * NOT EXIST MUST LEAVE NO TRACE: this write runs at MODULE EVALUATION,
+ * before any client has said anything and before `attach` can refuse
+ * anything, so without the gate the mere existence of a
+ * `new SharedWorker(url, {name: "pm-device-<erased id>"})` recreated
+ * that device's database — `ns.update` opens it, and IndexedDB
+ * open-on-missing creates it. No timer and no race needed: the
+ * construction IS the resurrection.
+ *
+ * THE INDEX ROW IS THE EXISTENCE ORACLE, which is not a new rule here
+ * but the one anchor.ts's `anchorIsLive` already states in as many
+ * words ("THE INDEX ROW IS THE ANSWER, and the namespace deliberately is
+ * not"). Reading it creates nothing that matters: the index database is
+ * origin-global and outlives every device in it.
+ *
+ * ORDERING, VERIFIED RATHER THAN ASSUMED (the gate would miscount if it
+ * were wrong): every path that constructs this worker writes the index
+ * row FIRST. `connectDevice` awaits `resolveDevice` before
+ * `new SharedWorker` — the `id` arm requires an existing row and throws
+ * without one, and the `anchor`/`new` arms `await createDevice(...)`,
+ * which commits the row in one index transaction. So a legitimately
+ * fresh device always finds its row here and counts its first boot as
+ * 1; the only caller that finds none is one naming a device that was
+ * erased or swept, which is exactly the caller that must write nothing.
  */
-const bootSeq: Promise<number> = (async () => {
+const bootSeq: Promise<number> = bootIfIndexed();
+
+async function bootIfIndexed(): Promise<number> {
   try {
+    // The row FIRST, and the namespace only if it answers. A device with
+    // no row has no storage anyone is entitled to recreate.
+    if (!(await getDevice(DEVICE_ID))) return 0;
     return (await ns.update<number>("meta", "boot", (n) => (n ?? 0) + 1)) ?? 1;
   } catch {
     // A namespace that cannot be opened at all is a real problem, but it
     // is `attach`'s to report against a client that can hear it. Boot
     // counting must never be the thing that stops a worker booting.
+    // (Unchanged posture: the index read joins the same try for the same
+    // reason — a failed index read must not stop a boot either.)
     return 0;
   }
-})();
+}
 
 // --- the lock and the lease -------------------------------------------------
 
 let lock: DeviceLock | null = null;
+/**
+ * THE RUNNING LEASE HEARTBEAT, kept so that ERASURE can stop it — and
+ * for that one reason (#112).
+ *
+ * The lifetime this handle used to be dropped on is very nearly right:
+ * the lease is the sweep's "alive" answer beside the lock, both are
+ * meant to end when this global does, and a global's death takes the
+ * interval with it. That equivalence — lease ⇔ lock ⇔ global — holds
+ * for every ending EXCEPT ONE, and the comment that dropped the handle
+ * predated it: at `destroy` the DEVICE dies while the GLOBAL lives on,
+ * for as long as it takes Chromium to reap a zero-client worker.
+ *
+ * In that window the interval keeps firing `touchLease(ns)` every 5 s,
+ * and `ns.put("meta", …)` OPENS the device's IndexedDB database —
+ * which, IndexedDB being open-on-missing, RECREATES the database
+ * `destroyNamespace` has just deleted. The erased device is back in
+ * `indexedDB.databases()` with a lease and nothing else. (Only the
+ * IndexedDB half resurrects; `touchLease` never touches OPFS, which is
+ * exactly the shape #112 reports: db present, directory
+ * `NotFoundError`.) Whether a 5 s-phase tick lands inside that window
+ * is the whole of the flake, which is why the e2e scenario passes
+ * isolated and fails under suite load.
+ *
+ * NOT STOPPED ON RESEAL, deliberately: a sealed device is still HOSTED
+ * — this global holds its lock and answers for it — so a lease that
+ * stopped at reseal would make the sweep's liveness answer a lie and
+ * put a live device's namespace up for collection.
+ */
+let lease: LeaseHeartbeat | null = null;
 
 /**
  * Take the device lock and start the lease. Idempotent: a second client
@@ -201,12 +269,10 @@ let lock: DeviceLock | null = null;
 async function takeLock(): Promise<void> {
   if (lock) return;
   lock = await holdDeviceLock(DEVICE_ID);
-  // THE HEARTBEAT'S `stop()` HANDLE IS DELIBERATELY DROPPED. Nothing
-  // here ever stops the lease: it is meant to end when this global does,
-  // exactly as the lock does, and the two together are the sweep's
-  // "alive" answer. `lock` is kept only because the early return above
+  // The handle is KEPT now; see `lease` above for the one ending that
+  // needs it. `lock` is kept for its own reason: the early return above
   // is what makes a second client's attach idempotent.
-  startLease(ns);
+  lease = startLease(ns);
 }
 
 // --- the unseal state machine -----------------------------------------------
@@ -1247,6 +1313,15 @@ function onTokenRefreshed(token: string, refreshToken?: string): void {
     row.access = token;
     if (refreshToken) row.refresh = refreshToken;
     row.obtainedAt = Date.now();
+    // THE ERASE RE-CHECK, and it is #112's mechanism rather than a
+    // second bug: this write is an `ns.put`, and an `ns.put` after
+    // `destroyNamespace` RECREATES the database it opens. The guard at
+    // the top of this function is read at CALL time, so a refresh that
+    // was already in flight when the erasure started would otherwise
+    // land on the other side of the delete. Nothing is lost by
+    // skipping: the row is being deleted with the namespace, and the
+    // token it describes belongs to a device that no longer exists.
+    if (destroyed) return;
     await writeOauth(key, row);
   })().catch(() => {});
 }
@@ -2933,6 +3008,29 @@ function syncStatusOf(binding: StoreBinding | null): SyncStatus | null {
 
 async function status(): Promise<DeviceStatus> {
   const record = await getDevice(DEVICE_ID);
+  // THE SAME EXISTENCE GATE `attach` APPLIES, and it is here because an
+  // IndexedDB READ CREATES TOO: `sealState(ns)` on the next line opens
+  // the namespace, and `indexedDB.open` of a missing database creates
+  // it just as a write would. So `status` — the first thing any client
+  // calls, and reachable on a raw port before `attach` — is the second
+  // door into #112's class and needs the same lock on it.
+  //
+  // NARROWED TO THE FRESH-GLOBAL CASE, deliberately. `attached === null`
+  // means no client has ever attached HERE, so this global is one
+  // constructed for a device that does not exist, which is the case that
+  // must leave no trace. A global that HAS attached passed the attach
+  // guard, so its device existed when it started; if the row vanishes
+  // afterwards (a sweep, an explicit remove) this keeps answering
+  // exactly as it did before, because that host is genuinely still
+  // holding an engine, a lock and a lease, and refusing to describe
+  // itself would be a lie of a different kind.
+  if (!record && attached === null) {
+    throw new SealError(
+      "no-rung",
+      `device-store: no device ${DEVICE_ID} in the index (erased or swept); ` +
+        `there is nothing to report on, and nothing here will recreate it`,
+    );
+  }
   const rungs = await sealState(ns);
   const policy = record?.unsealPolicy ?? "every-session";
   // Read once, reported below: `null` while sealed is UNREADABLE, not
@@ -3012,6 +3110,29 @@ async function callHost(method: string, args: unknown[]): Promise<unknown> {
         throw new Error(
           `device-store: this worker hosts ${DEVICE_ID}, not ${spec.deviceId} ` +
             `(the SharedWorker name is the device id)`,
+        );
+      }
+      // AND THE DEVICE HAS TO EXIST — the index row is the oracle, the
+      // same one `bootSeq` above and anchor.ts's `anchorIsLive` consult.
+      //
+      // THIS IS A STORAGE GUARD BEFORE IT IS A COURTESY. `takeLock()`
+      // below starts the lease, whose first act is an `ns.put` — and an
+      // `ns.put` against a deleted namespace RECREATES it (#112). So a
+      // client attaching to an erased or swept device must be refused
+      // HERE, before the lock, or the attach itself resurrects the
+      // device it was told does not exist.
+      //
+      // No legitimate caller reaches this: `connectDevice` resolves the
+      // row before it constructs the worker (its `id` arm throws for a
+      // missing row, and its `anchor`/`new` arms create one), so this
+      // refusal answers a raw port or a stale reconnect. The wording
+      // matches `unseal`'s for the same condition, and `SealError
+      // "no-rung"` is the code clients already branch on.
+      if (!(await getDevice(DEVICE_ID))) {
+        throw new SealError(
+          "no-rung",
+          `device-store: no device ${DEVICE_ID} in the index (erased or swept); ` +
+            `nothing to attach to, and nothing here will recreate it`,
         );
       }
       // FIRST ATTACH WINS. A second tab's spec is not applied: the
@@ -3105,6 +3226,29 @@ async function callHost(method: string, args: unknown[]): Promise<unknown> {
       if (debounceTimer !== undefined) {
         clearTimeout(debounceTimer);
         debounceTimer = undefined;
+      }
+      //    AND THE LEASE HEARTBEAT, which is the SAME hazard and the
+      //    sharper one (#112). It fires every 5 s and writes
+      //    `meta.lease` — an `ns.put`, which OPENS the device's
+      //    IndexedDB database, which for IndexedDB means CREATING it if
+      //    it is not there. A tick landing after the delete below
+      //    therefore RESURRECTS the erased device's database, and the
+      //    global outlives the device by however long Chromium takes to
+      //    reap a zero-client worker, so the window is real and
+      //    load-dependent: the e2e `solo-erase` scenario passed
+      //    isolated and failed roughly two runs in six under the full
+      //    suite, with exactly the signature this predicts — database
+      //    present, OPFS directory gone, because the heartbeat writes
+      //    IndexedDB and nothing else.
+      //
+      //    THIS IS THE ONLY PLACE THE LEASE IS STOPPED. Everywhere else
+      //    the device outlives the ceremony (a reseal is still a hosted
+      //    device, and the sweep must go on being told the truth about
+      //    it); erasure is the one ending where the DEVICE dies before
+      //    the GLOBAL does. See `lease`.
+      if (lease) {
+        lease.stop();
+        lease = null;
       }
       //    AND THE SYNC TIMERS, for a related but weaker reason: a
       //    background flush does not write the state root, but it does

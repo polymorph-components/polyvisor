@@ -11,7 +11,9 @@
 //   - row 52/52b: a port to a dead host hears NOTHING (there is no
 //     peer-death event to hear — `"onclose" in port` is platform-given,
 //     not a gap this store could close); a pending RPC against it ends
-//     only at the CLIENT'S OWN timeout deadline.
+//     only at the CLIENT'S OWN timeout deadline (client.ts's default
+//     120s — filed as #114: an evicted host is invisible to its tabs
+//     until that hang expires).
 //   - row 53: a fresh connect respawns the host, and the CHECKPOINTED
 //     state is intact.
 // Those rows are unit-level: one page, one device, a raw second port.
@@ -82,11 +84,13 @@
 // SYNTHETIC LABELED VALUES THROUGHOUT: the client pair below is
 // obviously-fake app identity for an in-process fake, issued by nobody.
 
-import type { Browser, Page } from "npm:playwright@1.57.0";
+import type { Page } from "npm:playwright@1.57.0";
 import type { Ctx, Scenario } from "../run.ts";
 import { act, assert, assertEquals, SOLO_KEYS, waitForBoot } from "../util.ts";
 import { addTodo, appFrame, createAccount, pairPages, solo, until, WAITS } from "../solo-util.ts";
 import { startFakeDrive } from "../../host/fake-drive.ts";
+import { killSharedWorker, listSharedWorkers } from "../cdp.ts";
+
 
 const ROOT = "pm-worker-eviction";
 const CLIENT_ID = "SYNTHETIC-EVICTION-CLIENT";
@@ -115,101 +119,27 @@ const CONVERGE_AFTER_RECOVERY = 100_000;
 const KILL_POLL_MS = 50;
 const KILL_POLL_DEADLINE_MS = 5_000;
 
-interface WorkerTarget {
-  targetId: string;
-  title: string;
-  url: string;
-}
-
-/** Every `shared_worker` CDP target titled `pm-device-<deviceId>` —
- * `Target.getTargets` is browser-wide, so this is not scoped to one
- * page. COPIED FROM devstore's `sharedWorkersFor`
- * (runtime/tests/devstore/run.ts:105-117) and demo/e2e/cdp.ts's
- * `listSharedWorkers` (:43-55), with ONE difference from cdp.ts's
- * exported helper: cdp.ts's `killSharedWorker` matches by URL
- * substring, which cannot tell two devices' hosts apart because every
- * solo/demo page runs the identical `./worker.js` script (cdp.ts's own
- * banner names this as the reason its sequence needed re-deriving for
- * a multi-device scenario) — client.ts instead names the SharedWorker
- * itself `pm-device-<deviceId>`, which is what the CDP target's TITLE
- * carries. SUGGESTED GENERALIZATION for cdp.ts: a title-matching
- * sibling to `killSharedWorker` would let any multi-device scenario do
- * this without a scenario-local copy — flagged in this track's report
- * rather than added here, since cdp.ts is owned by another track this
- * wave. Detaches its own browser-level CDP session in a `finally`,
- * cdp.ts's own reason: a caller that polls this repeatedly must not
- * accumulate one session per call. */
-async function sharedWorkersByTitle(browser: Browser, title: string): Promise<WorkerTarget[]> {
-  const cdp = await browser.newBrowserCDPSession();
-  try {
-    const { targetInfos } = await cdp.send("Target.getTargets") as {
-      targetInfos: (WorkerTarget & { type: string })[];
-    };
-    return targetInfos
-      .filter((t) => t.type === "shared_worker" && t.title === title)
-      .map((t) => ({ targetId: t.targetId, title: t.title, url: t.url }));
-  } finally {
-    await cdp.detach().catch(() => { /* already gone */ });
-  }
-}
-
-/** Kill the SharedWorker titled `pm-device-<deviceId>` via CDP
- * `Target.closeTarget` — no attach/evaluate fallback needed, per
- * demo/e2e/cdp.ts's own spike finding (its banner, and devstore row 51
- * re-confirming it for exactly this kind of target) that closeTarget
- * alone is sufficient. Throws, NAMING the live titles, if none matches:
- * a scenario claiming "the host died with no goodbye" must fail loudly
- * rather than silently killing the wrong thing (or nothing) if the
- * naming ever drifts. Also throws, naming every MATCHING target, if
- * more than one comes back: the claim this helper is built on is that
- * the title picks out ONE device's host (client.ts's "the name is the
- * device"), and killing `targets[0]` of an unasserted multi-match would
- * silently kill an arbitrary one of them rather than surface that the
- * naming assumption had broken. */
-async function killWorkerByDeviceId(browser: Browser, deviceId: string): Promise<WorkerTarget> {
-  const title = `pm-device-${deviceId}`;
-  const targets = await sharedWorkersByTitle(browser, title);
-  if (targets.length === 0) {
-    const cdp = await browser.newBrowserCDPSession();
-    let live = "";
-    try {
-      const { targetInfos } = await cdp.send("Target.getTargets") as {
-        targetInfos: { type: string; title: string }[];
-      };
-      live = JSON.stringify(
-        targetInfos.filter((t) => t.type === "shared_worker").map((t) => t.title),
-      );
-    } finally {
-      await cdp.detach().catch(() => { /* already gone */ });
-    }
-    throw new Error(`no shared worker titled ${JSON.stringify(title)} — live: ${live}`);
-  }
-  if (targets.length > 1) {
-    throw new Error(
-      `expected exactly one shared worker titled ${JSON.stringify(title)}, found ` +
-        `${targets.length}: ${JSON.stringify(targets.map((t) => t.targetId))} — the title is ` +
-        `supposed to pick out ONE device's host (client.ts), so more than one match means the ` +
-        `naming assumption this helper relies on has broken`,
-    );
-  }
-  const target = targets[0];
-  const cdp = await browser.newBrowserCDPSession();
-  try {
-    await cdp.send("Target.closeTarget", { targetId: target.targetId });
-  } finally {
-    await cdp.detach().catch(() => { /* already gone */ });
-  }
-  return target;
+/** Kill the SharedWorker titled `pm-device-<deviceId>` — via
+ * demo/e2e/cdp.ts's `killSharedWorker`, which matches by TITLE for
+ * exactly this reason: solo/demo pages all run the identical
+ * `./worker.js` script, so a URL substring cannot tell two devices'
+ * hosts apart, but client.ts names the SharedWorker itself
+ * `pm-device-<deviceId>`, which is what the CDP target's TITLE carries
+ * (cdp.ts's banner, and devstore row 51's measurement that first needed
+ * this distinction). cdp.ts's own exactly-one-match discipline covers
+ * the loud-failure requirement this scenario needs. */
+async function killWorkerByDeviceId(browser: Ctx["browser"], deviceId: string) {
+  return await killSharedWorker(browser, { title: `pm-device-${deviceId}` });
 }
 
 /** Bounded poll for the killed target to actually stop appearing in
- * `Target.getTargets` — verifying the kill rather than trusting that
- * `Target.closeTarget` returning is the same thing as the target being
- * gone (cdp.ts's spike measured them as effectively simultaneous, but
- * this scenario checks its OWN kill rather than importing that
- * measurement as a given). */
+ * `Target.getTargets` (via cdp.ts's `listSharedWorkers`) — verifying
+ * the kill rather than trusting that `Target.closeTarget` returning is
+ * the same thing as the target being gone (cdp.ts's spike measured them
+ * as effectively simultaneous, but this scenario checks its OWN kill
+ * rather than importing that measurement as a given). */
 async function untilWorkerGone(
-  browser: Browser,
+  browser: Ctx["browser"],
   deviceId: string,
 ): Promise<{ gone: boolean; waitedMs: number; polls: number }> {
   const title = `pm-device-${deviceId}`;
@@ -218,12 +148,15 @@ async function untilWorkerGone(
   let polls = 0;
   for (;;) {
     polls++;
-    const targets = await sharedWorkersByTitle(browser, title);
-    if (targets.length === 0) return { gone: true, waitedMs: Date.now() - started, polls };
+    const targets = await listSharedWorkers(browser);
+    if (!targets.some((t) => t.title === title)) {
+      return { gone: true, waitedMs: Date.now() - started, polls };
+    }
     if (Date.now() >= deadline) return { gone: false, waitedMs: Date.now() - started, polls };
     await new Promise((r) => setTimeout(r, KILL_POLL_MS));
   }
 }
+
 
 /** Keep a device (until-reseal), so it is on the picker for a page that
  * did not exist when the device was made. COPIED from
