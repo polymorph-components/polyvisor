@@ -292,17 +292,17 @@ const scenario: Scenario = {
       // AND THE CUT IS REAL: neither edit reaches the other side for a
       // window in which the live wire demonstrably delivers.
       //
-      // THIS ACT TAKES ~60s IN PRACTICE, not OUTAGE_WATCH_MS, and the
-      // extra 30s is a fact about the PAGE rather than slack in this
-      // loop. Measured, on this same harness: `stopRelay()` returns in
-      // 2ms and each local `addTodo` in ~85ms, but the FIRST `tick`
-      // after the relay dies takes ~30s — the drain runs a driver call
-      // that goes out over the dead transport and unwinds on one of
-      // solo.ts's own 30s `until` deadlines (:2617, :2641). Filed as
-      // #115. It happens ONCE; every later tick is milliseconds again, which is why the
-      // liveness act after this one costs nothing. Worth knowing before
-      // anyone reads the act's wall clock as a bug in the watch window.
-      
+      // THIS ACT USED TO TAKE ~60s IN PRACTICE, not OUTAGE_WATCH_MS: the
+      // FIRST `tick` after the relay died queued behind `adderWire`'s
+      // background retry, which held one `enqueue` slot open for its
+      // whole 30s `subscribe`-wait against the now-dead transport (the
+      // subscribe/dial `until` loops solo.ts runs at ceremony time).
+      // FIXED BY #115: those waits now enqueue each driver call
+      // individually rather than the whole 30s wait as one job, so a
+      // dead-transport retry no longer blocks anything else queued
+      // behind it. This act now costs ~OUTAGE_WATCH_MS, not
+      // OUTAGE_WATCH_MS-plus-a-stalled-tick — measured at ~30.5s on this
+      // harness, against ~60.5s before the fix.
       const deadline = Date.now() + OUTAGE_WATCH_MS;
       while (Date.now() < deadline) {
         for (const p of both) await solo(p, "tick").catch(() => {});
@@ -327,6 +327,23 @@ const scenario: Scenario = {
     });
 
     await act("both pages stay ALIVE and usable through the outage", async () => {
+      // THE #115 REGRESSION GATE: a tick against a relay that has been
+      // dead for a whole OUTAGE_WATCH_MS window still completes quickly.
+      // 10s is generous — every measured tick here is milliseconds — but
+      // bounded rather than exact, because a busy CI box's occasional
+      // slow tick is not this bug; a tick that eats a 30s driver-call
+      // deadline is. Both pages, because the fix applies to either
+      // role's retry (`adderWire`'s subscribe, `joinerWire`/resumeWire's
+      // dial).
+      for (const [who, page] of [["A", pageA], ["B", pageB]] as [string, Page][]) {
+        const t0 = Date.now();
+        await solo(page, "tick").catch(() => {});
+        const ms = Date.now() - t0;
+        assert(
+          ms < 10_000,
+          `${who}'s tick with the relay dead took ${ms}ms (#115 regression: it should be milliseconds, not a stalled 30s driver-call deadline)`,
+        );
+      }
       // THE TRANSPORT-REFUSAL SCENARIO'S SPIRIT, applied to the relay: a
       // dead wire may cost a user their sync, never their app. Asserted
       // on the PIXELS both sides of the frame boundary — the todomvc
