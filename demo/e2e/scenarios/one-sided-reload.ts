@@ -10,13 +10,14 @@
 // problem: it still holds a connection HANDLE from before the reload,
 // and has no way to learn the thing on the other end of it is gone.
 // `conn-status` reports the handshake's outcome once and is never
-// invalidated afterwards (engine/guest/src/lib.rs:4262 writes the
-// outcome into `conn_results` once per connection, and :4268-4275's
+// invalidated afterwards (engine/guest/src/lib.rs:4407 writes the
+// outcome into `conn_results` once per connection, and :4413-4420's
 // `conn_status` reads that same entry back forever), so the reader sees
 // a "healthy" connection to a page that no longer exists and never
 // re-dials. The honest fix belongs in the engine — a `conn-status` that
 // goes false when the connection drops — and until it lands, this file
 // cannot tell the difference between a healthy peer and a departed one.
+// Filed as #113.
 //
 // WHY THIS IS A GATE RATHER THAN MORE PROSE: `solo-resume-sync` proves
 // the BOTH-sides-reload case recovers (the ordinary one — a user closes
@@ -44,8 +45,8 @@
 //     resume-wire — the only code path that would make B re-dial —
 //     never runs at all. B's ORIGINAL ceremony-time connection object
 //     is still sitting there, and `conn-status` on it still answers
-//     with the handshake's old, one-time-written "true"
-//     (engine/guest/src/lib.rs:4262/:4268-4275). B has no symptom to
+  //     with the handshake's old, one-time-written "true"
+  //     (engine/guest/src/lib.rs:4407/:4413-4420). B has no symptom to
 //     act on and no trigger to re-dial: nothing in B's code ever asks
 //     "is this still good?" once the handshake result is latched.
 // So the crossing asserted is B → A: a todo authored on B after A's
@@ -181,8 +182,8 @@ const scenario: Scenario = {
         // resume-wire never runs — B never reloaded, so B's original
         // connection object is still there, and `conn-status` on it
         // still answers with the handshake's old, one-time "true"
-        // (engine/guest/src/lib.rs:4262 writes it, :4268-4275 reads it
-        // back).
+        // (engine/guest/src/lib.rs:4407 writes it, :4413-4420 reads it
+        // back). Filed as #113.
         await addTodo(pageB, "call the bank");
 
         // DIAGNOSIS RIDES WITH THE FAILURE: on a red run this wait times

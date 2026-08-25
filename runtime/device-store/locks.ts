@@ -19,8 +19,12 @@
 //     state of a device that is mid-reload. The lease's staleness
 //     window is precisely the grace period for that gap.
 //   * lock held, lease stale   → a host that is alive but has not
-//     written a lease in a while (a suspended tab, a long GC pause).
-//     Alive is alive.
+//     written a lease in a while (the worker wedged mid-GC, or a
+//     browser that froze the worker under memory pressure). Alive is
+//     alive. Whether a SUSPENDED TAB suspends the SharedWorker whose
+//     lease this is remains UNMEASURED: the devstore matrix's CDP page
+//     freeze does not take on a harness page in this build (row 55), so
+//     the question could not even be posed there, let alone answered.
 //
 // bfcache would complicate lock lifetimes; the page already holds a
 // live relay WebSocket and is bfcache-ineligible regardless, so the
