@@ -32,7 +32,7 @@
 // type-only and still erase.
 
 import { fromCloneable } from "@polyengine/protocol";
-import type { Driver, Tasks } from "../engine.ts";
+import type { Driver, RecoveryKit, Tasks } from "../engine.ts";
 import { adoptAnchor, setAnchor } from "./anchor.ts";
 import {
   createDevice,
@@ -52,7 +52,10 @@ import {
   type OauthStartResult,
   type OauthStartSpec,
   type PromoteOptions,
+  type RecoveryKitResult,
+  type RecoveryKitSpec,
   type ResealOptions,
+  type RestoreSpec,
   type Req,
   type Res,
   type StoreBinding,
@@ -69,7 +72,10 @@ export type {
   OauthStartResult,
   OauthStartSpec,
   PromoteOptions,
+  RecoveryKitResult,
+  RecoveryKitSpec,
   ResealOptions,
+  RestoreSpec,
   StoreBinding,
   /** The worker's sync schedule, as `DeviceStatus.sync` carries it
    * (SYNC.md §3). Re-exported beside `StoreBinding` for the same reason
@@ -224,6 +230,73 @@ export interface DeviceConnection {
    * (`eraseKeystore`), not to one device's unbind.
    */
   unbindStore(): Promise<DeviceStatus>;
+  /**
+   * OPEN A FRESH NAMESPACE FOR A RESTORE, WITHOUT INITING AN ENGINE.
+   *
+   * Only needed on the path where a ceremony has to run BETWEEN the DEK
+   * and the restore — the Google Drive consent, which seals tokens under
+   * the DEK and therefore refuses on a sealed device. The S3 path needs
+   * nothing here: its credential ceremony is page-side
+   * (`putSigningKey`) and keyed by destination origin, so `restore()`
+   * alone is the whole thing.
+   *
+   * Refused with `code: "bad-destination"` on a namespace that already
+   * holds a device: a restore is a NEW device, never an overwrite.
+   */
+  restorePrepare(opts?: UnsealOptions): Promise<DeviceStatus>;
+  /**
+   * RESTORE AN ACCOUNT FROM A RECOVERY KIT ONTO THIS FRESH DEVICE
+   * (RECOVERY.md, "Restore").
+   *
+   * The worker validates the binding with the ordinary fail-at-bind
+   * rules, brings the engine up from the KIT instead of from `init`,
+   * runs the account pull fan-out (the us-doc first, then the pointer
+   * map × the device directory), takes a first checkpoint, and only then
+   * consumes the kit.
+   *
+   * WHAT IT DOES NOT DO: promote. The restored device is T0 — keeping
+   * the machine you restored on is a separate decision the user makes
+   * afterwards (PERSISTENCE.md's try-then-keep).
+   *
+   * A CONSUME FAILURE DOES NOT FAIL THIS CALL. The kit is retried on the
+   * flush cadence's backoff loop and reported through
+   * `status().sync` — `consumePending`, plus the ordinary
+   * `flushFailures`/`lastError` a stalled sync shows.
+   *
+   * THE SECRET CROSSES ONCE. See `RecoveryKitInput` in rpc.ts for
+   * exactly what that promise is worth.
+   *
+   * Refusals: `"bad-destination"` when the namespace already holds a
+   * device or the destination is unusable, `"no-credential"` for a
+   * missing escrow or consent, and the guest's own — "no recovery kit at
+   * this name" for a wrong (or already-used) phrase, "unlock failed" for
+   * a wrong file passphrase — as branded `ComponentException`s.
+   */
+  restore(spec: RestoreSpec): Promise<DeviceStatus>;
+  /**
+   * MINT A RECOVERY KIT (RECOVERY.md, "The kit ceremony").
+   *
+   * Requires an unsealed, store-bound, account-holding device; each of
+   * those refusals is the GUEST's and arrives as a branded engine error.
+   * A bucket kit additionally refuses by name off S3 — the phrase-derived
+   * NAME is not a location on a provider that resolves ids through a
+   * folder walk, and the file kit covers those providers instead.
+   *
+   * The result is handed back ONCE: a phrase to display in visor pixels,
+   * or bytes to download. Neither is persisted anywhere by the device
+   * store, and there is no call that returns either of them again.
+   *
+   * When it resolves, the kit is VALID: the ceremony ends with the
+   * account document and every named partition flushed.
+   */
+  createRecoveryKit(spec: RecoveryKitSpec): Promise<RecoveryKitResult>;
+  /** The account's live kits, for the devices sheet. A projection of the
+   * us-doc's `recovery` map — nothing here unlocks anything. */
+  recoveryKits(): Promise<RecoveryKit[]>;
+  /** Revoke a kit — the same mechanic as a lost phone, because it IS the
+   * same thing. Resolves with the human-readable guarantee note the UI
+   * renders, exactly as `storeRevoke` does. */
+  revokeRecoveryKit(agentId: Uint8Array): Promise<string>;
   /**
    * BEGIN THE GOOGLE CONSENT — and note which half of it this is.
    *
@@ -555,6 +628,14 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
     bindStore: (binding: StoreBinding) =>
       send("host", "bindStore", [binding]) as Promise<DeviceStatus>,
     unbindStore: () => send("host", "unbindStore", []) as Promise<DeviceStatus>,
+    restorePrepare: (opts?: UnsealOptions) =>
+      send("host", "restorePrepare", [opts ?? {}]) as Promise<DeviceStatus>,
+    restore: (spec: RestoreSpec) => send("host", "restore", [spec]) as Promise<DeviceStatus>,
+    createRecoveryKit: (spec: RecoveryKitSpec) =>
+      send("host", "createRecoveryKit", [spec]) as Promise<RecoveryKitResult>,
+    recoveryKits: () => send("host", "recoveryKits", []) as Promise<RecoveryKit[]>,
+    revokeRecoveryKit: (agentId: Uint8Array) =>
+      send("host", "revokeRecoveryKit", [agentId]) as Promise<string>,
     oauthStart: (spec: OauthStartSpec) =>
       send("host", "oauthStart", [spec]) as Promise<OauthStartResult>,
     oauthComplete: (code: string, state: string) =>

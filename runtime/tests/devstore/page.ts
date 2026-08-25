@@ -41,7 +41,11 @@ import {
   makePublicFetch,
   makeSharedFetch,
 } from "../../store-egress.ts";
-import type { OauthStartSpec, StoreBinding } from "../../device-store/rpc.ts";
+import type {
+  OauthStartSpec,
+  RecoveryKitSpec,
+  StoreBinding,
+} from "../../device-store/rpc.ts";
 // The brand predicate, IN THE PAGE'S REALM. Row 18's central claim since
 // the 0.4.0 bump is that `fromCloneable` mints a value this copy
 // recognizes — so the predicate has to be the page's own, not the
@@ -1515,7 +1519,435 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
     const docHex = [...docId].map((b) => b.toString(16).padStart(2, "0")).join("");
     return { attempt: await refuses(() => conn.driver.bucketFlush(docId)), docHex };
   },
+
+  // --- account recovery (rows 54+; runtime/RECOVERY.md) ---------------------
+  //
+  // EVERY SECRET IN THIS SECTION IS SYNTHETIC AND LABELLED, and the
+  // GENERATED ones (the recovery phrase) are never chosen here at all:
+  // the guest mints the phrase, hands it back once, and this page
+  // carries it in a local for the length of one probe call. Nothing here
+  // stores a phrase anywhere the scan row could find it — which is
+  // exactly what row 54 is checking, so the harness has to hold itself
+  // to the same rule as the code under test.
+
+  /** Mint a kit through the HOST method, which is the supported path:
+   * it drives the post-ceremony flush fan-out so the kit is valid the
+   * moment this resolves (RECOVERY.md's ceremony step 6). */
+  "rc-kit-create": async (arg: { id: string; spec: RecoveryKitSpec }) => {
+    const conn = conns.get(arg.id)!;
+    const attempt = await attemptValue(() => conn.createRecoveryKit(arg.spec));
+    if (!attempt.ok) return { attempt: { ok: false, error: attempt.error } };
+    const out = attempt.value;
+    // THE PHRASE IS NOT RETURNED TO THE DRIVER. It goes into this
+    // page's `phrases` map under a handle, and the row drives the
+    // restore by handle — so the driver never holds the secret, the
+    // Playwright protocol never carries it, and the run's own log
+    // cannot leak it. What the row gets is its SHAPE: the word count
+    // and the length, which is what "10 words, ~103 bits" is asserted
+    // through.
+    const handle = `kit-${phrases.size + 1}`;
+    if (out.kind === "bucket") {
+      phrases.set(handle, out.phrase);
+      const words = out.phrase.split(/\s+/).filter((w) => w.length > 0);
+      return {
+        attempt: { ok: true },
+        kind: "bucket",
+        handle,
+        words: words.length,
+        chars: out.phrase.length,
+        allLowercaseWords: words.every((w) => /^[a-z]+$/.test(w)),
+        distinctWords: new Set(words).size,
+      };
+    }
+    bundles.set(handle, out.bundle);
+    return { attempt: { ok: true }, kind: "file", handle, bytes: out.bundle.length };
+  },
+
+  /** The account's kit list, as the devices sheet will read it. Agent
+   * ids come back as a short PREFIX only: they are public keys, but a
+   * row's evidence line is not the place for a full one. */
+  "rc-kits": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const attempt = await attemptValue(() => conn.recoveryKits());
+    if (!attempt.ok) return { attempt };
+    return {
+      attempt: { ok: true },
+      kits: attempt.value.map((k) => ({
+        agent: hexOf(k.agentId).slice(0, 12),
+        kind: k.kind,
+        created: String(k.created),
+      })),
+    };
+  },
+
+  "rc-revoke": async (arg: { id: string; agentPrefix: string }) => {
+    const conn = conns.get(arg.id)!;
+    const kits = await conn.recoveryKits();
+    const kit = kits.find((k) => hexOf(k.agentId).startsWith(arg.agentPrefix));
+    if (!kit) return { attempt: { ok: false, error: { message: "no such kit" } } };
+    return { attempt: await attemptValue(() => conn.revokeRecoveryKit(kit.agentId)) };
+  },
+
+  /**
+   * RESTORE A FRESH DEVICE FROM A KIT.
+   *
+   * `prepare` runs the DEK-only first stage — the gdrive path needs it,
+   * because the consent seals tokens under the DEK — and `oauth` runs
+   * the headless consent in between, exactly as the driver's own
+   * `startAndFetchAuth` does for an ordinary bind.
+   *
+   * The kit is named by HANDLE, never by value: see `rc-kit-create`.
+   */
+  "rc-restore": async (arg: {
+    /** An ALREADY-PREPARED device (the two-stage gdrive path), or absent
+     * to create the fresh namespace here. */
+    id?: string;
+    petname: string;
+    binding: StoreBinding;
+    handle: string;
+    kind: "bucket" | "file";
+    deviceName: string;
+    passphrase?: string;
+    wrongPhrase?: string;
+    prepare?: boolean;
+    /** The consent to run between `restorePrepare` and `restore`. The
+     * page cannot 302 for itself, so the driver hands back the code and
+     * state it fetched from the fake — the same split
+     * `startAndFetchAuth` uses. */
+    oauth?: { code: string; state: string };
+  }) => {
+    const deviceId = arg.id ??
+      (await createDevice({ petname: arg.petname, posture: "platform" })).id;
+    const conn = await connect({ id: deviceId });
+    if (arg.prepare) {
+      await conn.restorePrepare({ passphrase: PASS, untilReseal: true });
+    }
+    if (arg.oauth) {
+      await conn.oauthComplete(arg.oauth.code, arg.oauth.state);
+    }
+    const kit = arg.kind === "bucket"
+      ? {
+        kind: "bucket" as const,
+        phrase: arg.wrongPhrase ?? phrases.get(arg.handle) ?? "",
+      }
+      : {
+        kind: "file" as const,
+        bundle: bundles.get(arg.handle) ?? new Uint8Array(0),
+        passphrase: arg.passphrase ?? "",
+      };
+    const attempt = await refuses(() =>
+      conn.restore({
+        binding: arg.binding,
+        kit,
+        deviceName: arg.deviceName,
+        unseal: { passphrase: PASS, untilReseal: true },
+      })
+    );
+    return { id: deviceId, attempt, status: await conn.status() };
+  },
+
+  /** `restorePrepare` on its own, so a row can start the two-stage
+   * ceremony and then run a consent through the ordinary gd- ops. */
+  "rc-prepare": async (arg: { petname: string }) => {
+    const made = await createDevice({ petname: arg.petname, posture: "platform" });
+    const conn = await connect({ id: made.id });
+    const attempt = await refuses(() =>
+      conn.restorePrepare({ passphrase: PASS, untilReseal: true })
+    );
+    return { id: made.id, attempt, status: await conn.status() };
+  },
+
+  /**
+   * THE USER'S OWN Sync-now, spelled the way the storage sheet spells
+   * it: `driver.bucketFlush` per doc, straight through, with the
+   * ACCOUNT DOCUMENT first under its empty-id sentinel (engine.wit's
+   * `bucket-flush`; RECOVERY.md's unparking). Not the scheduler — an
+   * explicit act deserves an explicit answer, and a row that needs
+   * determinism should press the button rather than race a debounce.
+   */
+  "rc-flush-now": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const us = await refuses(() => conn.driver.bucketFlush(new Uint8Array(0)));
+    const parts = await conn.driver.usPartitions();
+    const each: { name: string; refused: boolean }[] = [];
+    for (const p of parts) {
+      const r = await refuses(() => conn.driver.bucketFlush(p.id));
+      each.push({ name: p.name, refused: r.refused });
+    }
+    return { us, each };
+  },
+
+  /** Adopt a partition named in the account's pointer map and pull it
+   * from a named sibling — the embedder half a PAIRED device runs
+   * (solo.ts's `adoptPartition` beat). The restore path does this
+   * inside the worker; this op exists for the rows that need a
+   * SIBLING's device to catch up without one. */
+  "rc-pull-now": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const devices = await conn.driver.usDevicesList();
+    const self = (await conn.status()).agentId ?? "";
+    const sibs = devices.filter((d) => !d.revoked && hexOf(d.agentId) !== self);
+    const us: boolean[] = [];
+    for (const s of sibs) {
+      const r = await refuses(() => conn.driver.bucketPull(new Uint8Array(0), s.agentId, undefined));
+      us.push(!r.refused);
+    }
+    return { siblings: sibs.length, usPulled: us.filter(Boolean).length };
+  },
+
+  /** The account's device directory, as a sheet would render it. */
+  "rc-devices": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const list = await conn.driver.usDevicesList();
+    return {
+      names: list.map((d) => d.name).sort(),
+      revoked: list.filter((d) => d.revoked).length,
+      n: list.length,
+    };
+  },
+
+  /** The account profile, both directions — row 60's mutation and its
+   * observation. `usProfileSet` is NOT in rpc.ts's READONLY_METHODS, so
+   * the set is a MUTATION and arms the same flush debounce a todo does;
+   * that is the fact the row is built on. */
+  "rc-profile-set": async (arg: { id: string; displayName: string; hue?: number }) => {
+    const conn = conns.get(arg.id)!;
+    const attempt = await refuses(() =>
+      conn.driver.usProfileSet({ displayName: arg.displayName, hue: arg.hue ?? 0 })
+    );
+    return { attempt };
+  },
+
+  "rc-profile-get": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const p = await conn.driver.usProfileGet();
+    return { displayName: p.displayName, hue: p.hue };
+  },
+
+  /** Drain the account's remote-change events — the ORDINARY surface a
+   * visor announces from (#22), with local-echo suppression engine-side
+   * so a device never hears its own writes. */
+  "rc-events": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const events = await conn.driver.usEvents();
+    return { kinds: events.map((e) => e.kind) };
+  },
+
+  /**
+   * THE SECRET-ABSENCE SCAN (row 54), in the shape the identity rows'
+   * at-rest checks use: go and look, everywhere this origin can store a
+   * byte, for the phrase — and for a distinctive slice of it, so a
+   * different encoding or a partial write cannot slip past an
+   * equality test.
+   *
+   *   * every IndexedDB database on the origin, every store, every
+   *     record, serialized (bytes included, as hex AND as latin1 text);
+   *   * localStorage and sessionStorage, keys and values;
+   *   * every file under every OPFS directory, recursively, as bytes.
+   *
+   * The needle is taken from the `phrases` map by handle and never
+   * returned to the driver; what comes back is counts and a boolean.
+   */
+  "rc-scan": async (arg: { handle: string }) => {
+    const phrase = phrases.get(arg.handle) ?? "";
+    if (phrase === "") throw new Error("rc-scan: no such phrase handle");
+    // Three needles: the phrase as typed, its middle words (a partial
+    // write or a re-joined variant), and the phrase with single spaces
+    // collapsed out entirely (a normalization that stored it another
+    // way would still contain this).
+    const words = phrase.split(/\s+/);
+    const needles = [
+      phrase,
+      words.slice(2, 5).join(" "),
+      words.join(""),
+    ].filter((n) => n.length >= 8);
+    const enc8 = new TextEncoder();
+    const needleHex = needles.map((n) => hexOf(enc8.encode(n)));
+
+    let idbRecords = 0;
+    let opfsFiles = 0;
+    let storageEntries = 0;
+    const hits: string[] = [];
+
+    const look = (where: string, hay: string, hayHex: string) => {
+      for (let i = 0; i < needles.length; i++) {
+        if (hay.includes(needles[i]) || hayHex.includes(needleHex[i])) hits.push(`${where}#${i}`);
+      }
+    };
+
+    // --- IndexedDB, every database this origin holds.
+    const dbs = await indexedDB.databases();
+    for (const info of dbs) {
+      if (!info.name) continue;
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open(info.name!);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+      for (const store of Array.from(db.objectStoreNames)) {
+        const all = await new Promise<unknown[]>((resolve, reject) => {
+          const tx = db.transaction(store, "readonly");
+          const req = tx.objectStore(store).getAll();
+          req.onsuccess = () => resolve(req.result as unknown[]);
+          req.onerror = () => reject(req.error);
+        });
+        for (const rec of all) {
+          idbRecords++;
+          const { text, hex } = flatten(rec);
+          look(`idb:${info.name}/${store}`, text, hex);
+        }
+      }
+      db.close();
+    }
+
+    // --- localStorage / sessionStorage.
+    for (const [label, area] of [["local", localStorage], ["session", sessionStorage]] as const) {
+      for (let i = 0; i < area.length; i++) {
+        const k = area.key(i)!;
+        const v = area.getItem(k) ?? "";
+        storageEntries++;
+        look(`${label}Storage:${k}`, `${k}\n${v}`, hexOf(enc8.encode(`${k}\n${v}`)));
+      }
+    }
+
+    // --- OPFS, every file under every directory, recursively.
+    const walk = async (dir: FileSystemDirectoryHandle, path: string): Promise<void> => {
+      // deno-lint-ignore no-explicit-any
+      for await (const [name, handle] of (dir as any).entries()) {
+        const at = `${path}/${name}`;
+        if (handle.kind === "directory") {
+          await walk(handle as FileSystemDirectoryHandle, at);
+        } else {
+          opfsFiles++;
+          const bytes = new Uint8Array(
+            await (await (handle as FileSystemFileHandle).getFile()).arrayBuffer(),
+          );
+          look(`opfs:${at}`, latin1(bytes), hexOf(bytes));
+        }
+      }
+    };
+    await walk(await navigator.storage.getDirectory(), "");
+
+    return {
+      needles: needles.length,
+      idbDatabases: dbs.length,
+      idbRecords,
+      storageEntries,
+      opfsFiles,
+      hits,
+      clean: hits.length === 0,
+    };
+  },
+
+  /**
+   * THE ACCOUNT CEREMONY IN THE SHAPE A REAL EMBEDDER RUNS IT
+   * (demo/host/solo.ts's `newAccount`, and the native recovery acts'
+   * setup — engine/host/src/recover_acts.rs).
+   *
+   * ORDER IS LOAD-BEARING: user-create → create the tasks partition →
+   * DELEGATE IT TO THE USER GROUP → seal → publish the pointer.
+   *
+   * THE DELEGATION IS WHY THIS OP EXISTS beside `hc-us-create` +
+   * `hc-us-partition-put`, which publish the partition the WORKER minted
+   * at fresh init — one delegated to the founding DEVICE, because it was
+   * created before any account existed. That is fine for the scheduler
+   * rows (a device syncing with itself), and it is exactly wrong for
+   * recovery: BeeKEM adds are not retroactive, so a doc's first epoch
+   * must already cover its intended readership, and a device-delegated
+   * partition is unreadable by a device enrolled later — including a
+   * restored kit. The recovery acts say the same thing in the same words
+   * ("A partition delegated to the founding DEVICE instead would be
+   * unreadable by the restored kit"). Measured here first as five dark
+   * chunks on a restored device that had pulled every byte correctly.
+   */
+  "rc-account-create": async (arg: { id: string; displayName: string; pointer?: string }) => {
+    const conn = conns.get(arg.id)!;
+    const groupId = await conn.driver.userCreate({ displayName: arg.displayName, hue: 0 });
+    const id = await conn.driver.createPartition();
+    await conn.driver.khAddMember(id, groupId, "edit");
+    await conn.driver.sealPartition(id);
+    await conn.driver.usPartitionPut(arg.pointer ?? "tasks", id);
+    const parts = await conn.driver.usPartitions();
+    return {
+      groupId: groupId.length,
+      partition: hexOf(id).slice(0, 16),
+      names: parts.map((p) => p.name),
+      active: hexOf(await conn.tasks.partition()).slice(0, 16),
+    };
+  },
 };
+
+/**
+ * THE MINTED SECRETS, HELD ON THE PAGE AND NEVER HANDED TO THE DRIVER.
+ *
+ * A recovery phrase is displayed once in visor pixels and persisted
+ * nowhere; the harness honours the same rule by keeping it in a page
+ * local under a handle. The row asks for a RESTORE BY HANDLE, so the
+ * secret never crosses the Playwright protocol and never reaches the
+ * run's log — and the scan row's needle is read from here rather than
+ * being sent back in.
+ *
+ * These are plain module-scope maps, so they die with the document. No
+ * row reloads between minting a kit and using it.
+ */
+const phrases = new Map<string, string>();
+const bundles = new Map<string, Uint8Array>();
+
+/** Bytes as latin1 text, so a byte-for-byte substring search over a
+ * binary file finds an ASCII needle inside it. */
+function latin1(bytes: Uint8Array): string {
+  let out = "";
+  for (const b of bytes) out += String.fromCharCode(b);
+  return out;
+}
+
+/**
+ * One stored record, flattened into (text, hex) so a search can look at
+ * it both ways: an IndexedDB value is an arbitrary structured-clone
+ * graph, and a phrase could be sitting in it as a string, as UTF-8 bytes
+ * inside a typed array, or inside a nested record.
+ */
+function flatten(value: unknown): { text: string; hex: string } {
+  const texts: string[] = [];
+  const hexes: string[] = [];
+  const seen = new Set<unknown>();
+  const walk = (v: unknown) => {
+    if (v === null || v === undefined) return;
+    if (typeof v === "string") {
+      texts.push(v);
+      hexes.push(hexOf(new TextEncoder().encode(v)));
+      return;
+    }
+    if (typeof v === "number" || typeof v === "boolean" || typeof v === "bigint") {
+      texts.push(String(v));
+      return;
+    }
+    if (v instanceof Uint8Array) {
+      texts.push(latin1(v));
+      hexes.push(hexOf(v));
+      return;
+    }
+    if (v instanceof ArrayBuffer) {
+      const b = new Uint8Array(v);
+      texts.push(latin1(b));
+      hexes.push(hexOf(b));
+      return;
+    }
+    if (typeof v === "object") {
+      if (seen.has(v)) return;
+      seen.add(v);
+      // A CryptoKey has nothing readable in it and that is the point;
+      // enumerating it yields nothing either way.
+      for (const k of Object.keys(v as Record<string, unknown>)) {
+        texts.push(k);
+        walk((v as Record<string, unknown>)[k]);
+      }
+      if (Array.isArray(v)) for (const item of v) walk(item);
+    }
+  };
+  walk(value);
+  return { text: texts.join("\u0000"), hex: hexes.join("") };
+}
 
 // --- the host client, per page ----------------------------------------------
 
