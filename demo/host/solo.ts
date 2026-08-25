@@ -3981,12 +3981,19 @@ async function startApp(
    * `us-*` surface, and the engine subscribes the us doc to every known
    * peer itself on every pump (usdoc.rs's `ensure_subscriptions`:
    * "Engine-driven because `us-*` hides doc identity by design"). By
-   * resume time the peer is known, so the engine does it. */
+   * resume time the peer is known, so the engine does it.
+   *
+   * IT RETURNS THE CONNECTION ID, and #113 is why. A conn id is the only
+   * handle anything on this page has for asking "is that wire still
+   * alive?" — `conn-status` and its `gone:` marker, which the wire-keeper
+   * below reads every tick. Dropping the id on the floor, which is what
+   * this function used to do, is precisely how a dead wire stayed
+   * indistinguishable from a healthy one on this side of the boundary. */
   const dialPeer = async (
     peer: Uint8Array,
     peerEndpoint: Uint8Array,
     usPartition?: Uint8Array,
-  ) => {
+  ): Promise<number> => {
     // #115: same shape as `subscribe` above and for the same reason —
     // each driver call is its own `enqueue` slot, and the 30s
     // `until` wait for the dial to land runs OUTSIDE any single slot.
@@ -3997,6 +4004,7 @@ async function startApp(
     const conn2 = await enqueue(() => driver.irohStart(true, peerEndpoint, RELAY, peer));
     await until("the other device answers", () => enqueue(() => driver.connStatus(conn2)), 30_000);
     if (usPartition) await subscribe(peer, usPartition, "your account");
+    return conn2;
   };
 
   /** The account's todo list, as the account's own pointer map names it
@@ -4015,7 +4023,184 @@ async function startApp(
     return pointer.id;
   };
 
-  // --- role: the JOINER (this page is the new device) ----------------------
+  // --- the wire-keeper's state, shared by every role (#113) ----------------
+  //
+  // WHY IT LIVES OUT HERE rather than inside the loop that reads it. The
+  // three wiring roles below are not three machines: they are three ways
+  // of ARRIVING at the same steady state — this device holding one
+  // connection per peer, in the direction the ceremony fixed. The
+  // ceremonies know things the account's directory may not carry yet (an
+  // enrollment's peer ids, seconds old); the keeper knows how to notice a
+  // wire die and put it back. So the ceremonies do the first wire-up and
+  // then HAND THE KEEPER THEIR STATE, and from that moment there is
+  // exactly one thing on this page responsible for the wire.
+  //
+  // Before #113 this state was private to `resumeWire`, because
+  // `resumeWire` was the only caller that could act on it: nothing could
+  // tell a live connection from a dead one, so a ceremony-paired page had
+  // nothing useful to hand over and no safe reason to re-dial. The engine
+  // half of #113 changed that fact, and this block is the shape the page
+  // takes once it is true.
+
+  /** THE ONE OUTBOUND CONNECTION this page holds, or null when it holds
+   * none. `peerHex` is who is on the other end; `conn` is the handle the
+   * health sweep asks about.
+   *
+   * SINGULAR ON PURPOSE, and it is the direction discipline (#78) rather
+   * than a simplification: a device dials its ENROLLER and nobody else.
+   * Everyone who dialled THIS device arrives on the acceptor. */
+  let dialledPeer: { peerHex: string; conn: number } | null = null;
+
+  /** Which peers this device has already subscribed the todo list to,
+   * keyed by agent id, hex. Emptied per-peer when that peer's wire dies:
+   * a subscription is a property OF a connection, so it does not survive
+   * one, and re-subscribing on a fresh conn is not a double-subscription
+   * of anything. */
+  const tasksWired = new Set<string>();
+
+  /** The agent ids (hex, lower) of this device's CHILDREN as the last
+   * directory read saw them. Held out here for one reason: the health
+   * sweep runs at the TOP of a tick, before that tick has read the
+   * directory, and when the acceptor dies it needs to know whose
+   * subscriptions died with it. Last tick's answer is the right one — the
+   * roster changes at enrollment time, not while a wire is dropping. */
+  let childrenHex: string[] = [];
+
+  /** Whether the tasks partition is this device's to read. False only on
+   * the resume path that boots without a todo-list pointer, until the
+   * pointer arrives and the adoption runs. */
+  let tasksHeld = true;
+
+  /** WHAT ONE CONNECTION HAS TO SAY FOR ITSELF — the whole point of
+   * #113's engine half, read at the one gate that matters.
+   *
+   * CONTRACT (engine/guest/wit/engine.wit, `conn-status`): `Ok(some)` is
+   * "the handshake succeeded and this is the last known live peer";
+   * `Ok(none)` is a handshake still settling; an `Err` whose text carries
+   * the `gone:` marker is "the wire came up and later DIED", latched; any
+   * other `Err` is a handshake that failed.
+   *
+   * MATCHED WITH `includes`, NOT `startsWith`. The marker is the guest's,
+   * and by the time it has crossed the component boundary the host has
+   * prefixed it ("component error: gone: …"). Anchoring at the start
+   * would be a check that passes in Rust and fails here.
+   *
+   * THE FOUR CASES ARE KEPT APART because the keeper does something
+   * different with three of them: `gone` re-dials, `failed` may be this
+   * device's own endpoint having died (`Closed`, which is what drives the
+   * rebind), and `settling` and `alive` are both "leave it alone". A
+   * two-way boolean would have to fold `failed` into one of the others,
+   * and folding it into "dead" is the version that re-dials on evidence
+   * that is not evidence — the double-dial the direction discipline
+   * exists to prevent. */
+  type ConnHealth =
+    | { kind: "alive"; peer: string }
+    | { kind: "settling" }
+    | { kind: "gone"; message: string }
+    | { kind: "failed"; error: unknown; message: string };
+
+  const probeConn = async (c: number): Promise<ConnHealth> => {
+    try {
+      // ITS OWN `enqueue` SLOT, and nothing else in it (#115): this is a
+      // millisecond-sized read — the engine answers out of a map, without
+      // touching the transport — so the sweep can never be the thing that
+      // stalls the chain, even with every wire on this page dead.
+      const peer = await enqueue(() => driver.connStatus(c));
+      return peer ? { kind: "alive", peer } : { kind: "settling" };
+    } catch (e) {
+      const message = err(e);
+      return message.includes("gone:")
+        ? { kind: "gone", message }
+        : { kind: "failed", error: e, message };
+    }
+  };
+
+  /** THE ONE PLACE A DIAL IS ATTEMPTED, and the reason it exists is that
+   * after #113 there are TWO callers: the ceremony that wires this pair
+   * for the first time, and the keeper that keeps the wire up afterwards
+   * — and for a while they overlap. A ceremony whose wiring failed
+   * mid-flight is still retrying (`WIRE_ATTEMPTS`) while the keeper is
+   * already ticking, and two dials to one peer is exactly the second
+   * connection carrying the same subscriptions that #78 forbids.
+   *
+   * SINGLE-FLIGHT, TWO GATES, both needed: `dialledPeer` rules out a
+   * peer already reached, and `dialInFlight` rules out a peer being
+   * reached RIGHT NOW — a dial has a 30s deadline inside it and this page
+   * is perfectly capable of ticking six times while one is in the air.
+   * Returns whether this call is the one that dialled, so a caller with
+   * follow-up work knows whether the wire is its to finish.
+   *
+   * NOT `enqueue`d as a whole (#115): `dialPeer` enqueues each driver
+   * call individually and waits outside the slots, and this guard is a
+   * pair of booleans rather than a queue for the same reason — a dial in
+   * progress must not be able to hold the chain. */
+  let dialInFlight = false;
+  const dialOnce = async (
+    peerHex: string,
+    peer: Uint8Array,
+    peerEndpoint: Uint8Array,
+    usPartition?: Uint8Array,
+  ): Promise<boolean> => {
+    if (dialledPeer !== null || dialInFlight) return false;
+    dialInFlight = true;
+    try {
+      const c = await dialPeer(peer, peerEndpoint, usPartition);
+      dialledPeer = { peerHex, conn: c };
+      return true;
+    } finally {
+      dialInFlight = false;
+    }
+  };
+
+  /** Subscribe the account's todo list to one peer, at most once per
+   * live wire. THE SET IS MARKED BEFORE THE AWAIT, which is the same
+   * discipline the ceremony guards use and for the same reason: a second
+   * caller arriving while the first is still in `sync-start` would
+   * otherwise start a second subduction for one pair. It is unmarked
+   * again if the subscription did not take, or this device would be
+   * silently unsubscribed for ever. */
+  const claimTasks = async (peerHex: string, peer: Uint8Array, tree: Uint8Array) => {
+    if (tasksWired.has(peerHex)) return;
+    tasksWired.add(peerHex);
+    try {
+      await subscribe(peer, tree, "your todo list");
+    } catch (e) {
+      tasksWired.delete(peerHex);
+      throw e;
+    }
+  };
+
+  /** Forget the outbound wire: the handle is dead, so the subscriptions
+   * riding on it are too. Idempotent — the rebind path and the health
+   * sweep both call it, and they can both be right at once. */
+  const forgetDial = () => {
+    if (!dialledPeer) return;
+    tasksWired.delete(dialledPeer.peerHex);
+    dialledPeer = null;
+  };
+
+  /** Forget the acceptor, and every subscription that was riding on it.
+   *
+   * THE SUBSCRIPTIONS ARE THE SUBTLE HALF, and leaving them behind is a
+   * bug that looks like nothing: a subduction is a property of the
+   * CONNECTION it was started on, so when the acceptor is replaced — by a
+   * repost after a death, or by a rebind taking the whole endpoint with
+   * it — every child's subscription died with the old handle while this
+   * page's `tasksWired` still claimed them all as done. The wire then
+   * comes back up, both sides report a healthy connection, and nothing
+   * crosses: #78's silence, reached by a fourth road. (Measured: a relay
+   * bounce healed the transport in ~10s and then sat there for two
+   * minutes with the acceptor "alive" and not one byte moving, purely
+   * because this set had not been emptied.)
+   *
+   * `childrenHex` rather than the whole set on purpose: the enroller's
+   * subscription rides the DIAL, and it is `forgetDial`'s to clear. */
+  const forgetAcceptor = () => {
+    acceptorPosted = false;
+    acceptorConn = null;
+    for (const child of childrenHex) tasksWired.delete(child);
+  };
+
 
   let joinWired = false;
   let joinAttempts = 0;
@@ -4048,16 +4233,19 @@ async function startApp(
         throw new Error("the enrollment carried no peer ids — cannot reach the other device");
       }
       const peer = enrollment.peerAgentId;
+      const peerHex = hex(peer).toLowerCase();
       // READER DIALS — and the account doc goes with the dial, because
-      // the two sides have only just met (see `dialPeer`).
-      await dialPeer(peer, enrollment.peerEndpointId, enrollment.partitionId);
+      // the two sides have only just met (see `dialPeer`). Through
+      // `dialOnce`, so that a retry of this ceremony running alongside
+      // the keeper cannot make two connections out of one pair.
+      await dialOnce(peerHex, peer, enrollment.peerEndpointId, enrollment.partitionId);
       const tasksId = await awaitTasksPointer("your account's todo list", 60_000);
       // #115: NOT wrapped in one outer `enqueue` any more — `subscribe`
       // now enqueues its own driver calls (see its definition), and
       // nesting an `enqueue` inside a job it starts is the self-deadlock
       // this file's own note on `enqueue` warns about.
       await enqueue(() => driver.adoptPartition(tasksId));
-      await subscribe(peer, tasksId, "your todo list");
+      await claimTasks(peerHex, peer, tasksId);
       usSynced = true;
       console.log("[solo] subduction wired: this device ⇄ the device that added it");
       // THE ADOPTION BEAT, at the only honest moment for it. The join
@@ -4092,6 +4280,22 @@ async function startApp(
       if (joinAttempts < WIRE_ATTEMPTS) joinWired = false;
       else announce(`could not sync this device with your account: ${err(e)}`, true);
       console.warn(`[solo] post-enrollment wiring failed (attempt ${joinAttempts}): ${err(e)}`);
+    } finally {
+      // #113: AND NOW THE KEEPER TAKES OVER — in a `finally`, which is
+      // the whole point. A ceremony that FAILED is precisely the page
+      // that most needs a patient loop: the first thing that ever went
+      // wrong here was a relay dying mid-`subscribe`, which threw out of
+      // the try above and left this device with no wire, no retry
+      // running, and no symptom. Arming the keeper only on the success
+      // path would have rebuilt that hole one level up.
+      //
+      // SAFE ALONGSIDE THE CEREMONY'S OWN RETRIES, because the two now
+      // share their state: `dialOnce` and `claimTasks` are the only ways
+      // either reaches the wire, and both are single-flight. The ceremony
+      // keeps its bounded three attempts (it has the enrollment's ids,
+      // which the directory may not carry yet); the keeper runs
+      // underneath it for as long as the page lives.
+      void wireKeeper(false);
     }
   };
 
@@ -4240,9 +4444,17 @@ async function startApp(
     console.warn(`[solo] endpoint was closed; rebound the same address ${hex(id).slice(0, 8)}…`);
     // The old acceptor went down with the endpoint, so the flag has to
     // as well — otherwise this device would look like it was listening
-    // while nothing was.
-    acceptorPosted = false;
-    acceptorConn = null;
+    // while nothing was. `forgetAcceptor` additionally drops the
+    // subscriptions that were riding on it (see its note): they died with
+    // the handle, and a page that still believes in them never rebuilds
+    // them.
+    forgetAcceptor();
+    // AND SO DID THE OUTBOUND WIRE (#113). Every connection this page
+    // held belonged to the endpoint that just went away; a `dialledPeer`
+    // surviving a rebind would be the keeper guarding a handle minted
+    // against a transport that no longer exists, which is the same
+    // stale-handle shape #113 is about, reached from the other side.
+    forgetDial();
     await postAcceptor();
   };
 
@@ -4298,37 +4510,72 @@ async function startApp(
       // (usdoc.rs's `ensure_subscriptions`, which runs on every pump).
       // What the engine cannot do for us is the TASKS partition — it
       // has no name for it — so that one is subscribed here.
-      if (tasksPart) await subscribe(peer, tasksPart.id, "your todo list");
+      if (tasksPart) await claimTasks(joiner.agentId.toLowerCase(), peer, tasksPart.id);
       usSynced = true;
       console.log("[solo] subduction wired: this device ⇄ the device it added");
     } catch (e) {
       if (adderAttempts < WIRE_ATTEMPTS) adderWired = false;
       else announce(`could not sync the new device with your account: ${err(e)}`, true);
       console.warn(`[solo] post-grant wiring failed (attempt ${adderAttempts}): ${err(e)}`);
+    } finally {
+      // #113, in a `finally` for the reason joinerWire's note gives: the
+      // ceremony that failed is the page that most needs the keeper. On
+      // this side the state it inherits is `acceptorConn` and whatever
+      // `claimTasks` managed to record; what it adds is a sweep that
+      // notices the acceptor die and reposts it.
+      void wireKeeper(false);
     }
   };
 
-  // --- role: a RESUMED BOOT (the account is already here) ------------------
+  // --- THE WIRE-KEEPER: this page's standing machinery for the wire ---------
   //
-  // THE GAP THIS CLOSES, stated plainly: the two roles above are
-  // CEREMONY roles. They run once, on the edge of an enrollment, and
-  // everything they know — who the peer is, where to dial it — came out
-  // of a ceremony that is over. So a page that reloads afterwards wires
-  // nothing, and once BOTH devices have reloaded there is no connection
-  // between them at all: edits stop crossing, and neither page has any
-  // symptom to show for it. Silence again, which is the failure mode
-  // this whole file keeps writing down.
+  // WHAT IT IS. One patient loop, entered ONCE per page and then running
+  // for the life of it, that keeps this device's connections to its
+  // account's other devices up — re-dialling, re-accepting and
+  // re-subscribing whenever the wire it is responsible for dies.
   //
-  // WHAT REPLACES THE CEREMONY'S KNOWLEDGE is the account's own device
-  // directory. Each entry now carries an ENDPOINT (where that device
-  // can be dialled) and an ENROLLED-BY (which device let it in), so the
-  // enrollment tree survives in the one place both devices already
-  // agree about — and a resumed boot can read its own role out of it
-  // instead of remembering one.
+  // WHERE IT IS ENTERED FROM, all three of them:
+  //   * a RESUMED BOOT — this device already held the account when the
+  //     page loaded, so there is no ceremony and the directory is the
+  //     only thing that knows who to reach;
+  //   * the JOINER's ceremony, once it has wired;
+  //   * the ADDER's ceremony, once it has wired.
+  // The ceremonies still do the FIRST wire-up, and it has to be that way:
+  // an enrollment carries peer ids that are seconds old, while the
+  // account's directory carries them only once the us doc has synced.
+  // What changes at #113 is that they hand over rather than finish.
   //
-  // THE ROLE IS THE SAME ROLE, and it must be: reversing the direction
-  // is the healthy-looking silence #78 is about. So this side re-enacts
-  // exactly what it did at ceremony time —
+  // THE GAP THIS CLOSES, first half — CEREMONY PAGES NEVER LOOPED. The
+  // two roles above run at most once each: `joinWired` / `adderWired`
+  // latch on the first success, and `WIRE_ATTEMPTS = 3` is a retry for
+  // wiring that never CAME UP, not a re-dial for a wire that came up and
+  // later died. So a pair that paired in this session and then lost its
+  // relay had no loop left running anywhere, and stayed dead until
+  // somebody reloaded a page. (Measured before the fix: no convergence in
+  // 240s with both pages alive and ticking.) Now both ceremonies end
+  // here, and the loop is a property of being PAIRED rather than of
+  // having RESUMED.
+  //
+  // THE GAP THIS CLOSES, second half — AND THERE WAS NOTHING TO LOOP ON.
+  // A retry needs a question it can ask, and `conn-status` used to have
+  // no answer: the engine wrote the HANDSHAKE's outcome into
+  // `conn_results` once and read it back forever, so a page holding a
+  // connection to a device that had been closed for an hour was told the
+  // same thing as one holding a live wire. Re-dialling on a timer against
+  // that would have been the double-dial #78's direction discipline
+  // exists to prevent — a second connection carrying the same
+  // subscriptions, silently. #113's engine half is what made this loop
+  // writable: every connection now carries a monitor that overwrites its
+  // entry with `Err("gone: …")` when the wire dies, and `connGone` above
+  // is the only gate that opens the re-dial path. THE DISCIPLINE IS
+  // UNCHANGED, it is merely now enforceable: a re-dial happens ONLY when
+  // the old connection has said it is dead.
+  //
+  // THE ROLE IS THE SAME ROLE, and it must be: reversing the direction is
+  // the healthy-looking silence #78 is about. So each tick re-enacts what
+  // this device did at ceremony time, reading its role out of the
+  // account's directory (each entry carries an ENDPOINT — where that
+  // device can be dialled — and an ENROLLED-BY — which device let it in):
   //
   //   * MY ENROLLER, if I have one, is who I DIALLED then; I dial it
   //     again. (READER DIALS.)
@@ -4348,54 +4595,92 @@ async function startApp(
   // device may be shut, on a train, or opened tomorrow — so the retry
   // runs for as long as the page lives, and says so ONCE. A line per
   // attempt would be a page shouting a fact that has not changed.
-
-  // AND WHAT THIS DOES NOT RECOVER, written down because the shape of
-  // the gap is not obvious and the workaround for it would be worse.
   //
-  // Only ONE side reloading is NOT recovered, when the side that
-  // reloaded is the one that ACCEPTS. Its own resume posts an acceptor
-  // and waits, correctly; but its peer — the reader — still holds a
-  // connection handle from before, and has no way to learn that the
-  // thing on the other end of it is gone. `conn-status` reports the
-  // outcome of the HANDSHAKE and is never invalidated afterwards
-  // (engine/guest/src/lib.rs:4407 writes it once — `s.conn_results.insert(id,
-  // outcome)`, with the error paths at :4343 and :4400 writing the same
-  // slot early — and :4413-4420's `conn_status` reads that slot back
-  // forever), and `sync-status` is one-shot per round rather than a
-  // subscription's health. So the reader has no evidence of staleness at
-  // all, and the only "fix" available to this file would be to re-dial
-  // on a timer — a second connection and a second set of subductions for
-  // the same pair, which is precisely the double-dialling the direction
-  // discipline exists to prevent.
+  // THE ENDPOINT IS THE OTHER CASUALTY, and this is the part that is easy
+  // to get wrong. MEASURED on this engine (throwaway probe, relay
+  // SIGKILL then restart on the same port): the relay's death does not
+  // merely kill the CONNECTIONS, it latches this device's own ENDPOINT
+  // `Closed` — a fresh `iroh-start` afterwards fails with
+  // `connect: Error::Closed` and keeps failing, no matter how healthy the
+  // relay is by then. A re-dial alone therefore heals nothing; the
+  // endpoint has to be rebound first, and after a rebind the dial lands
+  // in ~0.25s.
   //
-  // The both-sides case, which is the ordinary one (a user closes their
-  // laptop, then their phone), IS recovered: both readers come back with
-  // no handle to be misled by, and dial.
+  // THE REBIND IS DRIVEN BY EVIDENCE, NEVER BY SUSPICION. It would be
+  // easy to read "a connection went gone" as "rebind" — and wrong, badly:
+  // a rebind tears down the endpoint, which takes EVERY other connection
+  // on this page with it, including ones that are perfectly alive (the
+  // peer-vanish case, where the relay never went anywhere). So the sweep
+  // below only ever FORGETS a dead wire; the rebind stays where it
+  // already was, on the `Closed` error that the re-establish attempt
+  // itself raises (`isEndpointClosed` → `rebindEndpoint`, at most once
+  // per tick). The tick that notices the death is the tick that tries to
+  // repair it and learns the endpoint is gone too, which costs one extra
+  // cadence and buys the guarantee that a live wire is never collateral.
   //
-  // The honest fix belongs in the engine — a `conn-status` that goes
-  // false when the connection drops — and until it exists this page
-  // cannot tell the difference between a healthy peer and a departed
-  // one. Filed as #113.
+  // TWO DEATHS, TWO CLOCKS, and the difference is worth carrying because
+  // it is the difference between "this feels instant" and "this takes
+  // most of a minute", with identical code on this side of the boundary:
+  //
+  //   * A RELAY DIES: the relay leg is a websocket over TCP, so the
+  //     socket dies under this device and the endpoint learns
+  //     SYNCHRONOUSLY. `gone:` in under a second, measured
+  //     (demo/host/conn-gone-check.ts). It also latches this device's
+  //     endpoint `Closed` — see the rebind note above.
+  //   * A PEER VANISHES (its page reloads) while the relay stays up:
+  //     nothing under THIS device dies, and a page that has been
+  //     navigated away from sends no close frame, so the connection ends
+  //     only when the QUIC IDLE TIMEOUT fires. Measured end to end: 35s
+  //     from the peer's disappearance to this page having re-dialled and
+  //     the data crossing, three runs, of which ~30s is that timeout
+  //     (the e2e `one-sided-reload` scenario, which was `expected: "red"`
+  //     until this loop existed and is now green).
+  //
+  // Both numbers belong to the pinned endpoint rather than to this page,
+  // which is why nothing here asserts either of them: the keeper waits
+  // for the marker however long it takes, and the scenarios that DO
+  // assert a bound say where the bound came from.
+  //
+  // AND THE LAST GAP, RECOVERED IN THE ENGINE, recorded because this
+  // page spent a round unable to close it from up here: a relay OUTAGE
+  // between two pages that both stay open. Everything in this file's
+  // vocabulary worked — both sides mark the wire gone, rebind, repost,
+  // re-dial, and report a live connection again within ~10s of the
+  // relay returning — and for one round the partition STILL did not
+  // converge, because subduction did not resume across the endpoint
+  // rebind: the engine's peer registry kept the dead transport and
+  // walked it first, forever (the four-link chain is written out in
+  // scenarios/relay-partition.ts's banner, wave 3). That was below this
+  // page's vocabulary and was fixed in the engine (the gone monitor now
+  // closes a dead connection's inbound queues, so subduction's own
+  // teardown runs); demo/host/rebind-sync-check.ts pinned it red→green,
+  // and `relay-partition`/`relay-partition-asym` are green end to end —
+  // heal measured at ~5s from the relay's return.
 
   /** Slow on purpose: the thing being waited for is another human
    * opening a browser. */
-  const RESUME_TICK_MS = 5_000;
+  const KEEPER_TICK_MS = 5_000;
   /** Ten minutes, and it is a wait for a PERSON, not for a wire. */
   const RESUME_POINTER_MS = 600_000;
 
-  let resumeWired = false;
+  let keeperRunning = false;
 
-  /** Wire a device that already holds the account.
+  /** Arm the wire-keeper. Idempotent, and that is what makes it safe to
+   * call from all three entry points: whichever one gets here first owns
+   * the loop, and the others become no-ops.
    *
-   * `needsTasks` is the un-dead-end: an account whose todo-list pointer
-   * has not reached this device yet. That used to park the page on "this
-   * account has no todo list yet" — a sentence that describes a
-   * PERMANENT state and was being said about a temporary one. The
-   * pointer is us-doc content, so it arrives exactly when the wire below
-   * comes up; the page waits for it instead of concluding from it. */
-  const resumeWire = async (needsTasks: boolean) => {
-    if (resumeWired) return;
-    resumeWired = true;
+   * `needsTasks` is the un-dead-end, and it belongs to the resumed-boot
+   * caller alone: an account whose todo-list pointer has not reached this
+   * device yet. That used to park the page on "this account has no todo
+   * list yet" — a sentence that describes a PERMANENT state and was being
+   * said about a temporary one. The pointer is us-doc content, so it
+   * arrives exactly when the wire below comes up; the page waits for it
+   * instead of concluding from it. A ceremony caller passes false: it has
+   * just carried the pointer across itself. */
+  const wireKeeper = async (needsTasks: boolean) => {
+    if (keeperRunning) return;
+    keeperRunning = true;
+    if (needsTasks) tasksHeld = false;
 
     const st = await conn.status();
     // Hex both ways, lower-cased at the boundary: the worker's `meta`
@@ -4405,7 +4690,8 @@ async function startApp(
     // deciding it has no role in its own account.
     const me = (st.agentId ?? "").toLowerCase();
     if (!me) {
-      console.warn("[solo] resume wiring: this device has no recorded agent id");
+      console.warn("[solo] wire-keeper: this device has no recorded agent id");
+      keeperRunning = false;
       return;
     }
 
@@ -4416,43 +4702,24 @@ async function startApp(
       status("waiting for your other device…");
     };
 
-    /** Dialled at most once — a second dial to the same peer is a second
-     * connection carrying the same subscriptions. */
-    let dialled = false;
-    /** Which peers this device has already subscribed the todo list to.
-     * Keyed by agent id, hex. */
-    const tasksWired = new Set<string>();
-    /** Whether the tasks partition is this device's to read. False only
-     * on the `needsTasks` path, until the pointer arrives and the
-     * adoption below runs. */
-    let tasksHeld = !needsTasks;
-
-    /** Subscribe the account's todo list to one peer.
+    /** Subscribe the account's todo list to one peer, if it is this
+     * device's to subscribe and this peer's wire does not already carry
+     * it.
      *
      * ONLY THE TASKS PARTITION, because only it needs asking: the engine
      * subscribes the us doc to every known peer itself on every pump
      * (usdoc.rs's `ensure_subscriptions`), and it has no name for this
-     * one. Same division of labour as adderWire's. */
+     * one. Same division of labour as adderWire's — and the same
+     * `claimTasks` guard, which is what makes it safe for this loop and a
+     * still-retrying ceremony to be interested in the same peer. */
     const wireTasks = async (peerHex: string) => {
       if (!tasksHeld || tasksWired.has(peerHex)) return;
       const list = await enqueue(() => driver.usPartitions());
       const part = list.find((p) => p.name === TASKS_POINTER);
       if (!part) return;
-      tasksWired.add(peerHex);
-      try {
-        // #115: not wrapped in an outer `enqueue` — `subscribe` enqueues
-        // its own driver calls (see its definition), so wrapping it here
-        // too would nest one job inside another and self-deadlock the
-        // chain (see the `enqueue` footgun note above).
-        await subscribe(unhex(peerHex), part.id, "your todo list");
-        usSynced = true;
-        console.log(`[solo] subduction re-wired: this device ⇄ ${peerHex.slice(0, 8)}…`);
-      } catch (e) {
-        // Back out of the set: a subscription that did not take must be
-        // retried, or this device is silently unsubscribed for ever.
-        tasksWired.delete(peerHex);
-        throw e;
-      }
+      await claimTasks(peerHex, unhex(peerHex), part.id);
+      usSynced = true;
+      console.log(`[solo] subduction re-wired: this device ⇄ ${peerHex.slice(0, 8)}…`);
     };
 
     // THE POINTER ARM, when this device has no todo list yet. It runs
@@ -4485,7 +4752,7 @@ async function startApp(
       })();
     }
 
-    /** One attempt at everything, run again every `RESUME_TICK_MS`. Each
+    /** One attempt at everything, run again every `KEEPER_TICK_MS`. Each
      * step guards itself, so a tick that achieves half the wiring keeps
      * the half it got. */
     const tick = async () => {
@@ -4495,17 +4762,59 @@ async function startApp(
       // one to fail against.
       let rebound = false;
       const onError = async (e: unknown, what: string) => {
-        console.warn(`[solo] resume ${what}: ${err(e)}`);
+        console.warn(`[solo] wire-keeper ${what}: ${err(e)}`);
         if (rebound || !isEndpointClosed(e)) return;
         rebound = true;
         try {
           await rebindEndpoint();
         } catch (e2) {
-          console.warn(`[solo] resume: rebinding the endpoint failed: ${err(e2)}`);
+          console.warn(`[solo] wire-keeper: rebinding the endpoint failed: ${err(e2)}`);
         }
       };
+      // --- THE HEALTH SWEEP (#113), before anything is rebuilt ---------
+      //
+      // One cheap read per live handle, each its own millisecond-sized
+      // `enqueue` slot, and together they are the ONLY thing standing
+      // between this loop and the double-dial: everything below rebuilds
+      // what the sweep has just declared dead, and rebuilds nothing else.
+      // A wire that has not said `gone:` is left strictly alone, however
+      // long it has been quiet — silence is not evidence, and #78's
+      // silent double-dial is what happens when a page decides otherwise.
+      //
+      // A `failed` reading is passed to `onError` rather than acted on,
+      // because the one failure that matters here is this device's OWN
+      // endpoint having died (`Closed`), and that is a fact about the
+      // transport rather than about the peer: it is `rebindEndpoint`'s to
+      // answer, not the re-dial path's.
+      if (dialledPeer) {
+        const h = await probeConn(dialledPeer.conn);
+        if (h.kind === "gone") {
+          console.warn(
+            `[solo] the wire to ${dialledPeer.peerHex.slice(0, 8)}… is gone; re-dialling`,
+          );
+          // Forgetting the SUBSCRIPTION with the connection is not
+          // bookkeeping tidiness: a subduction is a property of the conn
+          // it was started on, so it died with it, and re-subscribing on
+          // the fresh conn below is a first subscription rather than a
+          // second.
+          forgetDial();
+        } else if (h.kind === "failed") await onError(h.error, "dial status");
+      }
+      if (acceptorConn !== null) {
+        const h = await probeConn(acceptorConn);
+        if (h.kind === "gone") {
+          console.warn("[solo] the acceptor's wire is gone; reposting");
+          // The children's dials will come back to the fresh acceptor —
+          // each child's own keeper is doing exactly what this one is —
+          // and this side re-subscribes them when they land.
+          forgetAcceptor();
+        } else if (h.kind === "failed") await onError(h.error, "acceptor status");
+      }
 
-      // WRITER ACCEPTS, first and always — see the section note.
+      // WRITER ACCEPTS, first and always — see the section note. When the
+      // sweep above just cleared the flag, this is where the repost
+      // happens, and where a `Closed` endpoint (the relay-death case)
+      // surfaces as the error that drives the rebind.
       try {
         await postAcceptor();
       } catch (e) {
@@ -4520,7 +4829,12 @@ async function startApp(
       // READER DIALS: my enroller is the device I dialled at ceremony
       // time, and an empty `enrolled-by` means I am the founding device
       // and never dialled anyone.
-      if (!dialled && mine && mine.enrolledBy !== "") {
+      //
+      // `dialledPeer === null` is the gate, and after #113 it means one
+      // of exactly three things: this page has never dialled, its dial
+      // failed, or the sweep above saw the old one die. It never means
+      // "it has been a while".
+      if (dialledPeer === null && mine && mine.enrolledBy !== "") {
         const enroller = devices.find(
           (d) => d.agentId.toLowerCase() === mine.enrolledBy.toLowerCase(),
         );
@@ -4531,14 +4845,17 @@ async function startApp(
         if (enroller && !enroller.revoked && enroller.endpoint !== "") {
           sayWaiting();
           try {
-            await dialPeer(unhex(enroller.agentId), unhex(enroller.endpoint));
-            dialled = true;
+            await dialOnce(
+              enroller.agentId.toLowerCase(),
+              unhex(enroller.agentId),
+              unhex(enroller.endpoint),
+            );
           } catch (e) {
             await onError(e, "dial");
           }
         }
       }
-      if (dialled && mine) {
+      if (dialledPeer && mine) {
         try {
           await wireTasks(mine.enrolledBy.toLowerCase());
         } catch (e) {
@@ -4556,11 +4873,15 @@ async function startApp(
       const children = devices.filter(
         (d) => !d.revoked && d.enrolledBy !== "" && d.enrolledBy.toLowerCase() === me,
       );
+      // Remembered for the NEXT tick's sweep, which needs to know whose
+      // subscriptions to forget when the acceptor dies — by then the
+      // directory read has not happened yet.
+      childrenHex = children.map((d) => d.agentId.toLowerCase());
       if (children.length > 0 && acceptorConn !== null) {
         sayWaiting();
         let connected = false;
         try {
-          connected = Boolean(await driver.connStatus(acceptorConn));
+          connected = Boolean(await enqueue(() => driver.connStatus(acceptorConn as number)));
         } catch (e) {
           await onError(e, "acceptor status");
         }
@@ -4579,9 +4900,12 @@ async function startApp(
     // NOT `until`, and not a bounded count. `poll` skips a tick whose
     // predecessor is still running, which is exactly right here: a dial
     // has its own 30s deadline inside it, and overlapping attempts would
-    // be several endpoints racing to reach one peer.
+    // be several endpoints racing to reach one peer. It is also what
+    // keeps the re-dial SINGLE-FLIGHT now that the loop runs for the life
+    // of the page: an attempt in progress means the next cadence is
+    // skipped, not queued behind it.
     void tick();
-    poll(RESUME_TICK_MS, tick);
+    poll(KEEPER_TICK_MS, tick);
   };
 
   const addTenant = visor.drawer.tenant<{ container: HTMLElement }>({
@@ -4781,15 +5105,15 @@ async function startApp(
       // would be the page confusing "not yet in sync" with "not yet
       // usable".
       await mountApp();
-      void resumeWire(false);
+      void wireKeeper(false);
     } else {
       // NOT A DEAD END ANY MORE. An account with no todo list is still
       // not a first run — offering to create a SECOND account here would
       // be the page guessing at a state it does not understand — but nor
       // is it a state to park in. The pointer lives in the account's own
-      // document, so it arrives when the wire does; `resumeWire` says so
+      // document, so it arrives when the wire does; `wireKeeper` says so
       // on screen, waits, adopts, and mounts.
-      void resumeWire(true);
+      void wireKeeper(true);
     }
   } else {
     note("account:none");
@@ -4872,6 +5196,38 @@ async function startApp(
      * has an account at all. */
     hasAccount: async () => (await us.usProfileGet()).ok,
     usSynced: () => usSynced,
+    /** WHAT THE WIRE-KEEPER BELIEVES, for a scenario that has to explain
+     * a failure rather than merely report one (#113). Read-only, and
+     * deliberately: nothing here lets a test dial, drop, or repost
+     * anything — it is the keeper's own account of which handles it holds
+     * and what `conn-status` says about each of them right now.
+     *
+     * `state` is the raw three-way the contract defines: "alive" (the
+     * handshake settled and the wire is last-known-good), "gone" (it came
+     * up and died — the marker the keeper re-dials on), "settling" (a
+     * handshake with no outcome yet), or the error text for anything
+     * else. A scenario reading "alive" on both sides while nothing
+     * crosses has learnt something quite different from one reading
+     * "gone" on a wire that is not being re-dialled. */
+    wireHealth: async () => {
+      const look = async (conn: number | null) => {
+        if (conn === null) return null;
+        const h = await probeConn(conn);
+        return {
+          conn,
+          state: h.kind === "failed" ? h.message : h.kind,
+          peer: h.kind === "alive" ? h.peer : "",
+        };
+      };
+      return {
+        dialled: dialledPeer
+          ? { ...(await look(dialledPeer.conn)), peer: dialledPeer.peerHex.slice(0, 8) }
+          : null,
+        acceptor: await look(acceptorConn),
+        subscribed: [...tasksWired].map((p) => p.slice(0, 8)),
+        keeper: keeperRunning,
+      };
+    },
     /** THE DEVICE, as the store holds it. Nothing personal: an opaque
      * id, the tier, the policy and the rungs the picker reasons about. */
     deviceId: () => conn.deviceId,

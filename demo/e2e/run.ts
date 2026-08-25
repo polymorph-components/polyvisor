@@ -183,14 +183,18 @@ const SCENARIOS: Scenario[] = [
   // the role read out of it, the acceptor and the dial — rather than in
   // anything either of them covers.
   soloResumeSync,
-  // AND ITS ONE-SIDED SIBLING, expected RED: solo-resume-sync proves
-  // the both-sides reload recovers, and solo.ts (~2988-3012) documents
-  // in prose that the ONE-SIDED reload — the acceptor reloads, the
-  // reader keeps a stale handle that `conn-status` will never
-  // invalidate — does not. This scenario turns that prose into a gate:
-  // it asserts the recovery as if it worked, fails today, and the
-  // xfail machinery FAILS THE SUITE the day an engine fix makes it
-  // pass un-promoted (drop its `expected` flag then).
+  // AND ITS ONE-SIDED SIBLING, GREEN SINCE #113: solo-resume-sync proves
+  // the both-sides reload recovers; this one proves the harder half —
+  // only the ACCEPTOR reloads, and the reader, holding a handle to a page
+  // that no longer exists, has to notice and dial again. It was pinned
+  // `expected: "red"` from PR #108 until #113 landed a `conn-status` that
+  // reports a wire that DIED (the `gone:` marker) and a solo-page
+  // wire-keeper that re-dials on it — and only on it, so a healthy peer
+  // is never double-dialled. Measured heal: 35s, three runs, dominated by
+  // the pinned endpoint's QUIC idle timeout (nothing under the reader's
+  // side dies when a peer merely vanishes, so the wire ends on a timer
+  // rather than on an error). It runs here, after the resume family,
+  // because its preconditions are exactly theirs.
   oneSidedReload,
   soloEphemeral,
   // THE WORKER HOST'S STORAGE EGRESS (STORAGE-EGRESS.md's T-E): the same
@@ -288,14 +292,28 @@ const SCENARIOS: Scenario[] = [
   // failure much easier to read.
   soloRecovery,
   soloRecoveryFile,
-  // THE TWO RELAY-PARTITION PINS, both expected RED and both SLOW —
-  // each spends minutes proving a heal that does not come (the
-  // freshly-paired ceremony wires never re-dial, and `conn-status`
-  // never learns a wire died; the full trace is in the scenarios' own
-  // banners). They run this late so a suite that is already broken
-  // earlier never pays for them, and after the solo family because
-  // their preconditions (pairing, convergence, the harness's own fault
-  // levers) are all claims made green above.
+  // THE TWO RELAY-PARTITION SCENARIOS, green since #113 landed end to
+  // end and the last of the `expected: "red"` pins from PR #108 to be
+  // dropped. Between them they claim that a paired account survives its
+  // RELAY going away — vanishing for everyone, and vanishing for one
+  // device while the other stays connected — with both pages open the
+  // whole time and nobody reloading, re-pairing or pressing anything.
+  // Three waves of gap had to close for that: the ceremony wires that
+  // never re-dialled and the `conn-status` latch that made re-dialling
+  // unsafe (#113 as filed), then the page's wire-keeper, then the stale
+  // transport chain in the engine that the wire-keeper uncovered. The
+  // scenarios' own banners carry all three, and demo/host's
+  // `conn-gone-check.ts` and `rebind-sync-check.ts` are the headless
+  // gates under them.
+  //
+  // STILL LATE, AND STILL FOR THE OLD REASON, though the cost has
+  // collapsed: ~39s each now (it was ~184s while each spent its whole
+  // HEAL_MS proving a heal that never came), and what remains is two
+  // deliberate 30s windows per scenario — the control crossing's bound
+  // and the negative assertion that the partition is real. That is still
+  // the most expensive pair in the suite, so they run after everything
+  // whose failure would explain theirs: pairing, convergence, and the
+  // harness's own fault levers are all claims made green above.
   relayPartition,
   relayPartitionAsym,
   // The erase ceremony: seeds a name, a petname and a storage sentinel,
