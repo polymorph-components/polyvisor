@@ -63,6 +63,7 @@ import {
   deviceLockIsHeld,
   type DeviceLock,
   type DeviceNamespace,
+  destroyNamespace,
   enableUntilReseal,
   ensureDevice,
   getAnchor,
@@ -920,8 +921,9 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
    * THE LEASE, READ RATHER THAN INFERRED (locks.ts's heartbeat).
    *
    * The heartbeat runs in the WORKER — `takeLock` calls `startLease(ns)`
-   * and deliberately drops the stop handle — so the only way to ask
-   * whether a host is still marking itself alive is to read the mark.
+   * and the handle it keeps is stopped at exactly one place, the erase
+   * (#112) — so the only way to ask whether a host is still marking
+   * itself alive is to read the mark.
    * The eviction/freeze rows ask this from a SECOND page, because a
    * frozen page cannot answer anything about itself (demo/e2e/cdp.ts's
    * `setWebLifecycleState` hazard note).
@@ -1161,6 +1163,230 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
   },
 
   "hc-forget": async (arg: { ids: string[] }) => ({ cleanup: await cleanup(arg.ids) }),
+
+  /**
+   * ERASE THIS DEVICE through the HOST, which is the ceremony's own
+   * path (`DeviceConnection.destroy` → worker.ts's `destroy`): the
+   * worker drains its checkpoint chain, drops the engine and the DEK,
+   * and deletes its own database, OPFS directory and index row.
+   *
+   * NOTHING HERE MAY OPEN THE NAMESPACE AFTERWARDS, and that is not
+   * fussiness — it is the very hazard the row using this op measures.
+   * `openNamespace(id).get(...)` would OPEN an IndexedDB database that
+   * has just been deleted, and IndexedDB open-on-missing CREATES it. So
+   * the only question asked below is `namespaceExists`, which reads
+   * `indexedDB.databases()` — an enumeration, never an open.
+   */
+  "hc-destroy": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const attempt = await refuses(() => conn.destroy());
+    conns.delete(arg.id);
+    return {
+      attempt,
+      dbGone: !(await namespaceExists(arg.id)),
+      indexRowGone: (await getDevice(arg.id)) === undefined,
+      lockHeld: await deviceLockIsHeld(arg.id),
+    };
+  },
+
+  /**
+   * THE MECHANISM, ISOLATED AND DETERMINISTIC (#112): a lease heartbeat
+   * running over a namespace that has just been DESTROYED.
+   *
+   * Both arms use the shipped modules — `startLease` from locks.ts,
+   * `destroyNamespace` from namespace.ts — and differ in exactly one
+   * act, the `stop()`. The interval is passed in short (`startLease`
+   * takes one) so the row costs a second rather than eleven; it is the
+   * same code path the 5 s production interval runs.
+   *
+   * WHY IT RESURRECTS: `touchLease` is an `ns.put`, namespace.ts holds
+   * no live connection (every operation opens, transacts, closes — its
+   * header says why), and an IndexedDB open of a missing database
+   * CREATES it. So a tick after the delete brings the database back
+   * with a lease in it and nothing else. The OPFS half never returns:
+   * `touchLease` writes IndexedDB and touches nothing else, which is
+   * the asymmetry #112 reports from the field (db present, directory
+   * `NotFoundError`).
+   */
+  "lease-vs-erase": async (arg: { intervalMs?: number }) => {
+    const intervalMs = arg?.intervalMs ?? 300;
+    const settle = intervalMs * 4;
+
+    // ARM A — the heartbeat is left running across the erasure.
+    const a = newDeviceId();
+    const beatA = startLease(openNamespace(a), intervalMs);
+    await touchLease(openNamespace(a));
+    const aBefore = await namespaceExists(a);
+    await destroyNamespace(a);
+    const aAtDelete = await namespaceExists(a);
+    await new Promise((r) => setTimeout(r, settle));
+    const aLater = await namespaceExists(a);
+    beatA.stop();
+    // Whatever came back goes now — and it goes AFTER the stop, or the
+    // cleanup would race the very thing it is cleaning up.
+    await destroyNamespace(a).catch(() => {});
+
+    // ARM B — stopped first, then the same erasure.
+    const b = newDeviceId();
+    const beatB = startLease(openNamespace(b), intervalMs);
+    await touchLease(openNamespace(b));
+    beatB.stop();
+    await destroyNamespace(b);
+    await new Promise((r) => setTimeout(r, settle));
+    const bLater = await namespaceExists(b);
+    await destroyNamespace(b).catch(() => {});
+
+    return {
+      intervalMs,
+      settleMs: settle,
+      running: { before: aBefore, atDelete: aAtDelete, later: aLater },
+      stopped: { later: bLater },
+    };
+  },
+
+  /**
+   * CONSTRUCT A WORKER FOR A DEVICE THAT DOES NOT EXIST, and watch it
+   * leave no trace (#112's class).
+   *
+   * A SharedWorker is keyed by (origin, script URL, NAME), and the name
+   * is the device id — so naming an ERASED device is all it takes to
+   * evaluate that module in a fresh global. Everything this op does is
+   * something a stale tab, a picker holding an old id, or a reconnect
+   * racing an erase could do by accident.
+   *
+   * THREE DOORS, ASKED SEPARATELY, because they open at different
+   * moments and each one used to recreate the database on its own:
+   *
+   *   1. THE CONSTRUCTION ITSELF — module evaluation runs `bootSeq`
+   *      before any client has said a word.
+   *   2. `status`, the first RPC any client sends, which reads the
+   *      namespace (`sealState`) — and an IndexedDB READ opens, and an
+   *      open of a missing database CREATES it, exactly as a write
+   *      would.
+   *   3. `attach`, whose `takeLock()` starts the LEASE, whose first act
+   *      is an `ns.put`.
+   *
+   * A RAW PORT, deliberately: `connectDevice` refuses this device
+   * client-side before it constructs anything (asked below as the
+   * fourth question), so the only way to put the WORKER's own guards
+   * under test is to speak to it directly — the same raw-port technique
+   * `port-listen` uses.
+   *
+   * `namespaceExists` is the enumeration, never an open: asking through
+   * the namespace would create the thing being asked about.
+   */
+  "erase-reconnect": async (arg: { id: string }) => {
+    const worker = new SharedWorker("./worker.js", { type: "module", name: nsDbName(arg.id) });
+    let hello: { bootSeq?: number } | null = null;
+    const waiting = new Map<number, (r: unknown) => void>();
+    worker.port.onmessage = (ev: MessageEvent) => {
+      const d = ev.data as { id?: number };
+      if (d?.id === 0) {
+        hello = d as { bootSeq?: number };
+        return;
+      }
+      const resolve = waiting.get(d?.id ?? -1);
+      if (resolve) {
+        waiting.delete(d!.id!);
+        resolve(d);
+      }
+    };
+    worker.port.start();
+
+    let nextId = 1;
+    const send = (target: string, method: string, args: unknown[]) =>
+      new Promise<Record<string, unknown>>((resolve) => {
+        const id = nextId++;
+        waiting.set(id, (r) => resolve(r as Record<string, unknown>));
+        worker.port.postMessage({ id, target, method, args });
+        setTimeout(() => {
+          if (waiting.delete(id)) resolve({ timedOut: true });
+        }, 5_000);
+      });
+
+    // The hello proves the global genuinely BOOTED — module evaluated,
+    // `bootSeq` ran — rather than the construction having quietly done
+    // nothing. Without it a clean database would prove only that no
+    // worker started.
+    const t0 = Date.now();
+    while (hello === null && Date.now() - t0 < 5_000) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const afterConstruct = await namespaceExists(arg.id);
+
+    const statusRes = await send("host", "status", []);
+    const afterStatus = await namespaceExists(arg.id);
+
+    const attachRes = await send("host", "attach", [{
+      deviceId: arg.id,
+      artifacts: ARTIFACTS,
+      label: "erased-probe",
+    }]);
+    // A lease tick is 5 s; wait past one so an attach that DID take the
+    // lock would have written by now.
+    await new Promise((r) => setTimeout(r, 6_000));
+    const afterAttach = await namespaceExists(arg.id);
+
+    // THE ORDINARY CLIENT PATH, for the record: what an application
+    // actually sees if it tries this.
+    const viaClient = await refuses(() =>
+      connectDevice({
+        device: { kind: "id", id: arg.id },
+        workerUrl: "./worker.js",
+        artifacts: ARTIFACTS,
+        label: "erased-probe",
+      })
+    );
+    const afterClient = await namespaceExists(arg.id);
+
+    worker.port.close();
+    const failureOf = (r: Record<string, unknown>) => {
+      const f = r?.failure as { form?: string; error?: { code?: string; message?: string } };
+      return {
+        ok: r?.ok === true,
+        form: f?.form ?? "",
+        code: f?.error?.code ?? "",
+        message: (f?.error?.message ?? "").slice(0, 140),
+      };
+    };
+    return {
+      booted: hello !== null,
+      bootSeq: (hello as { bootSeq?: number } | null)?.bootSeq ?? null,
+      afterConstruct,
+      status: failureOf(statusRes),
+      afterStatus,
+      attach: failureOf(attachRes),
+      afterAttach,
+      viaClient: {
+        refused: viaClient.refused,
+        message: (viaClient.error?.message ?? "").slice(0, 140),
+      },
+      afterClient,
+      lockHeld: await deviceLockIsHeld(arg.id),
+    };
+  },
+
+  /**
+   * IS THE DEVICE'S DATABASE THERE? — asked after a wait, by
+   * ENUMERATION only, for `hc-destroy`'s reason: any read or write
+   * through the namespace API would create the thing being asked about.
+   *
+   * The wait is the point of the op. A lease heartbeat renews every
+   * `LEASE_INTERVAL_MS` (5 s), so a window shorter than one full
+   * interval cannot distinguish a stopped heartbeat from one that has
+   * simply not ticked yet.
+   */
+  "db-present": async (arg: { id: string; waitMs: number }) => {
+    const started = Date.now();
+    await new Promise((r) => setTimeout(r, arg.waitMs));
+    const names = (await indexedDB.databases()).map((d) => d.name ?? "");
+    return {
+      waitedMs: Date.now() - started,
+      intervalMs: LEASE_INTERVAL_MS,
+      present: names.includes(nsDbName(arg.id)),
+      databases: names.length,
+    };
+  },
 
   /**
    * THE DEBOUNCE, with no explicit checkpoint anywhere: write, wait out
@@ -2217,8 +2443,41 @@ const ticks: {
 
 /** Best-effort teardown so cases cannot contaminate each other through
  * a shared index. */
+/**
+ * Best-effort teardown — THROUGH THE WORKER WHEN ONE IS LIVE, which is
+ * not tidiness but #112's class again.
+ *
+ * `removeDevice` deletes the namespace from THIS side. Do that to a
+ * device whose host is still running and the host's lease heartbeat
+ * writes `meta.lease` a few seconds later, an `ns.put` opens the
+ * database, and IndexedDB open-on-missing brings the whole thing back —
+ * so the harness was strewing resurrected databases behind every row
+ * that tore down a live device (measured: ~31 stray `pm-device-*`
+ * databases in a full run). client.ts's `destroy` says the rule in one
+ * line — "It has to be the worker's own hand" — because the host is the
+ * only thing that can drain its checkpoint chain, stop its lease and
+ * drop its engine before the storage goes.
+ *
+ * The page-side removal stays as the FALLBACK, for the rows that hold
+ * no connection (1-10 never construct a worker) and for a host that has
+ * already died.
+ */
 async function cleanup(ids: string[]): Promise<string> {
   for (const id of ids) {
+    const conn = conns.get(id);
+    if (conn) {
+      try {
+        await conn.destroy();
+        conns.delete(id);
+        continue;
+      } catch {
+        // A host that cannot erase itself (already dead, already
+        // erased) falls through to the page-side removal below, which
+        // is what teardown did before this and is still right when
+        // there is nothing alive to ask.
+        conns.delete(id);
+      }
+    }
     try {
       await removeDevice(id);
     } catch (e) {
