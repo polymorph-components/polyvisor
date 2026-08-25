@@ -53,11 +53,23 @@ pairing-bringup: translate
 # #113's engine half: conn-status must report a wire that came up and
 # later DIED, with the machine-readable `gone: ` marker the page half
 # re-dials on. Needs NO `just infra` — the probe spawns its OWN relay on
-# an ephemeral port precisely so it can kill it. Runs for a minute-ish:
-# the kill→gone latency is the pinned endpoint's QUIC idle timeout.
+# an ephemeral port precisely so it can kill it. Fast: the relay leg is a
+# websocket, so killing the relay tears the socket down and both sides
+# notice in ~0.1s. (The QUIC idle timeout governs only the shapes where
+# no socket dies — a black-holing relay, a NAT drop — see the probe's
+# banner, which measures rather than promises.)
 conn-gone: translate
     deno check host/conn-gone-check.ts
     deno run -A host/conn-gone-check.ts
+
+# #113's RESIDUAL gap: noticing a dead wire is not the same as being
+# able to USE its replacement. After a relay outage both sides rebind
+# their endpoint and re-dial, conn-status goes live in seconds — and
+# then sync-start never settles on the dialling side. Own relay child,
+# ephemeral port, same rig as conn-gone.
+rebind-sync: translate
+    deno check host/rebind-sync-check.ts
+    deno run -A host/rebind-sync-check.ts
 
 # The #20 G5 kill-and-resume beat: the engine checkpoints into a real
 # directory (@polyengine/wasi's `filesystem-node` backend) and a FRESH

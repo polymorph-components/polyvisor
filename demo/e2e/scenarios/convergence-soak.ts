@@ -31,12 +31,15 @@
 // bring-up and then a 45 s cadence, and §3 gives it a 20 s trailing
 // debounced flush armed by its own mutations — so two devices bound to
 // one account's bucket converge THROUGH THE STORE whatever state their
-// peer wires are in. That matters because of the gap
-// scenarios/relay-partition.ts pins (`expected: "red"`): relay wires
-// between two LIVE paired pages never re-dial after a relay outage —
-// a ceremony-time wire is not re-entered, and `conn-status` never
-// learns the wire died. This soak therefore NEVER asserts relay-path
-// recovery. It stops and starts the relay because that is a fault a
+// peer wires are in. That independence was originally forced by a gap
+// (relay wires never re-dialled after an outage — the three-wave
+// history now lives in scenarios/relay-partition.ts's banner, green
+// since #113 landed end to end), but it remains the right design even
+// with the wires healing themselves in ~5s: the soak's oracle must not
+// depend on BOTH channels being healthy, because faulting one of them
+// is half its alphabet. This soak therefore still NEVER asserts
+// relay-path recovery — relay-partition{,-asym} own that claim. It
+// stops and starts the relay because that is a fault a
 // real user's network produces, and it demands only what the bucket
 // can carry.
 //

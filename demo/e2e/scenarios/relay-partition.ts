@@ -1,14 +1,30 @@
-// A RELAY OUTAGE BETWEEN TWO LIVE SIBLINGS — and the heal that does not
-// come. Registered `expected: "red"`: this scenario PINS A GAP.
+// A RELAY OUTAGE BETWEEN TWO LIVE SIBLINGS, AND THE HEAL THAT COMES BY
+// ITSELF. Green since #113 landed end to end; it was `expected: "red"`
+// for three waves of gap before that, and the history is kept below
+// because each wave hid the next one.
 //
-// ─── THE CLAIM IT WOULD MAKE IF THE GAP WERE CLOSED ──────────────────
+// ─── THE CLAIM ───────────────────────────────────────────────────────
 //
 // Two devices of one account are paired and syncing live. The relay
 // they meet over goes away; each device is edited while it is alone;
 // the relay comes back. Both devices then hold the SAME todo set —
 // merged, not merely one-way delivered — with nobody reloading
 // anything, nobody re-running a ceremony, and nobody pressing a button.
-// That is what a user means by "my other device caught up".
+// That is what a user means by "my other device caught up", and every
+// step of it now happens on its own:
+//
+//     the relay dies       both sides' `conn-status` reports `gone:`
+//                          in ~0.1s (the relay leg is a websocket over
+//                          TCP, so the socket dies under each endpoint
+//                          and it learns synchronously)
+//     …the outage…         each page keeps taking edits locally
+//     the relay returns
+//     +~5s                 both pages rebind their endpoint — same
+//                          address, off the persisted transport key —
+//                          repost the acceptor, and re-dial
+//     +~5s from restore    BOTH engines hold the merged four-todo set
+//                          (measured 4.8–5.4s over five runs)
+//     +~0.3s               and both SCREENS show it (0.26–0.54s)
 //
 // ─── WHICH PATH CARRIES THE BYTES (asked first, answered empirically)
 //
@@ -21,87 +37,131 @@
 // two reasons that are both in the engine's own source:
 //
 //   * the endpoint is bound with WebRTC LEFT OFF. `iroh-bind` sets an
-//     ALPN pair and a relay URL and nothing else (engine/guest/src/lib.rs
-//     :4088-4096); `endpoint-options.webrtc` is never called, and
-//     iroh.wit says of it "When disabled (the default), `webrtc` entries
-//     are ignored for dialing and inbound signaling is discarded";
+//     ALPN pair and a relay URL and nothing else;
+//     `endpoint-options.webrtc` is never called, and iroh.wit says of it
+//     "When disabled (the default), `webrtc` entries are ignored for
+//     dialing and inbound signaling is discarded";
 //   * the dial address offers no other wire anyway — `iroh-start` builds
-//     `EndpointAddr { addrs: vec![TransportAddr::Relay(relay_url)] }`
-//     (lib.rs:4134), one relay entry, no `webrtc` and no `ip:port`.
+//     `EndpointAddr { addrs: vec![TransportAddr::Relay(relay_url)] }`,
+//     one relay entry, no `webrtc` and no `ip:port`.
 //
 // MEASURED, not merely read: with two paired pages converging in 4ms,
 // `ctx.stopRelay()` and then a todo authored on each side, NOTHING
-// crossed in either direction for 60s. The relay is the path.
+// crossed in either direction for 60s. The relay is the path — which is
+// what makes the outage act below a real partition and this file's
+// claim about the relay rather than about localhost.
 //
-// ─── AND THE HEAL DOES NOT HAPPEN. WHERE THE GAP IS ──────────────────
+// ─── THE THREE WAVES OF RED, KEPT ────────────────────────────────────
 //
-// Same probe, continued: `ctx.startRelay()`, then 240s of watching with
-// both pages alive and being ticked. Neither side ever saw the other's
-// outage edit. Traced, in the page's own terms:
+// This file spent its whole life so far as an `expected: "red"` pin, and
+// it was red for three DIFFERENT reasons in turn. Each one was only
+// findable once the one before it was fixed, which is the argument for
+// writing all three down rather than the last.
 //
-//   * THE ONLY PATIENT RETRY ON THIS PAGE IS `resumeWire`, and it is
-//     entered only from the RESUMED-BOOT branch (demo/host/solo.ts:3366
-//     and :3374 — the two `void resumeWire(…)` calls, both inside the
-//     `probe.ok` arm that means "this device already held the account
-//     when the page loaded"). Its tick loop is the thing that re-dials
-//     every RESUME_TICK_MS (solo.ts:3016, :3214) and the only caller of
-//     `rebindEndpoint` for a `Closed` endpoint (solo.ts:2879, :3132).
-//   * A PAGE THAT PAIRED IN THIS SESSION NEVER ENTERS IT. It is in a
-//     CEREMONY role — `joinerWire` (solo.ts:2673) or `adderWire`
-//     (:2900) — each of which runs at most once: the `joinWired` /
-//     `adderWired` guards latch true on the first success, and the
-//     `WIRE_ATTEMPTS = 3` budget (solo.ts:2666) is a retry for wiring
-//     that FAILED TO COME UP, not a re-dial for a wire that came up and
-//     later died. So when the relay dies under a freshly-paired pair,
-//     there is no loop left running that would ever dial again.
-//   * AND NEITHER SIDE CAN EVEN LEARN THE WIRE DIED, which is why the
-//     absence of a retry has no symptom. `conn-status` reports the
-//     outcome of the HANDSHAKE and is never invalidated afterwards
-//     — `iroh-start`'s spawned wiring writes the outcome into
-//     `conn_results` once and nothing ever removes it
-//     (engine/guest/src/lib.rs:4407, and :4343/:4400 for the two error
-//     outcomes), and `conn-status` reads that map back for ever
-//     (:4413-4420). `sync-status` is one-shot per round rather than a
-//     subscription's health. solo.ts:2988-3012 writes this down
-//     already, for the neighbouring one-sided-reload case; the relay
-//     outage is the same engine limit reached by a different road.
-//     (solo.ts's committed comment there still cites this latch by its
-//     OLD line numbers — the code moved, the fact did not.)
+// WAVE 1 — THE PAGE COULD NOT RETRY, AND COULD NOT HAVE (issue #113 as
+// filed). Two halves, and neither was any use without the other:
 //
-// THE MISSING PIECE, in the engine's own terms: a `conn-status` that
-// goes false when the connection drops (solo.ts:3009-3012 names exactly
-// this — filed as #113), plus a page-side retry that is armed for the
-// life of the page rather than only on the resumed-boot path. With the
-// first, the second is cheap and cannot double-dial; without it, any
-// re-dial-on-a-timer would be the double-dialling solo.ts's direction
-// discipline exists to prevent — which is why this is pinned as a gap
-// rather than papered over in a scenario-local workaround.
-
+//   * NO LOOP. A page that paired in THIS session is in a ceremony role
+//     — `joinerWire` / `adderWire` in demo/host/solo.ts — and both latch
+//     on their first success. `WIRE_ATTEMPTS = 3` is a retry for wiring
+//     that never CAME UP, not a re-dial for a wire that came up and
+//     died. The only patient loop, `resumeWire`, was entered exclusively
+//     from the resumed-boot branch. So when the relay died under a
+//     freshly-paired pair there was no loop left running anywhere.
+//   * AND NO SIGNAL TO LOOP ON. `conn-status` reported the outcome of
+//     the HANDSHAKE and was never invalidated afterwards: written into
+//     `conn_results` once, read back for ever. A handle to a peer that
+//     had been unreachable for an hour answered exactly as a live one
+//     did. Re-dialling on a timer against that would have been the
+//     double-dial the direction discipline exists to prevent (#78) — a
+//     second connection carrying the same subscriptions, silently.
+//
+//   Measured then: no convergence in 240s, both pages alive and ticking
+//   throughout.
+//
+// WAVE 2 — THE PAGE HALF, which fixed the above and MOVED the gap into
+// the engine. `conn-status` grew a machine-readable `gone:` marker
+// (every connection gets a monitor on the iroh WIT's `wait-closed`;
+// gated by demo/host/conn-gone-check.ts, ~0.1s on a relay kill), and
+// solo.ts grew ONE WIRE-KEEPER armed for the life of every paired page
+// rather than only on resumed boots: each 5s tick it reads `conn-status`
+// on the handles it holds, and a `gone:` — and nothing else — clears
+// that peer so the next tick re-dials. A third fact turned up here and
+// is worth keeping: a relay's death does not merely kill CONNECTIONS,
+// it latches this device's own ENDPOINT `Closed`, so the keeper's
+// repair path runs through `rebindEndpoint` (which re-mints the same
+// address off the persisted key) before a dial can land.
+//
+//   Measured then: the transport came ALL the way back — both sides
+//   rebound, re-dialled, and reported a live connection within ~10s of
+//   the relay returning — and then not one todo crossed in 150s. The
+//   reader's `sync-start` returned a handle whose `sync-status` never
+//   settled; the acceptor's settled fine.
+//
+// WAVE 3 — THE STALE TRANSPORT CHAIN, which is what that asymmetry was.
+// Four links, each individually reasonable:
+//
+//   1. `QueueTransport` held its OWN channel ends — `in_tx` alongside
+//      `in_rx` — so `recv_bytes` COULD NOT FAIL. When `iroh_reader` hit
+//      EOF it dropped only its clone of the sender; the channel stayed
+//      open and the transport went on politely awaiting frames from a
+//      socket that no longer existed.
+//   2. Subduction's teardown is driven ENTIRELY by a connection's reader
+//      failing — the per-connection loop's exit is the only thing that
+//      posts a closure, which is the only thing that removes the
+//      connection. A transport that cannot fail is therefore never
+//      removed.
+//   3. `add_connection` APPENDS rather than replaces, so after a rebind
+//      the peer owned a DEAD connection at index 0 and the live one at
+//      index 1.
+//   4. And `sync_with_peer` walks that list IN ORDER, under this
+//      engine's never-firing timeout — so it called the dead one first
+//      and parked there for ever, never reaching the live one.
+//
+//   THE ASYMMETRY EXPLAINED: only the side that CALLS `sync_with_peer`
+//   walks the stale list. An acceptor answering an inbound request
+//   replies on the connection the message arrived on, so it settled
+//   normally — which is why `one-sided-reload` was green throughout and
+//   only the dialling side ever hung.
+//
+//   THE FIX, one link, no upstream change and nothing reaching into
+//   subduction's registries behind its back: the gone-monitor now CLOSES
+//   the dead connection's inbound queues, so `recv_bytes` starts
+//   failing, subduction's own teardown runs, and the next
+//   `sync_with_peer` finds only the live connection.
+//
+//   Pinned by demo/host/rebind-sync-check.ts (`just rebind-sync`), the
+//   headless gate written for exactly this and red→green across the fix:
+//   post-rebind `sync-start` settles in 0.20s and a todo crosses in
+//   0.03–0.06s, both directions, where before neither settled at all.
 //
 // ─── WHAT IS NOT THE SUBJECT ────────────────────────────────────────
 //
-// NOTHING RELOADS HERE. The one-sided-reload gap (solo.ts:2988-3012) is
-// a different track's; the double reload is `solo-resume-sync`'s claim
-// and it is GREEN, precisely because a reloaded page does enter
-// `resumeWire`. The distinction is the finding: this account can
-// survive both its devices being closed and reopened, but not its relay
+// NOTHING RELOADS HERE, and that is the point of the file: a reload
+// re-handshakes from nothing, which is the state this scenario exists
+// NOT to be in. The double reload is `solo-resume-sync`'s claim and the
+// one-sided reload is `one-sided-reload`'s; with this file green, all
+// three shapes of "the wire went away" are now covered — both devices
+// closed and reopened, one device vanishing, and the relay itself
 // blinking while both stay open.
 //
 // NO STORAGE IS BOUND, deliberately. `solo-offline-sync` shows a todo
 // crossing through a Drive bucket with no live peer at all; if this
-// scenario bound a store, a heal could be the BUCKET's doing and the
+// scenario bound a store, the heal could be the BUCKET's doing and the
 // relay claim would be unfalsifiable. Neither page here has any store,
 // so the relay is the only channel that exists.
 //
 // ─── HOW IT FAILS WHEN IT FAILS ─────────────────────────────────────
 //
-// The red act is the LAST one, and everything before it is a plain
-// green precondition — pairing, a live crossing, a real cut. An xfail
-// that went red because pairing broke would be a gap flag hiding a
-// regression, so the last act's timeout carries a full diagnosis of
-// both pages (todos, `usSynced`, sync status, endpoint id) in the
-// solo-offline-sync manner, and the acts before it assert their own
-// preconditions loudly.
+// Everything before the heal is a plain precondition — pairing, a live
+// crossing, a real cut — and each asserts itself loudly, so a failure
+// there reads as the regression it is rather than as a heal that did not
+// come. The heal itself is split into TWO acts on purpose: the engines
+// agreeing and the screens following are different claims with different
+// failure modes, and keeping them apart means a red says which one went.
+// The convergence act's timeout carries a full diagnosis of both pages
+// (todos, `usSynced`, sync status, endpoint id, and the wire-keeper's own
+// view of its handles) in the solo-offline-sync manner.
 
 import type { Page } from "npm:playwright@1.57.0";
 import type { Ctx, Scenario } from "../run.ts";
@@ -150,24 +210,48 @@ const CONTROL_MS = 30_000;
  * return until the port REFUSES.) */
 const OUTAGE_WATCH_MS = 30_000;
 
-/** WHAT THE HEAL IS GIVEN, derived rather than guessed — sized to what
- * SHOULD work if the missing piece existed, since an xfail whose wait
- * was too short would be pinning the harness's impatience instead of
- * the gap:
+/** WHAT THE HEAL IS GIVEN, sized to the measurement rather than to a
+ * guess at machinery that did not exist yet:
  *
- *     RESUME_TICK_MS   5s   solo.ts:3016 — the page's own retry cadence
- *   + dial deadline   30s   solo.ts:2641 — `until` around conn-status
- *   + subscribe       30s   solo.ts:2617 — `until` around sync-status
- *   + relay pull      45s   the relay-mediated pull cadence run.ts's
- *                           `deadlineMs` note names
- *   ------------------------
- *                    110s, and a missed tick costs at most another 5s
+ *     ≤5s   the wire-keeper's tick noticing the relay is back and
+ *           running its repair (solo.ts's `KEEPER_TICK_MS`)
+ *   + ~1s   rebind, repost, re-dial, re-handshake (measured: the
+ *           post-rebind `sync-start` settles in 0.20s headless, and a
+ *           todo crosses in 0.03–0.06s — demo/host/rebind-sync-check.ts)
+ *   + slack for a missed tick and a busy CI box
+ *   ------
+ *     MEASURED end to end on this harness: 4.8–5.4s over five
+ *     consecutive runs, from `startRelay()` to both ENGINES holding the
+ *     merged set.
  *
- * Rounded up to 150s: two full dial-and-subscribe attempts plus a pull
- * cadence, which is a generous reading of every retry this page could
- * plausibly grow. The probe watched 240s and saw nothing move, so the
- * red is not this number being tight. */
-const HEAL_MS = 150_000;
+ * 60s is that with an order of magnitude of margin. It is not sized to
+ * the old never-happens world — the previous 150s existed to give a heal
+ * that was not coming every retry it might plausibly have grown, and
+ * that reasoning is stale. This bound's only job now is to absorb a slow
+ * box without letting a genuine regression cost the suite minutes. */
+const HEAL_MS = 60_000;
+
+/** AND WHAT THE SCREENS ARE GIVEN, once the engines agree.
+ *
+ * A REPAINT IS NOT A CLAIM VIOLATION, which is the whole reason this is
+ * a bounded wait and not a bare read. The engine convergence above is
+ * the network fact; the rows are rendered off a LATER drain, so sampling
+ * the DOM in the same breath catches a page mid-frame and fails on a row
+ * that appears milliseconds later. That was the last intermittent red in
+ * this file's life — a zero-tolerance DOM read racing the repaint, which
+ * alternated which device's row it found "missing" — and every other row
+ * assertion in this suite already waits.
+ *
+ * 30s: the drain that repaints runs on a 1s cadence, so a healthy paint
+ * is one or two of those behind the engine. Thirty of them is generous
+ * enough that a loaded box cannot turn a paint into a red, and short
+ * enough that a screen which genuinely never updates reports promptly —
+ * which is a real bug worth failing on, and the reason this is asserted
+ * at all rather than dropped as "the engine agreed, good enough".
+ *
+ * Measured: 0.26–0.54s over five consecutive runs, so the bound carries
+ * roughly two orders of magnitude of headroom. */
+const RENDER_MS = 30_000;
 
 /** Everything a timeout in this scenario should be able to say about a
  * page, in the shape solo-offline-sync attaches to its own waits: what
@@ -186,6 +270,12 @@ async function diagnose(label: string, page: Page): Promise<string> {
     await read("todos", () => solo(page, "todos")),
     await read("usSynced", () => solo(page, "usSynced")),
     await read("sync", () => solo(page, "syncStatus")),
+    // THE WIRE-KEEPER'S OWN VIEW, added with #113 and the single most
+    // useful line in this diagnosis now: which handles the page holds and
+    // what `conn-status` says about each. A reader meeting this failure
+    // needs to know whether the transport came back — because it does,
+    // and everything upstream of that fact is already working.
+    await read("wire", () => solo(page, "wireHealth")),
     // A PREFIX, not the whole id: 64 hex characters per page would
     // drown the two facts either side of it, and all a reader needs
     // from a transport address here is whether it is present and
@@ -210,14 +300,13 @@ async function engineTodos(page: Page): Promise<string[]> {
 const scenario: Scenario = {
   name: "relay-partition",
   why:
-    "a relay outage between two LIVE paired devices heals by itself when the relay returns — no reload, no ceremony (XFAIL: it does not; see this file's banner)",
-  // PINNED AS A GAP. Drop this flag the day the last act passes; the
-  // runner fails an `expected: "red"` scenario that goes green, which
-  // is what forces that promotion rather than leaving a stale flag.
-  expected: "red",
-  // Boot + pairing + CONTROL_MS + OUTAGE_WATCH_MS + HEAL_MS ≈ 250s of
-  // deliberate waiting, well past the suite-wide 240s.
-  deadlineMs: 420_000,
+    "a relay outage between two LIVE paired devices heals by itself when the relay returns — the wire is marked gone, the endpoint rebound, the dial remade and subduction resumed, and both devices converge with no reload and no ceremony",
+  // Boot + pairing + CONTROL_MS's crossing + the 30s OUTAGE_WATCH_MS
+  // window + a ~5s heal ≈ 39s measured (38.7–39.2s over five runs). 180s is comfortably over 4x
+  // that: the two deliberate 30s waits are what this scenario costs, and
+  // a heal that has regressed reports inside HEAL_MS long before this
+  // outer deadline is reached.
+  deadlineMs: 180_000,
   page: {
     path: "/solo.html",
     bootGlobal: "__solo",
@@ -389,7 +478,7 @@ const scenario: Scenario = {
       await input.fill("");
     });
 
-    // --- THE CLAIM (this is the act that is red) ------------------------
+    // --- THE CLAIM, in two acts -----------------------------------------
 
     await act("the relay returns and BOTH devices converge, with nothing reloaded", async () => {
       await ctx.startRelay();
@@ -407,26 +496,46 @@ const scenario: Scenario = {
           ? true
           : false;
       }, HEAL_MS).catch(async (e) => {
-        // THE DIAGNOSIS, because this act is the one a reader will meet
-        // as a failure — either as the expected red or, one day, as a
-        // regression in whatever closed the gap.
+        // THE DIAGNOSIS, because this is the act a reader will meet as a
+        // regression in whatever closed the gap — and the `wire` field
+        // says WHICH gap came back. Two LIVE wires with nothing crossing
+        // is the wave-3 shape (subduction holding a stale connection);
+        // a dead, missing or never-re-dialled wire is wave 2 (the page's
+        // wire-keeper); a wire still reading alive on a relay that has
+        // been dead for half a minute is wave 1 (the `gone:` marker).
+        // The banner's arithmetic for each is above.
         throw new Error(
           `${e instanceof Error ? e.message : e}\n` +
-            `        the relay came back and the two devices did not re-find each other ` +
+            `        the relay came back and the two devices did not converge ` +
             `within ${HEAL_MS / 1000}s. Expected exactly ${JSON.stringify(want)} on both.\n` +
             `        ${await diagnoseBoth(pageA, pageB)}`,
         );
       });
-      // AND ON THE ROWS TOO, once the engines agree: the user's
-      // complaint is about a screen, and a partition that healed in the
-      // engine but not on the surface is still a device that "stopped
-      // updating".
+    });
+
+    await act("and both SCREENS follow: each device RENDERS the other's outage edit", async () => {
+      // THE USER'S OWN TEST. A partition that healed in the engine but
+      // not on the surface is still a device that "stopped updating", so
+      // the claim is not finished until the rows say so on both sides.
+      //
+      // WAITED FOR, NOT SAMPLED — see `RENDER_MS`. The engines agreed in
+      // the act above; the rows are painted off a later drain, and a bare
+      // read here raced that repaint. It is its own act so that a red
+      // says plainly which half went: this one green means the network
+      // healed and the surface did not.
       for (const [who, page] of [["A", pageA], ["B", pageB]] as [string, Page][]) {
-        const rendered = await todoRows(page).allTextContents();
-        assert(
-          rendered.some((t) => t.includes(A_ALONE)) && rendered.some((t) => t.includes(B_ALONE)),
-          `${who}'s rendered rows after the heal: ${JSON.stringify(rendered)}`,
-        );
+        await until(both, `${who}'s rows to show both outage edits`, async () => {
+          const rendered = await todoRows(page).allTextContents();
+          return rendered.some((t) => t.includes(A_ALONE)) &&
+            rendered.some((t) => t.includes(B_ALONE));
+        }, RENDER_MS).catch(async (e) => {
+          throw new Error(
+            `${e instanceof Error ? e.message : e}\n` +
+              `        ${who}'s engine holds the merged set but its rows do not show it ` +
+              `after ${RENDER_MS / 1000}s: ${JSON.stringify(await todoRows(page).allTextContents())}\n` +
+              `        ${await diagnoseBoth(pageA, pageB)}`,
+          );
+        });
       }
     });
   },

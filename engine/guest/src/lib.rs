@@ -609,6 +609,14 @@ struct State {
     nonce_cache: Rc<NonceCache>,
     proto: Rc<KhProto>,
     conn_results: HashMap<u32, Result<String, String>>,
+    /// The INBOUND channel senders of every queue this connection feeds
+    /// — the subduction transport's, and the keyhive wire's once the
+    /// handshake mints it. Held for exactly one purpose: closing them
+    /// when the wire dies, so `recv` on the other end FAILS instead of
+    /// parking forever. See `conn_gone_monitor` for why a transport that
+    /// cannot fail is worse than no transport at all.
+    conn_inbound: HashMap<u32, Vec<async_channel::Sender<Vec<u8>>>>,
+
     syncs: HashMap<u32, Result<String, String>>,
     endpoint: Option<Rc<Endpoint>>,
     /// The relay this endpoint bound to. Pairing has no relay hint in the
@@ -858,14 +866,65 @@ async fn iroh_reader(in_tx: async_channel::Sender<Vec<u8>>, recv: RecvStream, se
 ///
 /// 1. It only overwrites an `Ok(peer)`. An existing `Err` is a
 ///    wire-setup or handshake failure, which says strictly more than
-///    "gone", and clobbering it would turn a diagnosis into a shrug. A
-///    MISSING entry is left missing too: the handshake has not settled
-///    yet, and it is about to record its own (failing, on a dead wire)
-///    outcome — letting the monitor race ahead would only invite that
-///    write to overwrite the gone marker back to something staler.
+///    "gone", and clobbering it would turn a diagnosis into a shrug.
+///
+///    A MISSING entry means the wiring task has not settled yet, and it
+///    is NOT a reason to give up: real awaits sit between the handshake
+///    returning `Ok` and the final insert (`proto.add_peer`,
+///    `refreshed_sync` — seconds wide), so a connection that dies inside
+///    that window would find no entry, write nothing, exit — and then
+///    the wiring task would insert its now-stale `Ok`, latching a dead
+///    wire ALIVE FOREVER, which is the exact bug this monitor exists to
+///    kill. So it WAITS instead: `wait-closed` is latched, so the news
+///    keeps until there is somewhere to put it, and the loop below
+///    breathes until an entry appears (or the connection is forgotten
+///    entirely, which is the other way out). Belt-and-braces, the final
+///    insert also consults `conn.state()` — see the wiring task — so
+///    the window is closed from both ends.
 /// 2. The marker is the literal prefix `gone: `, and engine.wit's
 ///    `conn-status` doc names it as machine-readable. The page half
 ///    matches on it; it is not free text to be reworded.
+///
+/// THE OTHER HALF, and the more consequential one: this monitor also
+/// CLOSES THE WIRE'S INBOUND QUEUES, because until #113's follow-up the
+/// engine was lying to subduction about liveness and that lie was worth
+/// more than the missing status.
+///
+/// `QueueTransport` (above) holds its OWN `in_tx` alongside `in_rx`, so
+/// `recv_bytes` could never fail: when `iroh_reader` hit EOF it dropped
+/// only its clone of the sender, the channel stayed open, and the
+/// transport went on politely waiting for frames from a socket that no
+/// longer existed. `send_bytes` was no better — `out_rx` is held by the
+/// transport too, so writes into a dead wire SUCCEED into a void.
+///
+/// Subduction's teardown is driven entirely by a connection's reader
+/// failing (subduction_core/src/connection/manager.rs:289-332 spawns a
+/// `connection_loop` per connection whose exit is the only thing that
+/// posts to `connection_closed`, consumed at subduction.rs:3244 where
+/// `remove_connection` finally runs). A transport that cannot fail
+/// therefore never gets removed — and `add_connection` APPENDS rather
+/// than replaces (`register_connection`, subduction.rs:758-791: the new
+/// connection is pushed onto the peer's list and a second multiplexer
+/// alongside it), so after an endpoint rebind the peer owns a dead
+/// connection at index 0 and the live one at index 1. `sync_with_peer`
+/// walks that list IN ORDER (subduction.rs:2190) and calls on the dead
+/// one first; with this engine's `NeverTimeout` (see it above — the
+/// `Timeout` impl that never fires) that call parks forever and the
+/// live connection is never reached. Net effect before this fix: after
+/// a relay outage, `conn-status` said LIVE within a second and no sync
+/// ever completed again, for the life of the page.
+///
+/// The asymmetry that made it confusing: only the side that CALLS
+/// `sync_with_peer` walks the stale list. An acceptor answering an
+/// incoming request replies on the connection the message arrived on,
+/// so it settles normally — which is why `one-sided-reload` was green
+/// throughout and only the dialling side ever hung.
+///
+/// Closing the inbound senders is the whole repair: `recv_bytes` starts
+/// failing, `connection_loop` exits, subduction removes the connection
+/// and its multiplexer by its own machinery, and the next
+/// `sync_with_peer` finds only the live one. No upstream change, and
+/// nothing here reaches into subduction's registries behind its back.
 ///
 /// WHAT ACTUALLY FIRES THIS. The obvious theory is the QUIC IDLE
 /// TIMEOUT — an idle connection sees no error, because nobody writes,
@@ -883,18 +942,61 @@ async fn iroh_reader(in_tx: async_channel::Sender<Vec<u8>>, recv: RecvStream, se
 /// seconds: they cannot tell which mechanism they are about to get.
 async fn conn_gone_monitor(id: u32, conn: Rc<polymorph::iroh::endpoint::Connection>) {
     let info = conn.wait_closed().await;
-    let why = match info {
+    let why = gone_reason(info);
+
+    // BEAT ONE, and the one that actually heals anything: TELL THE
+    // QUEUES THE TRUTH. See the "THE OTHER HALF" note above — until
+    // these channels close, `QueueTransport::recv_bytes` parks forever
+    // on a wire nobody will ever write to again, subduction never
+    // learns the connection died, and its replacement is unusable.
+    //
+    // Closing a `Sender` closes the channel for the receiver too, but
+    // only AFTER the queue drains — frames that arrived before the wire
+    // died are still delivered, so this loses no data. Done before the
+    // status write, and unconditionally, because it is repair rather
+    // than reporting: it must happen even when `conn_results` already
+    // holds an `Err` that rule 1 will decline to overwrite.
+    let _ = with_state(|s| {
+        for tx in s.conn_inbound.remove(&id).unwrap_or_default() {
+            tx.close();
+        }
+    });
+
+    // BEAT TWO: rule 1's wait. The cap is a runaway guard, not a
+    // deadline: every path through the wiring task inserts SOMETHING, so
+    // in practice the first or second pass lands. If it somehow never
+    // does, giving up quietly is better than a task spinning for the
+    // life of the page.
+    for _ in 0..10_000 {
+        let settled = with_state(|s| match s.conn_results.get(&id) {
+            Some(Ok(_)) => {
+                s.conn_results.insert(id, Err(why.clone()));
+                true
+            }
+            // An Err is already more informative than "gone" (rule 1).
+            Some(Err(_)) => true,
+            // Nothing recorded yet: keep the news until the wiring task
+            // settles, unless the connection has been forgotten outright.
+            None => !s.iroh_conns.contains_key(&id),
+        });
+        match settled {
+            Ok(true) | Err(_) => return,
+            Ok(false) => breathe().await,
+        }
+    }
+}
+
+/// The `gone: ` message for a `wait-closed` outcome. Shared with the
+/// wiring task's `state()` belt-and-braces check, which has no
+/// `close-info` to hand and must still say the same kind of thing.
+fn gone_reason(info: Option<polymorph::iroh::endpoint::CloseInfo>) -> String {
+    match info {
         Some(ci) if !ci.reason.is_empty() => {
             format!("gone: peer closed, code {}: {}", ci.code, ci.reason)
         }
         Some(ci) => format!("gone: peer closed, code {}", ci.code),
         None => "gone: transport closed (no close frame)".to_string(),
-    };
-    let _ = with_state(|s| {
-        if matches!(s.conn_results.get(&id), Some(Ok(_))) {
-            s.conn_results.insert(id, Err(why));
-        }
-    });
+    }
 }
 
 // --- the bucket path (#19's pull layer; adapted from spikes/storage) ---
@@ -3716,6 +3818,7 @@ fn finish_init(
             nonce_cache: Rc::new(NonceCache::default()),
             proto,
             conn_results: HashMap::new(),
+            conn_inbound: HashMap::new(),
             syncs: HashMap::new(),
             endpoint: None,
             relay_url: None,
@@ -4703,7 +4806,17 @@ impl DriverGuest for Component {
             wit_bindgen::spawn_local(iroh_writer(transport.out_rx.clone(), s_send));
             wit_bindgen::spawn_local(iroh_reader(transport.in_tx.clone(), s_recv, s_seed));
             let conn = Rc::new(conn);
-            let _ = with_state(|s| s.iroh_conns.insert(id, conn.clone()));
+            // Registered BEFORE the monitor is spawned: the monitor's
+            // first act is to close whatever is registered here, and a
+            // connection that is already dead by the time we get this far
+            // must not find an empty list and leave the queue open.
+            let _ = with_state(|s| {
+                s.iroh_conns.insert(id, conn.clone());
+                s.conn_inbound
+                    .entry(id)
+                    .or_default()
+                    .push(transport.in_tx.clone());
+            });
             wit_bindgen::spawn_local(conn_gone_monitor(id, conn.clone()));
 
             let outcome = subduction_handshake(
@@ -4726,7 +4839,27 @@ impl DriverGuest for Component {
                         let (kh_out_tx, kh_out_rx) = async_channel::unbounded();
                         let (kh_in_tx, kh_in_rx) = async_channel::unbounded();
                         wit_bindgen::spawn_local(iroh_writer(kh_out_rx, k_send));
-                        wit_bindgen::spawn_local(iroh_reader(kh_in_tx, k_recv, k_seed));
+                        wit_bindgen::spawn_local(iroh_reader(kh_in_tx.clone(), k_recv, k_seed));
+                        // The keyhive stream rides the SAME connection, so
+                        // it dies with it — and its receive loop below
+                        // (`while let Ok(msg) = recv_wire.recv()`) parks on
+                        // the same never-closing channel the subduction
+                        // transport did. Same registration, same repair.
+                        //
+                        // A monitor that already fired (the connection died
+                        // during the handshake) has drained and removed the
+                        // list, so pushing here would leak an open queue:
+                        // close immediately in that case instead.
+                        let kh_registered = with_state(|s| match s.conn_inbound.get_mut(&id) {
+                            Some(v) => {
+                                v.push(kh_in_tx.clone());
+                                true
+                            }
+                            None => false,
+                        });
+                        if !matches!(kh_registered, Ok(true)) {
+                            kh_in_tx.close();
+                        }
                         let kh_peer = KeyhivePeerId::from_bytes(peer32);
                         let kh_wire = KhWire {
                             peer: kh_peer.clone(),
@@ -4760,6 +4893,19 @@ impl DriverGuest for Component {
                     }
                 }
             }
+            // BELT-AND-BRACES on the monitor's rule 1 (see
+            // `conn_gone_monitor`): everything above this line — the
+            // handshake, `proto.add_peer`, `refreshed_sync` — is seconds
+            // wide, and a connection that died inside that window would
+            // be latched ALIVE by this very insert. `state()` is latched
+            // `closed` (iroh.wit:334), so asking it costs nothing and
+            // catches the case without waiting for anything.
+            let outcome = match outcome {
+                Ok(_) if conn.state() == polymorph::iroh::endpoint::ConnectionState::Closed => {
+                    Err(gone_reason(None))
+                }
+                other => other,
+            };
             let _ = with_state(|s| s.conn_results.insert(id, outcome));
         });
 
