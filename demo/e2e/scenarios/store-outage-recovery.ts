@@ -74,7 +74,7 @@
 
 import type { Page } from "npm:playwright@1.57.0";
 import type { Ctx, Scenario } from "../run.ts";
-import { act, assert, assertEquals, SOLO_KEYS, stripText } from "../util.ts";
+import { act, assert, assertEquals, recordSurfaceLine, SOLO_KEYS, stripText } from "../util.ts";
 import { addTodo, appFrame, createAccount, solo, until, WAITS } from "../solo-util.ts";
 
 const BUCKET = "pm-outage-recovery";
@@ -287,6 +287,26 @@ const scenario: Scenario = {
         // (or `pullFailures`) crosses `SYNC_VISIBLE_AFTER`, carrying the
         // seam's own error after the dash. Read off the strip's bottom
         // line (`stripText`, util.ts) rather than invented.
+        //
+        // THIS WATCH DOES NOT NEED THE RECORDER TREATMENT (unlike the
+        // heal act below), and the reasoning is read off
+        // `watchSyncFailures` itself rather than assumed: the
+        // stop-announcement is CONSEQUENTIAL (`announce(line, true)`),
+        // so `visorAnnounceSink` gives it `STICKY_MS` = 12s on screen
+        // (pairing.ts), not the 8s `ANNOUNCE_MS` default the recovery
+        // sentence gets. More importantly, NOTHING sits between the
+        // crossing and this watch the way `countBucketObjects`'s 30s
+        // filesystem poll sits between the heal and the recovery watch
+        // below: the `until` just above resolves the moment OUR OWN
+        // `syncStatus` poll (200ms cadence) sees `flushFailures >= 3`,
+        // two synchronous asserts run, and this watch starts — all
+        // within a fraction of a second of the crossing. The page's own
+        // announcement fires from its throttled 5s poll (`syncWatchAt`),
+        // so the announcement can only be LATE relative to this watch's
+        // start, never early, and the 12s display plus this watch's 20s
+        // budget comfortably outlasts that 5s worst-case lag. A slow CI
+        // disk cannot interpose here because nothing here reads the
+        // filesystem.
         const announced = await until([page], "the visor's failing-sync announcement", async () => {
           const t = await stripText(page);
           return t.bottom.includes("this device has stopped syncing with your storage") ? t.bottom : false;
@@ -302,6 +322,27 @@ const scenario: Scenario = {
       "THE STORE COMES BACK: nobody presses anything, and the backoff's own next retry heals it",
       async () => {
         const beforeHealObjects = await countBucketObjects(dataDir, BUCKET);
+
+        // AN OBSERVER INSTALLED BEFORE THE ACTION CANNOT MISS IT
+        // (util.ts's own idiom — see `recordSurfaceLine`'s doc comment,
+        // and `recordPaneStatus`'s). THE RACE THIS FIXES (found by CI,
+        // PR #120, 33/34): the recovery sentence is NON-STICKY
+        // (`watchSyncFailures` calls `announce(line)` with no
+        // `consequential` flag for it), so `visorAnnounceSink` gives it
+        // no ms override and `visor.announce`'s own default applies —
+        // `ANNOUNCE_MS` = 8s (util.ts). It fires once, from the page's
+        // own poll (throttled to a 5s cadence, `syncWatchAt`), the
+        // moment that poll observes the heal — which can be BEFORE the
+        // filesystem-witness wait below even starts, let alone before
+        // it finishes (up to 30s, slower on a loaded CI disk). Reading
+        // `stripText` only after that wait, as this act used to, could
+        // therefore watch a window that had already opened and closed.
+        // A MutationObserver installed HERE, before `ctx.startMinio()`,
+        // records every distinct value the strip's bottom line takes
+        // from this instant on, so the recovery sentence is caught
+        // regardless of when the filesystem poll lets this act get
+        // back to checking.
+        const stripRecorder = await recordSurfaceLine(page);
 
         await ctx.startMinio();
 
@@ -326,7 +367,10 @@ const scenario: Scenario = {
         // THE FILESYSTEM WITNESS: MinIO's own data directory shows more
         // objects than it did right before the heal — the bytes actually
         // reached the bucket, not merely a status field that flipped in
-        // the page (solo-storage.ts's technique).
+        // the page (solo-storage.ts's technique). THIS IS THE WAIT THAT
+        // CAN EAT THE RECOVERY ANNOUNCEMENT'S 8s WINDOW ON A SLOW DISK —
+        // which is exactly why the recorder above was installed before
+        // it, rather than the strip being read fresh afterward.
         const afterHealObjects = await until([page], "more objects on disk after the heal", async () => {
           const n = await countBucketObjects(dataDir, BUCKET);
           return n > beforeHealObjects ? n : false;
@@ -338,15 +382,29 @@ const scenario: Scenario = {
 
         // THE RECOVERY ANNOUNCEMENT (host/solo.ts's `watchSyncFailures`:
         // "A RECOVERY IS ANNOUNCED TOO, and only when a failure was
-        // announced").
+        // announced"). Read from the RECORDER's samples, not a fresh
+        // `stripText` read — the announcement may already be off screen
+        // by now. The bound below polls the recorder rather than the
+        // DOM (the recorder already holds whatever happened; this is
+        // belt-and-braces for the rare case the page's 5s poll had not
+        // yet ticked when the filesystem wait above finished): the
+        // recovery cannot land LATER than one more page-poll cadence
+        // (5s) plus its own 8s display after the heal `until` above
+        // already resolved, so 30s is generous margin on top of that
+        // ~13s, not a guess.
         const recovered = await until([page], "the visor's recovery announcement", async () => {
-          const t = await stripText(page);
-          return t.bottom.includes("this device is syncing with your storage again") ? t.bottom : false;
-        }, 20_000);
+          const samples = await stripRecorder.samples();
+          const hit = samples.find((s) => s.includes("this device is syncing with your storage again"));
+          return hit ?? false;
+        }, 30_000).catch(async (e) => {
+          const samples = await stripRecorder.samples();
+          throw new Error(`${(e as Error).message}; recorded strip values: ${JSON.stringify(samples)}`);
+        });
         assert(
           recovered.includes("this device is syncing with your storage again"),
           `the strip should carry the recovery announcement: ${JSON.stringify(recovered)}`,
         );
+        await stripRecorder.stop();
       },
     );
 
