@@ -64,15 +64,20 @@ import {
   getAnchor,
   getDevice,
   holdDeviceLock,
+  LEASE_INTERVAL_MS,
+  LEASE_STALE_MS,
+  leaseIsStale,
   listDevices,
   loadIdentity,
   loadOrMintIdentity,
   namespaceExists,
   newDeviceId,
+  nsDbName,
   type Posture,
   openNamespace,
   persistIdentity,
   promoteDevice,
+  readLease,
   rekeyPassphrase,
   removeDevice,
   reseal,
@@ -712,6 +717,7 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
     id?: string;
     anchorPetname?: string;
     seedPosture?: boolean;
+    timeoutMs?: number;
     unseal?: { passphrase?: string; untilReseal?: boolean };
   }) => {
     const conn = await connect(arg);
@@ -866,6 +872,197 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
       namespaceGone: !(await namespaceExists(arg.id)),
       anchorNotLive: !(await anchorIsLive(arg.id)),
     };
+  },
+
+  /**
+   * A PLAIN `setInterval` COUNTER IN THIS PAGE'S GLOBAL, plus the
+   * document's own LIFECYCLE EVENTS — the freeze instrument from
+   * demo/e2e/cdp.ts's own lifecycle spike, so a row that freezes a page
+   * can prove the freeze was real rather than a CDP call that returned
+   * successfully and did nothing. A frozen document runs no timers and
+   * fires `freeze`/`resume`; both are read back after the thaw, because
+   * a page that is genuinely frozen cannot answer a probe about itself.
+   */
+  "tick-start": (arg: { everyMs: number }) => {
+    ticks.count = 0;
+    ticks.startedAt = Date.now();
+    ticks.events = [];
+    if (ticks.timer !== undefined) clearInterval(ticks.timer);
+    ticks.timer = setInterval(() => ticks.count++, arg.everyMs);
+    if (!ticks.listening) {
+      ticks.listening = true;
+      document.addEventListener("freeze", () => ticks.events.push("freeze"));
+      document.addEventListener("resume", () => ticks.events.push("resume"));
+      document.addEventListener(
+        "visibilitychange",
+        () => ticks.events.push(`visibility:${document.visibilityState}`),
+      );
+    }
+    return Promise.resolve({ started: true, everyMs: arg.everyMs });
+  },
+
+  "tick-read": () => {
+    if (ticks.timer !== undefined) clearInterval(ticks.timer);
+    ticks.timer = undefined;
+    return Promise.resolve({
+      count: ticks.count,
+      elapsedMs: Date.now() - ticks.startedAt,
+      events: [...ticks.events],
+      visibility: document.visibilityState,
+    });
+  },
+
+  /**
+   * THE LEASE, READ RATHER THAN INFERRED (locks.ts's heartbeat).
+   *
+   * The heartbeat runs in the WORKER — `takeLock` calls `startLease(ns)`
+   * and deliberately drops the stop handle — so the only way to ask
+   * whether a host is still marking itself alive is to read the mark.
+   * The eviction/freeze rows ask this from a SECOND page, because a
+   * frozen page cannot answer anything about itself (demo/e2e/cdp.ts's
+   * `setWebLifecycleState` hazard note).
+   */
+  "lease-read": async (arg: { id: string }) => {
+    const ns = openNamespace(arg.id);
+    const at = await readLease(ns);
+    return {
+      at,
+      ageMs: at === null ? null : Date.now() - at,
+      stale: await leaseIsStale(ns),
+      intervalMs: LEASE_INTERVAL_MS,
+      staleAfterMs: LEASE_STALE_MS,
+      lockHeld: await deviceLockIsHeld(arg.id),
+    };
+  },
+
+  /** Backdate the lease by hand — the fallback route to the "lock held,
+   * lease stale" quadrant when the platform will not produce it on its
+   * own. Written through the namespace API exactly as `startLease`
+   * writes it, so the sweep cannot tell the two apart. */
+  "lease-backdate": async (arg: { id: string; ageMs: number }) => {
+    await openNamespace(arg.id).put("meta", "lease", { at: Date.now() - arg.ageMs });
+    const ns = openNamespace(arg.id);
+    return { at: await readLease(ns), stale: await leaseIsStale(ns) };
+  },
+
+  /** The sweep, with NOTHING touched first — the caller has already
+   * arranged whatever state it wants to ask about. (`hc-sweep-live`
+   * backdates on the way in, which is the wrong shape for a row whose
+   * whole question is what the lease did on its own.) */
+  "sweep-now": async (arg: { id: string }) => {
+    const result = await sweepT0();
+    return {
+      lockHeld: await deviceLockIsHeld(arg.id),
+      kept: result.kept.find((k) => k.id === arg.id) ?? null,
+      swept: result.swept.includes(arg.id),
+      stillIndexed: (await getDevice(arg.id)) !== undefined,
+      namespaceStillThere: await namespaceExists(arg.id),
+    };
+  },
+
+  /**
+   * WHAT A STILL-ATTACHED CLIENT OBSERVES when the worker underneath it
+   * is gone: issue one ordinary RPC and report, BOUNDED, whether it
+   * resolved, rejected, or simply never settled. The bound is the
+   * harness's patience, not a claim — a call that has not settled by
+   * then is reported as exactly that.
+   */
+  "hc-race": async (arg: { id: string; ms: number }) => {
+    const conn = conns.get(arg.id)!;
+    const started = Date.now();
+    let outcome: "resolved" | "rejected" | "never-settled" = "never-settled";
+    let error: ReturnType<typeof caught> | null = null;
+    const call = conn.tasks.items().then(
+      () => {
+        outcome = "resolved";
+      },
+      (e) => {
+        outcome = "rejected";
+        error = caught(e);
+      },
+    );
+    await Promise.race([call, new Promise((r) => setTimeout(r, arg.ms))]);
+    // A rejection that lands after the bound must not become an
+    // unhandled rejection and take the page down with it.
+    call.catch(() => {});
+    return { outcome, error, waitedMs: Date.now() - started };
+  },
+
+  /**
+   * DOES A MESSAGEPORT ANNOUNCE ITS PEER'S DEATH IN THIS BROWSER?
+   *
+   * client.ts listens for `message` and nothing else, so if the platform
+   * fired a `close` event on the port the client would still not act on
+   * it — but whether the event EXISTS is a fact about the browser worth
+   * measuring rather than assuming, because it is the difference between
+   * "our client chooses to wait for its timeout" and "there is nothing
+   * to hear". A RAW second port to the same SharedWorker (same origin,
+   * same script URL, same name ⇒ the same global — client.ts's "THE NAME
+   * IS THE DEVICE") is opened with both handlers attached; the driver
+   * kills the worker and reads back what fired.
+   */
+  "port-listen": async (arg: { id: string }) => {
+    const worker = new SharedWorker("./worker.js", { type: "module", name: nsDbName(arg.id) });
+    const seen: string[] = [];
+    // `close` is the event in question; `messageerror` is here so a
+    // "something arrived and could not be read" is not mistaken for
+    // silence.
+    worker.port.addEventListener("close", () => seen.push("close"));
+    worker.port.addEventListener("messageerror", () => seen.push("messageerror"));
+    worker.port.start();
+    rawPorts.set(arg.id, { seen });
+    // The hello the worker posts to every fresh connection, so this op
+    // can report that the port was genuinely live before the kill.
+    await new Promise((r) => setTimeout(r, 300));
+    return {
+      /** Whether this Chromium implements the event at all. */
+      closeEventSupported: "onclose" in worker.port,
+      seen: [...seen],
+    };
+  },
+
+  /** Read back what the raw port heard while the driver was killing the
+   * worker. */
+  "port-heard": (arg: { id: string }) =>
+    Promise.resolve({ seen: [...(rawPorts.get(arg.id)?.seen ?? [])] }),
+
+  /**
+   * START a flush and DO NOT wait for it — the only way a row can kill
+   * the worker while a flush is genuinely mid-sequence rather than
+   * before or after it. The promise is parked so nothing becomes an
+   * unhandled rejection; `flush-outcome` reads it back, bounded.
+   */
+  "gd-flush-start": async (arg: { id: string }) => {
+    const conn = conns.get(arg.id)!;
+    const docId = await conn.tasks.partition();
+    const state: { done: boolean; refused: boolean; error: unknown } = {
+      done: false,
+      refused: false,
+      error: null,
+    };
+    const p = conn.driver.bucketFlush(docId).then(
+      () => {
+        state.done = true;
+      },
+      (e) => {
+        state.done = true;
+        state.refused = true;
+        state.error = caught(e);
+      },
+    );
+    p.catch(() => {});
+    flushes.set(arg.id, state);
+    return { started: true };
+  },
+
+  "gd-flush-outcome": async (arg: { id: string; ms: number }) => {
+    const state = flushes.get(arg.id);
+    if (!state) return { known: false };
+    const deadline = Date.now() + arg.ms;
+    while (!state.done && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return { known: true, settled: state.done, refused: state.refused, error: state.error };
   },
 
   /**
@@ -1533,7 +1730,7 @@ const ARTIFACTS = {
 const conns = new Map<string, DeviceConnection>();
 
 function connect(
-  arg: { id?: string; anchorPetname?: string; seedPosture?: boolean },
+  arg: { id?: string; anchorPetname?: string; seedPosture?: boolean; timeoutMs?: number },
 ): Promise<DeviceConnection> {
   const existing = arg.id ? conns.get(arg.id) : undefined;
   if (existing) return Promise.resolve(existing);
@@ -1546,6 +1743,13 @@ function connect(
     workerUrl: "./worker.js",
     artifacts: ARTIFACTS,
     label: "probe",
+    // THE EVICTION ROWS' KNOB, and nothing else uses it: client.ts's
+    // default is 120 s, which is the right production number and far
+    // too long for a row that has to MEASURE what a pending call does
+    // when the worker underneath it is gone. Passing a short one does
+    // not change what is measured — the port stays silent either way —
+    // it only bounds how long the harness waits to say so.
+    timeoutMs: arg.timeoutMs,
     // PROBE ONLY, and only the seed-back-compat row passes it: the
     // worker inits in platform posture otherwise.
     __seedPosture: arg.seedPosture === true,
@@ -1556,6 +1760,28 @@ function connect(
 }
 
 const held = new Map<string, DeviceLock>();
+
+/** Raw SharedWorker ports opened by `port-listen`, and what each heard.
+ * Kept per device so the kill and the read-back are two probe calls. */
+const rawPorts = new Map<string, { seen: string[] }>();
+
+/** In-flight flushes started by `gd-flush-start`. */
+const flushes = new Map<string, { done: boolean; refused: boolean; error: unknown }>();
+
+/** The freeze instrument — see `tick-start`. */
+const ticks: {
+  count: number;
+  startedAt: number;
+  timer: number | undefined;
+  events: string[];
+  listening: boolean;
+} = {
+  count: 0,
+  startedAt: 0,
+  timer: undefined,
+  events: [],
+  listening: false,
+};
 
 /** Best-effort teardown so cases cannot contaminate each other through
  * a shared index. */

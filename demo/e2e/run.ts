@@ -70,6 +70,10 @@ import soloPasskey from "./scenarios/solo-passkey.ts";
 import visorReset from "./scenarios/visor-reset.ts";
 import firefoxSmoke from "./scenarios/firefox-smoke.ts";
 import harnessFaults from "./scenarios/harness-faults.ts";
+import storeOutageRecovery from "./scenarios/store-outage-recovery.ts";
+import oneSidedReload from "./scenarios/one-sided-reload.ts";
+import relayPartition from "./scenarios/relay-partition.ts";
+import relayPartitionAsym from "./scenarios/relay-partition-asym.ts";
 
 // Re-exported so a scenario imports its whole contract from one place:
 // `Scenario` and the `Ctx` it is handed.
@@ -175,6 +179,15 @@ const SCENARIOS: Scenario[] = [
   // the role read out of it, the acceptor and the dial — rather than in
   // anything either of them covers.
   soloResumeSync,
+  // AND ITS ONE-SIDED SIBLING, expected RED: solo-resume-sync proves
+  // the both-sides reload recovers, and solo.ts (~2988-3012) documents
+  // in prose that the ONE-SIDED reload — the acceptor reloads, the
+  // reader keeps a stale handle that `conn-status` will never
+  // invalidate — does not. This scenario turns that prose into a gate:
+  // it asserts the recovery as if it worked, fails today, and the
+  // xfail machinery FAILS THE SUITE the day an engine fix makes it
+  // pass un-promoted (drop its `expected` flag then).
+  oneSidedReload,
   soloEphemeral,
   // THE WORKER HOST'S STORAGE EGRESS (STORAGE-EGRESS.md's T-E): the same
   // sheet the two device-store scenarios above just proved a device
@@ -184,6 +197,16 @@ const SCENARIOS: Scenario[] = [
   // because a failure here with solo-persistence green says the fault is
   // in the store-egress wiring, not in the device store underneath it.
   soloStorage,
+  // THE STORE THAT COMES BACK (runtime/SYNC.md §3's backoff): the same
+  // MinIO binding solo-storage just proved, now with the store dying
+  // MID-SESSION and returning. transport-refusal pins the honest
+  // failure of a store that is down from the start; this pins the
+  // RECOVERY — failures counted, the announcement made, and the
+  // worker's own backoff retry healing everything with nobody pressing
+  // anything. It follows solo-storage because it uses that scenario's
+  // ceremony as a precondition: a failure here with solo-storage green
+  // says the fault is in the schedule's recovery, not in the binding.
+  storeOutageRecovery,
   // GOOGLE DRIVE FROM THE WORKER HOST (runtime/DRIVE.md's e2e gate): the
   // same solo page, the same fresh context, but this one needs no MinIO
   // at all — it drives its own in-process fake Drive instead, and runs
@@ -232,6 +255,16 @@ const SCENARIOS: Scenario[] = [
   // follows (nothing in this suite currently depends on that, but nor
   // did the observation cost anything to write down).
   soloPasskey,
+  // THE TWO RELAY-PARTITION PINS, both expected RED and both SLOW —
+  // each spends minutes proving a heal that does not come (the
+  // freshly-paired ceremony wires never re-dial, and `conn-status`
+  // never learns a wire died; the full trace is in the scenarios' own
+  // banners). They run this late so a suite that is already broken
+  // earlier never pays for them, and after the solo family because
+  // their preconditions (pairing, convergence, the harness's own fault
+  // levers) are all claims made green above.
+  relayPartition,
+  relayPartitionAsym,
   // The erase ceremony: seeds a name, a petname and a storage sentinel,
   // then reloads the page (twice) as part of its own claim. It runs
   // after the other identity/naming scenarios and before the one that
@@ -1041,12 +1074,23 @@ async function main() {
       }
       // The crash shape: the renderer stopped answering (either named by
       // waitForBoot/driverBounded, or caught only by the deadline), or a
-      // crash event was actually delivered. All three say "the browser
-      // died", not "the demo is wrong".
+      // crash event was actually delivered, or the whole BROWSER is gone
+      // — `isConnected()` false, and protocol calls failing with
+      // playwright's "has been closed" wording. All of these say "the
+      // browser died", not "the demo is wrong". The last two were
+      // learned the hard way (2026-08-24): an externally-killed Chromium
+      // made `newContext` fail INSTANTLY with "Target page, context or
+      // browser has been closed", which is not a RendererGoneError and
+      // never trips the deadline — so the runner sailed on with a dead
+      // browser and every following Chromium scenario failed in 0.0s.
+      // A cascade like that is a statement about the browser process,
+      // and the recovery it needs is exactly recoverBrowser's.
       const crashShaped = failed && (
         (failure instanceof RendererGoneError) ||
         (failure instanceof Error && failure.name === "RendererGoneError") ||
         (failure instanceof Error && failure.message.startsWith(DEADLINE_MARK)) ||
+        (failure instanceof Error && /has been closed/.test(failure.message)) ||
+        !current().isConnected() ||
         crashEventSeen
       );
       if (failed && crashShaped && attempt < MAX_ATTEMPTS) {
