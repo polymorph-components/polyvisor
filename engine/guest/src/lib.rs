@@ -833,6 +833,70 @@ async fn iroh_reader(in_tx: async_channel::Sender<Vec<u8>>, recv: RecvStream, se
     }
 }
 
+/// The wire's obituary (#113). `conn-status` used to be write-once: the
+/// handshake outcome went into `conn_results` and was read back forever,
+/// so a connection that came up and later DIED was indistinguishable
+/// from a healthy one — and a page with no liveness signal may never
+/// safely re-dial, because a second dial to the same peer is a second
+/// connection carrying the same subscriptions (#78's direction
+/// discipline). Nothing else observes the death: `iroh_writer` breaks on
+/// a write error and `iroh_reader` breaks on EOF, both silently, into
+/// their own tasks. So one more task per connection does nothing but
+/// wait for the end and write it down.
+///
+/// `wait-closed` is the notification, and it was always there — it needed
+/// plumbing, not a WIT change (guest/wit/deps/polymorph-iroh/iroh.wit:425
+/// — async, resolving with the peer's `close-info` when an application
+/// close arrived and `none` when the connection ended any other way, and
+/// LATCHED: once closed it resolves immediately with the same value any
+/// number of times). It is a method on `connection`, not on either
+/// stream, so holding a second `Rc<Connection>` here does not contend
+/// with the reader/writer tasks' borrows of `SendStream`/`RecvStream` —
+/// those are separate resources handed out by `open-bi`/`accept-bi`.
+///
+/// TWO RULES, both about not lying:
+///
+/// 1. It only overwrites an `Ok(peer)`. An existing `Err` is a
+///    wire-setup or handshake failure, which says strictly more than
+///    "gone", and clobbering it would turn a diagnosis into a shrug. A
+///    MISSING entry is left missing too: the handshake has not settled
+///    yet, and it is about to record its own (failing, on a dead wire)
+///    outcome — letting the monitor race ahead would only invite that
+///    write to overwrite the gone marker back to something staler.
+/// 2. The marker is the literal prefix `gone: `, and engine.wit's
+///    `conn-status` doc names it as machine-readable. The page half
+///    matches on it; it is not free text to be reworded.
+///
+/// WHAT ACTUALLY FIRES THIS. The obvious theory is the QUIC IDLE
+/// TIMEOUT — an idle connection sees no error, because nobody writes,
+/// so nobody learns the path is gone — and for a path that silently
+/// stops carrying packets (a black-holing relay, a NAT drop) that is
+/// indeed what ends it: tens of seconds, a property of the pinned
+/// endpoint (jsr:@polymorph/iroh@0.3.0), not a promise this engine
+/// makes or can tighten. But the case the gate exercises is FASTER for
+/// a structural reason: a relay-dialed connection's relay leg is a
+/// websocket over TCP, so killing the relay process closes that socket
+/// and the endpoint learns synchronously — `demo/host/conn-gone-check.ts`
+/// measures under a second, both sides, with `none` for the close-info
+/// (a peer that vanished sent no close frame). Callers should still
+/// treat "gone" as eventually-consistent on the order of tens of
+/// seconds: they cannot tell which mechanism they are about to get.
+async fn conn_gone_monitor(id: u32, conn: Rc<polymorph::iroh::endpoint::Connection>) {
+    let info = conn.wait_closed().await;
+    let why = match info {
+        Some(ci) if !ci.reason.is_empty() => {
+            format!("gone: peer closed, code {}: {}", ci.code, ci.reason)
+        }
+        Some(ci) => format!("gone: peer closed, code {}", ci.code),
+        None => "gone: transport closed (no close frame)".to_string(),
+    };
+    let _ = with_state(|s| {
+        if matches!(s.conn_results.get(&id), Some(Ok(_))) {
+            s.conn_results.insert(id, Err(why));
+        }
+    });
+}
+
 // --- the bucket path (#19's pull layer; adapted from spikes/storage) ---
 
 #[derive(Serialize, Deserialize)]
@@ -4638,7 +4702,9 @@ impl DriverGuest for Component {
             let transport = QueueTransport::new(id);
             wit_bindgen::spawn_local(iroh_writer(transport.out_rx.clone(), s_send));
             wit_bindgen::spawn_local(iroh_reader(transport.in_tx.clone(), s_recv, s_seed));
-            let _ = with_state(|s| s.iroh_conns.insert(id, Rc::new(conn)));
+            let conn = Rc::new(conn);
+            let _ = with_state(|s| s.iroh_conns.insert(id, conn.clone()));
+            wit_bindgen::spawn_local(conn_gone_monitor(id, conn.clone()));
 
             let outcome = subduction_handshake(
                 transport,

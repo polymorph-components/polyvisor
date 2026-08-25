@@ -496,6 +496,28 @@ interface driver {
 
     iroh-bind: async func(relay-url: string) -> result<string, string>;
     iroh-start: async func(initiator: bool, peer-endpoint-id: list<u8>, relay-url: string, expected-peer: list<u8>) -> result<u32, string>;
+    /// The connection's liveness, in three distinguishable answers
+    /// (#113 — this used to be write-once, reporting the handshake
+    /// outcome forever):
+    ///
+    ///   - `ok(some(peer))`: the handshake succeeded and the wire was
+    ///     last known ALIVE. `peer` is the authenticated peer id, hex.
+    ///   - `ok(none)`: no such connection id.
+    ///   - `err(e)` where `e` starts with the literal prefix `"gone: "`:
+    ///     the wire came UP and later DIED. Latched — it never returns
+    ///     to `ok`, because this id names that one dead connection; a
+    ///     re-dial mints a NEW conn id. The rest of the message is
+    ///     whatever the close carried (the peer's application close
+    ///     code and reason when one arrived, else an honest note that
+    ///     the transport just ended).
+    ///   - any other `err(e)`: the HANDSHAKE ITSELF failed (wire setup,
+    ///     peer mismatch, protocol error). Nothing ever came up.
+    ///
+    /// THE `"gone: "` PREFIX IS THE MACHINE-READABLE MARKER. Callers
+    /// that re-dial match on it to tell "this wire died, dial again"
+    /// from "this dial never worked, and dialling again the same way
+    /// will not work either". It is a contract, not phrasing: do not
+    /// rework it into free-form prose.
     conn-status: async func(conn: u32) -> result<option<string>, string>;
     sync-start: async func(peer: list<u8>, tree: list<u8>, subscribe: bool) -> result<u32, string>;
     sync-status: async func(handle: u32) -> result<option<string>, string>;
