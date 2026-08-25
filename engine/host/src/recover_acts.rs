@@ -466,6 +466,15 @@ pub(crate) async fn recover_act(
     }
     ok("act 6: consume removed the bundle and the K_p, and nothing else", Instant::now());
 
+    // Seen from the RESTORED device itself: its own registry read must
+    // agree with the consume it just performed (found disagreeing on the
+    // solo page — this pins where the disagreement lives).
+    let own = step!("restored.recovery-kits (own view)", r.call_recovery_kits(acc));
+    if !own.is_empty() {
+        bail!("the restored device still lists the kit it consumed: {own:?}");
+    }
+    ok("act 6: the restored device's own registry agrees with its consume", Instant::now());
+
     // IDEMPOTENT: the retry the embedder's backoff loop will make.
     step!(
         "restored.recovery-consume (retry: absence is success)",
@@ -519,6 +528,14 @@ pub(crate) async fn recover_act(
         bail!("a file kit wrote a bundle object into the bucket");
     }
     ok("act 8: the file kit returned bytes and stored no object", Instant::now());
+    // The registry must name the file kit — revocability is the record's
+    // stated answer to a leaked kit, and an unlisted kit cannot be
+    // revoked (found unasserted by T-C's sheet, which saw file kits
+    // silently missing).
+    let kits = step!("account.recovery-kits [file kit]", a.call_recovery_kits(acc));
+    if kits.len() != 1 || kits[0].kind != "file" {
+        bail!("recovery-kits does not name exactly the file kit just minted: {kits:?}");
+    }
     step!(
         "account.bucket-flush(us) [file kit]",
         a.call_bucket_flush(acc, Vec::new())

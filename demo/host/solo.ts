@@ -93,7 +93,14 @@ import {
 import type { PairingDriver, UsMark, UsProfile } from "../../visor/ui/pairing-driver.ts";
 import { createEnginePairingDriver } from "../../runtime/pairing-engine.ts";
 import type { UiEvent } from "../../visor/surface/events.ts";
-import { type EngineArtifacts, hex, unhex, until, type UsStorage } from "../../runtime/engine.ts";
+import {
+  type EngineArtifacts,
+  hex,
+  type RecoveryKit,
+  unhex,
+  until,
+  type UsStorage,
+} from "../../runtime/engine.ts";
 import { adoptAnchor, clearAnchor } from "../../runtime/device-store/anchor.ts";
 import {
   connectDevice,
@@ -109,6 +116,7 @@ import {
 import type {
   DeviceStatus,
   GdriveSpace,
+  RecoveryKitInput,
   StoreBinding,
 } from "../../runtime/device-store/rpc.ts";
 import { putSigningKey } from "../../runtime/keystore.ts";
@@ -276,6 +284,49 @@ interface AppExports {
 // note), so a tab that fires two overlapping driver calls still fires
 // them at one cooperative guest. The chain is therefore still this
 // page's job even though the engine moved.
+//
+// ────────────────────────────────────────────────────────────────────
+// NEVER CALL `enqueue` FROM INSIDE A JOB, and never `await` a helper
+// that does. THIS IS A PAGE-WIDE FOOTGUN, not a local one.
+//
+// The chain is ONE promise. An `enqueue` issued while a job is running
+// is appended AFTER that job, so it cannot start until the job finishes
+// — and if the job is awaiting it, the job never finishes. That is a
+// permanent self-deadlock, and the casualty is not just the caller: the
+// chain is left holding a promise that will never settle, so EVERY
+// later enqueue on the page (the announcement drain, the pairing polls,
+// every serialized driver call) queues behind it forever. The page goes
+// quietly dead rather than throwing.
+//
+// It has been paid for twice now. demo.ts's own note records the first;
+// the second was the recovery-kit sheet repainting its list from inside
+// its mint job (RECOVERY.md's T-C), which presented as "the file kind
+// never lists" and was misdiagnosed as an engine bug — the registry was
+// correct all along and the read was simply never run. Nesting fails
+// SILENTLY and looks exactly like the thing you are calling being
+// broken, which is why it is worth this many lines.
+//
+// The rule at a call site: if you are already inside a job, call the
+// connection or the driver DIRECTLY — the enclosing job is already the
+// serialization. A helper that reads the engine should either take its
+// reader as a parameter, so the question is answered where the answer
+// is known (see the recovery sheet's `readKitsQueued`/`readKitsInJob`
+// pair), or be fire-and-forget and never awaited (see
+// `writeThroughAccountStorage`, which enqueues from inside a job
+// harmlessly precisely because nothing waits for it).
+//
+// WHY THERE IS NO RE-ENTRANCY GUARD HERE, though one would make the
+// whole class impossible: it cannot be made sound in a browser. A guard
+// needs to know "is this call coming from within a running job", and a
+// plain boolean set around the job's execution answers a DIFFERENT
+// question — "is a job in flight" — which is also true for a timer or
+// an event handler that fires while a job sits at an await. Those are
+// not in the job; running them directly would put a second guest call
+// in flight beside the first and break exactly the serialization this
+// chain exists to provide. The honest tool is an async-context tracker
+// (`AsyncLocalStorage`), which the browser does not have. So the
+// invariant is kept at the call sites, and stated here.
+// ────────────────────────────────────────────────────────────────────
 let chain: Promise<unknown> = Promise.resolve();
 function enqueue<T>(f: () => Promise<T>): Promise<T> {
   const next = chain.then(f, f);
@@ -659,6 +710,40 @@ function picker(
           throw { needsPassphrase: false, message: err(e) };
         }
       },
+      // THE RECOVERY DOOR (entry.ts's `DevicePickerHost.restore`). The
+      // picker has already closed by the time this runs and will not
+      // reopen itself, so this arm owns the drawer and owns getting the
+      // user back to a usable entry surface.
+      //
+      // THE SUCCESS PATH IS THE ORDINARY ONE, and that is the point: it
+      // resolves the very promise a picked device resolves, so boot
+      // continues into `startApp`, which claims the visor. Colour, name
+      // and icon therefore arrive together, from the profile the restore
+      // just pulled, through the SAME machinery unseal-as-login uses —
+      // no second claim path, and nothing personal painted before the
+      // account state was genuinely in hand (RECOVERY.md, "Restore").
+      restore: () => {
+        say("ready — restore from your recovery kit");
+        note("picker:restore");
+        return new Promise<void>((settle) => {
+          mountRestore(visor, {
+            onRestored: (conn, consumePending) => {
+              restoredKitNote = consumedKitSentence(consumePending);
+              note("restored");
+              settle();
+              resolve(conn);
+            },
+            onAbandoned: () => {
+              // BACK TO THE PICKER, rebuilt: abandoning a ceremony must
+              // land somewhere a user can act, and the picker is where
+              // they were.
+              say("ready — choose a device");
+              settle();
+              mountDevicePicker(visor, rows, host);
+            },
+          });
+        });
+      },
     };
 
     // ONE KEPT DEVICE AND A POLICY THAT PERMITS IT: straight through
@@ -711,6 +796,657 @@ function picker(
   });
 }
 
+// --- account recovery: the restore ceremony (runtime/RECOVERY.md) ----------
+//
+// THE CLAIM THIS EXISTS TO MAKE: losing every device does not lose the
+// account. A recovery kit — a generated phrase, or a downloaded file
+// plus its passphrase — together with access to the account's storage
+// restores the account on a fresh browser with no live peer anywhere.
+//
+// WHERE IT RUNS, AND WHY THAT IS PRE-CLAIM. This ceremony lives at
+// MODULE scope, beside `picker()`, and not inside `startApp` like the
+// storage sheet it borrows its fields from. That is forced by the
+// record's own ordering rule: "the visor claims at the end — colour,
+// name and icon arrive from the pulled profile, and nothing personal
+// renders before the account state is genuinely in hand"
+// (RECOVERY.md, "Restore"). A ceremony hosted inside `startApp` would be
+// a ceremony running AFTER `visor.claim()` had already painted a colour,
+// which is precisely the ordering the anti-spoofing property forbids.
+//
+// So the restore runs on the UNCLAIMED grey dress, exactly as the picker
+// does, and hands back a `DeviceConnection` for the ordinary boot to
+// claim on. The two doors into it (the picker's, and the first-run
+// fork's) differ only in what they do with that connection — see each
+// call site.
+//
+// THE SECRET DISCIPLINE is the storage sheet's, unchanged: the phrase,
+// the file passphrase and the S3 secret key are each read straight off
+// their input and the field is cleared IN THE SAME TICK, before the
+// value is used. A local carries it into the ceremony, so a refusal at
+// any stage leaves no typed secret sitting in the DOM.
+
+/** A labelled field, the shape the credential sheets use. A module-scope
+ * twin of `startApp`'s own `field` — the restore ceremony cannot reach
+ * that one (it is a closure over a live device) and duplicating eleven
+ * lines beats hoisting a helper out of a sheet that is not this track's. */
+function credField(labelText: string, hintText?: string): HTMLElement {
+  const wrap = document.createElement("div");
+  wrap.className = "cred-field";
+  const label = document.createElement("label");
+  label.textContent = labelText;
+  wrap.append(label);
+  if (hintText !== undefined) {
+    const hint = document.createElement("div");
+    hint.className = "hint";
+    hint.textContent = hintText;
+    wrap.append(hint);
+  }
+  return wrap;
+}
+
+/**
+ * WHAT A COMPLETED RESTORE OWES THE NEXT SCREEN, parked here between the
+ * ceremony and the claim.
+ *
+ * The consumed-kit announcement is the record's own sentence and it is
+ * NOT OPTIONAL (RECOVERY.md, "Single-use"): "the visor announces 'your
+ * recovery kit was used — create a new one'". But the visor has no
+ * announcement surface worth using until it has CLAIMED, and the claim
+ * is deliberately the last thing that happens. So the ceremony leaves
+ * the sentence here and `startApp` says it immediately after claiming.
+ *
+ * A MODULE-LEVEL LATCH RATHER THAN A RETURN VALUE because the fork's
+ * door reaches the claim through a RELOAD (see its call site), and a
+ * value cannot cross that; `sessionStorage` carries it instead, and this
+ * variable carries it on the path that does not reload. Both are drained
+ * exactly once.
+ */
+const RESTORE_NOTE_KEY = "pm-solo-restored";
+let restoredKitNote: string | null = null;
+
+/** The consumed-kit sentence this page actually announced, or "". See
+ * the note at the announcement site: announcements REPLACE, so the strip
+ * is not a surface a claim about this sentence can rest on. */
+let restoreAnnouncedText = "";
+
+/** The sentence, worded off the one fact the worker will tell us: has
+ * the kit actually been retired yet? A consume failure never blocks a
+ * restore (RECOVERY.md), so "used — make a new one" is true either way;
+ * what changes is whether the cleanup is still in flight, and saying so
+ * is honest without being alarming. */
+function consumedKitSentence(consumePending: boolean): string {
+  return consumePending
+    ? "your recovery kit was used — create a new one. Retiring the old one is still " +
+      "being retried against your storage; it cannot be used again either way."
+    : "your recovery kit was used — create a new one";
+}
+
+/** Map a restore refusal onto a plain sentence.
+ *
+ * THE TYPED CLASSES ARE THE WORKER'S AND THE GUEST'S (client.ts's
+ * `restore`): `bad-destination` and `no-credential` are host codes;
+ * a wrong or already-spent phrase and a wrong file passphrase arrive as
+ * the guest's own branded messages. Each becomes a sentence that says
+ * what to DO, because a bare refusal at the end of a disaster is the
+ * least useful thing this sheet could render.
+ *
+ * ANYTHING UNRECOGNISED IS REPORTED AS IT CAME. Guessing at a cause
+ * would be worse than quoting the seam. */
+function restoreRefusal(e: unknown): string {
+  const code = (e as { code?: string }).code;
+  const raw = err(e);
+  if (code === "no-credential") {
+    return "this browser has no credential for that destination yet — enter the secret key " +
+      `for it, or grant access again (${raw})`;
+  }
+  if (code === "bad-destination") {
+    return `that destination could not be used: ${raw}`;
+  }
+  // The guest's slot failures. Matched on the engine's own words rather
+  // than a code because they arrive as branded component exceptions, not
+  // as host conditions — see client.ts's `restore` refusal note.
+  if (/no recovery kit at this name|not found|404/i.test(raw)) {
+    return "no recovery kit answers that phrase. Check the words, and remember that a kit " +
+      "is used up the first time it works — a phrase that restored once will never " +
+      "restore again.";
+  }
+  if (/unlock failed|decrypt/i.test(raw)) {
+    return "that passphrase did not open this file. Check it and try again — the file " +
+      "itself is fine.";
+  }
+  return raw;
+}
+
+/** What the ceremony needs from whichever door opened it. */
+interface RestoreCeremonyHost {
+  /** The restore succeeded and `conn` is a live, restored device. */
+  onRestored(conn: DeviceConnection, consumePending: boolean): void;
+  /** The user backed out. The door owns putting them somewhere usable —
+   * the ceremony has by then given the drawer up. */
+  onAbandoned(): void;
+}
+
+/**
+ * Mount the restore ceremony as a drawer sheet, opened immediately.
+ *
+ * ONE SHEET, COLLECTING IN THE RECORD'S OWN ORDER: kind, then
+ * destination + credentials, then the kit secret, then the name of the
+ * machine this is becoming. They are collected on one surface rather
+ * than as a wizard because every one of them is needed before ANYTHING
+ * can be attempted — a staged ceremony would only be able to validate at
+ * the end anyway, and would have spent four screens getting there.
+ */
+function mountRestore(visor: Visor, host: RestoreCeremonyHost): void {
+  const tenant = visor.drawer.tenant<{ root: HTMLElement }>({
+    name: "restore",
+    // EXCLUSIVE: this is a way IN, the same weight class as the picker,
+    // and nothing may displace a half-entered recovery phrase.
+    exclusive: true,
+    // ARMED: FALSE — the picker's ruling, for the picker's reason
+    // (entry.ts): pre-unseal there is no component frame on the page at
+    // all, so the arming tax would defend nothing. The geometry is doing
+    // the work: visor pixels, attached to the pinned strip, over a
+    // dimmed page.
+    armed: false,
+    dim: true,
+    context: () => ({ kind: "device-picker" }),
+  });
+
+  // THE PERSISTENT ROOT, for `mountDevicePicker`'s reason: the sheet
+  // re-measures on every visibility change, and a builder that rebuilt
+  // the tree would wipe a half-typed phrase the moment a refusal
+  // appeared under it.
+  const root = document.createElement("div");
+  root.id = "restore-sheet";
+  root.className = "cred-sheet";
+
+  const heading = document.createElement("h2");
+  heading.textContent = "Restore from a recovery kit";
+
+  const lead = document.createElement("p");
+  lead.className = "cred-note";
+  // THE HONEST FLOOR, said before anything is typed (RECOVERY.md, "The
+  // claim"): the kit is the bucket's key, not a second bucket. A user
+  // who no longer has the storage is not going to be rescued by this
+  // sheet, and finding that out after typing a ten-word phrase would be
+  // the ceremony wasting their hope.
+  lead.textContent =
+    "Your account lives in your storage; the kit is the key to it. So this needs both — " +
+    "where the account syncs, and the kit you kept.";
+
+  // --- the kit kind ---------------------------------------------------------
+  let kitKind: "bucket" | "file" = "bucket";
+  const kindField = credField("Which kind of kit do you have?");
+  const kindChoices: { value: "bucket" | "file"; id: string; label: string }[] = [
+    { value: "bucket", id: "restore-kind-phrase", label: "A recovery phrase (about ten words)" },
+    { value: "file", id: "restore-kind-file", label: "A recovery file, and its passphrase" },
+  ];
+  for (const k of kindChoices) {
+    const line = document.createElement("div");
+    line.className = "cred-field";
+    const label = document.createElement("label");
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = "restore-kind";
+    radio.id = k.id;
+    radio.value = k.value;
+    radio.checked = k.value === kitKind;
+    radio.onchange = () => {
+      kitKind = k.value;
+      phraseGroup.hidden = kitKind !== "bucket";
+      fileGroup.hidden = kitKind !== "file";
+      resize();
+    };
+    label.append(radio, document.createTextNode(` ${k.label}`));
+    line.append(label);
+    kindField.append(line);
+  }
+
+  // --- the destination ------------------------------------------------------
+  //
+  // THE SAME TWO PROVIDERS AND THE SAME FIELDS as the storage ceremony
+  // (`renderUnbound`), because it IS the same question — and the same
+  // credential paths behind them: the S3 secret escrows page-side
+  // through `putSigningKey` keyed by destination origin, and Drive runs
+  // the worker-owned OAuth with the page owning the popup. What this
+  // sheet does NOT do is `bindStore`: `restore()` validates and binds
+  // the destination itself, with the fail-at-bind discipline, BEFORE it
+  // fetches anything (rpc.ts's `RestoreSpec.binding`).
+  //
+  // IDS ARE ITS OWN (`restore-*`, not `storage-*`) because both sheets
+  // can exist in one document's lifetime and duplicate ids are a bug
+  // waiting for whichever driver looks one up first.
+  let destKind: StoreBinding["kind"] = "s3";
+  const destField = credField("Where does this account sync?");
+  const destChoices: { value: StoreBinding["kind"]; id: string; label: string }[] = [
+    { value: "s3", id: "restore-dest-s3", label: "S3-compatible object storage" },
+    { value: "gdrive", id: "restore-dest-gdrive", label: "Google Drive" },
+  ];
+  for (const d of destChoices) {
+    const line = document.createElement("div");
+    line.className = "cred-field";
+    const label = document.createElement("label");
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = "restore-dest";
+    radio.id = d.id;
+    radio.value = d.value;
+    radio.checked = d.value === destKind;
+    radio.onchange = () => {
+      destKind = d.value;
+      s3Group.hidden = destKind !== "s3";
+      gdGroup.hidden = destKind !== "gdrive";
+      resize();
+    };
+    label.append(radio, document.createTextNode(` ${d.label}`));
+    line.append(label);
+    destField.append(line);
+  }
+
+  const s3Group = document.createElement("div");
+  const mkInput = (id: string, masked = false): HTMLInputElement => {
+    const i = document.createElement("input");
+    i.id = id;
+    i.type = masked ? MASKED.type : "text";
+    i.autocomplete = "off";
+    return i;
+  };
+  const endpointInput = mkInput("restore-endpoint");
+  const bucketInput = mkInput("restore-bucket");
+  const accessInput = mkInput("restore-access");
+  const secretInput = mkInput("restore-secret", true);
+  {
+    const f1 = credField("Endpoint");
+    f1.append(endpointInput);
+    const f2 = credField("Bucket");
+    f2.append(bucketInput);
+    const f3 = credField("Access key ID");
+    f3.append(accessInput);
+    const f4 = credField(
+      "Secret key",
+      "Held here as a key this browser can use and never read back. Credentials never ride " +
+        "a recovery kit, so this is one thing the kit cannot bring for you.",
+    );
+    f4.append(secretInput);
+    s3Group.append(f1, f2, f3, f4);
+  }
+
+  const gdGroup = document.createElement("div");
+  gdGroup.hidden = true;
+  let gdSpace: GdriveSpace = "appdata";
+  const gdRootInput = mkInput("restore-gd-root");
+  gdRootInput.value = params.get("gdroot") ?? "polyvisor";
+  const gdClientInput = mkInput("restore-gd-client");
+  gdClientInput.value = params.get("gdclient") ?? "";
+  const gdSecretInput = mkInput("restore-gd-secret", true);
+  {
+    const spaceField = credField("Where in your Drive?");
+    for (
+      const sp of [
+        { value: "appdata" as GdriveSpace, id: "restore-gd-space-appdata", label: "Hidden app data" },
+        { value: "drive" as GdriveSpace, id: "restore-gd-space-drive", label: "A visible folder" },
+      ]
+    ) {
+      const line = document.createElement("div");
+      line.className = "cred-field";
+      const label = document.createElement("label");
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "restore-gd-space";
+      radio.id = sp.id;
+      radio.value = sp.value;
+      radio.checked = sp.value === gdSpace;
+      radio.onchange = () => {
+        gdSpace = sp.value;
+      };
+      label.append(radio, document.createTextNode(` ${sp.label}`));
+      line.append(label);
+      spaceField.append(line);
+    }
+    const f1 = credField("Drive folder");
+    f1.append(gdRootInput);
+    const f2 = credField("OAuth client id");
+    f2.append(gdClientInput);
+    const f3 = credField(
+      "OAuth client secret",
+      "This identifies the app to Google, not you — it is not your account's secret.",
+    );
+    f3.append(gdSecretInput);
+    gdGroup.append(spaceField, f1, f2, f3);
+  }
+
+  // --- the kit itself -------------------------------------------------------
+  const phraseGroup = document.createElement("div");
+  const phraseInput = document.createElement("textarea");
+  phraseInput.id = "restore-phrase";
+  phraseInput.rows = 3;
+  phraseInput.autocomplete = "off";
+  {
+    const f = credField(
+      "Your recovery phrase",
+      // NORMALIZATION IS THE GUEST'S (RECOVERY.md, "Derivation,
+      // pinned": trim + lowercase + collapse internal whitespace), so
+      // the sheet can promise this rather than police it.
+      "The words in order. Capitals and extra spaces do not matter.",
+    );
+    f.append(phraseInput);
+    phraseGroup.append(f);
+  }
+
+  const fileGroup = document.createElement("div");
+  fileGroup.hidden = true;
+  const fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.id = "restore-file";
+  const filePassInput = mkInput("restore-file-pass", true);
+  {
+    const f1 = credField("Your recovery file");
+    f1.append(fileInput);
+    const f2 = credField("The passphrase for that file");
+    f2.append(filePassInput);
+    // NO PRE-FILL FROM THE BUNDLE, and this is a recorded gap rather
+    // than an omission. RECOVERY.md's bundle payload carries the
+    // account's storage ADDRESSING snapshot precisely "so a file restore
+    // can pre-fill the destination fields after unlock" — but that
+    // snapshot does not surface page-side: `RecoveryKitResult`'s file arm
+    // is `{kind:"file", bundle}` and `RestoreSpec` takes a binding as an
+    // INPUT (rpc.ts:740-756), so the page must know the destination
+    // before the bundle is ever opened. Adding a worker surface to
+    // expose it is not this track's to add.
+    //
+    // CONTRACT: the file arm therefore asks for the destination exactly
+    // as the bucket arm does, where the record expects it to ask for
+    // credentials only.
+    fileGroup.append(f1, f2);
+  }
+
+  // --- the name of the machine this becomes ---------------------------------
+  const nameInput = mkInput("restore-device-name");
+  nameInput.value = "this device";
+  const nameField = credField(
+    "What will you call this machine?",
+    // THE KIT'S LABEL GIVES WAY TO THIS (RECOVERY.md, "Restore"): the
+    // kit was a dormant device wearing whatever the minting ceremony
+    // called it; the restore ends with the user's own word for the
+    // machine it woke up as.
+    "It appears in your devices under this name, in place of the kit's own label.",
+  );
+  nameField.append(nameInput);
+
+  const problem = document.createElement("div");
+  problem.id = "restore-problem";
+  problem.className = "entry-problem";
+  problem.hidden = true;
+
+  const stepNote = document.createElement("div");
+  stepNote.id = "restore-step";
+  stepNote.className = "hint";
+
+  const go = document.createElement("button");
+  go.type = "button";
+  go.id = "restore-go";
+  go.textContent = "Restore this account";
+
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.id = "restore-cancel";
+  cancel.className = "entry-secondary";
+  cancel.textContent = "not now";
+
+  root.append(
+    heading,
+    lead,
+    kindField,
+    destField,
+    s3Group,
+    gdGroup,
+    phraseGroup,
+    fileGroup,
+    nameField,
+    problem,
+    stepNote,
+    go,
+    cancel,
+  );
+
+  const resize = () => tenant.rebuild();
+  let busy = false;
+
+  const fail = (text: string) => {
+    busy = false;
+    go.disabled = false;
+    cancel.disabled = false;
+    stepNote.textContent = "";
+    problem.textContent = text;
+    problem.hidden = false;
+    resize();
+  };
+
+  cancel.onclick = () => {
+    // A CEREMONY IN FLIGHT IS NOT ABANDONABLE HERE: a half-run restore
+    // has a device namespace and possibly a bound store behind it, and
+    // "not now" cannot unwind those. The control simply refuses while
+    // busy, exactly as the picker's do.
+    if (busy) return;
+    tenant.close();
+    host.onAbandoned();
+  };
+
+  go.onclick = () => {
+    if (busy) return;
+    busy = true;
+    go.disabled = true;
+    cancel.disabled = true;
+    problem.hidden = true;
+
+    const kind = kitKind;
+    const dest = destKind;
+    const deviceName = nameInput.value.trim() === "" ? "this device" : nameInput.value.trim();
+    const endpoint = endpointInput.value.trim();
+    const bucket = bucketInput.value.trim();
+    const access = accessInput.value.trim();
+    // THE ONE MOMENT OF CLEARTEXT, three times over — read once, cleared
+    // in the same tick, carried onward by a local (the storage sheet's
+    // discipline, and the record prices this exposure explicitly in its
+    // threat-model deltas).
+    const secret = secretInput.value;
+    secretInput.value = "";
+    const phrase = phraseInput.value;
+    phraseInput.value = "";
+    const filePass = filePassInput.value;
+    filePassInput.value = "";
+    const gdRoot = gdRootInput.value.trim();
+    const gdClient = gdClientInput.value.trim();
+    const gdSecret = gdSecretInput.value;
+    gdSecretInput.value = "";
+    const chosenFile = fileInput.files?.[0] ?? null;
+    const space = gdSpace;
+
+    const at = (s: string) => {
+      stepNote.textContent = `${s}…`;
+      resize();
+    };
+
+    void (async () => {
+      let conn: DeviceConnection | null = null;
+      try {
+        // THE KIT, ASSEMBLED FIRST — before a namespace exists, so a
+        // missing file or an empty phrase costs nothing to refuse.
+        let kit: RecoveryKitInput;
+        if (kind === "bucket") {
+          if (phrase.trim() === "") throw new Error("enter your recovery phrase");
+          kit = { kind: "bucket", phrase };
+        } else {
+          if (chosenFile === null) throw new Error("choose your recovery file");
+          if (filePass === "") throw new Error("enter the passphrase for that file");
+          kit = {
+            kind: "file",
+            bundle: new Uint8Array(await chosenFile.arrayBuffer()),
+            passphrase: filePass,
+          };
+        }
+
+        let binding: StoreBinding;
+        if (dest === "s3") {
+          at("checking the destination");
+          const origin = normalizeOrigin(endpoint);
+          if (origin === null) {
+            throw new Error(`that endpoint is not a usable address: ${endpoint}`);
+          }
+          if (secret !== "") {
+            // ESCROW BEFORE THE NAMESPACE EXISTS: the keystore is
+            // PROFILE-tier and keyed by destination origin
+            // (STORAGE-EGRESS.md §2), so it belongs to the browser
+            // rather than to the device about to be made — which is
+            // exactly why the worker can read it back a moment later.
+            at("keeping the key for this browser");
+            await putSigningKey(origin, access, secret);
+          }
+          binding = { kind: "s3", endpoint, bucket, accessKey: access };
+        } else {
+          if (gdRoot === "") throw new Error("a Drive folder name is required");
+          if (gdClient === "") throw new Error("an OAuth client id is required");
+          binding = {
+            kind: "gdrive",
+            root: gdRoot,
+            apiBase: gdriveEndpoints.apiBase ?? "https://www.googleapis.com",
+            clientId: gdClient,
+            space,
+          };
+        }
+
+        // A BRAND-NEW NAMESPACE, always. `restore()` refuses on a
+        // namespace that already holds a device — "a restore is a NEW
+        // device, never an overwrite" (client.ts) — so `kind: "new"` is
+        // the only correct arm here: `"anchor"` would hand back whatever
+        // this tab was already looking at.
+        //
+        // NOT UNSEALED HERE. `restore` brings the engine up FROM THE KIT
+        // instead of from `init`, so an `unseal()` first would init the
+        // very engine the restore has to replace.
+        at("setting this device up");
+        conn = await connectDevice({
+          device: {
+            kind: "new",
+            petname: deviceName,
+            unsealPolicy: "while-open",
+            // SEED POSTURE, said honestly in the index row: the restored
+            // device's identity came out of a bundle, which is one notch
+            // below platform posture (RECOVERY.md, "Restore"). The
+            // migration for a restored device is parked, and a row
+            // claiming `platform` would be the index lying about it.
+            posture: "seed",
+          },
+          workerUrl: WORKER_URL,
+          artifacts: ENGINE_ARTIFACTS,
+          label: "solo",
+        });
+
+        if (dest === "gdrive") {
+          // THE TWO-STAGE SHAPE (rpc.ts's `RestoreSpec` note): the Drive
+          // consent seals its tokens under the DEK, so a DEK must exist
+          // before the popup runs — and `restorePrepare` is exactly that
+          // and nothing more: it opens the namespace WITHOUT initing an
+          // engine. The S3 arm needs no such stage; its escrow is
+          // page-side and keyed by origin.
+          at("opening this device");
+          await conn.restorePrepare({});
+          at("asking Google for permission");
+          const { authorizeUrl } = await conn.oauthStart({
+            provider: "gdrive",
+            clientId: gdClient,
+            clientSecret: gdSecret || undefined,
+            space,
+            redirectUri: new URL("./oauth-callback.html", location.href).toString(),
+            authUrl: gdriveEndpoints.authUrl,
+            tokenUrl: gdriveEndpoints.tokenUrl,
+          });
+          const expectedState = new URL(authorizeUrl).searchParams.get("state");
+          const popup = window.open(authorizeUrl, "pm-gdrive-auth", "width=680,height=760");
+          if (!popup) {
+            throw new Error("could not open the authorization window (popup blocked)");
+          }
+          const relay = await new Promise<{ code: string; state: string }>((resolve, reject) => {
+            const done = (f: () => void) => {
+              globalThis.removeEventListener("message", onMessage);
+              clearInterval(closedTimer);
+              clearTimeout(deadline);
+              f();
+            };
+            const onMessage = (e: MessageEvent) => {
+              if (e.origin !== location.origin) return;
+              const d = e.data as
+                | { pmGdriveCode?: unknown; pmGdriveError?: unknown; state?: unknown }
+                | null;
+              if (!d) return;
+              if (expectedState !== null && d.state !== expectedState) return;
+              if (typeof d.pmGdriveError === "string") {
+                done(() => reject(new Error(`authorization was refused: ${d.pmGdriveError}`)));
+                return;
+              }
+              if (typeof d.pmGdriveCode !== "string") return;
+              done(() =>
+                resolve({
+                  code: d.pmGdriveCode as string,
+                  state: typeof d.state === "string" ? d.state : "",
+                })
+              );
+            };
+            globalThis.addEventListener("message", onMessage);
+            const closedTimer = setInterval(() => {
+              if (popup.closed) done(() => reject(new Error("authorization window closed")));
+            }, 500);
+            const deadline = setTimeout(
+              () => done(() => reject(new Error("authorization timed out"))),
+              AUTH_TIMEOUT_MS,
+            );
+          });
+          try {
+            popup.close();
+          } catch { /* already gone */ }
+          await conn.oauthComplete(relay.code, relay.state);
+        }
+
+        // THE RESTORE ITSELF. Everything after this line is the worker's
+        // (client.ts's `restore`): validate the binding, bring the engine
+        // up from the kit, pull the us-doc and then the account fan-out,
+        // checkpoint, and only then consume the kit. The page's only job
+        // is to say so while it happens.
+        at("finding your account in your storage");
+        note("restore:started");
+        const st = await conn.restore({ binding, kit, deviceName, unseal: {} });
+        note("restore:done");
+        at("your account is here");
+
+        // A CONSUME FAILURE NEVER FAILS A RESTORE, so it is a fact to
+        // REPORT rather than a branch to take.
+        const consumePending = st.sync?.consumePending ?? false;
+        tenant.close();
+        host.onRestored(conn, consumePending);
+      } catch (e) {
+        // NOT A DEAD END. The sheet keeps everything the user typed
+        // except the secrets it cleared, says what happened in a plain
+        // sentence, and stays up — and the DOOR that opened it is still
+        // reachable through "not now", so a refused restore never wedges
+        // the way in.
+        note("restore:refused");
+        if (conn !== null) {
+          // The half-born namespace goes. Leaving it would put a device
+          // in the index that holds nothing, under a name the user gave
+          // to a machine that never became anything.
+          try {
+            await conn.destroy();
+          } catch { /* a namespace that will not go is not this refusal's story */ }
+          clearAnchor();
+        }
+        fail(restoreRefusal(e));
+      }
+    })();
+  };
+
+  tenant.open({ root }, () => ({ root }));
+}
+
 // --- everything after the seal opens ---------------------------------------
 
 async function startApp(
@@ -737,6 +1473,48 @@ async function startApp(
   }
   const announce: AnnounceSink = visorAnnounceSink(visor);
   note("visor:painted");
+
+  // THE CONSUMED-KIT ANNOUNCEMENT, said HERE and not in the ceremony
+  // (RECOVERY.md, "Single-use": "the visor announces 'your recovery kit
+  // was used — create a new one'").
+  //
+  // AFTER THE CLAIM, DELIBERATELY. The ceremony that earned this
+  // sentence ran on the unclaimed grey dress, where the visor has no
+  // voice worth using yet; one line above, the visor became the user's.
+  // This is the first thing it says as theirs, which is also the right
+  // order for the user: they see their account arrive, then they are
+  // told what it cost.
+  //
+  // STICKY, because "you currently have no recovery kit" is a standing
+  // condition and not news that should scroll past. The honest cost the
+  // record names is a window with NO kit until the user mints a fresh
+  // one — "no kit, loudly" is the whole bargain, and an announcement
+  // that vanished after fifteen seconds would be the quiet version.
+  //
+  // TWO SOURCES, ONE DRAIN: the picker's door leaves the sentence in a
+  // module variable (no reload crosses that path), the fork's door
+  // leaves it in `sessionStorage` (a reload does). Drained exactly once
+  // either way.
+  {
+    let kitNote = restoredKitNote;
+    restoredKitNote = null;
+    if (kitNote === null) {
+      try {
+        kitNote = sessionStorage.getItem(RESTORE_NOTE_KEY);
+        if (kitNote !== null) sessionStorage.removeItem(RESTORE_NOTE_KEY);
+      } catch { /* a storage-less browser simply loses the sentence */ }
+    }
+    if (kitNote !== null && kitNote !== "") {
+      note("restore:announced");
+      // KEPT FOR DRIVING, not for the UI: `visor.announce` REPLACES, so
+      // by the time anything else has been said the strip no longer
+      // holds this sentence — and a scenario asserting the record's
+      // exact stance would be asserting on a race. This is the same
+      // shape as `bootTrace`: the page's own account of what it said.
+      restoreAnnouncedText = kitNote;
+      announce(kitNote, true);
+    }
+  }
 
   /**
    * THE DEVICE-NAME DISPLAY RULE (PERSISTENCE.md, "Unseal UX", ruled):
@@ -1513,6 +2291,13 @@ async function startApp(
     context: () => ({ kind: "settings" }),
   });
 
+  /** Re-measure the storage sheet. Every view in it (bound, unbound,
+   * recovery kits) changes the sheet's height, and the drawer animates
+   * to a MEASURED pixel target and clips the overflow — so a view that
+   * grew without saying so is a view whose bottom controls cannot be
+   * reached. */
+  const tenantRebuild = () => storageTenant.rebuild();
+
   /** The connect ceremony's own busy-guard, mirroring `setupInFlight` in
    * demo.ts's `setupBucket`: a duplicate click while one binding is in
    * flight would race the same escrow write (or the same OAuth
@@ -1751,27 +2536,48 @@ async function startApp(
     const container = document.createElement("div");
     container.className = "cred-sheet";
     container.id = "storage-sheet";
+    // THE PERSISTENT BODY — the same discipline the device picker's root
+    // keeps (visor/ui/entry.ts), and it became load-bearing when this
+    // sheet grew a view tall enough to need a re-measure.
+    //
+    // THE DRAWER'S `rebuild()` RE-RUNS THIS BUILDER. So a builder that
+    // created the body would hand every re-measure a FRESH EMPTY body
+    // and detach the one the current view is living in — the sheet would
+    // blank itself at exactly the moment it was asked to fit its
+    // contents. Creating the body once, out here, makes `rebuild()` mean
+    // what its name says: measure this again, change nothing.
+    //
+    // Measured the hard way, twice: without a re-measure the recovery
+    // control below the fold was unclickable (the drawer clips to a
+    // measured height, so a click on it lands on the dim); with a
+    // re-measure against a builder-created body, the whole sheet went
+    // blank instead.
+    const body = document.createElement("div");
     const session = { container };
+    /** The async fill runs ONCE per open, not once per re-measure: it is
+     * a read of the device and the account, and re-issuing it on every
+     * height change would race the view the user is currently in. */
+    let filled = false;
     storageTenant.open(session, () => {
       const heading = document.createElement("h2");
       heading.textContent = "Storage";
-      const body = document.createElement("div");
-      container.replaceChildren(heading, body);
       const close = document.createElement("button");
       close.type = "button";
       close.textContent = "Close";
       close.onclick = () => {
         if (storageTenant.owns(session)) storageTenant.close();
       };
-      container.append(close);
-      // THE ACCOUNT'S RECORD IS READ ON EVERY OPEN AND EVERY RE-RENDER
-      // (DRIVE.md, "The account syncs its storage config; devices keep
-      // their credentials"): whether this device has a store of its own
-      // and whether its ACCOUNT has one are two different questions, and
-      // the interesting cell of that table — unbound device, bound
-      // account — is exactly the freshly-paired second device. A failed
-      // read is not a failed sheet: it degrades to the plain manual
-      // form, which is always correct, merely more typing.
+      container.replaceChildren(heading, body, close);
+      if (filled) return { root: container };
+      filled = true;
+      // THE ACCOUNT'S RECORD IS READ ON EVERY OPEN (DRIVE.md, "The
+      // account syncs its storage config; devices keep their
+      // credentials"): whether this device has a store of its own and
+      // whether its ACCOUNT has one are two different questions, and the
+      // interesting cell of that table — unbound device, bound account —
+      // is exactly the freshly-paired second device. A failed read is
+      // not a failed sheet: it degrades to the plain manual form, which
+      // is always correct, merely more typing.
       void Promise.all([
         conn.status(),
         enqueue(() => driver.usStorageGet()).catch(() => undefined),
@@ -2454,6 +3260,24 @@ async function startApp(
       renderUnbound(body, storage);
     };
 
+    // THE STORAGE-REBIND CAVEAT (RECOVERY.md's threat-model deltas, the
+    // recorded one): "storage rebind strands kits in the old bucket (K_p
+    // and bundle do not migrate). RECORDED CAVEAT: the storage
+    // ceremony's copy tells the user to re-mint kits after a destination
+    // change; no migration machinery."
+    //
+    // IT LANDS BESIDE "Change…", WHICH IS THE DESTINATION-CHANGE PATH,
+    // and it is stated BEFORE the change rather than announced after:
+    // the whole value of the sentence is that it is read by someone
+    // deciding, and a kit stranded in a bucket they have just stopped
+    // using is discovered at the disaster otherwise.
+    const rebindCaveat = document.createElement("div");
+    rebindCaveat.className = "hint";
+    rebindCaveat.id = "storage-rebind-caveat";
+    rebindCaveat.textContent =
+      "Changing where this account syncs leaves any recovery kit behind in the old storage — " +
+      "kits do not move. Make a new one afterwards.";
+
     // DISCONNECT VS. FORGET — THE SAME SPLIT AS STORAGE-EGRESS.md §6,
     // now with a second thing that can be forgotten: disconnecting the
     // DESTINATION is not forgetting the ACCOUNT, and (for Drive) forgetting
@@ -2492,6 +3316,35 @@ async function startApp(
     };
 
     body.append(sync, change, disconnect);
+
+    // THE WAY TO THE RECOVERY KITS, and this is where it belongs.
+    //
+    // PLACEMENT, JUSTIFIED (the track's one placement call): a kit
+    // REQUIRES a bound store — "both kinds still require a bound store
+    // at creation (a kit without a bucket restores nothing — content
+    // rehydrates from the bucket)" (RECOVERY.md). Hanging the control
+    // off the BOUND view makes that precondition structural instead of a
+    // refusal: the door only exists where walking it can work. The
+    // settings sheet was the alternative and it is the worse one — the
+    // control would be present on an unbound device, and the ceremony
+    // behind it would exist only to say no.
+    //
+    // IT SWAPS THIS SHEET'S BODY rather than opening a second drawer
+    // tenant. The storage tenant is EXCLUSIVE, so a second sheet could
+    // not open over it anyway; and view-swapping is already this sheet's
+    // grammar (bound ⇄ unbound ⇄ diverge). The kit ceremony is still in
+    // visor pixels, still attached to the pinned strip, still over a
+    // dimmed page — which is what the drawer rule is actually about.
+    const kits = document.createElement("button");
+    kits.type = "button";
+    kits.id = "storage-kits";
+    kits.textContent = "Recovery kit…";
+    kits.onclick = () => {
+      body.replaceChildren();
+      syncLine = null;
+      renderKits(body, storage);
+    };
+    body.append(kits, rebindCaveat);
 
     if (storage.kind === "gdrive") {
       // FORGET THIS GOOGLE ACCOUNT: the mirror of disconnect, and a
@@ -2544,6 +3397,491 @@ async function startApp(
     }
 
     body.append(stepNote, problem);
+    // RE-MEASURE, because this view was just swapped in under a height
+    // the drawer measured for a DIFFERENT one (the connect form, or the
+    // kit list). The drawer animates to a measured pixel target and
+    // CLIPS the overflow, so a taller view under a stale height has
+    // controls that are on the page and not reachable — a click on one
+    // lands on the dim instead, silently. Measured the hard way: the
+    // recovery-kit control, appended below the existing three, was
+    // clicked by a driver and did nothing at all.
+    tenantRebuild();
+  };
+
+  // --- recovery kits (runtime/RECOVERY.md, "The kit ceremony") -------------
+  //
+  // A KIT IS A DEVICE, and that is the round's core ruling rather than
+  // an implementation detail: "the kit ceremony mints a dormant member
+  // device — a real leaf in the account's delegation graph, visible in
+  // the devices sheet under the user's own label, revocable like any
+  // device". So this view lists kits the way a devices list lists
+  // devices, and its revoke control is the devices sheet's revoke,
+  // because it IS the same mechanic — "a leaked phrase or file is
+  // answered by revoking the kit device … the same mechanic as a lost
+  // phone, because it IS the same thing".
+  //
+  // WHAT THIS VIEW NEVER DOES: render a phrase twice. The phrase exists
+  // in exactly one moment — the tick `createRecoveryKit` resolves — and
+  // there is no call that returns it again (client.ts says so). The
+  // display-once pane below is that moment; everything after it lists
+  // metadata and nothing else.
+
+  /** THE CONFIRM-DISMISS PANE for a freshly minted phrase.
+   *
+   * NO TIMER, DELIBERATELY, and the reason is the whole design of this
+   * pane: a user copying ten words onto paper must not be racing a
+   * countdown. A phrase that vanished on a clock would produce exactly
+   * one outcome at scale — half-copied phrases, believed to be kits —
+   * and a half-copied kit is the "bad kit, quietly" failure the record
+   * spends its single-use ruling avoiding. The user says when they have
+   * it, and the announcement waits for that word too: announcing before
+   * the dismiss would put a sentence on the strip while the secret is
+   * still on screen being copied.
+   */
+  const renderPhraseOnce = (body: HTMLElement, phrase: string, label: string) => {
+    const heading = document.createElement("p");
+    heading.className = "cred-note";
+    heading.textContent = "Write these words down, in this order, and keep them somewhere safe.";
+
+    // VISOR PIXELS, and nothing else on the page ever sees this string:
+    // it came back over the port from the ceremony and is written into
+    // this node and into no other. It is not persisted, not logged, and
+    // there is no call that returns it a second time.
+    const words = document.createElement("p");
+    words.id = "recovery-phrase";
+    words.className = "recovery-phrase";
+    words.textContent = phrase;
+
+    const why = document.createElement("div");
+    why.className = "hint";
+    why.textContent =
+      "This is shown once and never again. With these words and access to your storage, " +
+      "this account can be brought back on a browser that has never seen it — which is " +
+      "also why anyone else who has them can do the same. It works once: restoring uses " +
+      "the kit up.";
+
+    const done = document.createElement("button");
+    done.type = "button";
+    done.id = "recovery-phrase-done";
+    done.textContent = "I have written it down";
+    done.onclick = () => {
+      note("recovery:kit-shown");
+      announce(`a recovery kit for this account is ready — you saved it as ${label}`);
+      body.replaceChildren();
+      renderKits(body, boundStorage!);
+    };
+
+    body.append(heading, words, why, done);
+  };
+
+  /** The bound destination this kit view was entered from, kept so the
+   * display-once pane can hand it back to `renderKits` on dismiss. */
+  let boundStorage: StoreBinding | null = null;
+
+  const renderKits = (body: HTMLElement, storage: StoreBinding) => {
+    boundStorage = storage;
+    const heading = document.createElement("p");
+    heading.className = "cred-note";
+    // THE HONEST FLOOR, stated where the user is deciding whether to
+    // bother (RECOVERY.md, "The claim"): bucket + all devices lost = the
+    // account is gone. The kit is the storage's key, not a second copy
+    // of the account, and a user who thinks otherwise has been sold the
+    // wrong safety.
+    heading.textContent =
+      "A recovery kit brings this account back on a fresh browser when every device is " +
+      "gone. It is a key to your storage, not a copy of your account — if the storage " +
+      "goes too, nothing can bring it back.";
+    body.append(heading);
+
+    const problem = document.createElement("div");
+    problem.className = "hint";
+    problem.id = "recovery-problem";
+    problem.hidden = true;
+
+    const stepNote = document.createElement("div");
+    stepNote.className = "hint";
+    stepNote.id = "recovery-step";
+
+    /** The guarantee note a revoke hands back, rendered as prose.
+     *
+     * PRIORITY OVER THE STATS TICK (the recorded UI finding for
+     * `storeRevoke`, whose note this is): the sentence describes what
+     * revocation does and does not guarantee, and a stats line
+     * repainting over it would replace the one thing the user needs to
+     * read with a number they do not. So it lands in its own node, and
+     * nothing in this view writes over it.
+     */
+    const guarantee = document.createElement("p");
+    guarantee.className = "cred-note";
+    guarantee.id = "recovery-guarantee";
+    guarantee.hidden = true;
+
+    const list = document.createElement("div");
+    list.id = "recovery-kits";
+
+    /**
+     * READ THE ACCOUNT'S KITS FROM OUTSIDE A CHAIN JOB — the ordinary
+     * case (a render, a user's click handler).
+     *
+     * The pair of readers below exists because `enqueue` MUST NOT BE
+     * NESTED (see its own note): the chain is one promise, so an
+     * `enqueue` issued from inside a running job queues BEHIND that job
+     * and can only run once it finishes — while the job is sitting there
+     * awaiting it. That is a permanent self-deadlock, and it takes the
+     * whole page's serialized chain with it, not just the caller.
+     *
+     * Making the two readers SEPARATE, NAMED THINGS is the fix rather
+     * than a comment on one reader: the question "am I already on the
+     * chain?" then has to be answered at every call site, in a word that
+     * is visible in the call itself.
+     */
+    const readKitsQueued = () => enqueue(() => conn.recoveryKits());
+
+    /** THE SAME READ, FROM INSIDE A CHAIN JOB — already serialized by
+     * the job that encloses it, so it goes straight to the connection.
+     * Wrapping this one in `enqueue` is the deadlock described above. */
+    const readKitsInJob = () => conn.recoveryKits();
+
+    /** Repaint the kit list from whichever reader the caller's position
+     * on the chain calls for (`readKitsQueued` / `readKitsInJob`).
+     *
+     * NO RETRY, AND NO GRACE PERIOD. An earlier revision had one, on the
+     * theory that a list read in the same breath as a create could beat
+     * the record it was reading — the file kind appeared to list nothing
+     * while the phrase kind listed correctly. That theory was WRONG and
+     * the asymmetry had nothing to do with timing: the phrase kind
+     * repaints from the display-once pane's dismiss click (off the
+     * chain), the file kind repainted from inside its own mint job (on
+     * it), and only the second one nested an `enqueue` and hung. The
+     * registry was correct all along and answers immediately. A grace
+     * period here would only be a place for the next such bug to hide. */
+    const paintList = async (read: () => Promise<RecoveryKit[]>) => {
+      let rows: RecoveryKit[];
+      try {
+        rows = await read();
+      } catch (e) {
+        list.replaceChildren();
+        const oops = document.createElement("div");
+        oops.className = "hint";
+        oops.textContent = `could not read this account's kits: ${err(e)}`;
+        list.append(oops);
+        tenantRebuild();
+        return;
+      }
+      list.replaceChildren();
+      if (rows.length === 0) {
+        const none = document.createElement("div");
+        none.className = "hint";
+        none.id = "recovery-none";
+        // AFTER A RESTORE THIS IS THE TRUE AND LOUD STATE (RECOVERY.md's
+        // "honest cost"): a window with no kit until the user mints a
+        // fresh one.
+        none.textContent = "This account has no recovery kit.";
+        list.append(none);
+      }
+      for (const kit of rows) {
+        const row = document.createElement("div");
+        row.className = "device-row recovery-row";
+        row.dataset.agent = hex(kit.agentId);
+        const what = document.createElement("span");
+        // USER VOICE would be the kit's label — which this projection
+        // does not carry (`RecoveryKit` is {agentId, kind, created}), so
+        // the row says what it honestly knows: which kind, and when.
+        what.className = "recovery-what";
+        what.textContent = kit.kind === "bucket"
+          ? "phrase kit, kept in your storage"
+          : "file kit, kept by you";
+        const when = document.createElement("span");
+        when.className = "device-when";
+        when.textContent = `created ${new Date(Number(kit.created)).toLocaleString()}`;
+        const revoke = document.createElement("button");
+        revoke.type = "button";
+        revoke.className = "recovery-revoke";
+        revoke.textContent = "Revoke";
+        let armed = false;
+        revoke.onclick = () => {
+          // TWO CLICKS, as the reseal and forget-Google controls take
+          // them: revoking a kit is not undoable and the first click
+          // says what the second one will do.
+          if (!armed) {
+            armed = true;
+            revoke.textContent = "Yes — revoke this kit";
+            tenantRebuild();
+            return;
+          }
+          revoke.disabled = true;
+          problem.hidden = true;
+          void enqueue(async () => {
+            try {
+              const guaranteeNote = await conn.revokeRecoveryKit(kit.agentId);
+              note("recovery:kit-revoked");
+              guarantee.textContent = guaranteeNote;
+              guarantee.hidden = false;
+              announce("that recovery kit is revoked — it cannot restore this account any more");
+              // IN-JOB READER: this whole handler is one chain job (the
+              // revoke and the repaint belong together — a list that
+              // still showed the kit would be the sheet contradicting
+              // the guarantee note it just rendered), so the read must
+              // NOT re-enter `enqueue`.
+              await paintList(readKitsInJob);
+            } catch (e) {
+              revoke.disabled = false;
+              armed = false;
+              revoke.textContent = "Revoke";
+              problem.textContent = err(e);
+              problem.hidden = false;
+            }
+            tenantRebuild();
+          });
+        };
+        row.append(what, when, revoke);
+        list.append(row);
+      }
+      tenantRebuild();
+    };
+
+    body.append(list);
+    // OFF-CHAIN READER: a render is not inside a job, so this one takes
+    // its turn on the chain like any other caller.
+    void paintList(readKitsQueued);
+
+    // --- minting a new one --------------------------------------------------
+    //
+    // BUCKET KITS ARE S3-ONLY AT THIS REV (RECOVERY.md, settled in T-A):
+    // the bucket kind needs an owner-tier PUT at a NAME the guest
+    // derives, and only S3 addresses objects by name. So on a
+    // Drive-bound account the phrase kind is not offered at all — and
+    // the sheet says why in one plain sentence rather than offering a
+    // control that would be refused by name a moment later.
+    const bucketKitsPossible = storage.kind === "s3";
+    let mintKind: "bucket" | "file" = bucketKitsPossible ? "bucket" : "file";
+
+    const kindField = credField("What kind of kit?");
+    if (bucketKitsPossible) {
+      for (
+        const k of [
+          {
+            value: "bucket" as const,
+            id: "recovery-kind-bucket",
+            label: "A phrase kit — ten words you write down; the kit itself lives in your bucket",
+          },
+          {
+            value: "file" as const,
+            id: "recovery-kind-file",
+            label: "A file kit — a file you keep, opened by a passphrase you choose",
+          },
+        ]
+      ) {
+        const line = document.createElement("div");
+        line.className = "cred-field";
+        const label = document.createElement("label");
+        const radio = document.createElement("input");
+        radio.type = "radio";
+        radio.name = "recovery-kind";
+        radio.id = k.id;
+        radio.value = k.value;
+        radio.checked = k.value === mintKind;
+        radio.onchange = () => {
+          mintKind = k.value;
+          fileFields.hidden = mintKind !== "file";
+          tenantRebuild();
+        };
+        label.append(radio, document.createTextNode(` ${k.label}`));
+        line.append(label);
+        kindField.append(line);
+      }
+    } else {
+      const only = document.createElement("div");
+      only.className = "hint";
+      only.id = "recovery-file-only";
+      // ONE PLAIN SENTENCE, and it names the cause rather than the
+      // mechanism: the user does not need "objects addressed by name" to
+      // understand which kind they are getting.
+      only.textContent =
+        "This account syncs through Google Drive, where a kit cannot be filed under a name " +
+        "the phrase alone would find. So this is a file kit: you keep the file.";
+      kindField.append(only);
+    }
+    body.append(kindField);
+
+    const labelInput = document.createElement("input");
+    labelInput.type = "text";
+    labelInput.id = "recovery-label";
+    labelInput.autocomplete = "off";
+    labelInput.value = "recovery kit";
+    const labelField = credField(
+      "Call this kit",
+      "It is a device in your account, and this is the name it wears there.",
+    );
+    labelField.append(labelInput);
+    body.append(labelField);
+
+    // --- the file kind's passphrase, and the loud warning -------------------
+    const fileFields = document.createElement("div");
+    fileFields.hidden = mintKind !== "file";
+
+    // THE OWNER'S AMENDMENT, RENDERED (RECOVERY.md: "disallowing custody
+    // would be paternalism, so the ceremony WARNS LOUDLY instead"). All
+    // three of the record's sentences are here, and none of them is
+    // softened:
+    //
+    //   1. the passphrase's strength is the USER'S OWN — and the visor
+    //      says so plainly instead of measuring it. A strength meter
+    //      would be the visor pretending to a judgement it cannot make
+    //      and, worse, would launder a weak choice into an approved one.
+    //   2. the file plus its passphrase open the WHOLE account.
+    //   3. the file is dead the day it is used or its device revoked.
+    const warn = document.createElement("div");
+    warn.id = "recovery-file-warning";
+    warn.className = "entry-problem recovery-warning";
+    warn.textContent =
+      "Read this before you choose a passphrase. This file and its passphrase together open " +
+      "your whole account — everything in it, and the ability to write to it. How hard that " +
+      "passphrase is to guess is entirely your choice: this app does not judge it, does not " +
+      "measure it, and cannot protect you from a weak one. A file that is easy to open is an " +
+      "account that is easy to take. The file dies the day it is used, or the day you revoke " +
+      "it here — nothing else retires it.";
+    fileFields.append(warn);
+
+    const kitPass = document.createElement("input");
+    kitPass.type = MASKED.type;
+    kitPass.id = "recovery-file-pass";
+    kitPass.autocomplete = "off";
+    const kitPassField = credField("A passphrase for this file");
+    kitPassField.append(kitPass);
+    const kitPass2 = document.createElement("input");
+    kitPass2.type = MASKED.type;
+    kitPass2.id = "recovery-file-pass2";
+    kitPass2.autocomplete = "off";
+    // THE CONFIRM FIELD, and it is not ceremony here: a mistyped
+    // passphrase on a file kit is undiscoverable until the disaster,
+    // because nothing ever asks for it again until then.
+    const kitPass2Field = credField("And again, to be sure");
+    kitPass2Field.append(kitPass2);
+    fileFields.append(kitPassField, kitPass2Field);
+    body.append(fileFields);
+
+    const make = document.createElement("button");
+    make.type = "button";
+    make.id = "recovery-make";
+    make.textContent = "Make a recovery kit";
+    make.onclick = () => {
+      if (make.disabled) return;
+      const kind = mintKind;
+      const label = labelInput.value.trim() === "" ? "recovery kit" : labelInput.value.trim();
+      // THE ONE MOMENT OF CLEARTEXT, as everywhere else on this page.
+      const pass = kitPass.value;
+      const pass2 = kitPass2.value;
+      kitPass.value = "";
+      kitPass2.value = "";
+      problem.hidden = true;
+
+      if (kind === "file") {
+        if (pass === "") {
+          problem.textContent = "choose a passphrase for this file";
+          problem.hidden = false;
+          tenantRebuild();
+          return;
+        }
+        if (pass !== pass2) {
+          problem.textContent = "those two did not match — try again";
+          problem.hidden = false;
+          tenantRebuild();
+          return;
+        }
+      }
+
+      make.disabled = true;
+      stepNote.textContent = "making your recovery kit…";
+      tenantRebuild();
+      void enqueue(async () => {
+        try {
+          const result = kind === "bucket"
+            ? await conn.createRecoveryKit({ kind: "bucket", label })
+            : await conn.createRecoveryKit({ kind: "file", label, passphrase: pass });
+          note("recovery:kit-created");
+          stepNote.textContent = "";
+          if (result.kind === "bucket") {
+            // DISPLAY ONCE, with the confirm-dismiss — see
+            // `renderPhraseOnce`. The announcement waits for the
+            // dismiss, deliberately.
+            body.replaceChildren();
+            renderPhraseOnce(body, result.phrase, label);
+            tenantRebuild();
+            return;
+          }
+          // THE FILE, DELIVERED AS A DOWNLOAD. A blob URL from this
+          // sheet's own button: the bytes came over the port, are
+          // written to no storage on the way past, and the object URL is
+          // revoked as soon as the click has been taken.
+          //
+          // A VISOR-VOICED FILENAME — the user's label plus the date, so
+          // a folder full of downloads still says which account and
+          // which day this one is.
+          const stampDate = new Date().toISOString().slice(0, 10);
+          const safe = label.replace(/[^a-zA-Z0-9 _-]/g, "").trim().replace(/\s+/g, "-") ||
+            "recovery-kit";
+          const blob = new Blob([result.bundle as BlobPart], {
+            type: "application/octet-stream",
+          });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `${safe}-${stampDate}.polyvisor-kit`;
+          a.id = "recovery-download";
+          a.textContent = "Download your recovery file";
+          body.append(a);
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 60_000);
+          note("recovery:kit-downloaded");
+          announce(
+            "your recovery file is downloaded — keep it somewhere its passphrase is not " +
+              "written down beside it",
+          );
+          // IN-JOB READER, for the reason spelled out on the readers
+          // above: this repaint runs inside the mint's own chain job.
+          // Re-entering `enqueue` here is what wedged the page — the
+          // read queued behind the very job that was awaiting it, so the
+          // list never painted AND every later call on the chain (the
+          // event drain, every driver call) queued behind a promise that
+          // would never settle.
+          await paintList(readKitsInJob);
+          // THE CEREMONY REOPENS. Unlike the phrase kind, which leaves
+          // for its display-once pane, the file kind finishes with the
+          // user still on this sheet — and an account may legitimately
+          // want a second kit (a kit per place the user keeps one). A
+          // control left dead would make the sheet a dead end reachable
+          // only by navigating out and back.
+          //
+          // A DOUBLE-CLICK CANNOT MINT TWICE BY ACCIDENT: the
+          // passphrase fields were cleared in the same tick the first
+          // mint read them, so a stray second press meets the ceremony's
+          // own "choose a passphrase" refusal rather than minting a kit
+          // nobody asked for.
+          make.disabled = false;
+        } catch (e) {
+          make.disabled = false;
+          stepNote.textContent = "";
+          problem.textContent = err(e);
+          problem.hidden = false;
+          tenantRebuild();
+        }
+      });
+    };
+
+    const back = document.createElement("button");
+    back.type = "button";
+    back.id = "recovery-back";
+    back.className = "hint";
+    back.textContent = "back to storage";
+    back.onclick = () => {
+      body.replaceChildren();
+      renderBound(body, storage);
+      tenantRebuild();
+    };
+
+    body.append(make, guarantee, stepNote, problem, back);
+    tenantRebuild();
   };
 
   // --- cross-page sync ------------------------------------------------------
@@ -3325,6 +4663,54 @@ async function startApp(
         throw new Error(err(e));
       }
     },
+    // THE FORK'S THIRD CHOICE — the recovery door on the surface a
+    // VIRGIN BROWSER actually lands on (entry.ts's `FirstRunHost.restore`
+    // carries the reasoning; in short, a browser with no devices never
+    // sees the picker, and that is precisely the browser a real recovery
+    // happens on).
+    //
+    // THIS ARM RELOADS, and the picker's does not. The difference is
+    // forced and worth stating: by the time the fork is on screen,
+    // `startApp` has ALREADY claimed the visor for the device that has
+    // no account — a colour is painted, a name may be. Restoring from
+    // here therefore cannot end with "the visor claims at the end",
+    // because the claim is behind us. A reload is the honest way back to
+    // the record's ordering: the restored device is anchored to this
+    // tab, so the next boot resumes it through `resolveDevice`'s anchor
+    // arm and claims from the profile the restore pulled — the same
+    // machinery, reached from the top.
+    //
+    // The device this fork belonged to is left in the index rather than
+    // swept: it is an account-less T0 device, which is exactly what the
+    // sweep already exists to collect, and destroying a namespace out
+    // from under a live worker on the way to a reload buys nothing.
+    restore: () => {
+      status("restoring from your recovery kit…");
+      note("first-run:restore");
+      return new Promise<void>((settle) => {
+        mountRestore(visor, {
+          onRestored: (_conn, consumePending) => {
+            note("restored");
+            // ACROSS THE RELOAD: a module variable cannot survive one,
+            // so the sentence rides sessionStorage and `startApp` drains
+            // it just after the claim on the other side.
+            try {
+              sessionStorage.setItem(RESTORE_NOTE_KEY, consumedKitSentence(consumePending));
+            } catch { /* a storage-less browser loses the sentence, not the account */ }
+            settle();
+            location.reload();
+          },
+          onAbandoned: () => {
+            // BACK TO THE FORK: an abandoned ceremony must land on a
+            // surface with something to do on it, and for an
+            // account-less device that surface is the fork.
+            status("ready");
+            settle();
+            entry = offerFirstRun(visor, us, announce, firstRunHost);
+          },
+        });
+      });
+    },
   };
 
   // DOES THIS DEVICE ALREADY HOLD THE ACCOUNT? `us-profile-get` refuses
@@ -3635,6 +5021,14 @@ async function startApp(
     appRunner: () => appRunner !== null,
     /** The storage sheet, entered the way a user enters it. */
     openStorageSheet: () => openStorage(),
+    /** THE CONSUMED-KIT SENTENCE this boot announced, or "" — the one
+     * announcement in this page that a scenario cannot read off the
+     * strip, because `visor.announce` replaces and the restored boot has
+     * several other things to say in the seconds that follow
+     * (runtime/RECOVERY.md, "Single-use"). The trace marker
+     * `restore:announced` proves it reached the visor; this proves WHAT
+     * reached it. */
+    restoreAnnouncement: () => restoreAnnouncedText,
     /** The device's own claim about where it syncs — `null` sealed or
      * unbound (`DeviceStatus.storage`'s own ambiguity; see rpc.ts). */
     storageStatus: async () => (await conn.status()).storage,

@@ -3732,9 +3732,92 @@ async function main() {
       );
       await probe(page, "hc-close", { id: idA });
       await probe(page, "hc-close", { id: idB });
-      await probe(page, "hc-close", { id: rcDevice });
-      await probe(page, "hc-close", { id: rcRestored });
     });
+
+    // --- 61: the consume survives the worker's death ------------------------
+    //
+    // THE STRAND, PINNED. A consume's last act is a write to the LIVE
+    // us-doc (`recovery_clear`) plus the guest's own flush of it. Both
+    // land, and without a checkpoint after them NEITHER survives a
+    // respawn:
+    //
+    //   * the worker calls `recoveryConsume()` INTERNALLY, and the
+    //     mutation debounce lives in `call()`, which dispatches CLIENT
+    //     requests only — so nothing arms a checkpoint, and a resume
+    //     rewinds the account to before the consume;
+    //   * the flushed copy is under THIS device's own keyed names, and
+    //     `pullCycle` self-filters a device out of its own fan-out — so
+    //     the durable copy is permanently out of its author's reach. It
+    //     heals only when ANOTHER device pulls it and re-manifests it,
+    //     which is exactly what an account that just spent its
+    //     last-resort kit does not have.
+    //
+    // The symptom is a restored device whose own kit list still shows
+    // the kit it consumed — reported from the solo page's fork-door
+    // restore, which reloads on completion and so respawns the worker.
+    // Row 56 asserts the ORIGIN device's view; this asserts the
+    // RESTORED device's, across a real death.
+    //
+    // WHY A SECOND CHECKPOINT AND NOT AN EARLIER ONE: the restore's
+    // checkpoint stays BEFORE the consume, because a crash between a
+    // consume and a first checkpoint would burn the kit with nothing
+    // durable to show for it — a lockout. So the fix adds a checkpoint
+    // after a SUCCESSFUL consume and changes no existing ordering.
+    await guard(async () => {
+      const kit = await probe(page, "rc-kit-create", {
+        id: rcDevice,
+        spec: { kind: "bucket", label: "a kit that gets consumed and killed" },
+      });
+      await probe(page, "rc-flush-now", { id: rcDevice });
+      const restored = await probe(page, "rc-restore", {
+        petname: "restored-then-killed",
+        binding: rcBinding,
+        handle: kit.handle,
+        kind: "bucket",
+        deviceName: "a device that outlives its kit",
+      });
+      const id = restored.id as string;
+      const live = restored.attempt.refused
+        ? { attempt: { ok: false }, kits: [{ kind: "?" }] }
+        : await probe(page, "rc-kits", { id });
+
+      // THE KILL: `__die` closes the worker's own global, which is a
+      // crash on demand — the lock and the lease go exactly as they
+      // would if the process had died (rows 11, 21, 50's discipline).
+      const died = await probe(page, "hc-die", { id });
+      const back = await probe(page, "hc-open", { id, unseal: { passphrase: PASS } });
+      const afterKill = await probe(page, "rc-kits", { id });
+
+      const ok = kit.attempt.ok === true && restored.attempt.refused === false &&
+        restored.status.sync?.consumePending === false &&
+        live.attempt.ok === true && live.kits.length === 0 &&
+        died.lockHeld === false &&
+        back.unseal.refused === false && back.status.resumed === true &&
+        afterKill.attempt.ok === true && afterKill.kits.length === 0;
+      record(
+        "61 recovery",
+        "a consumed kit STAYS consumed across the worker's death — the restored device's own view",
+        ok,
+        `a fresh kit was minted and used; the restore's consume succeeded ` +
+          `(consumePending=${restored.status.sync?.consumePending}) and the restored device's ` +
+          `OWN kit list read ${j(live.kits)} — the guest is consistent the moment it finishes. ` +
+          `The worker was then KILLED (lock released: ${died.lockHeld === false}) and a fresh ` +
+          `one opened the same namespace, resuming from the checkpoint ` +
+          `(resumed=${back.status.resumed}). Its kit list is ${j(afterKill.kits)}. WITHOUT the ` +
+          `post-consume checkpoint this reads back as the spent kit, and neither half of the ` +
+          `consume saves the other: the worker calls \`recoveryConsume()\` internally, so the ` +
+          `mutation debounce in \`call()\` — which dispatches CLIENT requests only — never arms, ` +
+          `and the clear that WAS flushed sits under this device's own keyed names, which ` +
+          `\`pullCycle\` self-filters out of its own fan-out. Durable in the bucket, invisible ` +
+          `to its author, forever, on the one device that just spent the account's last-resort ` +
+          `kit. The restore's FIRST checkpoint deliberately still precedes the consume: a crash ` +
+          `in between would burn the kit with nothing durable to show for it.`,
+      );
+      await probe(page, "hc-close", { id });
+    });
+
+    await probe(page, "hc-close", { id: rcDevice });
+    await probe(page, "hc-close", { id: rcRestored });
 
     await ctx.close();
   } finally {

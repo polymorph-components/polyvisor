@@ -2221,6 +2221,60 @@ by recovery; boot pull never awaited by unseal), the pairing battery's
 chain act asserting zero duplicate chunk names across concurrent
 sibling flushes, resume/pair/check green, invariants 9/9.
 
+**Recovery: the account outlives its last device** (2026-08-25; design
+record [runtime/RECOVERY.md](runtime/RECOVERY.md)). The round that
+closed SYNC.md's parked us-doc-through-the-bucket and #11's recovery
+body. The ruling: **recovery is a DEVICE, not a resurrection** — the
+kit ceremony mints a dormant member leaf through the ordinary
+`enroll_device` path (visible in the devices sheet, revocable like a
+lost phone) whose secrets exist only in a sealed bundle; dormancy is
+what kills bundle staleness (the G5 self-rotation finding never fires
+for a leaf that never authors — the proven G4 tablet path with the
+tablet replaced by a blob), and the K_p pickup answers the us-doc
+bootstrap chicken-and-egg (one pickup, sealed to prekeys that ride the
+bundle, bootstraps everything; `KpPayload.devices` became directory ∪
+grantees on the way, without which a post-SYNC.md account's pickup
+named no real author). Two kit kinds, one mechanism: a BUCKET kit
+under a generated 10-word EFF-short phrase (argon2id at a fixed
+context salt → HKDF → both the object name and the KEK — the exposure
+rule made structural: replicated copies get generated-secret slots
+only; S3-only at this rev, names being locations only there) and a
+FILE kit under a user passphrase (the custody exception, warned
+loudly, provider-neutral; the owner's amendment — disallowing custody
+would be paternalism). **Single-use, consumed at restore**: dormancy
+ends at first authoring, double-restore is an identity fork against
+the single-writer-per-name invariant, and a phrase captured during
+the ceremony must be worthless afterward; the K_p's deletion enforces
+single-use even for a file we cannot delete (a second restore is a
+404, never a fork). The us-doc now rides the ordinary flush/pull
+cycle via an empty-doc-id sentinel; restore is a two-stage worker
+ceremony (bind with fail-at-bind, engine born from the bundle instead
+of init, fan-out, checkpoint, then consume) ending at the claim —
+colour, name, icon from the pulled profile. Three defects found and
+pinned during the round, each with a regression owner: the solo
+page's nested-`enqueue` self-deadlock (a file-kit mint wedged the
+page-wide chain forever; the sheet's own "measured" comment had
+recorded the symptom as an engine bug), the consume-outlives-its-
+checkpoint strand (internal driver mutations bypass the client-call
+debounce, and the pull fan-out's self-filter keeps a device's own
+flushed clear permanently out of reach — every internal mutation now
+checkpoints explicitly; devstore row 61 pins it with a negative
+control), and the same stranding for kit create/revoke. Known
+limitation recorded, follow-up owed: a name-key rotation strands a
+bucket-only lagging sibling on the us-doc until wire contact —
+pre-existing SYNC.md territory that kit revocation now makes
+reachable. Parked: Drive bucket kits, the PRF second-input slot, kit
+migration on storage rebind, platform-posture migration for restored
+devices. Gates: a new `just recover` battery (8 acts: both kinds
+round-trip against MinIO with a post-kit revocation epoch crossed
+before restore, refusals as classes, consume verified by object
+set-difference and idempotent retry, the restored device's own-view
+registry agreement), devstore 61 rows, e2e 27/27 (`solo-recovery`
+destroys the browser context and restores from phrase + re-entered
+credentials alone; `solo-recovery-file` catches the real download and
+proves the wrong passphrase is one clean keyslot miss),
+pair/resume/check green, invariants 9/9.
+
 ## Parked and candidate non-goals
 
 - **Metadata privacy**: relays, push services, and origins see traffic

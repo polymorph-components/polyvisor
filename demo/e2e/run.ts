@@ -66,6 +66,8 @@ import drawerOverflow from "./scenarios/drawer-overflow.ts";
 import soloAccountStorage from "./scenarios/solo-account-storage.ts";
 import soloOfflineSync from "./scenarios/solo-offline-sync.ts";
 import soloPasskey from "./scenarios/solo-passkey.ts";
+import soloRecovery from "./scenarios/solo-recovery.ts";
+import soloRecoveryFile from "./scenarios/solo-recovery-file.ts";
 import visorReset from "./scenarios/visor-reset.ts";
 import firefoxSmoke from "./scenarios/firefox-smoke.ts";
 
@@ -208,6 +210,24 @@ const SCENARIOS: Scenario[] = [
   // follows (nothing in this suite currently depends on that, but nor
   // did the observation cost anything to write down).
   soloPasskey,
+  // ACCOUNT RECOVERY (runtime/RECOVERY.md's T-C gate) — the round's
+  // money shot, and the only pair of scenarios in this suite that
+  // DESTROY a browser context mid-story rather than merely reloading.
+  //
+  // THEY RUN HERE, after every storage scenario, because they consume
+  // all of it: an account, a bound bucket, a flush that actually landed,
+  // and then a wiped browser that has to find its way back to the
+  // account with nothing but a phrase (or a file) and the credentials
+  // the user remembers. A failure here with solo-storage and
+  // solo-offline-sync green says the fault is in the RECOVERY path — the
+  // kit ceremony, the restore bring-up, the consume — and not in the
+  // egress or the schedule it rides on.
+  //
+  // The phrase kind goes first: it is the record's primary kind, it
+  // needs no filesystem, and a failure in it makes the file kind's
+  // failure much easier to read.
+  soloRecovery,
+  soloRecoveryFile,
   // The erase ceremony: seeds a name, a petname and a storage sentinel,
   // then reloads the page (twice) as part of its own claim. It runs
   // after the other identity/naming scenarios and before the one that

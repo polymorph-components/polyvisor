@@ -1071,3 +1071,47 @@
   .settings-sheet .settings-head h2 { flex: 1 1 100%; }
   .settings-sheet .settings-reset { max-width: 100%; margin-left: auto; }
 }
+
+/* --- account recovery (runtime/RECOVERY.md) -------------------------------
+
+   THE PHRASE, DISPLAYED ONCE. It is set in a monospaced face, at a size
+   a person can read off a screen while writing on paper, and it WRAPS —
+   ten diceware words do not fit a phone's drawer on one line, and a
+   phrase clipped by an overflow rule is a kit the user believes they
+   have and does not. The generous line-height is for the same reader:
+   they are transcribing, not skimming, and word boundaries have to be
+   unambiguous. `user-select: all` makes one tap select the whole phrase,
+   because a partial selection copied to a note is the same silent
+   half-kit failure. */
+.recovery-phrase {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 15px;
+  line-height: 1.9;
+  word-spacing: .35em;
+  overflow-wrap: break-word;
+  user-select: all;
+  margin: .6em 0;
+  padding: .7em .8em;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, .07);
+}
+
+/* THE FILE KIT'S WARNING — the owner's amendment, and the one block of
+   copy in the visor that is meant to SLOW A READER DOWN. It reuses
+   .entry-problem's alarm colour (the sheet's existing vocabulary for
+   "read this") and adds the weight and the rule that stop it reading as
+   one more hint: a paragraph the eye can skip is a paragraph that did
+   not warn anybody. */
+.recovery-warning {
+  font-size: 13px;
+  line-height: 1.5;
+  margin: .6em 0;
+  padding: .6em .7em;
+  border-left: 3px solid #ffd79a;
+  background: rgba(255, 215, 154, .08);
+}
+
+/* A kit row is a DEVICE row (the round's core ruling), so it inherits
+   .device-row's layout and adds only what a kit has that a device does
+   not: a control that retires it. */
+.cred-sheet .recovery-row .recovery-revoke { font: inherit; }

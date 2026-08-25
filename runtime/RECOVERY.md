@@ -152,6 +152,25 @@ mints a fresh one. "No kit, loudly" is recoverable by a ceremony;
 (unreachable bucket at the end of a restore) never block the restore:
 they announce and retry on the flush cadence's backoff loop.
 
+**The consume-checkpoint discipline (settled in T-B's revision, pinned
+by devstore row 61 with a negative control).** The restore's FIRST
+checkpoint deliberately precedes the consume — a crash between them
+burns the kit with nothing durable, a lockout on a last device. But a
+consume that outlives its checkpoint is RESURRECTED by the next worker
+respawn: internal driver calls bypass the mutation-armed checkpoint
+debounce (which dispatches client requests only), and the consume's
+flushed clear sits under the device's OWN keyed names, which the pull
+fan-out self-filters — durable in the bucket, permanently invisible to
+its author. So every successful consume is followed by a second
+checkpoint, `consumePending` clears only after it lands, and the same
+rule covers the ceremony's other internal mutations: kit CREATE and
+REVOKE checkpoint explicitly too (a respawn forgetting a kit whose
+phrase the user just wrote down, or resurrecting a revocation the
+provider already executed, are the same stranding). The scheduler's
+own bucket-state mutations stay un-checkpointed on purpose: that state
+self-heals from the account document and the next pull's manifests,
+and the cost is one duplicate upload, never an unrecoverable fact.
+
 ## The kit ceremony (account device, guest-side)
 
 1. Mint a fresh soft Ed25519 identity — the recovery identity — and a

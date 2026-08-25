@@ -2090,13 +2090,61 @@ async function restoreFanOut(live: Engine): Promise<void> {
  */
 async function settleConsume(live: Engine): Promise<void> {
   try {
-    await live.driver.recoveryConsume();
-    consumePending = false;
+    await consumeAndCheckpoint(live);
   } catch (e) {
     consumePending = true;
     const delay = noteSyncOutcome("flush", e);
     armFlush(delay, false);
   }
+}
+
+/**
+ * CONSUME, THEN CHECKPOINT — and the checkpoint is not bookkeeping, it
+ * is what keeps the consume from being UNDONE by the next respawn.
+ *
+ * THE STRAND HAZARD, in full, because it cost a track to find. The
+ * consume's last act inside the guest is `recovery_clear` — a write to
+ * the LIVE us-doc — followed by the guest's own `bucket_flush(us)`.
+ * Both landed; neither survives a worker death, and here is why each
+ * half fails to save the other:
+ *
+ *   * THE CHECKPOINT NEVER ARMS ITSELF. The debounce hooks live in
+ *     `call()`, which is the dispatcher for CLIENT requests only. Every
+ *     driver call this file makes internally — the fan-out, the flush
+ *     cycles, this consume — goes straight to `engine.driver` and arms
+ *     nothing. So a mutation made after a sequence's last checkpoint is
+ *     simply not in any checkpoint, and a respawn resumes the state as
+ *     it was BEFORE the consume: the spent kit back in the account's
+ *     registry, on the one device most likely to be looking at it.
+ *   * THE BUCKET COPY IS OUT OF ITS OWN REACH. The clear WAS flushed —
+ *     under THIS device's own keyed object names — and `pullCycle`
+ *     self-filters the device out of its own sibling fan-out (a device
+ *     does not pull from itself). So the flushed clear is durable and
+ *     permanently invisible to every future resume of its author. It
+ *     heals only when some OTHER device pulls it and re-manifests it,
+ *     which is exactly what the account that just used its last-resort
+ *     kit does not have.
+ *
+ * The record's checkpoint-BEFORE-consume ordering stays as it is: a
+ * crash between the consume and a FIRST checkpoint would burn the kit
+ * with nothing durable to show for it, which is a lockout. So this is a
+ * SECOND checkpoint, after the fact, and the first one is untouched.
+ *
+ * `consumePending` IS CLEARED LAST, after the checkpoint has landed.
+ * A checkpoint that fails leaves the obligation standing and the retry
+ * runs the whole thing again — which is safe precisely because
+ * `recovery-consume` is idempotent by contract (absence is success), so
+ * a second pass over an already-consumed kit succeeds and reaches the
+ * checkpoint that failed the first time.
+ */
+async function consumeAndCheckpoint(live: Engine): Promise<void> {
+  await live.driver.recoveryConsume();
+  // Through `checkpoint()`, never `stateCheckpoint()` directly: that is
+  // the file's serialization point for checkpoints (they queue against
+  // each other on `checkpointChain` and against nothing else), and it is
+  // what keeps `lastCheckpoint` honest in `status()`.
+  await checkpoint();
+  consumePending = false;
 }
 
 /**
@@ -2127,6 +2175,23 @@ async function createRecoveryKit(spec: RecoveryKitSpec): Promise<RecoveryKitResu
   // it would silently turn ceremony step 6 into a no-op — which is the
   // "kit that looks valid and is not" the step exists to prevent.
   await syncFlushNow();
+  // AND A CHECKPOINT, for `consumeAndCheckpoint`'s reason exactly. This
+  // ceremony reaches the engine from the HOST surface (`callHost`), not
+  // through `call()`, so nothing here arms the mutation debounce — and
+  // what it just wrote is a minted device, an epoch rotation, a K_p
+  // grant and the account's `recovery` row. All of it went to the bucket
+  // under THIS device's own keyed names, which the pull fan-out
+  // self-filters, so a respawn before some unrelated client mutation
+  // happened to arm a checkpoint would resume an account that has never
+  // heard of the kit whose phrase the user has just written down.
+  //
+  // SWALLOWED, and the swallow is the same ruling the fan-out above
+  // takes: the kit EXISTS and the phrase is minted and returned once, so
+  // rejecting here would hand back nothing for a kit that is real, and
+  // a caller retrying would mint a second one. A failed local checkpoint
+  // is a device in trouble for other reasons, and the next mutation's
+  // debounce catches up.
+  await checkpoint().catch(() => {});
   return out;
 }
 
@@ -2242,7 +2307,24 @@ function scheduleCheckpoint(): void {
 // requests, or decides a pull is unnecessary — if that logic ever grows
 // a bug, this file is not where it lives.
 //
+// THE CYCLES MUTATE CHECKPOINTED STATE AND ARM NO CHECKPOINT, and that
+// is recorded rather than fixed. A flush or a pull writes the guest's
+// per-doc bucket state (#93: the name-key chain and the flushed-chunk
+// map are in the checkpoint), and these calls are INTERNAL — `call()`'s
+// debounce hooks are for client requests only — so a cycle's work is not
+// checkpointed until some unrelated mutation happens to arm one. It is
+// the same shape as the hazard `consumeAndCheckpoint` exists for, and it
+// is left alone because the consequence is not the same: this state
+// SELF-HEALS. The chain is re-read from the account document
+// (`ensure_bucket_state`'s case 1, since SYNC.md §1 made the us-doc its
+// source of truth) and the flushed-chunk map is repopulated from the
+// manifests the next pull reads, so the cost of losing it is at most one
+// duplicate upload, never a fact that cannot be recovered. Checkpointing
+// per cycle instead would put a disk write on every idle 45 s tick of
+// every bound device, which is a real price for a self-healing map.
+//
 // BACKOFF IS PER DIRECTION AND UNTRIAGED. Any failed background cycle
+
 // backs the direction off (truncated exponential, base 5 s, factor 2,
 // cap 10 min, jittered), because "transient-vs-permanent triage is not
 // worth string-matching error text for a background loop" — Google's
@@ -2568,8 +2650,13 @@ async function flushCycle(): Promise<void> {
   let failure: unknown | null = null;
   if (consumePending) {
     try {
-      await live.driver.recoveryConsume();
-      consumePending = false;
+      // AND THE CHECKPOINT THAT MAKES IT STICK — the retry path needs it
+      // exactly as much as the restore's own does, and for the same
+      // reason: this call is internal, so nothing here arms the
+      // debounce, and a consume that outlives its checkpoint is undone
+      // by the next respawn while its bucket copy stays self-filtered
+      // out of its own reach. See `consumeAndCheckpoint`.
+      await consumeAndCheckpoint(live);
     } catch (e) {
       failure ??= e;
     }
@@ -2981,7 +3068,19 @@ async function callHost(method: string, args: unknown[]): Promise<unknown> {
       if (!engine) {
         throw new SealError("no-rung", "the device is sealed; open it before revoking a kit");
       }
-      return await engine.driver.recoveryKitRevoke(args[0] as Uint8Array);
+      const note = await engine.driver.recoveryKitRevoke(args[0] as Uint8Array);
+      // AND A CHECKPOINT, the third instance of `consumeAndCheckpoint`'s
+      // hazard: a HOST-surface call arms no debounce, and everything
+      // this one wrote — the revoked membership, the new name-key epoch,
+      // the cleared registry row — would be resurrected by a respawn,
+      // with the bucket's copy self-filtered out of this device's own
+      // reach. A resurrected REVOCATION is the worst of the three: the
+      // device would go on believing a kit it has already destroyed is
+      // live. Swallowed for the kit ceremony's reason — the revocation
+      // has already happened at the provider, so reporting a failure
+      // here would be reporting a revoke that did not occur.
+      await checkpoint().catch(() => {});
+      return note;
     }
     case "oauthStart":
       return await oauthStart(args[0] as OauthStartSpec);
