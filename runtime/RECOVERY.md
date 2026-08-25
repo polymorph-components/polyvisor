@@ -153,7 +153,7 @@ mints a fresh one. "No kit, loudly" is recoverable by a ceremony;
 they announce and retry on the flush cadence's backoff loop.
 
 **The consume-checkpoint discipline (settled in T-B's revision, pinned
-by devstore row 61 with a negative control).** The restore's FIRST
+by devstore row 64 with a negative control).** The restore's FIRST
 checkpoint deliberately precedes the consume — a crash between them
 burns the kit with nothing durable, a lockout on a last device. But a
 consume that outlives its checkpoint is RESURRECTED by the next worker

@@ -275,7 +275,7 @@ const scenario: Scenario = {
       // worker resumed exactly that stale checkpoint, with the pull
       // fan-out's self-filter keeping the flushed clear permanently out
       // of its own author's reach. The devstore matrix owns that
-      // regression directly (row 61, with a negative control); this act
+      // regression directly (row 64, with a negative control); this act
       // is the same fact seen from where the user sees it.
       await openStorageSheet(fresh);
       await fresh.waitForSelector("#storage-kits", { state: "visible", timeout: WAITS.boot });

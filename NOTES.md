@@ -2258,7 +2258,7 @@ recorded the symptom as an engine bug), the consume-outlives-its-
 checkpoint strand (internal driver mutations bypass the client-call
 debounce, and the pull fan-out's self-filter keeps a device's own
 flushed clear permanently out of reach — every internal mutation now
-checkpoints explicitly; devstore row 61 pins it with a negative
+checkpoints explicitly; devstore row 64 pins it with a negative
 control), and the same stranding for kit create/revoke. Known
 limitation recorded, follow-up owed: a name-key rotation strands a
 bucket-only lagging sibling on the us-doc until wire contact —
@@ -2269,7 +2269,7 @@ devices. Gates: a new `just recover` battery (8 acts: both kinds
 round-trip against MinIO with a post-kit revocation epoch crossed
 before restore, refusals as classes, consume verified by object
 set-difference and idempotent retry, the restored device's own-view
-registry agreement), devstore 61 rows, e2e 27/27 (`solo-recovery`
+registry agreement), devstore 64-row matrix, e2e 27/27 (`solo-recovery`
 destroys the browser context and restores from phrase + re-entered
 credentials alone; `solo-recovery-file` catches the real download and
 proves the wrong passphrase is one clean keyslot miss),

@@ -42,6 +42,7 @@ import {
   resetActs,
   waitForBoot,
 } from "./util.ts";
+import { type SeverableProxy, startTcpProxy } from "./proxy.ts";
 
 import bootAppSurface from "./scenarios/boot-app-surface.ts";
 import petnameCeremony from "./scenarios/petname-ceremony.ts";
@@ -70,6 +71,13 @@ import soloRecovery from "./scenarios/solo-recovery.ts";
 import soloRecoveryFile from "./scenarios/solo-recovery-file.ts";
 import visorReset from "./scenarios/visor-reset.ts";
 import firefoxSmoke from "./scenarios/firefox-smoke.ts";
+import crossEnginePairing from "./scenarios/cross-engine-pairing.ts";
+import workerEviction from "./scenarios/worker-eviction.ts";
+import harnessFaults from "./scenarios/harness-faults.ts";
+import storeOutageRecovery from "./scenarios/store-outage-recovery.ts";
+import oneSidedReload from "./scenarios/one-sided-reload.ts";
+import relayPartition from "./scenarios/relay-partition.ts";
+import relayPartitionAsym from "./scenarios/relay-partition-asym.ts";
 
 // Re-exported so a scenario imports its whole contract from one place:
 // `Scenario` and the `Ctx` it is handed.
@@ -92,11 +100,33 @@ export interface Scenario {
    * suite is a Chromium suite plus ONE Gecko smoke beat, deliberately —
    * see `firefox-smoke` and the `FIREFOX_PREFS` note below. */
   engine?: "chromium" | "firefox";
+  /** A scenario expected to FAIL right now — a known gap being tracked
+   * rather than hidden. An `expected: "red"` scenario that fails is
+   * recorded `ok` with an `(xfail: expected red)` marker in the
+   * summary; one that PASSES is recorded as a FAILURE (the gate has
+   * flipped — promote it to green by dropping this flag, don't leave a
+   * silently-passing xfail in the suite). A CRASH-SHAPED failure
+   * (RendererGoneError, a scenario deadline, or a delivered crash
+   * event) is never read as "the expected red": it still retries under
+   * the same rule as every other scenario, because a renderer SEGV is
+   * an environment flake, not the fault this flag exists to track. */
+  expected?: "red";
+  /** Overrides `SCENARIO_DEADLINE_MS` for this one scenario. Partition
+   * scenarios legitimately wait out several real relay pull cadences
+   * (45s each) in a single run, which the suite-wide deadline was never
+   * sized for. */
+  deadlineMs?: number;
   run(page: Page, ctx: Ctx): Promise<void>;
 }
 
 const SCENARIOS: Scenario[] = [
   bootAppSurface,
+  // THE HARNESS'S OWN FAULT-INJECTION MACHINERY, tested against ITSELF
+  // rather than the demo. It needs no engine boot at all (`page: {
+  // noWait: true }`), so it runs early and cheaply — a broken proxy or
+  // relay stop/start would otherwise surface as a mysterious failure in
+  // whatever partition scenario used it first, several minutes later.
+  harnessFaults,
   petnameCeremony,
   settingsIdentity,
   stripGeometry,
@@ -153,6 +183,15 @@ const SCENARIOS: Scenario[] = [
   // the role read out of it, the acceptor and the dial — rather than in
   // anything either of them covers.
   soloResumeSync,
+  // AND ITS ONE-SIDED SIBLING, expected RED: solo-resume-sync proves
+  // the both-sides reload recovers, and solo.ts (~2988-3012) documents
+  // in prose that the ONE-SIDED reload — the acceptor reloads, the
+  // reader keeps a stale handle that `conn-status` will never
+  // invalidate — does not. This scenario turns that prose into a gate:
+  // it asserts the recovery as if it worked, fails today, and the
+  // xfail machinery FAILS THE SUITE the day an engine fix makes it
+  // pass un-promoted (drop its `expected` flag then).
+  oneSidedReload,
   soloEphemeral,
   // THE WORKER HOST'S STORAGE EGRESS (STORAGE-EGRESS.md's T-E): the same
   // sheet the two device-store scenarios above just proved a device
@@ -162,6 +201,16 @@ const SCENARIOS: Scenario[] = [
   // because a failure here with solo-persistence green says the fault is
   // in the store-egress wiring, not in the device store underneath it.
   soloStorage,
+  // THE STORE THAT COMES BACK (runtime/SYNC.md §3's backoff): the same
+  // MinIO binding solo-storage just proved, now with the store dying
+  // MID-SESSION and returning. transport-refusal pins the honest
+  // failure of a store that is down from the start; this pins the
+  // RECOVERY — failures counted, the announcement made, and the
+  // worker's own backoff retry healing everything with nobody pressing
+  // anything. It follows solo-storage because it uses that scenario's
+  // ceremony as a precondition: a failure here with solo-storage green
+  // says the fault is in the schedule's recovery, not in the binding.
+  storeOutageRecovery,
   // GOOGLE DRIVE FROM THE WORKER HOST (runtime/DRIVE.md's e2e gate): the
   // same solo page, the same fresh context, but this one needs no MinIO
   // at all — it drives its own in-process fake Drive instead, and runs
@@ -198,6 +247,17 @@ const SCENARIOS: Scenario[] = [
   // pull) rather than in anything about pairing, adoption or the Drive
   // ceremony underneath it.
   soloOfflineSync,
+  // THE WORKER THAT DIES WITH NO GOODBYE, at product level: B's whole
+  // engine host (its SharedWorker) is evicted via CDP while A keeps
+  // working, and the user-shaped recovery — reload the tab — brings the
+  // same device back from its checkpoint and the account converges
+  // again. It runs after solo-account-storage and solo-offline-sync
+  // because it uses their ceremony and their channels as preconditions:
+  // a failure here with both of those green says the fault is in the
+  // eviction/recovery path, not in pairing, adoption or the schedule.
+  // The mechanics underneath are pinned one level down in devstore rows
+  // 51-56 (lock release, the silent port, checkpoint intactness).
+  workerEviction,
   // THE PRF RUNG (passkey unseal, PERSISTENCE.md). Follows the device
   // store's other two for the same reason they follow solo-pairing: a
   // failure here with those two green says the fault is in the passkey
@@ -228,6 +288,16 @@ const SCENARIOS: Scenario[] = [
   // failure much easier to read.
   soloRecovery,
   soloRecoveryFile,
+  // THE TWO RELAY-PARTITION PINS, both expected RED and both SLOW —
+  // each spends minutes proving a heal that does not come (the
+  // freshly-paired ceremony wires never re-dial, and `conn-status`
+  // never learns a wire died; the full trace is in the scenarios' own
+  // banners). They run this late so a suite that is already broken
+  // earlier never pays for them, and after the solo family because
+  // their preconditions (pairing, convergence, the harness's own fault
+  // levers) are all claims made green above.
+  relayPartition,
+  relayPartitionAsym,
   // The erase ceremony: seeds a name, a petname and a storage sentinel,
   // then reloads the page (twice) as part of its own claim. It runs
   // after the other identity/naming scenarios and before the one that
@@ -243,6 +313,24 @@ const SCENARIOS: Scenario[] = [
   // suite that is already green is the right place to ask "and does it
   // work under the other engine".
   firefoxSmoke,
+  // AND THE ONE THAT NEEDS BOTH BROWSERS AT ONCE: a Chromium device and
+  // a Firefox device paired over the relay, converging both ways. It
+  // sits here for exactly firefoxSmoke's reason, cited above — Firefox
+  // is launched lazily, so a run that failed earlier must never pay for
+  // a second browser, and a Chromium suite that is already green is the
+  // right place to ask the cross-engine question.
+  //
+  // AFTER firefoxSmoke rather than before it, which is the ordering
+  // argument the solo family uses throughout: firefoxSmoke proves Gecko
+  // can boot the engine and keep a device AT ALL, and solo-pairing
+  // proves the ceremony works between two devices. A failure HERE with
+  // both of those green says the fault is in something only two
+  // DIFFERENT engines can break — a wire format, a transcript, a
+  // subduction across runtimes — rather than in Gecko or in the
+  // ceremony. It also inherits firefoxSmoke's warm Firefox process
+  // (run.ts's `browserFor` keeps the one handle), so the launch is paid
+  // for once.
+  crossEnginePairing,
 ];
 
 const here = new URL(".", import.meta.url).pathname;
@@ -413,6 +501,12 @@ class Relay {
     this.url = `http://127.0.0.1:${port}`;
   }
 
+  /** For `ctx.relayProxy()`, which needs the real relay's port to dial
+   * as its own upstream. */
+  get port(): number {
+    return this.#port;
+  }
+
   async start(): Promise<void> {
     if (this.#proc) return;
     try {
@@ -451,15 +545,43 @@ class Relay {
     throw new Error(`the local relay never answered on ${this.url}`);
   }
 
-  async dispose(): Promise<void> {
+  /** Mirrors `Minio.stop()` exactly, down to the refused/timeout split —
+   * see that method's comment for why a TIMEOUT is not the state a
+   * scenario asserting on transport refusal may be told it reached. The
+   * probe is `/generate_204`, the same net-report endpoint `start()`
+   * uses to know the relay is actually serving. `start()` re-creates
+   * `this.#proc` afterwards (it is null-checked, same as Minio), and
+   * keeps the SAME config file — same port — so a page that already
+   * captured `?relay=<url>` stays pointed at a relay that will listen
+   * there again. */
+  async stop(): Promise<void> {
+    if (!this.#proc) return;
     const proc = this.#proc;
     this.#proc = null;
-    if (proc) {
+    try {
+      proc.kill("SIGKILL");
+    } catch { /* already dead */ }
+    await proc.status;
+    for (let i = 0; i < 80; i++) {
       try {
-        proc.kill("SIGKILL");
-      } catch { /* already dead */ }
-      await proc.status;
+        const r = await fetch(`${this.url}/generate_204`, {
+          signal: AbortSignal.timeout(2_000),
+        });
+        await r.body?.cancel();
+      } catch (e) {
+        // Connection refused is the state this loop exists to reach —
+        // see Minio.stop()'s identical comment for why a TimeoutError
+        // must keep the loop going rather than being read as "down".
+        if (e instanceof DOMException && e.name === "TimeoutError") continue;
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 100));
     }
+    throw new Error("the relay kept answering after being killed");
+  }
+
+  async dispose(): Promise<void> {
+    await this.stop();
     if (this.#dir) await Deno.remove(this.#dir, { recursive: true }).catch(() => {});
   }
 }
@@ -467,8 +589,48 @@ class Relay {
 // --- the run ---------------------------------------------------------------
 
 async function main() {
-  const wanted = Deno.args.filter((a) => !a.startsWith("-"));
   const headed = Deno.args.includes("--headed");
+  // --file <path>: a DEV LOADER for scenarios not yet registered in
+  // SCENARIOS above. WHY THIS EXISTS: several partition scenarios are
+  // developed in parallel by separate tracks, and requiring every one
+  // of them to land a run.ts edit (import + list placement, with its
+  // own ordering commentary) before it can even be RUN once would
+  // gate iteration speed on a merge. `--file` imports the module
+  // directly (default export = Scenario) relative to this file's own
+  // directory (`demo/e2e/`), so `--file scenarios/foo.ts` finds
+  // `demo/e2e/scenarios/foo.ts` regardless of the caller's cwd. Mixed
+  // usage (bare names plus `--file`s) simply runs the union of both
+  // lists — keeping that simple was an explicit non-goal to gold-plate.
+  const filePaths: string[] = [];
+  // `wanted` must NOT swallow a --file's path argument as a scenario
+  // name (a path is a bare token too, and would otherwise be read as
+  // "unknown scenario"), so both are stripped from args before the
+  // ordinary bare-name scan runs.
+  const consumed = new Set<number>();
+  for (let i = 0; i < Deno.args.length; i++) {
+    if (Deno.args[i] === "--file") {
+      const p = Deno.args[i + 1];
+      if (!p) {
+        console.error("--file needs a path argument");
+        Deno.exit(2);
+      }
+      filePaths.push(p);
+      consumed.add(i);
+      consumed.add(i + 1);
+      i++;
+    }
+  }
+  const wanted = Deno.args.filter((a, i) => !consumed.has(i) && !a.startsWith("-"));
+  const fileScenarios: Scenario[] = [];
+  for (const p of filePaths) {
+    const mod = await import(new URL(p, `file://${here}`).toString());
+    const s = mod.default as Scenario | undefined;
+    if (!s || typeof s.run !== "function") {
+      console.error(`--file ${p}: default export is not a Scenario`);
+      Deno.exit(2);
+    }
+    fileScenarios.push(s);
+  }
   const site = `${demoRoot}serve`;
   try {
     await Deno.stat(`${site}/index.html`);
@@ -577,11 +739,75 @@ async function main() {
    * a promising export. `firefox-smoke` is written to that rule: it
    * evaluates only FEATURE PROBES (typeof checks, constructor presence),
    * which touch no promising export, and leaves engine instantiation to
-   * the page's own boot. */
+   * the page's own boot.
+   *
+   * WHERE THE RULE'S PRECONDITION NO LONGER HOLDS, measured 2026-08-24.
+   * /solo.html instantiates NO wasm in the document: `conn.driver`
+   * (host/solo.ts:723) is an RPC proxy over the device host's module
+   * SharedWorker, so an evaluate frame awaiting a `__solo` hook is
+   * awaiting a postMessage round trip, and the promising export it
+   * eventually reaches runs in the WORKER's global — a realm the Juggler
+   * evaluate frame is not on the stack of. Spiked before
+   * `cross-engine-pairing` was written: a Firefox solo page driven
+   * through `solo()`/`hookOn` survived 20 consecutive `tick`s, 20
+   * `hasAccount`s (`us-profile-get`), a `newAccount`, a todo typed into
+   * the app and read back through `todos()` (`tasks.items()`), and an
+   * `endpointId` off a live iroh bind — no crash, no renderer silence,
+   * on 3 of 3 runs. So `cross-engine-pairing` drives its whole Gecko
+   * side through ordinary `solo()` calls, and the queue-based command
+   * channel designed to dodge the hazard was never built: there was
+   * nothing left to dodge.
+   *
+   * That is a fact about ONE PAGE, not a repeal. /index.html still
+   * instantiates its engines in the document, and the rule above governs
+   * any Firefox-lane scenario that drives it — as it will govern
+   * /solo.html again the day the device host moves back into the page. */
   let engine: "chromium" | "firefox" = "chromium";
   const current = (): Browser => engine === "firefox" ? firefoxBrowser! : browser;
+  /** Did the scenario ATTEMPT NOW RUNNING actually get a Firefox
+   * context? Reset per attempt, set by `browserFor` the moment it hands
+   * the Gecko handle out — so it covers both ways in: a `firefox`-lane
+   * scenario and a Chromium-lane one that asked for a Gecko context
+   * through `ctx.fresh({ engine })`.
+   *
+   * It exists to SCOPE the dead-secondary crash test below. `firefox
+   * Browser` is a run-lifetime handle: once any scenario has launched
+   * Gecko it stays non-null for every scenario after it, so an
+   * unscoped "is the secondary connected?" would be consulted on
+   * failures that never touched Firefox at all — and a Gecko that died
+   * quietly in the background would then re-label a LATER Chromium
+   * scenario's ordinary assertion failure as crash-shaped. */
+  let usedFirefox = false;
+  /** The browser ONE `ctx.fresh` call gets. Without `opts.engine` this
+   * is just `current()` — the scenario's own lane, unchanged. WITH it,
+   * a scenario may open a context in the OTHER engine, which is what
+   * makes a genuinely cross-browser scenario possible at all:
+   * `cross-engine-pairing` keeps device A on the runner's Chromium page
+   * and asks for device B in Firefox.
+   *
+   * Firefox is launched HERE when first asked for, and kept — the same
+   * laziness the scenario-level `engine` field gets a few lines below,
+   * and for the same reason (a Chromium-only run must never pay for a
+   * Gecko launch). `firefoxBrowser` is the single handle both paths
+   * share, so a mixed scenario following `firefox-smoke` reuses the
+   * browser that scenario already started. */
+  const browserFor = async (want?: "chromium" | "firefox"): Promise<Browser> => {
+    const which = want ?? engine;
+    if (which !== "firefox") return browser;
+    usedFirefox = true;
+    if (!firefoxBrowser) {
+      setPhase("launchFirefox");
+      firefoxBrowser = await launchFirefox();
+    }
+    return firefoxBrowser;
+  };
 
   const openPages: Page[] = [];
+  // Every proxy a scenario opens via `ctx.relayProxy()`, closed in the
+  // per-scenario finally alongside `openPages` — isolation is the
+  // harness's job (see the comment at that finally block), not
+  // something a partition scenario has to remember to do for itself.
+  const openProxies: SeverableProxy[] = [];
   // Phase tracing for the deadline diagnostics: every await between a
   // scenario banner and its first act sets the phase it is entering, so
   // a deadline failure can NAME the wedged call instead of leaving a
@@ -608,9 +834,20 @@ async function main() {
     },
     stopMinio: () => minio.stop(),
     startMinio: () => minio.start(),
+    stopRelay: () => relay.stop(),
+    startRelay: () => relay.start(),
+    relayUrl: relay.url,
+    relayProxy: async () => {
+      const p = await startTcpProxy(relay.port);
+      openProxies.push(p);
+      return p;
+    },
     fresh: async (opts: FreshOptions = {}) => {
+      // `opts.engine` is the per-context override (util.ts's
+      // FreshOptions.engine); undefined keeps the scenario's own lane.
+      const target = await browserFor(opts.engine);
       setPhase("newContext");
-      const bctx = await newContext(current(), opts);
+      const bctx = await newContext(target, opts);
       setPhase("newPage");
       const page = await bctx.newPage();
       openPages.push(page);
@@ -657,14 +894,18 @@ async function main() {
     acts: number;
     error?: string;
     retried?: boolean;
+    xfailNote?: string;
   }[] = [];
   const runList = wanted.length > 0
     ? SCENARIOS.filter((s) => wanted.includes(s.name))
+    : filePaths.length > 0
+    ? [] // named --file(s) only, no bare names: run exactly those
     : SCENARIOS;
   if (wanted.length > 0 && runList.length !== wanted.length) {
     console.error(`unknown scenario(s): ${wanted.filter((w) => !SCENARIOS.some((s) => s.name === w))}`);
     Deno.exit(2);
   }
+  runList.push(...fileScenarios);
 
   console.log(`\ne2e: ${runList.length} scenario(s) against ${baseUrl}\n`);
   const started = performance.now();
@@ -697,19 +938,19 @@ async function main() {
   // would mask a real regression.
   const SCENARIO_DEADLINE_MS = 240_000; // > BOOT_TIMEOUT + slowest scenario
   const DEADLINE_MARK = "scenario deadline";
-  const withDeadline = <T>(p: Promise<T>): Promise<T> => {
+  const withDeadline = <T>(p: Promise<T>, deadlineMs = SCENARIO_DEADLINE_MS): Promise<T> => {
     let timer: number | undefined;
     const bomb = new Promise<never>((_, reject) => {
       timer = setTimeout(
         () =>
           reject(
             new Error(
-              `${DEADLINE_MARK}: no progress in ${SCENARIO_DEADLINE_MS / 1000}s ` +
+              `${DEADLINE_MARK}: no progress in ${deadlineMs / 1000}s ` +
                 `(a hang below the harness's own bounded waits — a wedged ` +
                 `browser protocol call is the known cause)`,
             ),
           ),
-        SCENARIO_DEADLINE_MS,
+        deadlineMs,
       );
     });
     return Promise.race([p, bomb]).finally(() => clearTimeout(timer)) as Promise<T>;
@@ -718,7 +959,38 @@ async function main() {
    * itself is a protocol call and can hang, so it races a short fuse
    * and the old process is abandoned to the OS if it does. Whichever
    * engine the failing scenario was driving is the one replaced — a
-   * relaunched Chromium would do nothing for a wedged Gecko. */
+   * relaunched Chromium would do nothing for a wedged Gecko.
+   *
+   * A MIXED scenario (one that opens a `ctx.fresh({ engine: … })`
+   * context in the OTHER browser — `cross-engine-pairing`) has TWO
+   * browsers in flight, and this recovers them ASYMMETRICALLY, which is
+   * a deliberate choice rather than an oversight:
+   *
+   *   - the scenario's OWN lane (`current()`) is always closed and
+   *     relaunched, because that is the browser the runner will hand to
+   *     the next scenario and a wedged one eats every scenario after it;
+   *   - the SECONDARY browser is relaunched only when it is visibly gone
+   *     (`isConnected()` false). A live secondary is left alone: closing
+   *     a healthy Firefox to recover a wedged Chromium would cost a
+   *     ~5s relaunch on the retry for no evidence at all.
+   *
+   * What this deliberately does NOT solve, in two directions. First: a
+   * secondary browser whose RENDERER wedged without disconnecting the
+   * browser process. In a mixed scenario that shows up as an ordinary
+   * act failure or a scenario deadline — the deadline IS crash-shaped,
+   * so the retry happens, but it happens against the same wedged
+   * secondary and will most likely fail the same way. Second, and
+   * currently unexercised: the MIRROR arrangement, a `firefox`-lane
+   * scenario that opens a CHROMIUM secondary through `ctx.fresh({
+   * engine: "chromium" })`. Nothing here relaunches that one — the
+   * clause above names Firefox specifically, and `browser` is not
+   * re-checked while `engine === "firefox"` — so a dead Chromium
+   * secondary survives until the NEXT Chromium-lane scenario's own
+   * `!current().isConnected()` test catches it, one scenario late.
+   * Fixing either properly means tracking crash events (and handles)
+   * per browser rather than per page, which is more machinery than one
+   * cross-engine scenario has earned; both are written down here rather
+   * than discovered later. */
   const recoverBrowser = async () => {
     const dying = current();
     await Promise.race([
@@ -728,6 +1000,11 @@ async function main() {
     if (engine === "firefox") firefoxBrowser = await launchFirefox();
     else browser = await launchBrowser();
     console.log(`         (${engine} relaunched)`);
+    // The secondary, only if it is demonstrably gone (see above).
+    if (engine !== "firefox" && firefoxBrowser && !firefoxBrowser.isConnected()) {
+      firefoxBrowser = await launchFirefox();
+      console.log("         (the secondary firefox was gone; relaunched too)");
+    }
   };
 
   // --- memory watch -------------------------------------------------------
@@ -837,6 +1114,9 @@ async function main() {
     const MAX_ATTEMPTS = 2;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       resetActs();
+      // Per ATTEMPT, not per scenario: the retry re-runs `ctx.fresh`
+      // and will set it again if it really opens a Gecko context.
+      usedFirefox = false;
       scenarioPeakMb = 0;
       recordSample();
       let page: Page | null = null;
@@ -850,22 +1130,28 @@ async function main() {
           setPhase("minio");
           if (scenario.minio === "down") await minio.stop();
           else await minio.start();
+          // Every scenario gets the relay UP at the start, unconditionally
+          // — mirrors the minio handling above. Unlike MinIO there is no
+          // `relay: "down"` scenario field: a scenario that wants the real
+          // relay down for its own duration calls `ctx.stopRelay()` itself
+          // (harness-faults.ts does exactly that), because a suite-wide
+          // relay outage would take EVERY scenario's page with it, not just
+          // one pane the way MinIO's outage does.
+          setPhase("relay");
+          await relay.start();
           // The engine is chosen BEFORE `fresh`, since that is what
           // `current()` resolves against. Firefox is launched lazily and
           // kept for the rest of the run: a suite that is one Gecko beat
           // long should not pay for a second browser it never opens.
           engine = scenario.engine ?? "chromium";
-          if (engine === "firefox") {
-            setPhase("launchFirefox");
-            if (!firefoxBrowser) firefoxBrowser = await launchFirefox();
-          }
+          if (engine === "firefox") await browserFor("firefox");
           page = await ctx.fresh(
             typeof scenario.page === "function" ? scenario.page(ctx) : scenario.page,
           );
           setPhase("scenario");
           await scenario.run(page, ctx);
           setPhase("idle");
-        })());
+        })(), scenario.deadlineMs);
       } catch (e) {
         failed = true;
         failure = e;
@@ -928,15 +1214,59 @@ async function main() {
             new Promise((r) => setTimeout(r, 5_000)),
           ]);
         }
+        // Every proxy a scenario opened, closed the same way and for the
+        // same reason: a partition scenario must never leak a listening
+        // socket into the one after it.
+        for (const p of openProxies.splice(0)) {
+          await p.close().catch(() => {});
+        }
       }
       // The crash shape: the renderer stopped answering (either named by
       // waitForBoot/driverBounded, or caught only by the deadline), or a
-      // crash event was actually delivered. All three say "the browser
-      // died", not "the demo is wrong".
+      // crash event was actually delivered, or the whole BROWSER is gone
+      // — `isConnected()` false, and protocol calls failing with
+      // playwright's "has been closed" wording. All of these say "the
+      // browser died", not "the demo is wrong". The last two were
+      // learned the hard way (2026-08-24): an externally-killed Chromium
+      // made `newContext` fail INSTANTLY with "Target page, context or
+      // browser has been closed", which is not a RendererGoneError and
+      // never trips the deadline — so the runner sailed on with a dead
+      // browser and every following Chromium scenario failed in 0.0s.
+      // A cascade like that is a statement about the browser process,
+      // and the recovery it needs is exactly recoverBrowser's.
       const crashShaped = failed && (
         (failure instanceof RendererGoneError) ||
         (failure instanceof Error && failure.name === "RendererGoneError") ||
         (failure instanceof Error && failure.message.startsWith(DEADLINE_MARK)) ||
+        (failure instanceof Error && /has been closed/.test(failure.message)) ||
+        !current().isConnected() ||
+        // THE SECONDARY BROWSER of a scenario that used both (ctx.fresh's
+        // `engine` override). `current()` only ever names the scenario's
+        // own lane, so without this a Firefox that died under a
+        // Chromium-lane cross-engine scenario would read as an ordinary
+        // act failure — a claim about the demo — and never be retried.
+        //
+        // SCOPED TO `usedFirefox` ON PURPOSE. `firefoxBrowser` is a
+        // run-lifetime handle, so the unscoped test would fire for EVERY
+        // failed scenario once Gecko had ever launched: a background
+        // Firefox that died quietly would turn a later Chromium
+        // scenario's ordinary assertion failure into a crash-shaped one
+        // — one wasted retry, and worse, an `expected: "red"` scenario
+        // loses its xfail reading on that attempt (crash-shaped failures
+        // are deliberately never folded into the xfail marker). It would
+        // self-heal on attempt 2, since the retry's recoverBrowser
+        // relaunches the dead secondary and MAX_ATTEMPTS bounds the
+        // whole thing — but a correct result reached through a
+        // misdiagnosis is still a misdiagnosis, and this flag costs four
+        // lines. What remains unguarded is narrow and honest: a Gecko
+        // that dies DURING the scenario that is using it, which is
+        // exactly the case this clause exists for.
+        // (The cast is the same one the close block at the end of the
+        // run needs, and for the same reason written there: every
+        // assignment to `firefoxBrowser` happens inside a closure, so
+        // the checker's flow analysis reaches here still believing it
+        // is `null`.)
+        (usedFirefox && (firefoxBrowser as Browser | null)?.isConnected() === false) ||
         crashEventSeen
       );
       if (failed && crashShaped && attempt < MAX_ATTEMPTS) {
@@ -946,15 +1276,40 @@ async function main() {
         await recoverBrowser();
         continue;
       }
+      // XFAIL: an `expected: "red"` scenario inverts the ok/fail reading,
+      // UNLESS the failure is crash-shaped — a renderer SEGV under an
+      // xfail scenario is still an environment flake, not "the expected
+      // red", so it must not be quietly folded into the xfail marker.
+      const xfail = scenario.expected === "red" && !crashShaped;
+      let ok = !failed;
+      let error = failed ? (failure instanceof Error ? failure.message : String(failure)) : undefined;
+      let xfailNote: string | undefined;
+      if (xfail) {
+        if (failed) {
+          // The expected shape: record it as ok, but say so plainly —
+          // this is a known gap being TRACKED, not a passing claim.
+          ok = true;
+          xfailNote = "(xfail: expected red)";
+        } else {
+          // The gate FLIPPED: a scenario marked `expected: "red"` just
+          // passed. That is itself a failure — an xfail that keeps
+          // passing silently is worse than no xfail at all, because it
+          // hides a fixed regression behind a flag nobody comes back to
+          // remove.
+          ok = false;
+          error =
+            "expected: \"red\" scenario PASSED — the gate has flipped; promote it to green " +
+            "by dropping the `expected` flag";
+        }
+      }
       results.push({
         name: scenario.name,
-        ok: !failed,
+        ok,
         ms: Math.round(performance.now() - t0),
         acts: actCount().acts,
-        error: failed
-          ? (failure instanceof Error ? failure.message : String(failure))
-          : undefined,
+        error,
         retried: attempt > 1,
+        xfailNote,
       });
       // A wedged browser stays wedged: never hand it to the next scenario.
       if (failed && crashShaped) await recoverBrowser();
@@ -995,7 +1350,7 @@ async function main() {
         (r.ms / 1000).toFixed(1)
       }s${r.error ? `  — ${r.error}` : ""}${
         r.retried && r.ok ? "  (2nd attempt; renderer crashed on the 1st)" : ""
-      }`,
+      }${r.xfailNote ? `  ${r.xfailNote}` : ""}`,
     );
   }
   console.log(
