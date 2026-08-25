@@ -617,5 +617,160 @@ pub(crate) async fn recover_act(
         Err(e) => refused("act 8: double restore (file)", &e, "kp missing")?,
     }
 
+    // === act 9: a rotation does not strand a bucket-only sibling (#110) ===
+    //
+    // THE STRAND THIS CLOSES. `store_revoke` on the us-doc appends a
+    // name-key epoch. The rotator's later flushes land under the NEW
+    // epoch's names. A sibling holding only the OLD chain scans its
+    // keychain newest-first, finds the rotator's STALE old-epoch
+    // manifest, and reads stale account state — silently, forever,
+    // because the chain that would correct it lives in the us-doc whose
+    // newest objects are exactly the ones it cannot name.
+    //
+    // THE CAST IS ALREADY RIGHT. `restored` is a real account device
+    // that is CURRENT as of its consume, and no wire exists between it
+    // and `account` anywhere in this battery — so "bucket-only lagging
+    // sibling" is what it is, not what it is pretending to be.
+    //
+    // THE NEGATIVE CONTROL IS RUNNABLE, not quoted: with
+    // `PM_NO_CHAIN_DROP=1 just recover` the guest writes no drops and
+    // this act fails at the profile comparison below, the lagging device
+    // still holding the pre-rotation profile. That is the pre-fix
+    // behaviour, reproducible on demand rather than asserted in prose.
+
+    // (a) A fresh kit, revoked — a us-chain rotation `restored` was not
+    //     present for. File kits, so no bundle object joins the object
+    //     set and the deltas below stay about pickups and drops alone.
+    // The account's registry may still carry act 8's row: that kit was
+    // consumed by the RESTORING device, and this device has not pulled
+    // the clear. Harmless and not this act's business — so the two new
+    // kits are identified by DIFFERENCE against what was already listed,
+    // rather than by assuming an empty registry.
+    let pre_kits: std::collections::HashSet<Vec<u8>> =
+        step!("act 9: account.recovery-kits (before)", a.call_recovery_kits(acc))
+            .into_iter()
+            .map(|k| k.agent_id)
+            .collect();
+    let kit_a = step!(
+        "act 9: account.recovery-kit-create-file(rotation trigger)",
+        a.call_recovery_kit_create_file(
+            acc,
+            "the rotation trigger".to_string(),
+            FILE_PASSPHRASE.to_string(),
+        )
+    );
+    let kit_b = step!(
+        "act 9: account.recovery-kit-create-file(the drop witness)",
+        a.call_recovery_kit_create_file(
+            acc,
+            "the drop witness".to_string(),
+            FILE_PASSPHRASE.to_string(),
+        )
+    );
+    if kit_a.is_empty() || kit_b.is_empty() {
+        bail!("act 9: a kit ceremony returned no bytes");
+    }
+    let fresh: Vec<Vec<u8>> = step!("act 9: account.recovery-kits", a.call_recovery_kits(acc))
+        .into_iter()
+        .map(|k| k.agent_id)
+        .filter(|id| !pre_kits.contains(id))
+        .collect();
+    if fresh.len() != 2 {
+        bail!("act 9: expected two NEW kits before the rotation, got {}", fresh.len());
+    }
+    let trigger = fresh[0].clone();
+    let witness = fresh[1].clone();
+
+    step!(
+        "act 9: account.recovery-kit-revoke(rotation trigger)",
+        a.call_recovery_kit_revoke(acc, trigger.clone())
+    );
+
+    // (b) A us-visible change AFTER the rotation, and a flush. Both the
+    //     registry (the revoke cleared a row) and the profile move, so
+    //     the assertion does not rest on one key.
+    step!(
+        "act 9: account.us-profile-set(after the rotation)",
+        a.call_us_profile_set(
+            acc,
+            UsProfile {
+                display_name: "Rose, post-rotation".to_string(),
+                hue: 42,
+                icon: None,
+            },
+        )
+    );
+    step!(
+        "act 9: account.bucket-flush(us) [under the NEW epoch]",
+        a.call_bucket_flush(acc, Vec::new())
+    );
+
+    // (c) The lagging sibling pulls. ONE pull: the probe adopts the
+    //     longer chain before a single manifest name is derived, so the
+    //     scan that follows is the scan it would have done had it never
+    //     lagged. No second pull is permitted here — needing one would
+    //     mean the probe landed after the names it was supposed to fix.
+    let summary = step!(
+        "act 9: restored.bucket-pull(us, account) [one pull, lagging by an epoch]",
+        r.call_bucket_pull(acc, Vec::new(), a_id.clone(), None)
+    );
+    println!("           us: {summary}");
+
+    let profile = step!("act 9: restored.us-profile-get", r.call_us_profile_get(acc));
+    if profile.display_name != "Rose, post-rotation" || profile.hue != 42 {
+        bail!(
+            "act 9: THE STRAND — the lagging sibling read stale state across the rotation: \
+             got {:?}/{}, expected \"Rose, post-rotation\"/42",
+            profile.display_name,
+            profile.hue
+        );
+    }
+    let kits = step!("act 9: restored.recovery-kits", r.call_recovery_kits(acc));
+    if kits.iter().any(|k| k.agent_id == trigger) {
+        bail!("act 9: the lagging sibling still lists the revoked kit: {kits:?}");
+    }
+    if !kits.iter().any(|k| k.agent_id == witness) {
+        bail!("act 9: the lagging sibling lost the surviving kit: {kits:?}");
+    }
+    ok("act 9: one pull across a missed rotation — profile AND registry are current", Instant::now());
+
+    // (d) THE REVOKED PARTY'S DROP IS DELETED, beside its K_p. Asserted
+    //     by set difference, the act-6 discipline: the witness kit was
+    //     enrolled BEFORE the rotation above, so that rotation wrote it a
+    //     drop, and revoking it now must take exactly two objects away —
+    //     its pickup and its drop.
+    //
+    //     EXACTLY TWO is the whole assertion, and it is a sharp one:
+    //     nothing else in this flow deletes anything, so the count
+    //     distinguishes the two deletions from the one a build without
+    //     the drop would perform.
+    //
+    //     WHAT IS DELIBERATELY NOT ASSERTED is that nothing is ADDED. It
+    //     is not true and must not be: this revoke rotates, and the
+    //     account's flush right after it rewrites the us-doc's oplog,
+    //     manifest and chunks under the NEW epoch's names. That rewrite
+    //     is exactly the phenomenon that stranded the sibling in the
+    //     first place — asserting it away would be asserting the absence
+    //     of the bug this act exists to prove is handled. The drop
+    //     REFRESHES for surviving devices do land on the names they
+    //     already occupy, but they are indistinguishable host-side from
+    //     the flush's own opaque names, so the claim is left to the
+    //     mechanism rather than dressed up as a measurement.
+    let before = probe.keys().await?;
+    step!(
+        "act 9: account.recovery-kit-revoke(the drop witness)",
+        a.call_recovery_kit_revoke(acc, witness.clone())
+    );
+    let after = probe.keys().await?;
+    let gone: Vec<&String> = before.iter().filter(|k| !after.contains(k)).collect();
+    if gone.len() != 2 {
+        bail!(
+            "act 9: revoking a kit that had a drop removed {} object(s), expected exactly 2 \
+             (its pickup + its drop): {gone:?}",
+            gone.len()
+        );
+    }
+    ok("act 9: the revoked kit's pickup AND its chain drop are gone (exactly two)", Instant::now());
+
     Ok(())
 }
