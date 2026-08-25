@@ -1892,6 +1892,41 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
     return { siblings: sibs.length, usPulled: us.filter(Boolean).length };
   },
 
+  /**
+   * PULL THE ACCOUNT DOCUMENT FROM ONE NAMED SIBLING, and hand back the
+   * guest's own summary string.
+   *
+   * `rc-pull-now` fans out over the whole directory, which is right for
+   * a device catching up in general and wrong for a row whose claim is
+   * about ONE pull from ONE device: an account that has minted kits and
+   * restored devices carries several non-revoked members, and most of
+   * those pairs are 404s that say nothing.
+   *
+   * THE SUMMARY IS THE EVIDENCE. `bucket-pull` answers
+   * `pulled s3(account) epochs=N devices=… events=… chunks=…`, and
+   * `epochs` is the length of the name-key chain the pull actually
+   * derived names from — so a chain that GREW between two pulls is
+   * visible from here without exposing a single key.
+   */
+  "rc-pull-us-from": async (arg: { id: string; agentPrefix: string }) => {
+    const conn = conns.get(arg.id)!;
+    const devices = await conn.driver.usDevicesList();
+    const target = devices.find((d) => hexOf(d.agentId).startsWith(arg.agentPrefix));
+    if (!target) return { found: false, summary: "", error: "no such sibling" };
+    const r = await attemptValue(() =>
+      conn.driver.bucketPull(new Uint8Array(0), target.agentId, undefined)
+    );
+    return {
+      found: true,
+      ok: r.ok,
+      summary: r.ok ? r.value : "",
+      /** `epochs=N` out of the summary — the chain length this pull
+       * derived names from, which is the whole observable of #110. */
+      epochs: r.ok ? Number(/epochs=(\d+)/.exec(r.value)?.[1] ?? -1) : -1,
+      error: r.ok ? "" : r.error.message.slice(0, 140),
+    };
+  },
+
   /** The account's device directory, as a sheet would render it. */
   "rc-devices": async (arg: { id: string }) => {
     const conn = conns.get(arg.id)!;

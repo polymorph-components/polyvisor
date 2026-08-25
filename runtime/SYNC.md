@@ -61,6 +61,33 @@ chain for NON-account readers (S3's link tier), unchanged.
   holding the user's OAuth is already outside this provider's threat
   reach (DRIVE.md §1's honest revocation note), so chain rotation adds
   little until that story changes.
+- THE SELF-ADDRESSED CHAIN DROP (added 2026-08-25, closing #110). A
+  us-doc rotation used to strand a bucket-only lagging sibling
+  PERMANENTLY: the new epoch's objects sit under names only the new
+  chain derives, and the chain lives in the very document those names
+  gate — the sibling silently reads the rotator's stale old-epoch
+  manifest forever, until wire contact. Now `store_revoke` on the
+  us-doc writes every NON-REVOKED account device a sealed copy of the
+  new chain at `kp_location(us, member, member)` — the K_p machinery
+  self-addressed: one derivable location per member, any rotator
+  writes it, payload sealed to the member's contact-card prekeys
+  exactly like a grantee K_p (same payload, same sealing, different
+  addressee derivation) — and the S3 sibling pull PROBES ITS OWN DROP
+  before deriving any name, adopting a strictly longer chain
+  (idempotent: chains only extend). The revoked member's drop is
+  deleted beside its K_p. Concurrent rotators last-writer-win the
+  drop, exactly as the chain register itself is LWW under concurrent
+  rotation — the drop is a best-effort freshness channel; us-doc sync
+  over the wire remains the truth channel. Drive writes and probes no
+  drop BECAUSE its store-revoke arm never rotates (names there are not
+  access control, by its own ruling) — the reading half is
+  provider-neutral and the re-add is three lines per side if a trigger
+  ever exists. Gates: the recover battery's act 9 (one pull across a
+  missed rotation, with a runnable `PM_NO_CHAIN_DROP` negative control
+  reproducing the strand), devstore row 67 (the same claim through the
+  worker's own pull path; row 63's no-revocation pair constraint is
+  now historical). Parked: the change-board epoch-ordinal
+  optimization (probe only when the board says the chain moved).
 
 THE FIRST RULING — derive from keyhive epoch secrets, G4's coupling
 sketch — is RECORDED AS THE BLOCKED IDEAL, not deleted: it would make

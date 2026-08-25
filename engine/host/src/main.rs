@@ -617,7 +617,18 @@ async fn recover_scenarios(
     make_store: &StoreFactory<'_>,
     probe: &resume_acts::S3Probe,
 ) -> Result<()> {
-    let mut store = make_store(&[]);
+    // The strand's NEGATIVE CONTROL, forwarded rather than hardcoded:
+    // `PM_NO_CHAIN_DROP=1 just recover` makes the guest write no chain
+    // drops (#110's pre-fix behaviour) and the chain-drop act below then
+    // FAILS, which is what turns "the strand was real" from a sentence
+    // into something anybody can re-run.
+    let no_drop = std::env::var("PM_NO_CHAIN_DROP").unwrap_or_default();
+    let env: Vec<(&str, &str)> = if no_drop.is_empty() {
+        Vec::new()
+    } else {
+        vec![("PM_NO_CHAIN_DROP", no_drop.as_str())]
+    };
+    let mut store = make_store(&env);
     let account = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
     let restored = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
     let double = bindings::Engine::instantiate_async(&mut store, component, linker).await?;

@@ -4402,20 +4402,31 @@ async function main() {
     // suppression is engine-side, so `profile-changed` arriving there
     // means B learned it from somewhere other than itself.
     //
-    // THE PAIR IS ROW 62'S, and the choice is a FINDING rather than a
-    // convenience. Rows 59-61 put the S3 account through a
+    // THE PAIR IS ROW 62'S, and the reason is now HISTORICAL — the
+    // constraint it was chosen under is gone. It was a FINDING when it
+    // was written: rows 59-61 put the S3 account through a
     // `recovery-kit-revoke`, which rotates the us-doc's NAME-KEY EPOCH
-    // (that is the "hard forward" half of the guarantee note), and a
-    // sibling that has not yet caught up derives object names from the
-    // chain it holds — which it can only refresh by reading the us-doc,
-    // whose newest objects now sit under the NEW epoch's names. Measured
-    // here: after that revocation the restored device kept reading the
-    // origin's stale epoch-0 manifest and never saw the profile change.
-    // That is a pre-existing property of rotation-plus-a-lagging-device
-    // (SYNC.md's territory, not this round's), and pinning this row to a
-    // pair that has crossed no revocation keeps it a measurement of the
-    // us-doc riding the cycle rather than of that separate question.
-    // Flagged in the track report.
+    // (the "hard forward" half of the guarantee note), and a sibling
+    // that had not caught up derived object names from the chain it
+    // held — which it could only refresh by reading the us-doc, whose
+    // newest objects now sat under the NEW epoch's names. Measured here
+    // first: after that revocation the restored device went on reading
+    // the origin's stale epoch-0 manifest and never saw the profile
+    // change. That became issue #110.
+    //
+    // #110 IS CLOSED, and ROW 67 OWNS THE CLAIM: a rotation now writes
+    // every non-revoked account device a sealed CHAIN DROP at a
+    // self-addressed location, and a us-doc pull probes its own drop
+    // before deriving any name (engine/guest/src/lib.rs's
+    // `publish_chain_drops` / `probe_chain_drop`). A lagging sibling
+    // catches up in ONE pull, which is exactly what row 67 asserts
+    // against a pair that HAS crossed a revocation.
+    //
+    // So the pinned pair stays for this row's own FOCUS and nothing
+    // else: row 63 is about the account document riding the ordinary
+    // flush/pull cycle with no button pressed, and a pair with no
+    // rotation in its history keeps that the only variable. It is no
+    // longer dodging anything.
     await guard(async () => {
       const idA = rcGdOrigin;
       const idB = rcGdRestored;
@@ -4553,6 +4564,131 @@ async function main() {
           `in between would burn the kit with nothing durable to show for it.`,
       );
       await probe(page, "hc-close", { id });
+    });
+
+    // --- 67: a missed rotation does not strand a bucket-only sibling (#110) -
+    //
+    // WHAT ROW 63 HAD TO DODGE, now asserted head-on. `store-revoke` on
+    // the us-doc APPENDS a name-key epoch, and the rotator's later
+    // flushes land under the NEW epoch's names. A sibling holding only
+    // the OLD chain scans its keychain newest-first, finds the rotator's
+    // STALE old-epoch manifest, and reads stale account state — silently
+    // and permanently, because the chain that would correct it lives in
+    // the us-doc whose newest objects are exactly the ones it cannot
+    // name. Measured in this matrix first (row 63's pinned pair) and
+    // filed as #110.
+    //
+    // THE FIX IS SELF-ADDRESSED (engine/guest/src/lib.rs's
+    // `publish_chain_drops` / `probe_chain_drop`). A rotation writes
+    // every non-revoked account device a sealed CHAIN DROP at a location
+    // only that device derives — `kp_location(us, member, member)`, the
+    // K_p machinery pointed at itself — carrying the new chain. A
+    // sibling's us-doc pull probes its OWN drop BEFORE it derives a
+    // single name, adopts a longer chain if one is there, and then runs
+    // the ordinary scan it would have run had it never lagged. So the
+    // catch-up costs ONE pull, not two, and needing two would mean the
+    // probe landed after the names it was supposed to fix.
+    //
+    // THE CAST IS REAL, not arranged: A is the origin device and B is
+    // the device restored from a kit in row 58 — a genuine account
+    // member, current as of its consume, with NO WIRE to A anywhere in
+    // this matrix. "Bucket-only lagging sibling" is what B IS.
+    //
+    // THE NEGATIVE CONTROL IS THE ENGINE BATTERY'S, cited rather than
+    // re-run: `PM_NO_CHAIN_DROP=1 just recover` makes the guest write no
+    // drops and fails the recovery battery's act 9 at the profile
+    // comparison, the lagging device still holding pre-rotation state.
+    // That switch is a guest env var; wiring one through a SharedWorker
+    // in a browser would be new plumbing for a control that already
+    // exists where the mechanism lives, so this row asserts the fixed
+    // behaviour and points at the reproduction.
+    await guard(async () => {
+      const idA = rcDevice;
+      const idB = rcRestored;
+      const agentA = ((await probe(page, "hc-status", { id: idA })).agentId ?? "").slice(0, 12);
+
+      // (a) BOTH CURRENT. B catches up on everything the matrix has done
+      //     to this account so far, so the only thing it can be behind
+      //     by afterwards is the rotation this row performs.
+      await probe(page, "rc-pull-now", { id: idB });
+      const settled = await probe(page, "rc-pull-us-from", { id: idB, agentPrefix: agentA });
+      const beforeA = await probe(page, "rc-profile-get", { id: idA });
+      const beforeB = await probe(page, "rc-profile-get", { id: idB });
+
+      // (b) THE ROTATION B IS NOT PRESENT FOR. A file kit, minted and
+      //     immediately revoked: `recovery-kit-revoke` runs
+      //     `store-revoke` on the us-doc, which is the reachable
+      //     rotation trigger. File kind so no bundle object joins the
+      //     store and the pull below is about pickups and drops alone.
+      //     The new kit is identified by DIFFERENCE — this account's
+      //     registry carries rows from earlier rows of this matrix.
+      const kitsBefore = await probe(page, "rc-kits", { id: idA });
+      const before = new Set(kitsBefore.kits.map((k: { agent: string }) => k.agent));
+      await probe(page, "rc-kit-create", {
+        id: idA,
+        spec: { kind: "file", label: "the rotation trigger", passphrase: FILE_PASS },
+      });
+      const kitsAfter = await probe(page, "rc-kits", { id: idA });
+      const minted = kitsAfter.kits
+        .map((k: { agent: string }) => k.agent)
+        .filter((a: string) => !before.has(a));
+      const revoked = minted.length === 1
+        ? await probe(page, "rc-revoke", { id: idA, agentPrefix: minted[0] })
+        : { attempt: { ok: false } };
+
+      // (c) A us-VISIBLE CHANGE AFTER THE ROTATION, flushed under the
+      //     new epoch. Profile AND registry both move, so the assertion
+      //     does not rest on one key.
+      const NEW_NAME = "Renamed across a rotation B never saw";
+      // B AUTHORS NOTHING ANYWHERE IN THIS ROW. Everything it learns has
+      // to come out of the bucket, or the row would be measuring a
+      // merge instead of a pull.
+      await probe(page, "rc-profile-set", { id: idA, displayName: NEW_NAME, hue: 3 });
+      const flushed = await probe(page, "rc-flush-now", { id: idA });
+
+      // (d) ONE PULL. No second attempt is permitted here.
+      const pulled = await probe(page, "rc-pull-us-from", { id: idB, agentPrefix: agentA });
+      const afterB = await probe(page, "rc-profile-get", { id: idB });
+      const kitsB = await probe(page, "rc-kits", { id: idB });
+      const stillListed = kitsB.attempt.ok &&
+        kitsB.kits.some((k: { agent: string }) => k.agent === minted[0]);
+
+      const ok = settled.found === true && settled.ok === true &&
+        beforeB.displayName === beforeA.displayName &&
+        minted.length === 1 && revoked.attempt.ok === true &&
+        flushed.us.refused === false &&
+        pulled.ok === true && pulled.epochs > settled.epochs &&
+        afterB.displayName === NEW_NAME && afterB.hue === 3 &&
+        kitsB.attempt.ok === true && stillListed === false;
+      record(
+        "67 sync",
+        "a missed us-chain rotation does not strand a bucket-only sibling — one pull, self-addressed (#110)",
+        ok,
+        `A and B are one account on one S3 bucket with NO WIRE between them (B is the device ` +
+          `restored from a kit in row 58 — a real member, not a stand-in). Both were brought ` +
+          `current first: B's us pull derived names from a ${settled.epochs}-epoch chain and ` +
+          `both read the same profile (${j(beforeB.displayName)}). A then ROTATED the us-doc's ` +
+          `name-key chain in the way a user reaches: it minted a file kit and revoked it, and ` +
+          `\`recovery-kit-revoke\` runs \`store-revoke\` on the us-doc — the "hard forward" ` +
+          `half of the guarantee note it returned (${j(String(revoked.attempt.value ?? "").slice(0, 60))}). ` +
+          `B was not there for it. A then changed the account profile and flushed, so every new ` +
+          `us object sits under the NEW epoch's names — the exact configuration that used to ` +
+          `strand B forever, reading A's stale old-epoch manifest with no way to learn the ` +
+          `chain, because the chain lives in the document whose current objects it cannot name. ` +
+          `ONE pull later (no second attempt, and needing one would mean the probe landed after ` +
+          `the names it was meant to fix) B derived from a ${pulled.epochs}-epoch chain — it ` +
+          `GREW — and B now reads ${j(afterB.displayName)}/hue ${afterB.hue}, with the revoked ` +
+          `kit gone from its registry (still listed: ${stillListed}). The mechanism is a ` +
+          `SELF-ADDRESSED drop: the rotation writes every non-revoked device a sealed copy of ` +
+          `the new chain at \`kp_location(us, member, member)\` — the K_p machinery pointed at ` +
+          `itself, a location only that member derives — and a us pull PROBES ITS OWN drop ` +
+          `before deriving any name, adopting a longer chain if one is there ` +
+          `(\`publish_chain_drops\` / \`probe_chain_drop\`). NEGATIVE CONTROL, cited rather ` +
+          `than re-run: \`PM_NO_CHAIN_DROP=1 just recover\` writes no drops and fails the ` +
+          `recovery battery's act 9 at this comparison, the lagging device still holding ` +
+          `pre-rotation state. That switch is a guest env var and belongs where the mechanism ` +
+          `lives; this row measures the same claim through the WORKER's own pull path.`,
+      );
     });
 
     await probe(page, "hc-close", { id: rcDevice });

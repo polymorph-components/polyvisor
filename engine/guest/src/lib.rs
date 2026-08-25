@@ -1318,12 +1318,13 @@ async fn pickup_devices(doc: &[u8]) -> Result<Vec<[u8; 32]>, String> {
     Ok(devices)
 }
 
-/// Publish one member's K_p: the name-key keychain + device list, sealed
-/// to a prekey DH (see `seal_to_member`).
-async fn publish_kp(st: &S3Cfg, kh: &Kh, doc: &[u8], member: &[u8]) -> Result<(), String> {
-    let my_id_bytes = with_state(|s| s.my_peer.as_bytes().to_vec())?;
+/// The bootstrap payload as this device currently holds it: the WHOLE
+/// name-key chain plus the honest author set. Shared by the grantee K_p
+/// and by the self-addressed chain drop (#110), which differ only in
+/// where they are written and to whom.
+async fn kp_payload_for(doc: &[u8]) -> Result<KpPayload, String> {
     let devices = pickup_devices(doc).await?;
-    let payload = with_state(|s| {
+    with_state(|s| {
         let b = s.buckets.get(doc).ok_or("no bucket state".to_string())?;
         Ok::<_, String>(KpPayload {
             name_keys: b
@@ -1334,7 +1335,44 @@ async fn publish_kp(st: &S3Cfg, kh: &Kh, doc: &[u8], member: &[u8]) -> Result<()
                 .collect(),
             devices,
         })
-    })??;
+    })?
+}
+
+/// Open a `KpObject` addressed to THIS device: look up the secret for
+/// the recorded member prekey and DH against the writer's.
+///
+/// Factored out of `s3_pull`'s link-tier arm so the chain drop's read
+/// path is the same code rather than a second copy of it — the drop and
+/// the grantee K_p are the same bytes under the same `kp-wrap` info and
+/// the same doc AAD, so anything that could open one opens the other.
+async fn open_kp_object(kh: &Kh, doc: &[u8], blob: &[u8]) -> Result<KpPayload, String> {
+    let obj: KpObject = bincode::deserialize(blob).map_err(|e| format!("kp decode: {e}"))?;
+    let pairs = my_prekey_pairs(kh).await?;
+    let sk = pairs
+        .get(&obj.member_pk)
+        .ok_or("K_p not sealed to any of my prekeys")?;
+    let ikm = sk.derive_new_secret_key(&obj.owner_pk).to_bytes();
+    let aead = ikm_aead(&ikm, b"kp-wrap").await?;
+    bincode::deserialize(&aead_open(&aead, doc, &obj.sealed).await?)
+        .map_err(|e| format!("kp payload decode: {e}"))
+}
+
+/// Is `doc` this device's own account document?
+///
+/// The chain-drop machinery (#110) turns on this and nothing else: every
+/// doc's chain lives IN the us-doc, so a CONTENT doc's rotation is
+/// learned through ordinary us-doc sync and strands nobody. Only the
+/// us-doc's own rotation can hide the chain that would have announced
+/// it, which is why the drop exists for exactly one document.
+fn is_us_doc(doc: &[u8]) -> Result<bool, String> {
+    with_state(|s| s.us.doc.as_deref() == Some(doc))
+}
+
+/// Publish one member's K_p: the name-key keychain + device list, sealed
+/// to a prekey DH (see `seal_to_member`).
+async fn publish_kp(st: &S3Cfg, kh: &Kh, doc: &[u8], member: &[u8]) -> Result<(), String> {
+    let my_id_bytes = with_state(|s| s.my_peer.as_bytes().to_vec())?;
+    let payload = kp_payload_for(doc).await?;
     let obj = seal_to_member(
         kh,
         doc,
@@ -1352,6 +1390,209 @@ async fn publish_kp(st: &S3Cfg, kh: &Kh, doc: &[u8], member: &[u8]) -> Result<()
         bincode::serialize(&obj).map_err(|e| e.to_string())?,
     )
     .await
+}
+
+// --- the self-addressed chain drop (#110) -------------------------------
+//
+// THE STRAND IT CLOSES. `store_revoke` on the us-doc appends a name-key
+// epoch; the rotator's later flushes land under the NEW epoch's names; a
+// sibling holding only the OLD chain — bucket-only, no wire — scans its
+// keychain newest-first, finds the rotator's STALE old-epoch manifest,
+// and reads stale account state silently forever. Its chain could only
+// be refreshed by reading the us-doc, whose newest objects are exactly
+// the ones it cannot name. A content doc's rotation strands nobody
+// (the new chain arrives through us-doc sync); only the us-doc's own
+// rotation hides the announcement of itself.
+//
+// THE ANSWER, and it is deliberately the dullest one available: at
+// us-doc rotation the rotator writes each non-revoked account device a
+// copy of the payload it already builds for grantees, at a location
+// that device can derive with no help at all — its OWN id in both the
+// owner and member slots. One name per (doc, member); any rotator
+// writes it; the reader probes exactly one object.
+//
+// SIBLINGS OF THE GRANTEE K_p, not a new mechanism: same `KpPayload`,
+// same `seal_to_member` under the same `kp-wrap` info and doc AAD, same
+// `open_kp_object` on the way back. ONLY THE ADDRESSEE DERIVATION
+// DIFFERS — `kp_location(doc, granter, member)` for a grant this device
+// issued, `kp_location(doc, member, member)` for a drop addressed to
+// whoever can already name themselves.
+//
+// NO COLLISION IS POSSIBLE with an existing object, and the argument is
+// short: a grantee K_p sits at `kp_location(doc, granter, member)` where
+// `granter` is the device that ran `store-grant`, and a device never
+// grants a pickup to itself — an account device reads the chain out of
+// the us-doc (SYNC.md §1) and needs no pickup, and the link tier's
+// grantees are outside parties. So `owner == member` names a slot that
+// nothing else has ever written.
+//
+// CONCURRENT ROTATORS last-writer-win the drop. That is not a defect
+// introduced here: the chain itself is ONE `ScalarValue::Bytes` register
+// merged wholesale (usdoc's `BUCKET_CHAINS`), so concurrent rotation is
+// already last-writer-wins on the authoritative copy. The drop is a
+// best-effort FRESHNESS channel for a device that cannot reach the
+// truth channel; us-doc sync over the wire remains the truth.
+
+/// Where a device's own chain drop lives on S3. Self-addressed: owner
+/// and member are both `member`.
+async fn drop_location_s3(doc: &[u8], member: &[u8]) -> Result<String, String> {
+    kp_location(doc, member, member).await
+}
+
+/// Write every non-revoked account device its own chain drop, and delete
+/// the revoked member's if one is there.
+///
+/// Called from `store_revoke`'s S3 arm, immediately after the rotation
+/// that creates the hazard and with the same payload the grantee
+/// republish below it uses.
+///
+/// FAILURES ARE PER-DEVICE AND NON-FATAL. The revocation itself has
+/// already landed — membership revoked, K_p deleted, epoch rotated — and
+/// it is correct. A drop is a freshness convenience for a sibling that
+/// may not even exist offline right now; losing one to a transient PUT
+/// would be a bad reason to report a completed revocation as failed. The
+/// sibling's other recovery path (a wire sync with any current device)
+/// is unchanged, and the next rotation writes a fresh drop.
+async fn publish_chain_drops(
+    st: &S3Cfg,
+    kh: &Kh,
+    doc: &[u8],
+    revoked: &[u8],
+) -> Result<(), String> {
+    if !usdoc::has_account()? {
+        return Ok(());
+    }
+    // `PM_NO_CHAIN_DROP` exists for the same reason `PM_NO_ROTATE` does
+    // in usdoc.rs: to keep the MEASUREMENT re-runnable rather than a
+    // claim in a comment. With it set, `just recover` reproduces the
+    // pre-fix strand — the lagging sibling reads the rotator's stale
+    // old-epoch manifest and misses everything after the rotation — and
+    // the recovery battery's chain-drop act fails, which is the point.
+    if std::env::var("PM_NO_CHAIN_DROP").is_ok() {
+        eprintln!("[drop] PM_NO_CHAIN_DROP set: writing no drops (the pre-#110 behaviour)");
+        return Ok(());
+    }
+    let payload = bincode::serialize(&kp_payload_for(doc).await?).map_err(|e| e.to_string())?;
+    let devices = usdoc::devices_list().await?;
+    let mut written = 0usize;
+    for d in &devices {
+        // The member being revoked gets no drop (its own is deleted
+        // below), and neither does a row already flagged revoked: a
+        // revoked device is not a sibling to keep current.
+        if d.agent_id == revoked || d.revoked {
+            continue;
+        }
+        // The rotator's own drop is written too, deliberately. It costs
+        // one PUT and removes a case: this device may itself be the
+        // lagging sibling next time, restored from a checkpoint that
+        // predates a rotation somebody else performed.
+        let name = match drop_location_s3(doc, &d.agent_id).await {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("[drop] location for {}: {e}", &hex::encode(&d.agent_id)[..8]);
+                continue;
+            }
+        };
+        // Prekeys this keyhive does not hold should not happen for an
+        // ENROLLED device — enrollment ingests the card — so a skip here
+        // is worth saying out loud rather than swallowing.
+        let obj = match seal_to_member(kh, doc, &d.agent_id, b"kp-wrap", &payload).await {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!(
+                    "[drop] cannot seal a chain drop to enrolled device {}: {e}",
+                    &hex::encode(&d.agent_id)[..8]
+                );
+                continue;
+            }
+        };
+        let body = match bincode::serialize(&obj) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[drop] serialize: {e}");
+                continue;
+            }
+        };
+        match put_object(st, &EngineFetch, &EngineSigner, &name, body).await {
+            Ok(()) => written += 1,
+            Err(e) => eprintln!(
+                "[drop] write for {} failed (revocation stands): {e}",
+                &hex::encode(&d.agent_id)[..8]
+            ),
+        }
+    }
+    // The revoked party's drop goes away beside its K_p. A stale drop
+    // only carries the OLD chain, which that party already had, so this
+    // buys no secrecy — but pull-now hygiene is the K_p discipline and
+    // the drop is the K_p's sibling, so it follows the same rule rather
+    // than acquiring an exception nobody would remember.
+    if let Ok(name) = drop_location_s3(doc, revoked).await {
+        if let Err(e) = delete_object(st, &EngineFetch, &EngineSigner, &name).await {
+            // Absence is success: S3 answers a delete of a missing key
+            // with 204, and anything that does not is a hint, not a
+            // failure of the revocation.
+            eprintln!("[drop] revoked member's drop delete (absence is fine): {e}");
+        }
+    }
+    eprintln!("[drop] wrote {written} chain drop(s) for the account's devices");
+    Ok(())
+}
+
+/// THE PROBE. Read this device's own chain drop and adopt the carried
+/// chain IF IT IS LONGER than the one held locally.
+///
+/// US-DOC ONLY, and called from the SIBLING branch of the account pull
+/// before any manifest is named — the whole point is to fix the names
+/// the scan is about to derive.
+///
+/// ADOPT-IF-LONGER IS THE IDEMPOTENCE. A chain only ever extends
+/// (`rotate_bucket_chain` pushes; nothing truncates), so "longer" is a
+/// total order on the versions a device can hold, and a second probe
+/// after adoption compares equal and writes nothing. That guard is doing
+/// real work: `adopt_bucket_chain` writes through to the us-doc's chain
+/// register, so an unguarded adopt would author one us-doc change per
+/// pull, forever, carrying a value that did not change.
+///
+/// ABSENCE IS THE ORDINARY ANSWER: no rotation has happened since this
+/// device last flushed, or none ever has. One small GET per us-doc pull
+/// buys it, on S3 — the only provider that rotates, and so the only one
+/// that calls this (see `gd_pull`'s sibling branch for why Drive does
+/// not, and for what re-adding it would take). The change-board
+/// optimization, where a rotator patches an epoch ordinal and the probe
+/// runs only when it exceeds the local chain length, is PARKED, not
+/// built.
+///
+/// The body below is provider-neutral on purpose: it takes the fetched
+/// bytes rather than fetching them, so a second provider's probe is its
+/// own two-line fetch and nothing else.
+///
+/// A drop that fails to open is a HINT THAT FAILED, never a pull that
+/// failed: the scan below it works exactly as well as it did before this
+/// existed, which is the whole safety argument for adding a fetch to a
+/// path that was already correct for every non-rotating account.
+async fn probe_chain_drop(doc: &[u8], blob: Option<Vec<u8>>) -> Result<Option<usize>, String> {
+    let Some(blob) = blob else { return Ok(None) };
+    let kh = with_state(|s| s.kh.clone())?;
+    let payload = match open_kp_object(&kh, doc, &blob).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[drop] unreadable, pulling with the chain in hand (hint only): {e}");
+            return Ok(None);
+        }
+    };
+    let mut carried: Vec<(u32, [u8; 32])> = payload.name_keys;
+    carried.sort_by_key(|(e, _)| *e);
+    let local = with_state(|s| {
+        s.buckets
+            .get(doc)
+            .map(|b| b.name_keys.len())
+            .unwrap_or_default()
+    })?;
+    if carried.len() <= local {
+        return Ok(None);
+    }
+    adopt_bucket_chain(doc, carried.iter().map(|(_, nk)| *nk).collect()).await?;
+    Ok(Some(carried.len()))
 }
 
 // --- the Dropbox provider ---
@@ -2258,6 +2499,27 @@ async fn gd_pull(doc_id: Vec<u8>, owner: Vec<u8>, pickup: Option<String>) -> Res
     let (keychain, devices, folder) = if sibling {
         // The chain is already reconciled against the account by the
         // `ensure_bucket_state` above; no adoption, nothing to unseal.
+        //
+        // NO CHAIN-DROP PROBE HERE, and the absence is the ruling
+        // (#110). S3's sibling branch probes a self-addressed drop
+        // because a us-doc rotation can leave it naming an epoch behind;
+        // this provider CANNOT reach that state, because its
+        // `store_revoke` arm deliberately never rotates (see the ruling
+        // there: names on this provider blind an observer's labels and
+        // are not access control, so a fresh epoch would draw no
+        // boundary). No rotation means no drop is ever written, so a
+        // probe here would be one resolve + one download per us-doc
+        // pull, forever, for an object that cannot exist — a standing
+        // bill for a readiness that may never be called on.
+        //
+        // If Drive ever does grow a rotation trigger, the drop is
+        // re-added on BOTH sides together: `publish_chain_drops` gains a
+        // gdrive arm writing to `gd_pickup_name(doc, member, member)` in
+        // the flat pickup folder, and this branch gains the mirror of
+        // `s3_pull`'s probe — `gd_download` of that name into
+        // `probe_chain_drop`, before `doc_keychain` below. Three lines
+        // each, and the reading half (`probe_chain_drop`,
+        // `open_kp_object`) is already provider-neutral.
         let keychain = doc_keychain(&doc_id)?;
         let owner_vk = arr32(&owner, "pull owner device id")?;
 
@@ -2465,6 +2727,21 @@ async fn s3_pull(doc_id: Vec<u8>, owner: Vec<u8>) -> Result<String, String> {
         // pull answers events=0 chunks=0 — the ordinary "nothing new"
         // the boot-time fan-out will hit for most (partition, sibling)
         // pairs.
+        //
+        // THE CHAIN DROP PROBE (#110), before a single name is derived.
+        // `ensure_bucket_state` above reconciled this device's chain
+        // against its own copy of the us-doc — which is exactly the copy
+        // a rotation this device missed has not updated — so on the
+        // us-doc the reconciliation can hand back a chain that is one
+        // epoch behind the names it is about to derive. One GET at a
+        // self-addressed location fixes that or answers absent.
+        if is_us_doc(&doc_id)? {
+            let name = drop_location_s3(&doc_id, &my_id).await?;
+            let blob = get_object_unsigned(&st, &EngineFetch, &name).await?;
+            if let Some(epochs) = probe_chain_drop(&doc_id, blob).await? {
+                eprintln!("[drop] adopted a longer chain from my own drop: {epochs} epoch(s)");
+            }
+        }
         (doc_keychain(&doc_id)?, vec![arr32(&owner, "pull owner device id")?])
     } else {
         // NON-ACCOUNT OWNER — the link tier. Unchanged, byte for byte:
@@ -3719,6 +3996,19 @@ impl DriverGuest for Component {
                 // there (SYNC.md §1), so the owner's other devices flush
                 // under it without being told separately.
                 rotate_bucket_chain(&doc_id).await?;
+
+                // THE SELF-ADDRESSED CHAIN DROP (#110), beside the
+                // grantee republish below and for the case that
+                // republish structurally cannot cover: the account's own
+                // devices hold no K_p — they read the chain out of the
+                // us-doc — so a sibling that is offline across THIS
+                // rotation has no object naming the new epoch and, for
+                // the us-doc alone, no way to learn one. See the drop
+                // section above for why only this document needs it.
+                if is_us_doc(&doc_id)? {
+                    publish_chain_drops(&st, &kh, &doc_id, &member).await?;
+                }
+
                 let remaining = with_state(|s| {
                     let b = s
                         .buckets
