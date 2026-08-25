@@ -3949,10 +3949,23 @@ async function startApp(
 
   /** Subscribe to `tree` with `peer`, both directions being the caller's
    * to arrange. `subscribe` is what makes a LATER write push rather than
-   * wait for a poll. */
+   * wait for a poll.
+   *
+   * #115: EACH DRIVER CALL IS ITS OWN `enqueue` SLOT, deliberately, and
+   * the 30s `until` loop that waits for the subscription to come up
+   * lives OUTSIDE any single slot. Wrapping the whole wait in one
+   * `enqueue(...)` (the previous shape) made it ONE job on the shared
+   * chain — with a dead transport, `syncStatus` never turns true, so
+   * that job sat on the chain for its full 30s, and the page's own
+   * `tick` (also `enqueue`d, see the exposed `tick` hook below) queued
+   * behind it: a driving surface that reads as a stalled UI. Enqueuing
+   * only the individual `syncStart`/`syncStatus` calls keeps each slot
+   * millisecond-sized, so `tick` interleaves between polls instead of
+   * waiting out the whole deadline. The retries and the 30s ceiling are
+   * unchanged — only where the waiting happens moved. */
   const subscribe = async (peer: Uint8Array, tree: Uint8Array, what: string) => {
-    const h = await driver.syncStart(peer, tree, true);
-    await until(`subscribed to ${what}`, () => driver.syncStatus(h), 30_000);
+    const h = await enqueue(() => driver.syncStart(peer, tree, true));
+    await until(`subscribed to ${what}`, () => enqueue(() => driver.syncStatus(h)), 30_000);
   };
 
   /** READER DIALS, and this is the only place on this page that opens a
@@ -3974,11 +3987,16 @@ async function startApp(
     peerEndpoint: Uint8Array,
     usPartition?: Uint8Array,
   ) => {
-    await enqueue(async () => {
-      const conn2 = await driver.irohStart(true, peerEndpoint, RELAY, peer);
-      await until("the other device answers", () => driver.connStatus(conn2), 30_000);
-      if (usPartition) await subscribe(peer, usPartition, "your account");
-    });
+    // #115: same shape as `subscribe` above and for the same reason —
+    // each driver call is its own `enqueue` slot, and the 30s
+    // `until` wait for the dial to land runs OUTSIDE any single slot.
+    // The previous shape wrapped `irohStart` + the whole 30s wait +
+    // `subscribe` in ONE `enqueue(...)`, so a dial against a dead relay
+    // held the chain hostage for its full 30s and every other queued
+    // driver call — including the page's own `tick` — waited behind it.
+    const conn2 = await enqueue(() => driver.irohStart(true, peerEndpoint, RELAY, peer));
+    await until("the other device answers", () => enqueue(() => driver.connStatus(conn2)), 30_000);
+    if (usPartition) await subscribe(peer, usPartition, "your account");
   };
 
   /** The account's todo list, as the account's own pointer map names it
@@ -4034,10 +4052,12 @@ async function startApp(
       // the two sides have only just met (see `dialPeer`).
       await dialPeer(peer, enrollment.peerEndpointId, enrollment.partitionId);
       const tasksId = await awaitTasksPointer("your account's todo list", 60_000);
-      await enqueue(async () => {
-        await driver.adoptPartition(tasksId);
-        await subscribe(peer, tasksId, "your todo list");
-      });
+      // #115: NOT wrapped in one outer `enqueue` any more — `subscribe`
+      // now enqueues its own driver calls (see its definition), and
+      // nesting an `enqueue` inside a job it starts is the self-deadlock
+      // this file's own note on `enqueue` warns about.
+      await enqueue(() => driver.adoptPartition(tasksId));
+      await subscribe(peer, tasksId, "your todo list");
       usSynced = true;
       console.log("[solo] subduction wired: this device ⇄ the device that added it");
       // THE ADOPTION BEAT, at the only honest moment for it. The join
@@ -4264,15 +4284,21 @@ async function startApp(
       );
       const partitions = await enqueue(() => driver.usPartitions());
       const tasksPart = partitions.find((p) => p.name === TASKS_POINTER);
-      await enqueue(async () => {
-        // The user-system doc's own id is not exposed by the `us-*`
-        // surface by design, and it does not need to be: the engine
-        // subscribes the us doc to every known peer itself
-        // (usdoc.rs's `ensure_subscriptions`, which runs on every pump).
-        // What the engine cannot do for us is the TASKS partition — it
-        // has no name for it — so that one is subscribed here.
-        if (tasksPart) await subscribe(peer, tasksPart.id, "your todo list");
-      });
+      // #115: NOT wrapped in an outer `enqueue` — `subscribe` enqueues
+      // its own driver calls now (see its definition's note). This is
+      // the exact call that produced the ~30s tick stall: with the
+      // relay dead, the old shape held ONE `enqueue` slot open for
+      // `subscribe`'s whole 30s `until` wait, and every other queued
+      // driver call — the page's own `tick` among them — waited behind
+      // it before this fix.
+      //
+      // The user-system doc's own id is not exposed by the `us-*`
+      // surface by design, and it does not need to be: the engine
+      // subscribes the us doc to every known peer itself
+      // (usdoc.rs's `ensure_subscriptions`, which runs on every pump).
+      // What the engine cannot do for us is the TASKS partition — it
+      // has no name for it — so that one is subscribed here.
+      if (tasksPart) await subscribe(peer, tasksPart.id, "your todo list");
       usSynced = true;
       console.log("[solo] subduction wired: this device ⇄ the device it added");
     } catch (e) {
@@ -4414,7 +4440,11 @@ async function startApp(
       if (!part) return;
       tasksWired.add(peerHex);
       try {
-        await enqueue(() => subscribe(unhex(peerHex), part.id, "your todo list"));
+        // #115: not wrapped in an outer `enqueue` — `subscribe` enqueues
+        // its own driver calls (see its definition), so wrapping it here
+        // too would nest one job inside another and self-deadlock the
+        // chain (see the `enqueue` footgun note above).
+        await subscribe(unhex(peerHex), part.id, "your todo list");
         usSynced = true;
         console.log(`[solo] subduction re-wired: this device ⇄ ${peerHex.slice(0, 8)}…`);
       } catch (e) {
