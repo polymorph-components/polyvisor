@@ -291,4 +291,4 @@ e2e *SCENARIOS: site
 # Type-check the harness on its own (the scenarios are not part of the
 # site graph, so `just site`'s deno check does not reach them).
 e2e-check:
-    deno check e2e/run.ts e2e/util.ts e2e/scenarios/*.ts
+    deno check e2e/run.ts e2e/util.ts e2e/proxy.ts e2e/cdp.ts e2e/scenarios/*.ts

@@ -42,6 +42,7 @@ import {
   resetActs,
   waitForBoot,
 } from "./util.ts";
+import { type SeverableProxy, startTcpProxy } from "./proxy.ts";
 
 import bootAppSurface from "./scenarios/boot-app-surface.ts";
 import petnameCeremony from "./scenarios/petname-ceremony.ts";
@@ -68,6 +69,7 @@ import soloOfflineSync from "./scenarios/solo-offline-sync.ts";
 import soloPasskey from "./scenarios/solo-passkey.ts";
 import visorReset from "./scenarios/visor-reset.ts";
 import firefoxSmoke from "./scenarios/firefox-smoke.ts";
+import harnessFaults from "./scenarios/harness-faults.ts";
 
 // Re-exported so a scenario imports its whole contract from one place:
 // `Scenario` and the `Ctx` it is handed.
@@ -90,11 +92,33 @@ export interface Scenario {
    * suite is a Chromium suite plus ONE Gecko smoke beat, deliberately —
    * see `firefox-smoke` and the `FIREFOX_PREFS` note below. */
   engine?: "chromium" | "firefox";
+  /** A scenario expected to FAIL right now — a known gap being tracked
+   * rather than hidden. An `expected: "red"` scenario that fails is
+   * recorded `ok` with an `(xfail: expected red)` marker in the
+   * summary; one that PASSES is recorded as a FAILURE (the gate has
+   * flipped — promote it to green by dropping this flag, don't leave a
+   * silently-passing xfail in the suite). A CRASH-SHAPED failure
+   * (RendererGoneError, a scenario deadline, or a delivered crash
+   * event) is never read as "the expected red": it still retries under
+   * the same rule as every other scenario, because a renderer SEGV is
+   * an environment flake, not the fault this flag exists to track. */
+  expected?: "red";
+  /** Overrides `SCENARIO_DEADLINE_MS` for this one scenario. Partition
+   * scenarios legitimately wait out several real relay pull cadences
+   * (45s each) in a single run, which the suite-wide deadline was never
+   * sized for. */
+  deadlineMs?: number;
   run(page: Page, ctx: Ctx): Promise<void>;
 }
 
 const SCENARIOS: Scenario[] = [
   bootAppSurface,
+  // THE HARNESS'S OWN FAULT-INJECTION MACHINERY, tested against ITSELF
+  // rather than the demo. It needs no engine boot at all (`page: {
+  // noWait: true }`), so it runs early and cheaply — a broken proxy or
+  // relay stop/start would otherwise surface as a mysterious failure in
+  // whatever partition scenario used it first, several minutes later.
+  harnessFaults,
   petnameCeremony,
   settingsIdentity,
   stripGeometry,
@@ -393,6 +417,12 @@ class Relay {
     this.url = `http://127.0.0.1:${port}`;
   }
 
+  /** For `ctx.relayProxy()`, which needs the real relay's port to dial
+   * as its own upstream. */
+  get port(): number {
+    return this.#port;
+  }
+
   async start(): Promise<void> {
     if (this.#proc) return;
     try {
@@ -431,15 +461,43 @@ class Relay {
     throw new Error(`the local relay never answered on ${this.url}`);
   }
 
-  async dispose(): Promise<void> {
+  /** Mirrors `Minio.stop()` exactly, down to the refused/timeout split —
+   * see that method's comment for why a TIMEOUT is not the state a
+   * scenario asserting on transport refusal may be told it reached. The
+   * probe is `/generate_204`, the same net-report endpoint `start()`
+   * uses to know the relay is actually serving. `start()` re-creates
+   * `this.#proc` afterwards (it is null-checked, same as Minio), and
+   * keeps the SAME config file — same port — so a page that already
+   * captured `?relay=<url>` stays pointed at a relay that will listen
+   * there again. */
+  async stop(): Promise<void> {
+    if (!this.#proc) return;
     const proc = this.#proc;
     this.#proc = null;
-    if (proc) {
+    try {
+      proc.kill("SIGKILL");
+    } catch { /* already dead */ }
+    await proc.status;
+    for (let i = 0; i < 80; i++) {
       try {
-        proc.kill("SIGKILL");
-      } catch { /* already dead */ }
-      await proc.status;
+        const r = await fetch(`${this.url}/generate_204`, {
+          signal: AbortSignal.timeout(2_000),
+        });
+        await r.body?.cancel();
+      } catch (e) {
+        // Connection refused is the state this loop exists to reach —
+        // see Minio.stop()'s identical comment for why a TimeoutError
+        // must keep the loop going rather than being read as "down".
+        if (e instanceof DOMException && e.name === "TimeoutError") continue;
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 100));
     }
+    throw new Error("the relay kept answering after being killed");
+  }
+
+  async dispose(): Promise<void> {
+    await this.stop();
     if (this.#dir) await Deno.remove(this.#dir, { recursive: true }).catch(() => {});
   }
 }
@@ -447,8 +505,48 @@ class Relay {
 // --- the run ---------------------------------------------------------------
 
 async function main() {
-  const wanted = Deno.args.filter((a) => !a.startsWith("-"));
   const headed = Deno.args.includes("--headed");
+  // --file <path>: a DEV LOADER for scenarios not yet registered in
+  // SCENARIOS above. WHY THIS EXISTS: several partition scenarios are
+  // developed in parallel by separate tracks, and requiring every one
+  // of them to land a run.ts edit (import + list placement, with its
+  // own ordering commentary) before it can even be RUN once would
+  // gate iteration speed on a merge. `--file` imports the module
+  // directly (default export = Scenario) relative to this file's own
+  // directory (`demo/e2e/`), so `--file scenarios/foo.ts` finds
+  // `demo/e2e/scenarios/foo.ts` regardless of the caller's cwd. Mixed
+  // usage (bare names plus `--file`s) simply runs the union of both
+  // lists — keeping that simple was an explicit non-goal to gold-plate.
+  const filePaths: string[] = [];
+  // `wanted` must NOT swallow a --file's path argument as a scenario
+  // name (a path is a bare token too, and would otherwise be read as
+  // "unknown scenario"), so both are stripped from args before the
+  // ordinary bare-name scan runs.
+  const consumed = new Set<number>();
+  for (let i = 0; i < Deno.args.length; i++) {
+    if (Deno.args[i] === "--file") {
+      const p = Deno.args[i + 1];
+      if (!p) {
+        console.error("--file needs a path argument");
+        Deno.exit(2);
+      }
+      filePaths.push(p);
+      consumed.add(i);
+      consumed.add(i + 1);
+      i++;
+    }
+  }
+  const wanted = Deno.args.filter((a, i) => !consumed.has(i) && !a.startsWith("-"));
+  const fileScenarios: Scenario[] = [];
+  for (const p of filePaths) {
+    const mod = await import(new URL(p, `file://${here}`).toString());
+    const s = mod.default as Scenario | undefined;
+    if (!s || typeof s.run !== "function") {
+      console.error(`--file ${p}: default export is not a Scenario`);
+      Deno.exit(2);
+    }
+    fileScenarios.push(s);
+  }
   const site = `${demoRoot}serve`;
   try {
     await Deno.stat(`${site}/index.html`);
@@ -562,6 +660,11 @@ async function main() {
   const current = (): Browser => engine === "firefox" ? firefoxBrowser! : browser;
 
   const openPages: Page[] = [];
+  // Every proxy a scenario opens via `ctx.relayProxy()`, closed in the
+  // per-scenario finally alongside `openPages` — isolation is the
+  // harness's job (see the comment at that finally block), not
+  // something a partition scenario has to remember to do for itself.
+  const openProxies: SeverableProxy[] = [];
   // Phase tracing for the deadline diagnostics: every await between a
   // scenario banner and its first act sets the phase it is entering, so
   // a deadline failure can NAME the wedged call instead of leaving a
@@ -588,6 +691,14 @@ async function main() {
     },
     stopMinio: () => minio.stop(),
     startMinio: () => minio.start(),
+    stopRelay: () => relay.stop(),
+    startRelay: () => relay.start(),
+    relayUrl: relay.url,
+    relayProxy: async () => {
+      const p = await startTcpProxy(relay.port);
+      openProxies.push(p);
+      return p;
+    },
     fresh: async (opts: FreshOptions = {}) => {
       setPhase("newContext");
       const bctx = await newContext(current(), opts);
@@ -637,14 +748,18 @@ async function main() {
     acts: number;
     error?: string;
     retried?: boolean;
+    xfailNote?: string;
   }[] = [];
   const runList = wanted.length > 0
     ? SCENARIOS.filter((s) => wanted.includes(s.name))
+    : filePaths.length > 0
+    ? [] // named --file(s) only, no bare names: run exactly those
     : SCENARIOS;
   if (wanted.length > 0 && runList.length !== wanted.length) {
     console.error(`unknown scenario(s): ${wanted.filter((w) => !SCENARIOS.some((s) => s.name === w))}`);
     Deno.exit(2);
   }
+  runList.push(...fileScenarios);
 
   console.log(`\ne2e: ${runList.length} scenario(s) against ${baseUrl}\n`);
   const started = performance.now();
@@ -677,19 +792,19 @@ async function main() {
   // would mask a real regression.
   const SCENARIO_DEADLINE_MS = 240_000; // > BOOT_TIMEOUT + slowest scenario
   const DEADLINE_MARK = "scenario deadline";
-  const withDeadline = <T>(p: Promise<T>): Promise<T> => {
+  const withDeadline = <T>(p: Promise<T>, deadlineMs = SCENARIO_DEADLINE_MS): Promise<T> => {
     let timer: number | undefined;
     const bomb = new Promise<never>((_, reject) => {
       timer = setTimeout(
         () =>
           reject(
             new Error(
-              `${DEADLINE_MARK}: no progress in ${SCENARIO_DEADLINE_MS / 1000}s ` +
+              `${DEADLINE_MARK}: no progress in ${deadlineMs / 1000}s ` +
                 `(a hang below the harness's own bounded waits — a wedged ` +
                 `browser protocol call is the known cause)`,
             ),
           ),
-        SCENARIO_DEADLINE_MS,
+        deadlineMs,
       );
     });
     return Promise.race([p, bomb]).finally(() => clearTimeout(timer)) as Promise<T>;
@@ -830,6 +945,15 @@ async function main() {
           setPhase("minio");
           if (scenario.minio === "down") await minio.stop();
           else await minio.start();
+          // Every scenario gets the relay UP at the start, unconditionally
+          // — mirrors the minio handling above. Unlike MinIO there is no
+          // `relay: "down"` scenario field: a scenario that wants the real
+          // relay down for its own duration calls `ctx.stopRelay()` itself
+          // (harness-faults.ts does exactly that), because a suite-wide
+          // relay outage would take EVERY scenario's page with it, not just
+          // one pane the way MinIO's outage does.
+          setPhase("relay");
+          await relay.start();
           // The engine is chosen BEFORE `fresh`, since that is what
           // `current()` resolves against. Firefox is launched lazily and
           // kept for the rest of the run: a suite that is one Gecko beat
@@ -845,7 +969,7 @@ async function main() {
           setPhase("scenario");
           await scenario.run(page, ctx);
           setPhase("idle");
-        })());
+        })(), scenario.deadlineMs);
       } catch (e) {
         failed = true;
         failure = e;
@@ -908,6 +1032,12 @@ async function main() {
             new Promise((r) => setTimeout(r, 5_000)),
           ]);
         }
+        // Every proxy a scenario opened, closed the same way and for the
+        // same reason: a partition scenario must never leak a listening
+        // socket into the one after it.
+        for (const p of openProxies.splice(0)) {
+          await p.close().catch(() => {});
+        }
       }
       // The crash shape: the renderer stopped answering (either named by
       // waitForBoot/driverBounded, or caught only by the deadline), or a
@@ -926,15 +1056,40 @@ async function main() {
         await recoverBrowser();
         continue;
       }
+      // XFAIL: an `expected: "red"` scenario inverts the ok/fail reading,
+      // UNLESS the failure is crash-shaped — a renderer SEGV under an
+      // xfail scenario is still an environment flake, not "the expected
+      // red", so it must not be quietly folded into the xfail marker.
+      const xfail = scenario.expected === "red" && !crashShaped;
+      let ok = !failed;
+      let error = failed ? (failure instanceof Error ? failure.message : String(failure)) : undefined;
+      let xfailNote: string | undefined;
+      if (xfail) {
+        if (failed) {
+          // The expected shape: record it as ok, but say so plainly —
+          // this is a known gap being TRACKED, not a passing claim.
+          ok = true;
+          xfailNote = "(xfail: expected red)";
+        } else {
+          // The gate FLIPPED: a scenario marked `expected: "red"` just
+          // passed. That is itself a failure — an xfail that keeps
+          // passing silently is worse than no xfail at all, because it
+          // hides a fixed regression behind a flag nobody comes back to
+          // remove.
+          ok = false;
+          error =
+            "expected: \"red\" scenario PASSED — the gate has flipped; promote it to green " +
+            "by dropping the `expected` flag";
+        }
+      }
       results.push({
         name: scenario.name,
-        ok: !failed,
+        ok,
         ms: Math.round(performance.now() - t0),
         acts: actCount().acts,
-        error: failed
-          ? (failure instanceof Error ? failure.message : String(failure))
-          : undefined,
+        error,
         retried: attempt > 1,
+        xfailNote,
       });
       // A wedged browser stays wedged: never hand it to the next scenario.
       if (failed && crashShaped) await recoverBrowser();
@@ -975,7 +1130,7 @@ async function main() {
         (r.ms / 1000).toFixed(1)
       }s${r.error ? `  — ${r.error}` : ""}${
         r.retried && r.ok ? "  (2nd attempt; renderer crashed on the 1st)" : ""
-      }`,
+      }${r.xfailNote ? `  ${r.xfailNote}` : ""}`,
     );
   }
   console.log(

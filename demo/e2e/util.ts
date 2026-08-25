@@ -30,6 +30,22 @@ export interface Ctx {
    * `null` only before the harness's MinIO has ever started, which
    * cannot happen once a scenario is running. */
   readonly minioDataDir: string | null;
+  /** Stop the harness's own iroh relay — the beat that is ABOUT the
+   * relay being unreachable (a symmetric fault: every page in the
+   * suite loses it at once, unlike `relayProxy()` below). */
+  stopRelay(): Promise<void>;
+  /** Bring the relay back up (a no-op when it is already running; same
+   * contract as `startMinio`). */
+  startRelay(): Promise<void>;
+  readonly relayUrl: string;
+  /** A severable TCP proxy in front of the harness relay, for an
+   * ASYMMETRIC partition — one page's `?relay=` pointed at the proxy
+   * while every other page keeps the real relay. The runner tracks
+   * every proxy a scenario opens and closes them all in its own
+   * finally, the same isolation discipline as `openPages` (see
+   * run.ts's per-scenario cleanup) — a scenario never has to remember
+   * to close its own proxy. */
+  relayProxy(): Promise<import("./proxy.ts").SeverableProxy>;
 }
 
 export interface FreshOptions {
