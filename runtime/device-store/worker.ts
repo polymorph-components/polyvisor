@@ -53,6 +53,8 @@ import {
   type Engine,
   newEngine,
   type PersistDir,
+  type RecoveryKit,
+  type StoreConfig,
   type StoreSign,
   type UsPartition,
 } from "../engine.ts";
@@ -118,7 +120,11 @@ import {
   type OauthStartSpec,
   type PromoteOptions,
   READONLY_METHODS,
+  type RecoveryKitInput,
+  type RecoveryKitResult,
+  type RecoveryKitSpec,
   type ResealOptions,
+  type RestoreSpec,
   hostCodeOf,
   hostErrorOf,
   type Req,
@@ -1197,7 +1203,7 @@ async function oauthComplete(code: string, state: string): Promise<DeviceStatus>
     // THE SPACE THE CONSENT WAS ASKED FOR, sealed with the tokens it
     // bought: it is what the scope above was chosen from, so it is the
     // only honest record of what this consent actually permits, and
-    // `bindGdrive` refuses a binding that disagrees with it.
+    // `settleGdrive` refuses a binding that disagrees with it.
     space: spec.space,
     obtainedAt: Date.now(),
   };
@@ -1303,9 +1309,68 @@ async function bindStore(binding: StoreBinding): Promise<DeviceStatus> {
   if (!dek || !engine) {
     throw new SealError("no-rung", "the device is sealed; open it before binding storage");
   }
-  if (binding?.kind === "gdrive") {
-    return await bindGdrive(binding, dek, engine);
-  }
+  const stored = await settleBinding(binding, dek);
+  // A THROW FROM HERE LEAVES THE BINDING SEALED AND THE GRANT ARMED
+  // while the live instance still has no addressing — self-consistent
+  // rather than half-open (the seams refuse or the engine does, and
+  // nothing writes anywhere unintended), and the next bring-up repairs
+  // it by re-applying the same config. Rolling the seal back instead
+  // would throw away a binding the user correctly entered because one
+  // engine call failed.
+  await engine.driver.initStore(storeConfigOf(stored));
+  // A DESTINATION EXISTS AGAIN, SO THE SCHEDULE DOES. `clearGrant` stops
+  // it at every unbind/reseal/erase, so a bind is the matching arm: a
+  // device that has just been pointed at a bucket should sync on its own
+  // without waiting for a reload. At the ORDINARY cadence, never the
+  // boot pull's — see `rearmSyncSchedule`.
+  rearmSyncSchedule();
+  return await status();
+}
+
+/**
+ * THE `initStore` CONFIG FOR A SETTLED BINDING — one spelling, used by
+ * `bindStore`, by every bring-up's re-apply, and by the restore (where
+ * it is a PARAMETER of `recovery-restore-*` rather than a call, because
+ * finding the bundle needs the destination before any engine state
+ * exists — engine.wit's `recovery-restore-bucket`).
+ *
+ * ADDRESSING ONLY, on every arm. The gdrive arm carries no credential
+ * at all, not even a public identifier; the S3 arm carries the access
+ * key, which is a public identifier that travels in the Authorization
+ * header in clear.
+ */
+function storeConfigOf(b: StoreBinding): StoreConfig {
+  return b.kind === "gdrive"
+    ? {
+      kind: "gdrive",
+      // The space rides on the sealed binding, so every re-apply
+      // restores the SAME space the bind chose — a default here would
+      // silently move the store.
+      value: { root: b.root, apiBase: b.apiBase, space: b.space },
+    }
+    : {
+      kind: "s3",
+      value: { endpoint: b.endpoint, bucket: b.bucket, accessKey: b.accessKey },
+    };
+}
+
+/**
+ * VALIDATE A BINDING AND MAKE IT THIS DEVICE'S, minus the engine.
+ *
+ * The fail-at-bind half of `bindStore`, factored out because the RESTORE
+ * needs exactly it and nothing else: a restore has no engine to
+ * `initStore` (that is the point — the config is a parameter of the
+ * restore call), but it must run the same refusals, in the same order,
+ * before it fetches anything. Two copies of the destination checks would
+ * be two places for the escrow rules to drift.
+ *
+ * Everything fallible and cheap is checked first, and the binding is
+ * PERSISTED before the grant is armed — a bind that survives the answer
+ * but not the disk would come back unbound at the next unseal, which is
+ * the confusing direction.
+ */
+async function settleBinding(binding: StoreBinding, key: CryptoKey): Promise<StoreBinding> {
+  if (binding?.kind === "gdrive") return await settleGdrive(binding, key);
   if (binding?.kind !== "s3") {
     // The two arms this host binds are S3 and Google Drive. DROPBOX is
     // still parked for the worker and the reason is unchanged
@@ -1361,30 +1426,14 @@ async function bindStore(binding: StoreBinding): Promise<DeviceStatus> {
     bucket: binding.bucket,
     accessKey: binding.accessKey,
   };
-  await sealedPut(ns, dek, STORE_BINDING_KEY, new TextEncoder().encode(JSON.stringify(stored)));
+  await sealedPut(ns, key, STORE_BINDING_KEY, new TextEncoder().encode(JSON.stringify(stored)));
   await applyBinding(stored);
-  // A THROW FROM HERE LEAVES THE BINDING SEALED AND THE GRANT ARMED
-  // while the live instance still has no addressing — self-consistent
-  // rather than half-open (the seams refuse or the engine does, and
-  // nothing writes anywhere unintended), and the next bring-up repairs
-  // it by re-applying the same config. Rolling the seal back instead
-  // would throw away a binding the user correctly entered because one
-  // engine call failed.
-  await engine.driver.initStore({
-    kind: "s3",
-    value: { endpoint: stored.endpoint, bucket: stored.bucket, accessKey: stored.accessKey },
-  });
-  // A DESTINATION EXISTS AGAIN, SO THE SCHEDULE DOES. `clearGrant` stops
-  // it at every unbind/reseal/erase, so a bind is the matching arm: a
-  // device that has just been pointed at a bucket should sync on its own
-  // without waiting for a reload. At the ORDINARY cadence, never the
-  // boot pull's — see `rearmSyncSchedule`.
-  rearmSyncSchedule();
-  return await status();
+  return stored;
 }
 
 /**
- * BIND THIS DEVICE TO A DRIVE FOLDER (DRIVE.md §5).
+ * VALIDATE A DRIVE BINDING AND MAKE IT THIS DEVICE'S (DRIVE.md §5) —
+ * the gdrive arm of `settleBinding`, and the same shape of thing.
  *
  * The refusals mirror the S3 arm's one-for-one, because they are the
  * same rule wearing this provider's vocabulary: everything that can be
@@ -1406,11 +1455,10 @@ async function bindStore(binding: StoreBinding): Promise<DeviceStatus> {
  *                    other space is a consent to a different permission
  *                    entirely.
  */
-async function bindGdrive(
+async function settleGdrive(
   binding: Extract<StoreBinding, { kind: "gdrive" }>,
   key: CryptoKey,
-  live: Engine,
-): Promise<DeviceStatus> {
+): Promise<StoreBinding> {
   if (binding.root.trim() === "" || binding.clientId.trim() === "") {
     throw new StoreError("bad-destination", "a Drive binding needs a root folder and a client id");
   }
@@ -1459,17 +1507,7 @@ async function bindGdrive(
   };
   await sealedPut(ns, key, STORE_BINDING_KEY, new TextEncoder().encode(JSON.stringify(stored)));
   await applyBinding(stored);
-  // Addressing only, exactly like every other arm (DRIVE.md §2): the
-  // guest gets no credential here, not even a public identifier. The
-  // space is addressing too — it picks the root parent the strategy
-  // creates under, and nothing else.
-  await live.driver.initStore({
-    kind: "gdrive",
-    value: { root: stored.root, apiBase: stored.apiBase, space: stored.space },
-  });
-  // The S3 arm's reason verbatim.
-  rearmSyncSchedule();
-  return await status();
+  return stored;
 }
 
 /**
@@ -1640,8 +1678,16 @@ function deviceIdentityFragment(): DeviceIdentityFragment {
  * THE RESUME IDIOM IS THE ENGINE'S, verbatim (engine.ts:100-113): call
  * `stateResume()` FIRST and only `init` when it answers `false`. `false`
  * is "nothing to resume" and is the fresh-boot path, never an error.
+ *
+ * WITH A `restore` PLAN THERE IS NEITHER (RECOVERY.md, "Restore"): the
+ * engine is born from the kit, so `stateResume()`'s answer becomes a
+ * guard and `init` never runs. Everything AFTER the guest's restore —
+ * the pull fan-out, the first checkpoint, the consume — belongs to
+ * `restore()` below rather than here, because none of it is bring-up:
+ * it is the ceremony's own tail, and it needs the published engine and
+ * the schedule that this function's callers arm.
  */
-async function bringUpEngine(): Promise<void> {
+async function bringUpEngine(restore?: RestorePlan): Promise<void> {
   if (engine) return;
   requireJspi();
   if (!attached) throw new Error("device-store: the host was never attached (no engine artifacts)");
@@ -1687,6 +1733,53 @@ async function bringUpEngine(): Promise<void> {
   );
 
   resumed = await e.driver.stateResume();
+  if (restore) {
+    // THE RESTORE BRING-UP (RECOVERY.md, "Restore"): the engine is born
+    // from the KIT, so there is neither a resume nor an `init` here.
+    //
+    // `stateResume()` still ran, and its answer is a GUARD rather than a
+    // step: a namespace with something to resume is not a fresh device,
+    // and restoring over it would strand whatever it held behind an
+    // identity that no longer matches the manifest. `restore()`'s
+    // pre-checks refuse that case before we ever get here; this is the
+    // last line of it, checked against the engine's own answer rather
+    // than against our bookkeeping.
+    if (resumed) {
+      throw new StoreError(
+        "bad-destination",
+        "this namespace already holds a device: a restore needs a fresh one",
+      );
+    }
+    // THE CONFIG IS A PARAMETER, NOT `initStore` STATE, and the ordering
+    // is the reason (engine.wit's `recovery-restore-bucket`): finding
+    // the bundle needs the destination FIRST, and the destination cannot
+    // be read out of the account document the bundle is what unlocks. So
+    // the guest fetches through config-parameterized helpers before any
+    // engine state exists and applies the same config as `init-store`
+    // would once it does — which is why the `if (binding)` re-apply
+    // below is skipped on this path rather than merely redundant.
+    const agent = restore.kit.kind === "bucket"
+      ? await e.driver.recoveryRestoreBucket(
+        storeConfigOf(restore.binding),
+        restore.kit.phrase,
+        restore.deviceName,
+      )
+      : await e.driver.recoveryRestoreFile(
+        storeConfigOf(restore.binding),
+        restore.kit.bundle,
+        restore.kit.passphrase,
+        restore.deviceName,
+      );
+    // The fresh-init path's write, for the fresh-init path's reason: an
+    // agent id is a public key, the sweep and the picker read it before
+    // anything is open, and the SYNC SCHEDULER needs it in order to tell
+    // this device apart from its siblings in the account directory
+    // (`pullCycle`'s self-filter). A restored device that never recorded
+    // it would fan out pulls against ITSELF.
+    await ns.put("meta", AGENT_KEY, agent);
+    engine = e;
+    return;
+  }
   if (!resumed) {
     // The bringup `solo` shape (demo/host/bringup.ts:57-64): a fresh
     // device needs an identity and a partition before `tasks` has
@@ -1729,24 +1822,7 @@ async function bringUpEngine(): Promise<void> {
   // its address. A device therefore returns to its bucket on every
   // unseal with no page-side state and nothing re-entered (§3).
   if (binding) {
-    await e.driver.initStore(
-      binding.kind === "gdrive"
-        ? {
-          kind: "gdrive",
-          // The space rides on the sealed binding, so the re-apply
-          // restores the SAME space the bind chose — a bring-up that
-          // defaulted here would silently move the store.
-          value: { root: binding.root, apiBase: binding.apiBase, space: binding.space },
-        }
-        : {
-          kind: "s3",
-          value: {
-            endpoint: binding.endpoint,
-            bucket: binding.bucket,
-            accessKey: binding.accessKey,
-          },
-        },
-    );
+    await e.driver.initStore(storeConfigOf(binding));
   }
   engine = e;
 
@@ -1759,6 +1835,387 @@ async function bringUpEngine(): Promise<void> {
     await checkpoint();
   }
 }
+
+// --- the restore bring-up (RECOVERY.md, "Restore") --------------------------
+//
+// A FRESH DEVICE NAMESPACE WHOSE ENGINE IS BORN FROM A KIT. The whole of
+// what makes it different from an ordinary bring-up is stated in
+// engine.wit's `recovery-restore-bucket` doc comment and in RECOVERY.md;
+// what lives here is the ORDER, and the order is the design:
+//
+//   1. THE BINDING, settled with `bindStore`'s own fail-at-bind
+//      discipline (`settleBinding` — shared code, not a second copy).
+//      Everything knowable is settled before a single byte is fetched.
+//   2. THE ENGINE, wired to the seams over the just-armed grant, with NO
+//      `stateResume` and NO `init` — `bringUpEngine`'s restore arm.
+//   3. THE GUEST'S RESTORE, which fetches (or is handed) the bundle,
+//      adopts the us partition, takes the K_p pickup and writes this
+//      device's own entry under the ceremony's name.
+//   4. THE PULL FAN-OUT, US-DOC FIRST. The guest's own pull bootstrapped
+//      the account; this is the ordinary account pull path (SYNC.md §2),
+//      run once eagerly so the restored device has CONTENT and not only
+//      membership. It is the worker's existing machinery on purpose —
+//      RECOVERY.md keeps the content fan-out out of the guest so there
+//      is one account pull path rather than two.
+//   5. THE FIRST CHECKPOINT, so a device that is restored and then
+//      reloaded before anyone touches it comes back as itself.
+//   6. THE CONSUME, LAST AND NEVER FATAL. engine.wit: "called by the
+//      embedder AFTER the content fan-out and the first checkpoint
+//      succeed — not before: a consume that raced the restore would burn
+//      the kit for a restore that had not landed."
+//
+// THE RESTORED DEVICE IS T0. Promotion is the user's own later act
+// (PERSISTENCE.md's try-then-keep), so nothing here touches the index
+// row's tier: a restore is not a decision to keep the machine it ran on.
+
+interface RestorePlan {
+  binding: StoreBinding;
+  kit: RecoveryKitInput;
+  deviceName: string;
+}
+
+/**
+ * RUN ONE CEREMONY WITH THE STORE TO ITSELF.
+ *
+ * `call()` does this for every client-initiated bucket op it dispatches
+ * (see `clientBucketOps`), but the recovery ceremonies arrive on the
+ * HOST surface, which never passes through it — so they hold the same
+ * claim explicitly. Without it a 45-second pull cycle could land in the
+ * middle of a restore and pull against an engine that is still being
+ * born. The counter is released in `finally`, because a REFUSED
+ * ceremony must not leave the scheduler muted for the life of the
+ * worker.
+ */
+async function holdingStore<T>(body: () => Promise<T>): Promise<T> {
+  clientBucketOps++;
+  try {
+    return await body();
+  } finally {
+    clientBucketOps--;
+  }
+}
+
+/**
+ * OPEN A FRESH NAMESPACE WITHOUT INITING AN ENGINE — the restore path's
+ * first stage, and the one thing `unseal` cannot do (it inits).
+ *
+ * IT EXISTS FOR THE DRIVE CONSENT. `oauthStart`/`oauthComplete` seal
+ * tokens under the DEK, so they refuse on a sealed device — and a gdrive
+ * restore needs its consent BEFORE the binding it is about to validate.
+ * The S3 arm needs no such stage: its escrow is page-side and keyed by
+ * destination origin, so `restore()` alone is the whole ceremony there.
+ *
+ * IDEMPOTENT, and refuses a namespace that already holds a device: this
+ * is a door into a device that has not been born yet, and it must never
+ * become a second way to open one that has.
+ */
+async function restorePrepare(opts: UnsealOptions = {}): Promise<DeviceStatus> {
+  if (engine) {
+    throw new StoreError(
+      "bad-destination",
+      "this device is already running: a restore needs a fresh namespace",
+    );
+  }
+  await refuseUnlessFresh();
+  if (!dek) {
+    const record = await getDevice(DEVICE_ID);
+    if (!record) {
+      throw new SealError("no-rung", `device-store: no device ${DEVICE_ID} in the index`);
+    }
+    const rungs = await sealState(ns);
+    // A namespace with rungs has been sealed before, which means a DEK
+    // was minted for it — and `refuseUnlessFresh` has already established
+    // that no ENGINE state rests under it. Climbing rather than minting
+    // a second one is `unseal`'s rule and its reason (a second DEK
+    // silently orphans everything sealed under the first).
+    dek = (!rungs.passphrase && !rungs.untilReseal && !rungs.prf)
+      ? await firstSeal(record.tier, opts)
+      : await climbRung(record.unsealPolicy, rungs, opts);
+  }
+  return await status();
+}
+
+/**
+ * "A RESTORE NEEDS A FRESH NAMESPACE", checked rather than assumed.
+ *
+ * The agent id in unsealed `meta` is the honest witness: it is written
+ * exactly once, on the fresh-init path and on the restore path, and it
+ * is readable WITHOUT the DEK — so this refusal works on a device
+ * nobody has opened yet, which is precisely when a client would be
+ * about to make the mistake.
+ */
+async function refuseUnlessFresh(): Promise<void> {
+  const agent = await ns.get<string>("meta", AGENT_KEY);
+  if (agent) {
+    throw new StoreError(
+      "bad-destination",
+      "this namespace already holds a device — restore into a fresh one " +
+        "(a restore is a new device, never an overwrite)",
+    );
+  }
+}
+
+/**
+ * RESTORE THIS DEVICE FROM A RECOVERY KIT.
+ *
+ * The secret discipline, stated where it is implemented: `spec.kit`
+ * carries the phrase (or the file's passphrase), it is handed to the
+ * guest, and the local references are dropped in `finally`. Nothing
+ * writes it to the namespace, the checkpoint, the bucket or a log, and
+ * `status()` has nowhere to echo it. HONESTLY BEST-EFFORT: dropping a
+ * reference is not scrubbing a heap — the string was cloned across the
+ * port and neither realm can erase the other's copy — but it is the
+ * same promise `UnsealOptions.passphrase` makes and it is kept the same
+ * way.
+ */
+async function restore(spec: RestoreSpec): Promise<DeviceStatus> {
+  return await holdingStore(() => restoreCeremony(spec));
+}
+
+async function restoreCeremony(spec: RestoreSpec): Promise<DeviceStatus> {
+  if (engine) {
+    throw new StoreError(
+      "bad-destination",
+      "this device is already running: a restore needs a fresh namespace",
+    );
+  }
+  await refuseUnlessFresh();
+  if (!dek) await restorePrepare(spec.unseal ?? {});
+  const key = dek;
+  if (!key) throw new SealError("no-rung", "the device is sealed; there is nothing to restore into");
+  const kit = spec.kit;
+  try {
+    // 1. THE DESTINATION, on `bindStore`'s terms and before anything is
+    //    fetched. A missing escrow or a mismatched access key is a
+    //    refusal HERE rather than a provider 403 in the middle of a
+    //    ceremony that has already minted half a device.
+    const binding = await settleBinding(spec.binding, key);
+    // 2-3. The engine, and the guest's restore inside it.
+    try {
+      await bringUpEngine({ binding, kit, deviceName: spec.deviceName });
+    } catch (e) {
+      // `unseal`'s atomic rollback, for `unseal`'s reason: a half-open
+      // device — key held, no engine, `status()` claiming unsealed — is
+      // the state this whole discipline exists to forbid. The binding
+      // stays sealed in the namespace (the user entered it correctly and
+      // a retry should not re-ask), but the grant goes: armed seams with
+      // no engine are authority with nothing to authorize.
+      dek = null;
+      engine = null;
+      resumed = null;
+      clearGrant();
+      throw e;
+    }
+    const live = engine as unknown as Engine;
+    // 4. THE CONTENT FAN-OUT, us-doc first. Failures are TOLERATED and
+    //    left to the schedule: a sibling that has not flushed, or a
+    //    partition whose objects are not there yet, is absence — and a
+    //    restore that refused over it would throw away an account it has
+    //    already successfully rebuilt. The ordinary cycle retries.
+    await restoreFanOut(live);
+    // 5. The first checkpoint. This one is NOT tolerated: without it a
+    //    reload before the debounce fires would find a namespace with an
+    //    agent id and no state, which is the one shape nothing recovers
+    //    from.
+    await checkpoint();
+    // 6. THE CONSUME, and its failure is an announcement rather than a
+    //    refusal — see `settleConsume`.
+    await settleConsume(live);
+    // The schedule starts at the END, `unseal`'s placement and for
+    // `unseal`'s reason: the engine is published and `status()` is
+    // answerable, and this only arms timers.
+    startSyncSchedule();
+    return await status();
+  } finally {
+    // The secret's last local reference. See this function's header for
+    // what that is and is not worth.
+    if (kit.kind === "bucket") kit.phrase = "";
+    else {
+      kit.passphrase = "";
+      kit.bundle = new Uint8Array(0);
+    }
+  }
+}
+
+/**
+ * THE RESTORED DEVICE'S FIRST PULL — the account pull path (SYNC.md §2)
+ * run once, eagerly, instead of waiting out a cadence.
+ *
+ * US-DOC FIRST AND THEN THE POINTER MAP, in that order and re-read
+ * between: the us-doc's content IS the pointer map, so a fan-out that
+ * read the map first would fan out over whatever the guest's own
+ * bootstrap pull happened to leave and miss every partition a sibling
+ * added since.
+ *
+ * IT ADOPTS BEFORE IT PULLS, and only here. `adoptPartition` REPLACES
+ * whatever this device held for that id with an empty document
+ * (engine/guest/src/lib.rs, and solo.ts:3100's contract note), so it is
+ * only ever safe on a device that demonstrably held nothing — which is
+ * the definition of the device this function runs on, and is why this
+ * lives in the restore rather than in the ordinary `pullCycle`.
+ */
+async function restoreFanOut(live: Engine): Promise<void> {
+  await pullUsDoc(live, await siblingsOf(live));
+  const parts = await syncScope(live);
+  if (parts === null) return;
+  const siblings = await siblingsOf(live);
+  for (const part of parts) {
+    try {
+      await live.driver.adoptPartition(part.id);
+    } catch {
+      // A partition this device cannot adopt is one it is not a member
+      // of, or one the guest already holds. Neither is a reason to stop
+      // the ones after it.
+      continue;
+    }
+    for (const sib of siblings) {
+      // Owner tier between two devices of one account, so no pickup —
+      // `pullCycle`'s argument verbatim.
+      await live.driver.bucketPull(part.id, sib.agentId, undefined).catch(() => {});
+    }
+  }
+}
+
+/**
+ * CONSUME THE KIT, AND NEVER FAIL THE RESTORE OVER IT (RECOVERY.md:
+ * "consume failures … never block the restore: they announce and retry
+ * on the flush cadence's backoff loop").
+ *
+ * The announcement is the SCHEDULER'S OWN SURFACE rather than a new one:
+ * the failure counts as a flush-direction failure, so it escalates
+ * toward the announce-after-three threshold, leaves its sentence in
+ * `lastError`, and is retried on the same jittered backoff. The one
+ * thing that count cannot say — WHAT is outstanding — is
+ * `SyncStatus.consumePending`.
+ */
+async function settleConsume(live: Engine): Promise<void> {
+  try {
+    await consumeAndCheckpoint(live);
+  } catch (e) {
+    consumePending = true;
+    const delay = noteSyncOutcome("flush", e);
+    armFlush(delay, false);
+  }
+}
+
+/**
+ * CONSUME, THEN CHECKPOINT — and the checkpoint is not bookkeeping, it
+ * is what keeps the consume from being UNDONE by the next respawn.
+ *
+ * THE STRAND HAZARD, in full, because it cost a track to find. The
+ * consume's last act inside the guest is `recovery_clear` — a write to
+ * the LIVE us-doc — followed by the guest's own `bucket_flush(us)`.
+ * Both landed; neither survives a worker death, and here is why each
+ * half fails to save the other:
+ *
+ *   * THE CHECKPOINT NEVER ARMS ITSELF. The debounce hooks live in
+ *     `call()`, which is the dispatcher for CLIENT requests only. Every
+ *     driver call this file makes internally — the fan-out, the flush
+ *     cycles, this consume — goes straight to `engine.driver` and arms
+ *     nothing. So a mutation made after a sequence's last checkpoint is
+ *     simply not in any checkpoint, and a respawn resumes the state as
+ *     it was BEFORE the consume: the spent kit back in the account's
+ *     registry, on the one device most likely to be looking at it.
+ *   * THE BUCKET COPY IS OUT OF ITS OWN REACH. The clear WAS flushed —
+ *     under THIS device's own keyed object names — and `pullCycle`
+ *     self-filters the device out of its own sibling fan-out (a device
+ *     does not pull from itself). So the flushed clear is durable and
+ *     permanently invisible to every future resume of its author. It
+ *     heals only when some OTHER device pulls it and re-manifests it,
+ *     which is exactly what the account that just used its last-resort
+ *     kit does not have.
+ *
+ * The record's checkpoint-BEFORE-consume ordering stays as it is: a
+ * crash between the consume and a FIRST checkpoint would burn the kit
+ * with nothing durable to show for it, which is a lockout. So this is a
+ * SECOND checkpoint, after the fact, and the first one is untouched.
+ *
+ * `consumePending` IS CLEARED LAST, after the checkpoint has landed.
+ * A checkpoint that fails leaves the obligation standing and the retry
+ * runs the whole thing again — which is safe precisely because
+ * `recovery-consume` is idempotent by contract (absence is success), so
+ * a second pass over an already-consumed kit succeeds and reaches the
+ * checkpoint that failed the first time.
+ */
+async function consumeAndCheckpoint(live: Engine): Promise<void> {
+  await live.driver.recoveryConsume();
+  // Through `checkpoint()`, never `stateCheckpoint()` directly: that is
+  // the file's serialization point for checkpoints (they queue against
+  // each other on `checkpointChain` and against nothing else), and it is
+  // what keeps `lastCheckpoint` honest in `status()`.
+  await checkpoint();
+  consumePending = false;
+}
+
+/**
+ * MINT A RECOVERY KIT (RECOVERY.md, "The kit ceremony").
+ *
+ * The guest owns every refusal that matters — no bound store, no
+ * account, a bucket kit on a provider that cannot address objects by
+ * name — and they arrive as ordinary engine errors through the typed
+ * failure path. Nothing here second-guesses them.
+ *
+ * THE FAN-OUT IS STEP 6 AND IT IS PART OF THE CEREMONY, not a
+ * background nicety: "the worker then flushes the us-doc and every named
+ * partition, so the kit is valid the moment the ceremony reports
+ * success". The guest flushes the us-doc itself (`publish_account`); the
+ * PARTITIONS are ours, because a kit whose account names a partition the
+ * bucket has never seen restores an account with no content.
+ *
+ * A FAILED FAN-OUT DOES NOT UNMAKE THE KIT — the device is enrolled and
+ * the phrase is already minted, so refusing here would hand back nothing
+ * for a kit that exists. It leaves the ordinary flush schedule armed and
+ * the failure visible where every other flush failure is.
+ */
+async function createRecoveryKit(spec: RecoveryKitSpec): Promise<RecoveryKitResult> {
+  const out = await holdingStore(() => kitCeremony(spec));
+  // THE FAN-OUT IS OUTSIDE THE HOLD, and it has to be: `syncFlushNow`
+  // runs the scheduler's OWN cycle, and `syncMayRun` refuses to run one
+  // while a client bucket op is outstanding. Holding the store across
+  // it would silently turn ceremony step 6 into a no-op — which is the
+  // "kit that looks valid and is not" the step exists to prevent.
+  await syncFlushNow();
+  // AND A CHECKPOINT, for `consumeAndCheckpoint`'s reason exactly. This
+  // ceremony reaches the engine from the HOST surface (`callHost`), not
+  // through `call()`, so nothing here arms the mutation debounce — and
+  // what it just wrote is a minted device, an epoch rotation, a K_p
+  // grant and the account's `recovery` row. All of it went to the bucket
+  // under THIS device's own keyed names, which the pull fan-out
+  // self-filters, so a respawn before some unrelated client mutation
+  // happened to arm a checkpoint would resume an account that has never
+  // heard of the kit whose phrase the user has just written down.
+  //
+  // SWALLOWED, and the swallow is the same ruling the fan-out above
+  // takes: the kit EXISTS and the phrase is minted and returned once, so
+  // rejecting here would hand back nothing for a kit that is real, and
+  // a caller retrying would mint a second one. A failed local checkpoint
+  // is a device in trouble for other reasons, and the next mutation's
+  // debounce catches up.
+  await checkpoint().catch(() => {});
+  return out;
+}
+
+async function kitCeremony(spec: RecoveryKitSpec): Promise<RecoveryKitResult> {
+  if (!engine) {
+    throw new SealError("no-rung", "the device is sealed; open it before creating a recovery kit");
+  }
+  const live = engine;
+  let out: RecoveryKitResult;
+  if (spec.kind === "bucket") {
+    out = { kind: "bucket", phrase: await live.driver.recoveryKitCreateBucket(spec.label) };
+  } else {
+    try {
+      out = {
+        kind: "file",
+        bundle: await live.driver.recoveryKitCreateFile(spec.label, spec.passphrase),
+      };
+    } finally {
+      spec.passphrase = "";
+    }
+  }
+  return out;
+}
+
 
 // --- the checkpoint cadence -------------------------------------------------
 //
@@ -1850,7 +2307,24 @@ function scheduleCheckpoint(): void {
 // requests, or decides a pull is unnecessary — if that logic ever grows
 // a bug, this file is not where it lives.
 //
+// THE CYCLES MUTATE CHECKPOINTED STATE AND ARM NO CHECKPOINT, and that
+// is recorded rather than fixed. A flush or a pull writes the guest's
+// per-doc bucket state (#93: the name-key chain and the flushed-chunk
+// map are in the checkpoint), and these calls are INTERNAL — `call()`'s
+// debounce hooks are for client requests only — so a cycle's work is not
+// checkpointed until some unrelated mutation happens to arm one. It is
+// the same shape as the hazard `consumeAndCheckpoint` exists for, and it
+// is left alone because the consequence is not the same: this state
+// SELF-HEALS. The chain is re-read from the account document
+// (`ensure_bucket_state`'s case 1, since SYNC.md §1 made the us-doc its
+// source of truth) and the flushed-chunk map is repopulated from the
+// manifests the next pull reads, so the cost of losing it is at most one
+// duplicate upload, never a fact that cannot be recovered. Checkpointing
+// per cycle instead would put a disk write on every idle 45 s tick of
+// every bound device, which is a real price for a self-healing map.
+//
 // BACKOFF IS PER DIRECTION AND UNTRIAGED. Any failed background cycle
+
 // backs the direction off (truncated exponential, base 5 s, factor 2,
 // cap 10 min, jittered), because "transient-vs-permanent triage is not
 // worth string-matching error text for a background loop" — Google's
@@ -1876,6 +2350,34 @@ let pullFailures = 0;
 let lastFlush: number | null = null;
 let lastPull: number | null = null;
 let lastSyncError: string | null = null;
+/**
+ * A RESTORED DEVICE'S KIT IS STILL WAITING TO BE RETIRED — see
+ * `settleConsume`. Cleared by the first `recoveryConsume()` that
+ * succeeds, from wherever it is attempted; absence is success by
+ * contract, so this never becomes permanently stuck on a kit somebody
+ * else already revoked.
+ */
+let consumePending = false;
+
+/**
+ * THE US-DOC, AS THE BUCKET SURFACE NAMES IT: an EMPTY doc-id
+ * (engine.wit's `bucket-flush`/`bucket-pull`; RECOVERY.md, "The us-doc
+ * through the bucket, unparked").
+ *
+ * SYNC.md §3 scoped the cycle to the pointer map and parked the us-doc;
+ * this is the unparking. The account document has to BE in the bucket
+ * because a cold restore reads the account out of it — and the engine
+ * flushes it only at the moments the engine controls (kit create,
+ * revoke, consume), so a restore can otherwise be only as fresh as the
+ * last of those.
+ *
+ * THE SPELLING IS `new Uint8Array(0)`: `list<u8>` lowers to a typed
+ * array through this adapter, so the empty list is an empty typed array
+ * — not `undefined`, and not an omitted argument. One frozen instance
+ * because it is read-only by every caller and minting one per cycle
+ * would be noise.
+ */
+const US_DOC: Uint8Array = new Uint8Array(0);
 
 let flushTimer: number | undefined;
 let pullTimer: number | undefined;
@@ -1924,6 +2426,19 @@ const CLIENT_BUCKET_METHODS: ReadonlySet<string> = new Set([
   "bucketFlush",
   "bucketPull",
   "initStore",
+  // THE RECOVERY CEREMONIES ARE CLIENT BUCKET OPS TOO, and for the
+  // reason above rather than by analogy: each of them writes or deletes
+  // objects (the bundle, the K_p) and flushes the account document, and
+  // a background cycle landing in the middle of one would race a
+  // ceremony the user is watching — and would make a gate row's
+  // assertion about "what one ceremony wrote" false. `recoveryKits` is
+  // absent because it reads a document and touches no store.
+  "recoveryKitCreateBucket",
+  "recoveryKitCreateFile",
+  "recoveryRestoreBucket",
+  "recoveryRestoreFile",
+  "recoveryConsume",
+  "recoveryKitRevoke",
 ]);
 let clientBucketOps = 0;
 
@@ -1994,7 +2509,7 @@ async function syncMayRun(): Promise<Engine | null> {
 
 /**
  * THE PARTITIONS A CYCLE COVERS: the ACCOUNT POINTER MAP, re-read every
- * cycle (SYNC.md §3, "Scope").
+ * cycle (SYNC.md §3, "Scope"), or NULL for "this device has no account".
  *
  * Re-read rather than cached because a partition added on another device
  * arrives through the account's own sync, and a cached list would keep
@@ -2010,13 +2525,74 @@ async function syncMayRun(): Promise<Engine | null> {
  * broken sync at a device that was never asked to sync anything. Read
  * failures of the map are therefore ABSENCE, not error; failures of the
  * flush/pull calls themselves are what the backoff is about.
+ *
+ * NULL AND `[]` ARE NOW DIFFERENT ANSWERS, and the us-doc is why. An
+ * account with an empty pointer map still HAS an account document to
+ * flush and pull (RECOVERY.md's unparking), so "no partitions" can no
+ * longer stand in for "nothing to do". The refusal above is the honest
+ * test for the account's existence — it is the same call, asked for its
+ * other meaning.
  */
-async function syncScope(live: Engine): Promise<UsPartition[]> {
+async function syncScope(live: Engine): Promise<UsPartition[] | null> {
   try {
     return await live.driver.usPartitions();
   } catch {
+    return null;
+  }
+}
+
+/**
+ * THIS ACCOUNT'S OTHER DEVICES — the pull fan-out's other axis
+ * (`pullCycle`'s header has the argument for why a fan-out is what
+ * "pull whatever my other devices wrote" means).
+ *
+ * Revoked entries are dropped, and so is this device itself, by the
+ * agent id `meta` recorded at init or restore. NO DIRECTORY IS ABSENCE:
+ * an account-less device's ordinary state is an empty sibling list, not
+ * a failed cycle.
+ */
+async function siblingsOf(live: Engine): Promise<{ agentId: Uint8Array }[]> {
+  const self = (await ns.get<string>("meta", AGENT_KEY)) ?? null;
+  try {
+    return (await live.driver.usDevicesList())
+      .filter((d) => !d.revoked && (self === null || hexOf(d.agentId) !== self));
+  } catch {
     return [];
   }
+}
+
+/**
+ * PULL THE ACCOUNT DOCUMENT from every sibling, absence-tolerant.
+ *
+ * IT GOES FIRST IN EVERY CYCLE, and the ordering is the whole point:
+ * the us-doc's content IS the pointer map and the device directory, so
+ * the content pulls that follow chain off what this one brought in. A
+ * cycle that read the map first would fan out over yesterday's set.
+ *
+ * A SIBLING THAT HAS NEVER FLUSHED THE US-DOC IS ABSENCE, NEVER AN
+ * ERROR — it is the ordinary state of a device that was enrolled and has
+ * not synced yet, and it must not cost the siblings that would have
+ * worked. So the per-pair outcome is counted (for `pullCycle`'s
+ * every-pair-failed rule) and never thrown.
+ */
+async function pullUsDoc(
+  live: Engine,
+  siblings: { agentId: Uint8Array }[],
+): Promise<{ attempted: number; succeeded: number; failure: unknown | null }> {
+  let attempted = 0;
+  let succeeded = 0;
+  let failure: unknown | null = null;
+  for (const sib of siblings) {
+    if (engine !== live || dek === null || destroyed) break;
+    attempted++;
+    try {
+      await live.driver.bucketPull(US_DOC, sib.agentId, undefined);
+      succeeded++;
+    } catch (e) {
+      failure ??= e;
+    }
+  }
+  return { attempted, succeeded, failure };
 }
 
 /** Record a cycle's outcome and hand back the delay the direction's next
@@ -2042,7 +2618,8 @@ function noteSyncOutcome(direction: "flush" | "pull", failure: unknown | null): 
 }
 
 /**
- * ONE FLUSH CYCLE: every partition in the pointer map, in order.
+ * ONE FLUSH CYCLE: the ACCOUNT DOCUMENT first, then every partition in
+ * the pointer map, in order.
  *
  * A partition that fails does NOT stop the ones after it — a doc whose
  * objects a provider is refusing is no reason to leave the others
@@ -2050,6 +2627,19 @@ function noteSyncOutcome(direction: "flush" | "pull", failure: unknown | null): 
  * failed, which is the literal reading of SYNC.md §3's "ANY failed
  * background flush". The first failure is the one whose sentence is
  * kept, because it is the one with the least other noise in front of it.
+ *
+ * THE US-DOC RIDES THE SAME DEBOUNCE (RECOVERY.md's unparking). It is
+ * armed by the same mutation hook as everything else, which is correct
+ * without a special case: `usProfileSet`, `usMarkPut`, `usPartitionPut`,
+ * `usDeviceEndpointPut` and the rest are all NON-readonly methods, so a
+ * write to the account document already schedules a flush through
+ * `call()`. It goes FIRST so a cycle that dies halfway has published the
+ * account state that names everything else.
+ *
+ * AND THE OUTSTANDING CONSUME, at the head of the cycle. A restore whose
+ * kit could not be retired retries here — this is the "flush cadence's
+ * backoff loop" engine.wit's `recovery-consume` names, and the retry is
+ * safe because absence is success by contract.
  */
 async function flushCycle(): Promise<void> {
   const live = await syncMayRun();
@@ -2057,9 +2647,34 @@ async function flushCycle(): Promise<void> {
     armFlush(FLUSH_DEBOUNCE_MS, false);
     return;
   }
-  const parts = await syncScope(live);
-  if (parts.length === 0) return; // nothing to do; the next mutation re-arms
   let failure: unknown | null = null;
+  if (consumePending) {
+    try {
+      // AND THE CHECKPOINT THAT MAKES IT STICK — the retry path needs it
+      // exactly as much as the restore's own does, and for the same
+      // reason: this call is internal, so nothing here arms the
+      // debounce, and a consume that outlives its checkpoint is undone
+      // by the next respawn while its bucket copy stays self-filtered
+      // out of its own reach. See `consumeAndCheckpoint`.
+      await consumeAndCheckpoint(live);
+    } catch (e) {
+      failure ??= e;
+    }
+  }
+  const parts = await syncScope(live);
+  if (parts === null) {
+    // No account: no us-doc to flush and no map to walk. The next
+    // mutation re-arms — except that an outstanding consume has to keep
+    // being retried, and a device with a kit to retire always has an
+    // account, so this branch cannot strand one.
+    if (failure !== null) armFlush(noteSyncOutcome("flush", failure), true);
+    return;
+  }
+  try {
+    await live.driver.bucketFlush(US_DOC);
+  } catch (e) {
+    failure ??= e;
+  }
   for (const part of parts) {
     if (engine !== live || dek === null || destroyed) break;
     try {
@@ -2076,8 +2691,14 @@ async function flushCycle(): Promise<void> {
 }
 
 /**
- * ONE PULL CYCLE: every partition in the pointer map, from every SIBLING
- * DEVICE of this account that is not this one.
+ * ONE PULL CYCLE: the ACCOUNT DOCUMENT and then every partition in the
+ * pointer map, from every SIBLING DEVICE of this account that is not
+ * this one.
+ *
+ * THE US-DOC IS PULLED FIRST AND THE MAP IS RE-READ AFTER IT
+ * (RECOVERY.md's unparking of "the us-doc through the bucket"): the
+ * account document carries the pointer map and the device directory, so
+ * it is what the content pulls chain off. See `pullUsDoc`.
  *
  * WHY A FAN-OUT AT ALL. `bucketPull(docId, ownerId, pickup)` names the
  * device whose keyed namespace is being read (the bringup's cold pull
@@ -2111,25 +2732,22 @@ async function pullCycle(): Promise<void> {
     armPull(PULL_INTERVAL_MS);
     return;
   }
-  const parts = await syncScope(live);
-  const self = (await ns.get<string>("meta", AGENT_KEY)) ?? null;
-  let siblings: { agentId: Uint8Array }[] = [];
-  try {
-    siblings = (await live.driver.usDevicesList())
-      .filter((d) => !d.revoked && (self === null || hexOf(d.agentId) !== self));
-  } catch {
-    // No account directory is the account-less device's ordinary state,
-    // and it is ABSENCE for `syncScope`'s reason: nothing to pull from.
-    siblings = [];
-  }
-  if (parts.length === 0 || siblings.length === 0) {
+  const siblings = await siblingsOf(live);
+  if (siblings.length === 0) {
     armPull(PULL_INTERVAL_MS);
     return;
   }
-  let attempted = 0;
-  let succeeded = 0;
-  let failure: unknown | null = null;
-  for (const part of parts) {
+  // THE ACCOUNT DOCUMENT FIRST, and then the map it just updated — see
+  // `pullUsDoc`. Reading the scope AFTER this pull rather than before is
+  // the whole reason the ordering is specified: a partition a sibling
+  // published a minute ago is in the map this pull brought in, and a
+  // cycle that read the map first would not fetch it until the next one.
+  const us = await pullUsDoc(live, siblings);
+  let attempted = us.attempted;
+  let succeeded = us.succeeded;
+  let failure: unknown | null = us.failure;
+  const parts = await syncScope(live);
+  for (const part of parts ?? []) {
     for (const sib of siblings) {
       if (engine !== live || dek === null || destroyed) break;
       attempted++;
@@ -2258,6 +2876,13 @@ function rearmSyncSchedule(): void {
  * with a destination; a device that has just been unbound, resealed or
  * re-pointed is not in that conversation any more, so carrying a failure
  * count across would announce an old bucket's outage against a new one.
+ *
+ * `consumePending` DOES NOT GO WITH THEM, deliberately: it is not a
+ * fact about a conversation but an OBLIGATION this device took on when
+ * it restored — the kit is still live in the account until something
+ * retires it. A reseal does not retire it, so the flag survives to be
+ * retried at the next cycle. (An ERASE does end it, by ending the
+ * global that holds it.)
  */
 function stopSyncSchedule(): void {
   if (flushTimer !== undefined) {
@@ -2294,7 +2919,14 @@ function syncFlushNow(): Promise<void> {
  * cannot-know/has-no-opinion split rpc.ts documents. */
 function syncStatusOf(binding: StoreBinding | null): SyncStatus | null {
   if (dek === null || binding === null) return null;
-  return { lastFlush, lastPull, flushFailures, pullFailures, lastError: lastSyncError };
+  return {
+    lastFlush,
+    lastPull,
+    flushFailures,
+    pullFailures,
+    lastError: lastSyncError,
+    consumePending,
+  };
 }
 
 // --- status -----------------------------------------------------------------
@@ -2407,6 +3039,49 @@ async function callHost(method: string, args: unknown[]): Promise<unknown> {
       return await bindStore(args[0] as StoreBinding);
     case "unbindStore":
       return await unbindStore();
+    // --- account recovery (RECOVERY.md; the ordering lives in
+    // --- `restore` and the reason it is a method in rpc.ts's
+    // --- `RestoreSpec`).
+    case "restorePrepare":
+      return await restorePrepare((args[0] as UnsealOptions) ?? {});
+    case "restore":
+      return await restore(args[0] as RestoreSpec);
+    case "createRecoveryKit":
+      return await createRecoveryKit(args[0] as RecoveryKitSpec);
+    case "recoveryKits": {
+      // A pure read, but it goes through the host surface beside its two
+      // siblings so a sheet has ONE place to reach for kit management
+      // rather than one method on the host and one on the proxied
+      // driver. The refusals are the guest's own.
+      if (!engine) {
+        throw new SealError("no-rung", "the device is sealed; open it before listing kits");
+      }
+      return await engine.driver.recoveryKits();
+    }
+    case "revokeRecoveryKit": {
+      // The guest does the whole revocation — membership, the K_p, the
+      // epoch rotation, the bundle object, the record — and flushes the
+      // account document itself, so there is nothing to arrange here
+      // beyond handing back the guarantee note the UI renders. The
+      // partition flush the rotation implies rides the ordinary
+      // mutation-armed cadence.
+      if (!engine) {
+        throw new SealError("no-rung", "the device is sealed; open it before revoking a kit");
+      }
+      const note = await engine.driver.recoveryKitRevoke(args[0] as Uint8Array);
+      // AND A CHECKPOINT, the third instance of `consumeAndCheckpoint`'s
+      // hazard: a HOST-surface call arms no debounce, and everything
+      // this one wrote — the revoked membership, the new name-key epoch,
+      // the cleared registry row — would be resurrected by a respawn,
+      // with the bucket's copy self-filtered out of this device's own
+      // reach. A resurrected REVOCATION is the worst of the three: the
+      // device would go on believing a kit it has already destroyed is
+      // live. Swallowed for the kit ceremony's reason — the revocation
+      // has already happened at the provider, so reporting a failure
+      // here would be reporting a revoke that did not occur.
+      await checkpoint().catch(() => {});
+      return note;
+    }
     case "oauthStart":
       return await oauthStart(args[0] as OauthStartSpec);
     case "oauthComplete":

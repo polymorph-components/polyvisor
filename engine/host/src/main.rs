@@ -46,6 +46,7 @@ mod bindings {
 }
 
 mod pairing_acts;
+mod recover_acts;
 mod resume_acts;
 
 use bindings::exports::polyvisor::engine::driver::{Guest as Driver, S3Config, StoreConfig};
@@ -558,8 +559,28 @@ async fn main() -> Result<()> {
         };
         return pairing_scenarios(&engine, &component, &linker, &make_store, relay, &probe).await;
     }
+    if acts == "recover" {
+        // The recovery battery (#11; runtime/RECOVERY.md's T-A gate).
+        // Its own bucket, named for this process, for the reason the
+        // other two take one: the acts assert over the WHOLE key set
+        // (bundle objects present, then exactly two objects gone at
+        // consume), so a co-tenant's leftovers would be counted as ours.
+        //
+        // NO RELAY IS USED AT ALL — deliberately. The claim under test
+        // is "restores on a fresh browser with no live peer anywhere",
+        // and an act with a peer available could not tell a bucket-only
+        // bootstrap from a wire-assisted one.
+        let probe = resume_acts::S3Probe {
+            endpoint: s3.endpoint.clone(),
+            bucket: format!("pm-recover-{}", std::process::id()),
+            access: s3.access.clone(),
+            secret: (*egress.secret).clone(),
+            http: reqwest::Client::new(),
+        };
+        return recover_scenarios(&component, &linker, &make_store, &probe).await;
+    }
     if acts != "full" {
-        bail!("unknown act set {acts} (want `full`, `pairing` or `resume`)");
+        bail!("unknown act set {acts} (want `full`, `pairing`, `resume` or `recover`)");
     }
 
     let mut store = make_store(&[]);
@@ -581,6 +602,62 @@ async fn main() -> Result<()> {
             scenario(acc, laptop, phone, bob, tablet, laptop2, laptop3, relay, s3).await
         })
         .await?
+}
+
+/// The recovery act set (#11; runtime/RECOVERY.md).
+///
+/// SEVEN INSTANCES, one store. Component instances do not share linear
+/// memory, so every "fresh browser" below is genuinely fresh: an
+/// uninitialized engine whose only inputs are the store config and the
+/// kit material the act hands it. The account device is the only one
+/// that ever calls `init`.
+async fn recover_scenarios(
+    component: &Component,
+    linker: &Linker<Ctx>,
+    make_store: &StoreFactory<'_>,
+    probe: &resume_acts::S3Probe,
+) -> Result<()> {
+    let mut store = make_store(&[]);
+    let account = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    let restored = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    let double = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    let wrong_phrase = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    let file_wrong_pass =
+        bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    let file_restored = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    let file_double = bindings::Engine::instantiate_async(&mut store, component, linker).await?;
+    println!("instantiated the account device + 6 fresh restore shells");
+
+    let probe = probe.clone();
+    let outcome = store
+        .run_concurrent(async move |acc| {
+            recover_acts::recover_act(
+                acc,
+                account,
+                recover_acts::Shells {
+                    restored,
+                    double,
+                    wrong_phrase,
+                    file_wrong_pass,
+                    file_restored,
+                    file_double,
+                },
+                &probe,
+            )
+            .await
+        })
+        .await?
+        .map_err(|e| e.to_string());
+    match outcome {
+        Ok(()) => {
+            println!("\nrecovery acts: ALL GREEN");
+            Ok(())
+        }
+        Err(e) => {
+            println!("\nrecovery acts: FAILED: {e}");
+            bail!("the recovery act set failed")
+        }
+    }
 }
 
 /// Builds a store with the given WASI environment and, optionally, a

@@ -137,6 +137,31 @@ export interface DevicePickerHost {
    * device never needs a passphrase, so a refusal here is only ever a
    * report. */
   openNew(): Promise<void>;
+  /** RESTORE AN ACCOUNT FROM A RECOVERY KIT (runtime/RECOVERY.md,
+   * "Restore"). The account outlives its last device, so this door must
+   * exist on a browser that holds NO device of that account — which is
+   * every browser a real recovery happens on.
+   *
+   * THE CEREMONY IS THE HOST'S, exactly as `openWithPasskey`'s is, and
+   * for a stronger reason: restoring collects a destination, storage
+   * credentials, a kit secret and a device name, and drives a
+   * multi-stage worker bring-up. None of that is the visor's to know.
+   * The visor renders the door; the host walks it.
+   *
+   * THIS MODULE CLOSES THE PICKER BEFORE CALLING, and does not reopen
+   * it. That is a departure from the resolve/reject contract above and
+   * it is deliberate: the picker is an EXCLUSIVE drawer tenant, so a
+   * ceremony that needs the drawer cannot have it while the picker
+   * holds it. The host therefore owns the whole drawer from here on —
+   * including putting the user back at a usable entry surface if the
+   * restore is abandoned or refused (runtime/RECOVERY.md's ceremony
+   * must never wedge the way in). A rejection is not rendered here,
+   * because by then there is nothing here to render into.
+   *
+   * OPTIONAL because an embedder may ship no recovery path at all; the
+   * control is simply not drawn on such a host, rather than drawn and
+   * then apologised for. */
+  restore?(): Promise<void>;
 }
 
 /** Read a rejection as a refusal, without trusting its shape. */
@@ -267,7 +292,23 @@ export function mountDevicePicker(
   newBtn.id = "device-new";
   newBtn.textContent = "Set up a new device here";
 
+  // THE RECOVERY DOOR. Drawn only when the host has one — and drawn
+  // WHATEVER `rows` holds, because the question it answers ("all my
+  // devices are gone") is independent of what this browser happens to
+  // remember. A browser with three unrelated devices in its index is
+  // still a browser someone may be recovering an account onto.
+  //
+  // SECONDARY, not primary: recovery is the rare door, and a control
+  // with the same weight as "open this device" would read as an
+  // invitation rather than a way out of a disaster.
+  const restoreBtn = document.createElement("button");
+  restoreBtn.type = "button";
+  restoreBtn.id = "device-restore";
+  restoreBtn.className = "entry-secondary";
+  restoreBtn.textContent = "Restore from a recovery kit…";
+
   root.append(heading, note, list, pass, passkey, problem, newBtn);
+  if (host.restore !== undefined) root.append(restoreBtn);
 
   /** THE HEIGHT IS MEASURED, so every visibility change owes the drawer
    * a re-measure: the sheet animates to a pixel target and clips
@@ -424,6 +465,20 @@ export function mountDevicePicker(
 
   if (opts.problem !== undefined && opts.problem !== "") showProblem(opts.problem);
 
+  // THE HANDOVER (see `DevicePickerHost.restore`): close first, then
+  // call. The picker is exclusive, so the drawer has to be given up
+  // before a ceremony that needs it can open — and closing first also
+  // means a host whose ceremony throws immediately cannot leave two
+  // sheets contending for the same slot.
+  restoreBtn.onclick = () => {
+    if (busy) return;
+    const run = host.restore;
+    if (run === undefined) return;
+    busy = true;
+    tenant.close();
+    void run();
+  };
+
   tenant.open({ root }, () => ({ root }));
 
   return {
@@ -440,6 +495,21 @@ export interface FirstRunHost {
    * created, and this module closes the sheet. Reject to re-enable the
    * fork and show the message on it. */
   newAccount(): Promise<void>;
+  /** RESTORE AN ACCOUNT FROM A RECOVERY KIT — the same door the picker
+   * carries, on the surface a VIRGIN BROWSER actually lands on.
+   *
+   * WHY IT IS HERE AS WELL, and this is the important half: a browser
+   * with no devices never sees the picker at all (the first-run path
+   * makes a device without asking — PERSISTENCE.md's try-then-keep), and
+   * a browser with no devices is exactly the browser a real recovery
+   * happens on. A recovery door that only appeared once you already had
+   * a device would be a door on the wrong side of the disaster.
+   *
+   * Same handover contract as `DevicePickerHost.restore`: this module
+   * closes the fork before calling and does not reopen it; the host owns
+   * the drawer, the ceremony, and returning the user to a usable
+   * surface. OPTIONAL for the same reason. */
+  restore?(): Promise<void>;
 }
 
 /**
@@ -542,10 +612,35 @@ export function offerFirstRun(
       "it there, and both of you check the same six digits.",
   );
 
+  // THE THIRD CHOICE — see `FirstRunHost.restore`. Rendered as a quiet
+  // control rather than a third peer of the two above: it is the answer
+  // to a disaster, not a way to start.
+  const restoreBtn = document.createElement("button");
+  restoreBtn.type = "button";
+  restoreBtn.id = "solo-restore-account";
+  restoreBtn.className = "entry-secondary";
+  restoreBtn.textContent = "Restore from a recovery kit…";
+  const restoreChoice = choice(
+    restoreBtn,
+    "Every device for this account is gone, and you kept a recovery kit — a phrase, or a " +
+      "file and its passphrase. You will need the storage this account syncs through as well.",
+  );
+
   const build = () => {
     if (phase === "join") root.replaceChildren(joinHeading, joinContainer);
-    else root.replaceChildren(forkHeading, newChoice, joinChoice, problem);
+    else if (host.restore !== undefined) {
+      root.replaceChildren(forkHeading, newChoice, joinChoice, restoreChoice, problem);
+    } else root.replaceChildren(forkHeading, newChoice, joinChoice, problem);
     return { root };
+  };
+
+  restoreBtn.onclick = () => {
+    const run = host.restore;
+    if (run === undefined) return;
+    // Close first, then call — the handover the picker's door makes, for
+    // the same reason: the ceremony needs the drawer this sheet is in.
+    tenant.close();
+    void run();
   };
 
   newBtn.onclick = () => {

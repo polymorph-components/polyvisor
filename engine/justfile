@@ -227,3 +227,43 @@ pair: compose relay-bin minio
         --acts pairing --relay http://127.0.0.1:3340 \
         --endpoint http://127.0.0.1:9000 \
         --access minioadmin --secret minioadmin
+
+# The RECOVERY.md T-A acts (#11): the recovery kit ceremony, the restore
+# on a fresh engine, consume, double-restore refusal, and revocation.
+#
+# NO RELAY IS DIALLED and none is needed — which is the whole claim under
+# test: "restores on a fresh browser with no live peer anywhere". The
+# relay is still a recipe dependency so the binary is present and the
+# recipe's shape matches `pair`/`resume`; nothing here connects to it.
+#
+# MinIO is the only channel. Own bucket, named for the host pid, and the
+# same fixed-port guard `pair`/`resume` carry: the acts assert over the
+# WHOLE key set (bundle objects present, then exactly two objects gone at
+# consume), so probing a co-tenant's server would pass for the wrong
+# reason.
+recover: compose relay-bin minio
+    #!/usr/bin/env bash
+    set -euo pipefail
+    data="$(mktemp -d /tmp/pm-recover-minio.XXXXXX)"
+    MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+        .deps/minio server "$data" --address 127.0.0.1:9000 --quiet &
+    minio_pid=$!
+    # Ordered teardown, as in `pair`/`resume`: MinIO is still writing into
+    # $data when it is signalled, so removing the tree without waiting
+    # loses the race often enough to fail an otherwise-passing recipe on
+    # its own cleanup.
+    trap 'kill $minio_pid 2>/dev/null || true; wait $minio_pid 2>/dev/null || true; rm -rf "$data" 2>/dev/null || true' EXIT
+    for _ in $(seq 1 50); do
+        if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then break; fi
+        sleep 0.2
+    done
+    if ! kill -0 "$minio_pid" 2>/dev/null; then
+        echo "minio did not survive startup on 127.0.0.1:9000 (port already in use?)" >&2
+        echo "the recovery acts would have probed someone else's server; refusing" >&2
+        exit 1
+    fi
+    sleep 0.5
+    cargo run --release -p engine-host -- target/composed.wasm \
+        --acts recover \
+        --endpoint http://127.0.0.1:9000 \
+        --access minioadmin --secret minioadmin

@@ -294,6 +294,115 @@ const s3LogGet = (port: number): Promise<S3LogEntry[]> =>
 const s3LogClear = (port: number): Promise<void> =>
   fetch(`http://127.0.0.1:${port}/__s3log/clear`, { method: "POST" }).then(() => {});
 
+// --- the S3-shaped OBJECT STORE (recovery rows 57+) -----------------------------
+//
+// A STORE, NOT A RECORDER, AND THAT IS THE DIFFERENCE THAT MATTERS. The
+// recorder above answers every GET with 404 by design — it exists to
+// observe that a signed request left the worker, and the rows that use
+// it assert egress rather than durability. The RECOVERY rows cannot
+// live on that: a restore READS the account out of the bucket (that is
+// the whole claim), so the kit's bundle, the K_p and every flushed
+// object have to still be there when a second device asks for them.
+//
+// So this is a separate server on its own ephemeral port rather than an
+// upgrade of the recorder: every existing row keeps the backend it was
+// written against, and nothing about "GET is always a 404" changes
+// underneath rows 28-47.
+//
+// It implements exactly what providers/s3/store's four verbs need
+// (`/{bucket}` for the bucket, `/{bucket}/{key}` for an object; keys
+// contain slashes — `recovery/<hex>` — so the key is everything after
+// the first segment) and NOT S3: no signature is checked, no ACL, no
+// versioning, no listing. The signing claim is rows 30/33's and is
+// measured against the recorder.
+//
+// DELETE ANSWERS 204 WHETHER OR NOT THE OBJECT WAS THERE, which is real
+// S3 behaviour and is exactly the property `recovery-consume`'s
+// idempotency contract rests on ("absence is success ... a retry after
+// partial success must not error on an object that is already gone").
+// `refuseNextDeletes` is the injected outage for the consume-failure
+// row: it refuses the DELETE and NOTHING else, so a restore still
+// succeeds end to end and only its tail fails — which is the exact
+// shape RECOVERY.md says must never block a restore.
+interface ObjectStoreHandle {
+  server: Deno.HttpServer;
+  port: number;
+  /** Every object key currently stored, sorted. Names only — no bytes
+   * ever leave this harness, and the names are keyed hashes anyway. */
+  names(): string[];
+  /** Refuse the next `n` DELETEs with a 503. `Infinity` for an outage
+   * with no end until it is healed with 0. */
+  refuseNextDeletes(n: number): void;
+  deleteRefusalsPending(): number;
+}
+
+function serveObjects(): ObjectStoreHandle {
+  const objects = new Map<string, Uint8Array>();
+  const buckets = new Set<string>();
+  let refuseDeletes = 0;
+  let port = 0;
+  const cors = {
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET, PUT, POST, DELETE, OPTIONS",
+    "access-control-allow-headers": "*",
+  };
+  const server = Deno.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    onListen: (addr) => {
+      port = addr.port;
+    },
+  }, async (req) => {
+    if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+    const url = new URL(req.url);
+    const segments = url.pathname.replace(/^\//, "").split("/");
+    const bucket = segments[0] ?? "";
+    const key = segments.slice(1).join("/");
+    if (key === "") {
+      // The bucket itself: `ensureBucket`'s PUT, and nothing else.
+      if (req.method === "PUT") {
+        buckets.add(bucket);
+        return new Response(null, { status: 200, headers: cors });
+      }
+      return new Response(null, { status: buckets.has(bucket) ? 200 : 404, headers: cors });
+    }
+    if (req.method === "PUT") {
+      objects.set(key, new Uint8Array(await req.arrayBuffer()));
+      return new Response(null, { status: 200, headers: cors });
+    }
+    if (req.method === "GET") {
+      const body = objects.get(key);
+      if (!body) return new Response(null, { status: 404, headers: cors });
+      return new Response(body as BodyInit, {
+        status: 200,
+        headers: { ...cors, "content-type": "application/octet-stream" },
+      });
+    }
+    if (req.method === "DELETE") {
+      if (refuseDeletes > 0) {
+        refuseDeletes--;
+        return new Response("injected outage: this store is refusing deletes", {
+          status: 503,
+          headers: cors,
+        });
+      }
+      // 204 whether or not it was there — see the header.
+      objects.delete(key);
+      return new Response(null, { status: 204, headers: cors });
+    }
+    return new Response(null, { status: 405, headers: cors });
+  });
+  return {
+    server,
+    port,
+    names: () => [...objects.keys()].sort(),
+    refuseNextDeletes: (n: number) => {
+      refuseDeletes = n;
+    },
+    deleteRefusalsPending: () => (refuseDeletes === Infinity ? Infinity : refuseDeletes),
+  };
+}
+
 // Synthetic labeled S3 credentials — never realistic-looking material,
 // spelled the same way across every row that uses them.
 const S3_ACCESS_KEY = "SYNTHETIC-TEST-KEY";
@@ -464,6 +573,13 @@ async function main() {
   await new Promise((r) => setTimeout(r, 50));
   const s3Origin = `http://127.0.0.1:${s3Port}`;
   console.log(`s3 recorder: ${s3Origin}`);
+
+  // The recovery rows' backend: a real (tiny) object store, because a
+  // restore reads the account back out of the bucket. See `serveObjects`.
+  const objects = serveObjects();
+  await new Promise((r) => setTimeout(r, 50));
+  const objOrigin = `http://127.0.0.1:${objects.port}`;
+  console.log(`s3 object store: ${objOrigin}`);
 
   const fake = await startFakeDrive();
   // The fake now serves its own CORS (access-control-allow-origin: *,
@@ -2917,16 +3033,24 @@ async function main() {
         45_000,
       );
       const boardsAfter = syncBoards();
-      const board = boardsAfter[0]?.board ?? {};
-      const values = Object.values(board);
+      const boards = boardsAfter.map((b) => b.board);
+      // TWO DOC FOLDERS, NOT ONE, since RECOVERY.md unparked the us-doc:
+      // a cycle now flushes the ACCOUNT DOCUMENT (the empty-doc-id
+      // sentinel) as well as every partition in the pointer map. Each
+      // carries its own change board, and each board's single value is
+      // this device's FIRST committed flush of that doc — so "1" twice
+      // rather than "1" once. The count is the assertion it always was;
+      // what changed is the SCOPE of a cycle, deliberately.
+      const everyBoardFirstFlush = boards.length > 0 &&
+        boards.every((b) => Object.keys(b).length === 1 && Object.values(b)[0] === "1");
 
       const ok = consent.ok && bound.attempt.refused === false &&
         ensure.attempt.refused === false &&
         scoped.attempt.refused === false && scoped.names.includes("tasks") &&
         idleStatus.sync !== null && idleStatus.sync.lastFlush === null &&
         flushed.ok && flushed.sync.flushFailures === 0 &&
-        boardsBefore.length === 0 && boardsAfter.length === 1 &&
-        Object.keys(board).length === 1 && values[0] === "1";
+        boardsBefore.length === 0 && boardsAfter.length === 2 &&
+        everyBoardFirstFlush;
       record(
         "48 sync",
         "a mutation flushes itself within the debounce window, with no button pressed",
@@ -2940,11 +3064,13 @@ async function main() {
           `todo went in through the RPC and NOTHING ELSE was called: ${flushed.waitedMs} ms ` +
           `later (debounce 20 s + margin, deadline 45 s) status().sync=${j(flushed.sync)} — ` +
           `lastFlush stamped, flushFailures 0. The provider agrees: ${boardsAfter.length} doc ` +
-          `folder now, carrying the change board ${j(board)} — ONE key (16 hex characters of a ` +
-          `public verifying key) whose value is the decimal counter "1", this device's first ` +
-          `COMMITTED flush of this doc, patched after the manifest write that is the commit ` +
-          `point. A counter and a public tag are the only things that may ever go on that ` +
-          `board (SYNC.md §2).`,
+          `folders now — the tasks partition AND the ACCOUNT DOCUMENT, which rides the cycle ` +
+          `since RECOVERY.md unparked SYNC.md §3's parked item (the empty-doc-id sentinel; a ` +
+          `restore can only be as fresh as the last us flush) — carrying the change boards ` +
+          `${j(boards)}: each ONE key (16 hex characters of a public verifying key) whose value ` +
+          `is the decimal counter "1", this device's first COMMITTED flush of that doc, patched ` +
+          `after the manifest write that is the commit point. A counter and a public tag are ` +
+          `the only things that may ever go on that board (SYNC.md §2).`,
       );
     });
 
@@ -3716,12 +3842,729 @@ async function main() {
       await storm.close();
     });
 
+    // --- 54-60: ACCOUNT RECOVERY (runtime/RECOVERY.md) ---------------------
+    //
+    // "Losing every device does not lose the account." The kit ceremony
+    // mints a DORMANT MEMBER DEVICE whose secrets exist only inside a
+    // sealed bundle; restore boots that device on a fresh namespace and
+    // then consumes the kit, because a reusable kit would need a silent
+    // background re-exporter whose failure is invisible until the
+    // disaster it exists for.
+    //
+    // THE SECRETS NEVER REACH THIS FILE. The guest mints the phrase and
+    // the page holds it under a handle (page.ts's `phrases`); every row
+    // below drives a restore BY HANDLE, so no phrase and no bundle
+    // crosses the Playwright protocol or lands in this run's log. What
+    // the rows assert about them is shape (ten words), absence (the scan)
+    // and consequence (a restore that works, and one that refuses).
+    //
+    // THE BACKEND IS THE OBJECT STORE, not the recorder: see
+    // `serveObjects` for why the difference is structural rather than
+    // convenient.
+    const rcBinding = {
+      kind: "s3" as const,
+      endpoint: objOrigin,
+      bucket: "pm-recovery",
+      accessKey: S3_ACCESS_KEY,
+    };
+    // A wrong phrase, obviously synthetic and obviously not a kit's: ten
+    // words that no wordlist draw would produce together.
+    const WRONG_PHRASE = "wrong wrong wrong not the phrase test test test test test";
+    const FILE_PASS = "the-file-kit-passphrase-TEST";
+    const FILE_PASS_WRONG = "definitely-not-the-file-passphrase-TEST";
+    let rcDevice = "";
+    let rcKitHandle = "";
+    let rcRestored = "";
+    let objectsAfterKit: string[] = [];
+    let objectsAfterRestore: string[] = [];
+    const RC_TODOS = ["a todo from before the kit", "a second todo from before the kit"];
+    const RC_LATE = "a todo written AFTER the kit was minted";
+    const RC_NAME = "the machine it became";
+
+    // --- 57: the kit ceremony, and the phrase is nowhere on disk -----------
+    //
+    // RECOVERY.md pins the phrase: ten words from the EFF short
+    // wordlist, ~103.4 bits, "generated IN-GUEST (single authority for
+    // format and derivation), displayed once in visor pixels, never
+    // persisted anywhere".
+    //
+    // THE ABSENCE IS THE HEADLINE and it is asked the way the identity
+    // rows ask their at-rest questions: go and look. Every IndexedDB
+    // record on the origin (bytes included), both web-storage areas, and
+    // every file under every OPFS directory — searched for the phrase,
+    // for a slice of it, and for a whitespace-collapsed variant, as text
+    // AND as hex. A `clean` verdict here is the difference between "we
+    // do not write it down" as a claim and as a fact: the DEVICE STORE
+    // is the layer that persists things, so it is the layer that has to
+    // be searched.
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "recovery-origin",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const id = made.id as string;
+      rcDevice = id;
+      await probe(page, "hc-open", { id, unseal: { passphrase: PASS, untilReseal: true } });
+      await probe(page, "sx-escrow", {
+        origin: objOrigin,
+        accessKey: S3_ACCESS_KEY,
+        secret: S3_SECRET,
+      });
+      const bound = await probe(page, "hc-bind", { id, binding: rcBinding });
+      const ensure = await probe(page, "hc-ensure-bucket", { id });
+      // THE ACCOUNT IN THE SHAPE A REAL EMBEDDER BUILDS IT — the tasks
+      // partition DELEGATED TO THE USER GROUP, not to this device. See
+      // page.ts's `rc-account-create`: a device-delegated partition is
+      // unreadable by any device enrolled later, restored kits included,
+      // because BeeKEM adds are not retroactive.
+      const scoped = await probe(page, "rc-account-create", {
+        id,
+        displayName: "Synthetic Recovery Account",
+      });
+      await probe(page, "hc-add", { id, titles: RC_TODOS });
+      // The user's own Sync-now, not the schedule: this row wants
+      // determinism, and an explicit act deserves an explicit answer.
+      const flushed = await probe(page, "rc-flush-now", { id });
+
+      const kit = await probe(page, "rc-kit-create", {
+        id,
+        spec: { kind: "bucket", label: "paper backup" },
+      });
+      const kits = await probe(page, "rc-kits", { id });
+      const scan = kit.attempt.ok ? await probe(page, "rc-scan", { handle: kit.handle }) : null;
+      const devices = await probe(page, "rc-devices", { id });
+      if (kit.attempt.ok) rcKitHandle = kit.handle;
+      objectsAfterKit = objects.names();
+      const bundleObjects = objectsAfterKit.filter((n) => n.startsWith("recovery/"));
+
+      const ok = bound.attempt.refused === false && ensure.attempt.refused === false &&
+        j(scoped.names) === j(["tasks"]) && flushed.us.refused === false &&
+        kit.attempt.ok === true && kit.kind === "bucket" &&
+        kit.words === 10 && kit.allLowercaseWords === true &&
+        kits.attempt.ok === true && kits.kits.length === 1 &&
+        kits.kits[0].kind === "bucket" &&
+        devices.n === 2 && devices.names.includes("paper backup") &&
+        bundleObjects.length === 1 &&
+        scan !== null && scan.clean === true && scan.idbRecords > 0 && scan.opfsFiles > 0;
+      record(
+        "57 recovery",
+        "a bucket kit mints ten words, enrolls a dormant device — and the phrase is on no disk anywhere",
+        ok,
+        `an S3-bound device with an account and its tasks partition published minted a BUCKET ` +
+          `kit. The phrase came back with ${kit.words} words (RECOVERY.md pins ten from the EFF ` +
+          `short list, ~103.4 bits), all lowercase word characters: ${kit.allLowercaseWords} — ` +
+          `and it never left the page: the driver holds a HANDLE, not a secret. The account's ` +
+          `kit list is ${j(kits.kits)} (agent ids truncated to 12 hex characters here; they are ` +
+          `public keys, but a log is not the place for a whole one), and the kit is a real ` +
+          `DEVICE: the directory now names ${j(devices.names)} — ${devices.n} entries, the kit ` +
+          `beside the machine that minted it, revocable like any device. The store holds ` +
+          `${bundleObjects.length} object under \`recovery/\` (the phrase-derived name; the ` +
+          `provider sees it regardless and it unlocks nothing — the payload is sealed under the ` +
+          `phrase-derived KEK). THE SCAN: ${scan?.idbDatabases} IndexedDB database(s), ` +
+          `${scan?.idbRecords} records, ${scan?.storageEntries} web-storage entries and ` +
+          `${scan?.opfsFiles} OPFS files were searched for the phrase, for a three-word slice of ` +
+          `it and for a whitespace-collapsed variant, as text and as hex. Hits: ` +
+          `${j(scan?.hits ?? [])}.`,
+      );
+    });
+
+    // --- 58: the restore round trip, on a SECOND device namespace ----------
+    //
+    // THE CLAIM RECOVERY.md OPENS WITH, made executable in one browser:
+    // a fresh device namespace with no engine state, no identity and no
+    // account boots from the kit plus the destination alone, and comes
+    // up holding the account's content.
+    //
+    // THE LATE WRITE IS THE POINT OF THE THIRD TODO. A kit is a key to
+    // the BUCKET, not a snapshot of the account (RECOVERY.md: "the kit
+    // is the bucket's key, not a second bucket"), so a todo written
+    // AFTER the ceremony has to arrive too — which is only true if the
+    // restore actually rehydrates from the store rather than from
+    // anything bundled.
+    //
+    // AND THE NAME: "the kit's label gives way to the user's word for
+    // the machine it became" (engine.wit's `recovery-restore-bucket`).
+    // The devices sheet must show the ceremony's name, not "paper
+    // backup".
+    await guard(async () => {
+      await probe(page, "hc-add", { id: rcDevice, titles: [RC_LATE] });
+      const flushed = await probe(page, "rc-flush-now", { id: rcDevice });
+      const before = await probe(page, "hc-items", { id: rcDevice });
+
+      const restored = await probe(page, "rc-restore", {
+        petname: "restored-device",
+        binding: rcBinding,
+        handle: rcKitHandle,
+        kind: "bucket",
+        deviceName: RC_NAME,
+      });
+      rcRestored = restored.id as string;
+      const after = restored.attempt.refused
+        ? { titles: [], n: 0, revision: "-" }
+        : await probe(page, "hc-items", { id: rcRestored });
+      const devices = restored.attempt.refused
+        ? { names: [], n: 0 }
+        : await probe(page, "rc-devices", { id: rcRestored });
+      objectsAfterRestore = objects.names();
+
+      const equal = j(after.titles) === j(before.titles);
+      const ok = flushed.us.refused === false && restored.attempt.refused === false &&
+        restored.status.sealed === false && restored.status.storage?.kind === "s3" &&
+        restored.status.agentId !== null && restored.status.tier === "t0" &&
+        equal && after.n === 3 && after.titles.includes(RC_LATE) &&
+        devices.names.includes(RC_NAME) && !devices.names.includes("paper backup");
+      record(
+        "58 recovery",
+        "a fresh namespace restores the whole account from phrase + destination, with NO live peer",
+        ok,
+        `a SECOND device namespace in this browser — no engine state, no identity, no account — ` +
+          `was handed the destination and the kit and nothing else. It came up unsealed ` +
+          `(sealed=${restored.status.sealed}), bound (${j(restored.status.storage?.kind)}), with ` +
+          `an agent id of its own, and at TIER ${j(restored.status.tier)}: a restore is not a ` +
+          `decision to keep the machine it ran on, so promotion stays the user's later act ` +
+          `(PERSISTENCE.md's try-then-keep). Its todo list is ${j(after.titles)} against the ` +
+          `origin device's ${j(before.titles)} — equal: ${equal} — INCLUDING ` +
+          `${j(RC_LATE)}, written after the kit was minted, which is what proves the content ` +
+          `came out of the BUCKET rather than out of the bundle. The devices sheet now reads ` +
+          `${j(devices.names)}: the ceremony's name, and the kit's label "paper backup" is gone ` +
+          `from it.`,
+      );
+    });
+
+    // --- 59: the kit is spent — consumed artifacts, and a refused second ---
+    //
+    // RECOVERY.md, "Single-use, consumed at restore": the bundle object
+    // and the K_p are deleted after the restore fully succeeds and the
+    // us-doc record is cleared. Three witnesses, because each one alone
+    // is weaker than it looks:
+    //
+    //   * THE STORE'S OWN SET DIFFERENCE — what actually stopped
+    //     existing between the ceremony and the end of the restore.
+    //     Asked as REMOVALS only: a restore also WRITES (its own
+    //     manifests, its own oplogs), so the assertion is about what
+    //     went, not about what is left.
+    //   * A SECOND RESTORE, refused. Double-restore is an identity fork
+    //     — two live instances of one identity clobbering each other's
+    //     keyed names — so consumption makes it structurally impossible
+    //     rather than merely discouraged.
+    //   * THE ACCOUNT'S OWN LIST, read on the ORIGIN device after it
+    //     pulls: the consume cleared the record and flushed the us-doc,
+    //     so the device that minted the kit learns it is gone through
+    //     the ordinary account pull path and not through a side channel.
+    await guard(async () => {
+      const removed = objectsAfterKit.filter((n) => !objectsAfterRestore.includes(n));
+      const bundleGone = removed.some((n) => n.startsWith("recovery/"));
+      const kpGone = removed.some((n) => !n.startsWith("recovery/"));
+
+      const second = await probe(page, "rc-restore", {
+        petname: "second-restore",
+        binding: rcBinding,
+        handle: rcKitHandle,
+        kind: "bucket",
+        deviceName: "a device that must not exist",
+      });
+      const refusal = String(second.attempt.error?.message ?? "");
+
+      // The origin device catches up through the ordinary pull path.
+      const pulled = await probe(page, "rc-pull-now", { id: rcDevice });
+      const kits = await probe(page, "rc-kits", { id: rcDevice });
+
+      const ok = bundleGone && kpGone && removed.length === 2 &&
+        second.attempt.refused === true &&
+        /no recovery kit at this name/i.test(refusal) &&
+        second.attempt.error?.isWit === true &&
+        pulled.usPulled >= 1 &&
+        kits.attempt.ok === true && kits.kits.length === 0;
+      record(
+        "59 recovery",
+        "the kit is single-use: artifacts gone, a second restore refused, the account's list empty",
+        ok,
+        `between the ceremony and the end of the restore the store LOST exactly ` +
+          `${removed.length} object(s): the \`recovery/\` bundle (${bundleGone}) and one ` +
+          `unprefixed object, the K_p pickup (${kpGone}). Nothing else was removed — a restore ` +
+          `writes as well as reads, so the claim is about removals. A SECOND restore with the ` +
+          `same kit was refused (isWit=${second.attempt.error?.isWit}) with ` +
+          `${j(refusal.slice(0, 90))} — the same refusal a WRONG phrase gets, deliberately: the ` +
+          `kit's absence is the only fact either case establishes, and a double restore would ` +
+          `be an identity fork of one account (two live instances clobbering each other's keyed ` +
+          `oplog/manifest names, which SYNC.md's single-writer-per-name invariant forbids). The ` +
+          `ORIGIN device then pulled the account document from ${pulled.usPulled} of ` +
+          `${pulled.siblings} sibling(s) and its kit list is now ${j(kits.kits)} — empty, ` +
+          `learned through the ordinary account pull path rather than announced out of band.`,
+      );
+    });
+
+    // --- 60: the two refusals, one per kit kind -----------------------------
+    //
+    // A WRONG PHRASE derives a different name and finds nothing: "the
+    // refusal is 'no recovery kit at this name', never a partial
+    // restore" (engine.wit). A WRONG FILE PASSPHRASE is a clean keyslot
+    // miss — "unlock failed", indistinguishable from any other, which is
+    // the point: a slot that told you WHICH slot missed would be an
+    // oracle.
+    //
+    // The file kit minted here is revoked at the end of the row rather
+    // than left standing, so the account goes back to holding no kits —
+    // and the revocation is the leaked-kit answer exercised in passing
+    // ("a leaked phrase or file is answered by revoking the kit device,
+    // because it IS the same thing").
+    await guard(async () => {
+      const wrong = await probe(page, "rc-restore", {
+        petname: "wrong-phrase",
+        binding: rcBinding,
+        handle: rcKitHandle,
+        kind: "bucket",
+        wrongPhrase: WRONG_PHRASE,
+        deviceName: "a device that must not exist",
+      });
+      const wrongMsg = String(wrong.attempt.error?.message ?? "");
+
+      const fileKit = await probe(page, "rc-kit-create", {
+        id: rcDevice,
+        spec: { kind: "file", label: "downloaded file kit", passphrase: FILE_PASS },
+      });
+      const badPass = fileKit.attempt.ok
+        ? await probe(page, "rc-restore", {
+          petname: "wrong-passphrase",
+          binding: rcBinding,
+          handle: fileKit.handle,
+          kind: "file",
+          passphrase: FILE_PASS_WRONG,
+          deviceName: "a device that must not exist",
+        })
+        : { attempt: { refused: false, error: null } };
+      const badMsg = String(badPass.attempt.error?.message ?? "");
+
+      const kitsBefore = await probe(page, "rc-kits", { id: rcDevice });
+      const revoked = kitsBefore.attempt.ok && kitsBefore.kits.length > 0
+        ? await probe(page, "rc-revoke", { id: rcDevice, agentPrefix: kitsBefore.kits[0].agent })
+        : { attempt: { ok: false } };
+      const kitsAfter = await probe(page, "rc-kits", { id: rcDevice });
+
+      const ok = wrong.attempt.refused === true &&
+        /no recovery kit at this name/i.test(wrongMsg) &&
+        wrong.attempt.error?.isWit === true &&
+        fileKit.attempt.ok === true && fileKit.kind === "file" && fileKit.bytes > 0 &&
+        badPass.attempt.refused === true && /unlock failed/i.test(badMsg) &&
+        revoked.attempt.ok === true && typeof revoked.attempt.value === "string" &&
+        revoked.attempt.value.length > 0 &&
+        kitsAfter.attempt.ok === true && kitsAfter.kits.length === 0;
+      record(
+        "60 recovery",
+        "a wrong phrase finds no kit; a wrong file passphrase is one clean keyslot miss",
+        ok,
+        `a restore attempted with an obviously-synthetic wrong phrase was refused ` +
+          `(isWit=${wrong.attempt.error?.isWit}) with ${j(wrongMsg.slice(0, 90))}: a wrong ` +
+          `phrase derives a DIFFERENT object name and finds nothing there, so the refusal is ` +
+          `an absence and never a partial restore. A FILE kit (${fileKit.bytes} sealed bytes, ` +
+          `stored in no bucket — which is why this kind works on every provider) was then ` +
+          `opened with the wrong passphrase and refused with ${j(badMsg.slice(0, 90))} — a ` +
+          `clean keyslot miss, indistinguishable from any other, because a slot that named ` +
+          `which one missed would be an oracle. The file kit was then REVOKED, the leaked-kit ` +
+          `answer: the call returned the guarantee note the UI renders ` +
+          `(${j(String(revoked.attempt.value ?? "").slice(0, 80))}) and the account's list is ` +
+          `back to ${j(kitsAfter.kits)}.`,
+      );
+    });
+
+    // --- 61: a consume that fails announces and retries — it never blocks ---
+    //
+    // RECOVERY.md: "Consume failures (unreachable bucket at the end of a
+    // restore) never block the restore: they announce and retry on the
+    // flush cadence's backoff loop." engine.wit says why the retry is
+    // safe: `recovery-consume` is IDEMPOTENT BY CONTRACT, absence is
+    // success.
+    //
+    // THE OUTAGE IS DELETE-ONLY, injected into the object store, and
+    // that shape is chosen rather than convenient: a restore reads and
+    // writes but deletes nothing, so refusing DELETEs leaves the whole
+    // restore working and breaks only its tail — which is exactly the
+    // condition the rule is about. A blanket outage would have failed
+    // the restore itself and proved nothing about the tail.
+    //
+    // "ANNOUNCE-SHAPED" IS ASSERTED, not asserted-about: the failure
+    // lands on the SCHEDULER'S OWN surface — `flushFailures` climbing
+    // toward the announce-after-three threshold (SYNC.md §3, row 49's
+    // claim) and a sentence in `lastError` — plus the one thing a count
+    // cannot say, `consumePending`, so a sheet can name what is
+    // outstanding instead of reporting a generic stall.
+    await guard(async () => {
+      const kit = await probe(page, "rc-kit-create", {
+        id: rcDevice,
+        spec: { kind: "bucket", label: "a kit whose consume will fail" },
+      });
+      await probe(page, "rc-flush-now", { id: rcDevice });
+
+      // THE OUTAGE. `Infinity` rather than a count: the row heals it
+      // explicitly, and a count would make the number of deletes one
+      // consume happens to make into a load-bearing constant.
+      objects.refuseNextDeletes(Infinity);
+      const restored = await probe(page, "rc-restore", {
+        petname: "restored-under-outage",
+        binding: rcBinding,
+        handle: kit.handle,
+        kind: "bucket",
+        deviceName: "a device whose kit outlived its restore",
+      });
+      const id = restored.id as string;
+      const atReturn = restored.status.sync;
+      const items = restored.attempt.refused ? { n: 0 } : await probe(page, "hc-items", { id });
+
+      // The retry is on the flush direction's backoff (base 5 s, ×2,
+      // jittered ×0.5–1.5), so a second failure lands within ~15 s of
+      // the first; 60 s is margin.
+      const failing = await untilSync(
+        page,
+        id,
+        "the consume retry failing a second time",
+        (s) => s.flushFailures >= 2 && s.consumePending === true,
+        60_000,
+      );
+      const sentence = String(failing.sync?.lastError ?? "");
+
+      // AND THE STORE COMES BACK.
+      objects.refuseNextDeletes(0);
+      const healed = await untilSync(
+        page,
+        id,
+        "the consume succeeding on a retry",
+        (s) => s.consumePending === false && s.flushFailures === 0,
+        90_000,
+      );
+      await probe(page, "hc-close", { id });
+
+      const ok = kit.attempt.ok === true && restored.attempt.refused === false &&
+        restored.status.sealed === false && items.n === 3 &&
+        atReturn !== null && atReturn.consumePending === true &&
+        failing.ok && sentence.length > 0 && /\s/.test(sentence) &&
+        healed.ok && healed.sync.consumePending === false;
+      record(
+        "61 recovery",
+        "a consume that cannot reach the store announces and retries; the restore itself stands",
+        ok,
+        `a fresh kit was minted and the store was put into a DELETE-ONLY outage — a restore ` +
+          `reads and writes but deletes nothing, so this breaks the ceremony's TAIL and nothing ` +
+          `else. The restore SUCCEEDED anyway (refused=${restored.attempt.refused}, ` +
+          `${items.n} todos in hand) and at the instant it returned status().sync=${j(atReturn)}: ` +
+          `consumePending TRUE, which is the one thing a failure count cannot say — WHAT is ` +
+          `outstanding, so a sheet can name the kit instead of reporting a generic stall. The ` +
+          `retry then ran on the flush direction's own backoff: ${failing.waitedMs} ms later ` +
+          `flushFailures=${failing.sync?.flushFailures} (climbing toward the announce-after-three ` +
+          `threshold SYNC.md §3 sets, and row 49 measures) with the sentence ` +
+          `${j(sentence.slice(0, 100))} — prose, no object name, no material. The store was then ` +
+          `healed and left alone: ${healed.waitedMs} ms later sync=${j(healed.sync)} — the kit ` +
+          `was retired by a RETRY, which is only safe because absence is success by contract ` +
+          `(engine.wit: "a retry after partial success must not error on an object that is ` +
+          `already gone").`,
+      );
+    });
+
+    // --- 62: a FILE kit end to end against the fake Drive ------------------
+    //
+    // THE PROVIDER HALF OF THE DESIGN, executable. Bucket kits are
+    // S3-ONLY at this rev (the kind needs an owner-tier PUT at a name
+    // the guest DERIVES, and only S3 addresses objects by name), so the
+    // promise that "no provider loses recovery coverage" rests entirely
+    // on the FILE kit — which stores no object and therefore works
+    // anywhere. This row is that promise, run.
+    //
+    // IT IS ALSO THE `recovery-consume` GDRIVE ARM'S PROMISED COVERAGE.
+    // The engine's own battery runs against MinIO, so its S3 arm is the
+    // one `just recover` exercises; recovery.rs's `delete_own_pickup`
+    // names these devstore rows as where the Drive arm gets its
+    // executable coverage instead of duplicating a fake Drive inside the
+    // native rig for one delete.
+    //
+    // THE CREDENTIALS DO NOT RIDE THE BUNDLE, and the two-stage ceremony
+    // is that rule made structural: the restoring device runs its OWN
+    // consent (`restorePrepare` opens the namespace so the consent has
+    // somewhere sealed to land) before the restore validates a binding
+    // against it. An OAuth token is device-scoped by DRIVE.md's ruling
+    // and there is nowhere in a bundle to put one.
+    const RC_GD_ROOT = "pm-recovery-gd";
+    // Row 60 rides this pair; see the note there for why it must be a
+    // pair that has crossed no revocation epoch.
+    let rcGdOrigin = "";
+    let rcGdRestored = "";
+    const rcGdBinding = {
+      kind: "gdrive" as const,
+      root: RC_GD_ROOT,
+      apiBase: gdOrigin,
+      clientId: GD_CLIENT_ID,
+      space: "drive" as const,
+    };
+    await guard(async () => {
+      const made = await probe(page, "hc-make", {
+        petname: "recovery-gdrive",
+        policy: "until-reseal",
+        promote: true,
+      });
+      const originId = made.id as string;
+      rcGdOrigin = originId;
+      await probe(page, "hc-open", {
+        id: originId,
+        unseal: { passphrase: PASS, untilReseal: true },
+      });
+      const consent = await startAndFetchAuth(page, originId, gdriveSpec);
+      await probe(page, "gd-oauth-complete", {
+        id: originId,
+        code: consent.code,
+        state: consent.state,
+      });
+      const bound = await probe(page, "hc-bind", { id: originId, binding: rcGdBinding });
+      await probe(page, "hc-ensure-bucket", { id: originId });
+      await probe(page, "rc-account-create", {
+        id: originId,
+        displayName: "Synthetic Drive Account",
+      });
+      const titles = ["a drive todo", "a second drive todo"];
+      await probe(page, "hc-add", { id: originId, titles });
+      await probe(page, "rc-flush-now", { id: originId });
+
+      const kit = await probe(page, "rc-kit-create", {
+        id: originId,
+        spec: { kind: "file", label: "drive file kit", passphrase: FILE_PASS },
+      });
+
+      // The restoring device: prepare (DEK), consent (sealed under it),
+      // then restore. The consent's code/state are fetched here for the
+      // same reason every other gdrive row fetches them here — the page
+      // cannot follow the fake's 302 for itself.
+      const fresh = await probe(page, "rc-prepare", { petname: "restored-from-file" });
+      const freshId = fresh.id as string;
+      const consent2 = await startAndFetchAuth(page, freshId, gdriveSpec);
+      const restored = await probe(page, "rc-restore", {
+        id: freshId,
+        petname: "restored-from-file",
+        binding: rcGdBinding,
+        handle: kit.handle,
+        kind: "file",
+        passphrase: FILE_PASS,
+        deviceName: "the drive machine it became",
+        oauth: { code: consent2.code, state: consent2.state },
+      });
+      const id = restored.id as string;
+      rcGdRestored = id;
+      const after = restored.attempt.refused
+        ? { titles: [], n: 0 }
+        : await probe(page, "hc-items", { id });
+      const sync = restored.status.sync;
+      const devices = restored.attempt.refused
+        ? { names: [] }
+        : await probe(page, "rc-devices", { id });
+
+      const ok = bound.attempt.refused === false && kit.attempt.ok === true &&
+        kit.kind === "file" && kit.bytes > 0 &&
+        fresh.attempt.refused === false && fresh.status.sealed === false &&
+        restored.attempt.refused === false &&
+        restored.status.storage?.kind === "gdrive" &&
+        j(after.titles) === j([...titles].sort()) &&
+        sync !== null && sync.consumePending === false &&
+        devices.names.includes("the drive machine it became");
+      record(
+        "62 recovery",
+        "a FILE kit restores a Drive-bound account end to end, and the consume lands there too",
+        ok,
+        `a Google-Drive-bound account (its own store root, its own consent) minted a FILE kit of ` +
+          `${kit.bytes} sealed bytes — no object stored anywhere, which is why this kind works ` +
+          `on a provider that cannot address objects by a name the guest derives, and why ` +
+          `RECOVERY.md can say no provider loses recovery coverage while bucket kits stay ` +
+          `S3-only. A fresh namespace then ran the TWO-STAGE ceremony: restorePrepare opened it ` +
+          `(sealed=${fresh.status.sealed}) so the Drive consent had somewhere sealed to land — ` +
+          `credentials never ride bundles, and an OAuth grant is device-scoped — and the restore ` +
+          `followed with bytes + passphrase + destination. It came up bound ` +
+          `(${j(restored.status.storage?.kind)}) holding ${j(after.titles)}, and its devices ` +
+          `entry reads ${j(devices.names)}. THE CONSUME SUCCEEDED ON DRIVE: ` +
+          `sync.consumePending=${sync?.consumePending} — this is the executable coverage ` +
+          `recovery.rs's \`delete_own_pickup\` promises for the gdrive arm, which the engine's ` +
+          `MinIO-only battery cannot reach.`,
+      );
+    });
+
+    // --- 63: the us-doc rides the cycle, with no button anywhere -----------
+    //
+    // RECOVERY.md unparks what SYNC.md §3 explicitly parked: "the worker's
+    // flush/pull cycle MUST include [the us-doc] — the engine flushes the
+    // us-doc only at the moments it controls (kit create, revoke,
+    // consume), and a restore can only be as fresh as the last us flush."
+    //
+    // The claim is therefore about the SCHEDULER and not about a
+    // ceremony, so nothing in this row presses anything. Device A
+    // changes its PROFILE — a us-doc write, and one that is not in
+    // rpc.ts's READONLY_METHODS, so it arms the same 20 s flush debounce
+    // a todo does — and then two waits: A's own `lastFlush` moving, and
+    // B (a sibling with NO wire between them, only the bucket) reporting
+    // the change through the ordinary surfaces.
+    //
+    // B'S WITNESS IS THE EVENT QUEUE, which is the honest one: `usEvents`
+    // is where a visor's announcements come from, and local-echo
+    // suppression is engine-side, so `profile-changed` arriving there
+    // means B learned it from somewhere other than itself.
+    //
+    // THE PAIR IS ROW 62'S, and the choice is a FINDING rather than a
+    // convenience. Rows 59-61 put the S3 account through a
+    // `recovery-kit-revoke`, which rotates the us-doc's NAME-KEY EPOCH
+    // (that is the "hard forward" half of the guarantee note), and a
+    // sibling that has not yet caught up derives object names from the
+    // chain it holds — which it can only refresh by reading the us-doc,
+    // whose newest objects now sit under the NEW epoch's names. Measured
+    // here: after that revocation the restored device kept reading the
+    // origin's stale epoch-0 manifest and never saw the profile change.
+    // That is a pre-existing property of rotation-plus-a-lagging-device
+    // (SYNC.md's territory, not this round's), and pinning this row to a
+    // pair that has crossed no revocation keeps it a measurement of the
+    // us-doc riding the cycle rather than of that separate question.
+    // Flagged in the track report.
+    await guard(async () => {
+      const idA = rcGdOrigin;
+      const idB = rcGdRestored;
+      const NEW_NAME = "Renamed On The Other Device";
+      const beforeA = (await probe(page, "hc-status", { id: idA })).sync;
+      // Drain B's queue first, so anything the row observes afterwards
+      // is this row's own change and not an older one.
+      await probe(page, "rc-events", { id: idB });
+
+      const set = await probe(page, "rc-profile-set", { id: idA, displayName: NEW_NAME });
+      const flushedA = await untilSync(
+        page,
+        idA,
+        "A's scheduled flush after a us-doc write",
+        (s) => s.lastFlush !== null && (beforeA?.lastFlush === null || s.lastFlush > beforeA.lastFlush),
+        60_000,
+      );
+      // B pulls on the ordinary 45 s cadence; the us-doc goes FIRST in
+      // its cycle, which is what makes the profile arrive at all.
+      const deadline = Date.now() + 120_000;
+      let profileB = { displayName: "" };
+      let kindsB: string[] = [];
+      while (Date.now() < deadline) {
+        profileB = await probe(page, "rc-profile-get", { id: idB });
+        const ev = await probe(page, "rc-events", { id: idB });
+        kindsB = [...kindsB, ...ev.kinds];
+        if (profileB.displayName === NEW_NAME) break;
+        await new Promise((r) => setTimeout(r, 2_000));
+      }
+      const syncB = (await probe(page, "hc-status", { id: idB })).sync;
+
+      const ok = set.attempt.refused === false && flushedA.ok &&
+        flushedA.sync.flushFailures === 0 &&
+        profileB.displayName === NEW_NAME &&
+        kindsB.includes("profile-changed") &&
+        syncB !== null && syncB.lastPull !== null;
+      record(
+        "63 recovery",
+        "the account document rides the ordinary flush/pull cycle — SYNC.md's parked item, unparked",
+        ok,
+        `device A changed its account PROFILE and NOTHING ELSE was called. A us-doc write is a ` +
+          `mutation like any other (it is absent from rpc.ts's READONLY_METHODS), so it armed ` +
+          `the same ~20 s flush debounce a todo does: ${flushedA.waitedMs} ms later A's ` +
+          `status().sync=${j(flushedA.sync)} — a completed scheduled cycle, which now includes ` +
+          `the account document under the EMPTY doc-id sentinel (engine.wit's bucket-flush; the ` +
+          `us id itself stays hidden and an empty id was meaningless on every arm before this). ` +
+          `Device B — a SIBLING with no wire of any kind between them, only the shared bucket — ` +
+          `then pulled on its ordinary 45 s cadence, where the us-doc goes FIRST so the content ` +
+          `pulls chain off the map it brings in. B's profile now reads ${j(profileB.displayName)} ` +
+          `and its event queue carried ${j(kindsB)}: \`profile-changed\` arrived through the ` +
+          `ORDINARY announcement surface, and local-echo suppression is engine-side, so B could ` +
+          `only have learned it from A. B's own sync record: ${j(syncB)}.`,
+      );
+      await probe(page, "hc-close", { id: idA });
+      await probe(page, "hc-close", { id: idB });
+    });
+
+    // --- 64: the consume survives the worker's death ------------------------
+    //
+    // THE STRAND, PINNED. A consume's last act is a write to the LIVE
+    // us-doc (`recovery_clear`) plus the guest's own flush of it. Both
+    // land, and without a checkpoint after them NEITHER survives a
+    // respawn:
+    //
+    //   * the worker calls `recoveryConsume()` INTERNALLY, and the
+    //     mutation debounce lives in `call()`, which dispatches CLIENT
+    //     requests only — so nothing arms a checkpoint, and a resume
+    //     rewinds the account to before the consume;
+    //   * the flushed copy is under THIS device's own keyed names, and
+    //     `pullCycle` self-filters a device out of its own fan-out — so
+    //     the durable copy is permanently out of its author's reach. It
+    //     heals only when ANOTHER device pulls it and re-manifests it,
+    //     which is exactly what an account that just spent its
+    //     last-resort kit does not have.
+    //
+    // The symptom is a restored device whose own kit list still shows
+    // the kit it consumed — reported from the solo page's fork-door
+    // restore, which reloads on completion and so respawns the worker.
+    // Row 56 asserts the ORIGIN device's view; this asserts the
+    // RESTORED device's, across a real death.
+    //
+    // WHY A SECOND CHECKPOINT AND NOT AN EARLIER ONE: the restore's
+    // checkpoint stays BEFORE the consume, because a crash between a
+    // consume and a first checkpoint would burn the kit with nothing
+    // durable to show for it — a lockout. So the fix adds a checkpoint
+    // after a SUCCESSFUL consume and changes no existing ordering.
+    await guard(async () => {
+      const kit = await probe(page, "rc-kit-create", {
+        id: rcDevice,
+        spec: { kind: "bucket", label: "a kit that gets consumed and killed" },
+      });
+      await probe(page, "rc-flush-now", { id: rcDevice });
+      const restored = await probe(page, "rc-restore", {
+        petname: "restored-then-killed",
+        binding: rcBinding,
+        handle: kit.handle,
+        kind: "bucket",
+        deviceName: "a device that outlives its kit",
+      });
+      const id = restored.id as string;
+      const live = restored.attempt.refused
+        ? { attempt: { ok: false }, kits: [{ kind: "?" }] }
+        : await probe(page, "rc-kits", { id });
+
+      // THE KILL: `__die` closes the worker's own global, which is a
+      // crash on demand — the lock and the lease go exactly as they
+      // would if the process had died (rows 11, 21, 50's discipline).
+      const died = await probe(page, "hc-die", { id });
+      const back = await probe(page, "hc-open", { id, unseal: { passphrase: PASS } });
+      const afterKill = await probe(page, "rc-kits", { id });
+
+      const ok = kit.attempt.ok === true && restored.attempt.refused === false &&
+        restored.status.sync?.consumePending === false &&
+        live.attempt.ok === true && live.kits.length === 0 &&
+        died.lockHeld === false &&
+        back.unseal.refused === false && back.status.resumed === true &&
+        afterKill.attempt.ok === true && afterKill.kits.length === 0;
+      record(
+        "64 recovery",
+        "a consumed kit STAYS consumed across the worker's death — the restored device's own view",
+        ok,
+        `a fresh kit was minted and used; the restore's consume succeeded ` +
+          `(consumePending=${restored.status.sync?.consumePending}) and the restored device's ` +
+          `OWN kit list read ${j(live.kits)} — the guest is consistent the moment it finishes. ` +
+          `The worker was then KILLED (lock released: ${died.lockHeld === false}) and a fresh ` +
+          `one opened the same namespace, resuming from the checkpoint ` +
+          `(resumed=${back.status.resumed}). Its kit list is ${j(afterKill.kits)}. WITHOUT the ` +
+          `post-consume checkpoint this reads back as the spent kit, and neither half of the ` +
+          `consume saves the other: the worker calls \`recoveryConsume()\` internally, so the ` +
+          `mutation debounce in \`call()\` — which dispatches CLIENT requests only — never arms, ` +
+          `and the clear that WAS flushed sits under this device's own keyed names, which ` +
+          `\`pullCycle\` self-filters out of its own fan-out. Durable in the bucket, invisible ` +
+          `to its author, forever, on the one device that just spent the account's last-resort ` +
+          `kit. The restore's FIRST checkpoint deliberately still precedes the consume: a crash ` +
+          `in between would burn the kit with nothing durable to show for it.`,
+      );
+      await probe(page, "hc-close", { id });
+    });
+
+    await probe(page, "hc-close", { id: rcDevice });
+    await probe(page, "hc-close", { id: rcRestored });
+
     await ctx.close();
 
   } finally {
     await browser.close();
     await server.shutdown();
     await s3Server.shutdown();
+    await objects.server.shutdown();
     await fake.close();
   }
 

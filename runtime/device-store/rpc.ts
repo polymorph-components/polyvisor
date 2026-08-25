@@ -290,6 +290,13 @@ export const DRIVER_METHODS = [
   "usDeviceRevoke",
   "usDeviceEndpointPut",
   "usEvents",
+  "recoveryKitCreateBucket",
+  "recoveryKitCreateFile",
+  "recoveryRestoreBucket",
+  "recoveryRestoreFile",
+  "recoveryConsume",
+  "recoveryKits",
+  "recoveryKitRevoke",
   "stats",
 ] as const;
 
@@ -364,6 +371,12 @@ export const READONLY_METHODS: ReadonlySet<string> = new Set([
   // debounce entirely. Treated as a read, deliberately, and recorded
   // here rather than left to be inferred.
   "usEvents",
+  // `recoveryKits` is a pure read of the account's `recovery` map — a
+  // projection that unlocks nothing and changes nothing. Every OTHER
+  // `recovery*` method is deliberately absent: they mint or revoke a
+  // member device, write the us-doc and delete bucket objects, which is
+  // as much a mutation as anything else on this surface.
+  "recoveryKits",
   // tasks — reads
   "partition",
   "revision",
@@ -601,6 +614,26 @@ export interface SyncStatus {
   /** The most recent background failure, as a sentence for a human, or
    * null when the last cycle in each direction succeeded. */
   lastError: string | null;
+  /**
+   * A RESTORE'S KIT IS STILL WAITING TO BE CONSUMED (RECOVERY.md,
+   * "Single-use"): the restore fully succeeded and `recoveryConsume()`
+   * has not yet.
+   *
+   * A CONSUME FAILURE NEVER BLOCKS OR UNDOES A RESTORE — an unreachable
+   * bucket at the end of a restore is exactly the moment least able to
+   * afford a refusal — so it is retried on the flush direction's own
+   * backoff loop, which is why the failure ALSO shows up as
+   * `flushFailures` and a `lastError` sentence and reaches the
+   * announcement threshold like any other stalled sync. This flag is
+   * the one thing that count cannot say: WHAT is still outstanding, so
+   * a sheet can name it ("your recovery kit has not been retired yet")
+   * rather than reporting a generic sync failure.
+   *
+   * It is a boolean and nothing else. The kit's name, its object and
+   * its phrase are not derivable from it, and none of them may ever
+   * appear on this type.
+   */
+  consumePending: boolean;
 }
 
 
@@ -654,6 +687,96 @@ export interface OauthStartSpec {
 export interface OauthStartResult {
   authorizeUrl: string;
 }
+
+/**
+ * WHICH KIT IS BEING PRESENTED, and it is the ONE PLACE a recovery
+ * secret crosses this wire (RECOVERY.md, "Restore"; the threat-model
+ * line that prices it: "the restore ceremony types the secret into page
+ * script — the same exposure class as the passphrase unseal rung").
+ *
+ * IT CROSSES ONCE. The worker hands the value straight to the guest and
+ * drops its own reference; nothing here is persisted, logged, or echoed
+ * back in `status()`. That is the same promise `UnsealOptions.passphrase`
+ * carries and it is worth no more than that promise is: a string in a
+ * page's heap is a string in a page's heap, and neither side can scrub
+ * the other's realm.
+ *
+ * The FILE arm's `bundle` is not secret on its own — it is sealed under
+ * the passphrase beside it — but it is treated identically, because
+ * "the file plus its passphrase open the account" and the two travel
+ * together here.
+ */
+export type RecoveryKitInput =
+  | { kind: "bucket"; phrase: string }
+  | { kind: "file"; bundle: Uint8Array; passphrase: string };
+
+/**
+ * WHAT A RESTORE NEEDS, and why it is a HOST METHOD rather than an
+ * `AttachSpec` variant (the track's structural decision, recorded here
+ * because rpc.ts is where the wire is described).
+ *
+ * The restore is a BRING-UP MODE: the engine is born from the kit
+ * instead of from `init`, so it cannot ride `unseal`, which inits. Two
+ * shapes could carry it — a variant on `AttachSpec`, or a method of its
+ * own — and the method wins on both counts that matter:
+ *
+ *   * SECRET LIFETIME. `AttachSpec` is REMEMBERED: worker.ts keeps it in
+ *     `attached` for the life of the global (first attach wins, and the
+ *     artifacts are re-read from it). A phrase on that record would rest
+ *     in worker memory long after the ceremony it belonged to. A method
+ *     argument lives for one call.
+ *   * WHEN IT IS VALID. Attach happens at CONNECT, before any ceremony
+ *     — before the DEK exists, and before the Drive consent a gdrive
+ *     restore needs. A method can be refused precisely when it is wrong
+ *     ("this namespace already holds a device") instead of being
+ *     accepted early and discovered late.
+ *
+ * The corollary is the two-stage shape below: `restorePrepare` opens the
+ * device (mints the DEK) WITHOUT initing an engine, which is what gives
+ * the page a window to run the Drive consent — that ceremony seals
+ * tokens under the DEK, so it needs one, and the S3 arm needs no such
+ * stage because its escrow is page-side and keyed by origin.
+ */
+export interface RestoreSpec {
+  /** Where the restored account's bucket is. Validated with `bindStore`'s
+   * own fail-at-bind discipline (STORAGE-EGRESS.md §4) BEFORE anything
+   * is fetched: a restore that discovered a missing credential halfway
+   * through would leave a half-born device. */
+  binding: StoreBinding;
+  /** The kit, and the secret that opens it. See `RecoveryKitInput`. */
+  kit: RecoveryKitInput;
+  /** The user's own word for the machine this became. The kit's label
+   * gives way to it in the devices sheet at the end of the restore
+   * (engine.wit's `recovery-restore-bucket`). */
+  deviceName: string;
+  /** The seal choices for the fresh namespace, exactly as `unseal`
+   * takes them. Ignored when `restorePrepare` already opened the
+   * device. */
+  unseal?: UnsealOptions;
+}
+
+/**
+ * WHICH KIND OF KIT TO MINT (RECOVERY.md, "The kit ceremony").
+ *
+ * `label` is the name the kit's DEVICE wears in the devices sheet — it
+ * is a real leaf in the delegation graph, so it is labelled like one.
+ * The `file` arm's `passphrase` is the user's own choice and its
+ * strength is the user's own; the ceremony that collects it warns
+ * loudly, which is the owner's amendment and the visor's job. It
+ * crosses this wire under `RecoveryKitInput`'s discipline.
+ */
+export type RecoveryKitSpec =
+  | { kind: "bucket"; label: string }
+  | { kind: "file"; label: string; passphrase: string };
+
+/**
+ * What a kit ceremony hands back: the phrase for a bucket kit (displayed
+ * once in visor pixels, never persisted), the sealed bytes for a file
+ * kit (downloaded by the user, never persisted here).
+ */
+export type RecoveryKitResult =
+  | { kind: "bucket"; phrase: string }
+  | { kind: "file"; bundle: Uint8Array };
 
 /** Everything a picker or a strip needs to know, and nothing secret. */
 export interface DeviceStatus {
@@ -774,6 +897,14 @@ export type HostMethod =
   | "status"
   | "bindStore"
   | "unbindStore"
+  // --- account recovery (RECOVERY.md; T-B) ---
+  /** Open a fresh namespace WITHOUT initing an engine — the restore
+   * path's first stage. See `RestoreSpec`. */
+  | "restorePrepare"
+  | "restore"
+  | "createRecoveryKit"
+  | "recoveryKits"
+  | "revokeRecoveryKit"
   | "oauthStart"
   | "oauthComplete"
   | "forgetOauth"

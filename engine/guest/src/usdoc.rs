@@ -147,6 +147,30 @@ const ENROLLED: &str = "_enrolled";
 /// forces otherwise — `snapshot` reads the families it announces and
 /// this key is not one of them.
 const BUCKET_CHAINS: &str = "bucket-chains";
+/// THE ACCOUNT'S LIVE RECOVERY KITS (runtime/RECOVERY.md, step 5 of the
+/// kit ceremony). `agent id (hex) -> { kind, name, created }`, a flat
+/// top-level map modelled on `PARTITIONS`: ADDITIVE, so a document
+/// written before this key existed simply has no `recovery` entry and
+/// every read below turns a missing map into an empty list rather than
+/// an error.
+///
+/// IT LIVES IN THE ACCOUNT so that ANY device can revoke or supersede a
+/// kit — the devices sheet is the interface, and a kit that only its
+/// minting device could see would be unrevocable from the device you
+/// still have, which is the case recovery exists for.
+///
+/// WHAT IS IN IT IS NOT SECRET. `kind` and `created` are metadata; the
+/// bucket object NAME is not secret material either — the provider sees
+/// the object regardless, and the payload behind it is sealed under the
+/// phrase-derived KEK. The PHRASE is nowhere: it is displayed once in
+/// visor pixels and persisted by nothing, here least of all.
+///
+/// NO NEW `us-event` CASE, for the reason `us-partition-put` gives:
+/// consumers poll, and a fresh arm through every adapter's exhaustive
+/// match buys nothing nobody edge-triggers on. The devices map already
+/// announces — a kit IS a device — so a kit's arrival and its revocation
+/// are announced as `device-added` / `device-revoked` already.
+const RECOVERY: &str = "recovery";
 
 fn map_at(am: &AutoCommit, key: &str) -> Option<ObjId> {
     match am.get(ROOT, key) {
@@ -1472,6 +1496,139 @@ pub(crate) async fn device_endpoint_put(endpoint: Vec<u8>) -> Result<(), String>
         let d = child_map(am, &devices, &key).ok_or("no entry for this device")?;
         am.put(&d, "endpoint", endpoint)
             .map_err(|e| format!("device endpoint: {e}"))?;
+        Ok(())
+    })
+    .await
+}
+
+/// Rename one device's entry — the restore ceremony's last write
+/// (RECOVERY.md: "the kit's label gives way to the user's word for the
+/// machine it became").
+///
+/// CONTRACT, the same one `device_endpoint_put` states and for the same
+/// reason: an ABSENT entry is REFUSED rather than created. The devices
+/// map is keyed by agent id, and two devices concurrently
+/// `put_object`-ing a fresh map under one key is an automerge conflict
+/// whose loser's fields vanish. A restore reaching this point has
+/// already pulled the account state that contains its own entry, so an
+/// absent one means the pull did not land — which is worth an error, not
+/// a silently half-built device record.
+pub(crate) async fn device_rename(agent: &[u8], name: &str) -> Result<(), String> {
+    let key = hex::encode(agent);
+    let name = name.to_string();
+    write(move |am| {
+        let devices = map_at(am, DEVICES).ok_or("no devices map")?;
+        let d = child_map(am, &devices, &key)
+            .ok_or("no devices entry for this device (the account state has not arrived)")?;
+        am.put(&d, "name", name.as_str())
+            .map_err(|e| format!("device name: {e}"))?;
+        Ok(())
+    })
+    .await
+}
+
+// --- the account's recovery kits (RECOVERY.md) ---------------------------
+
+/// One row of the `recovery` map, as the document holds it.
+pub(crate) struct RecoveryRow {
+    /// `"bucket"` or `"file"`.
+    pub(crate) kind: String,
+    /// The bucket object name; empty for a file kit.
+    pub(crate) name: String,
+    pub(crate) created: u64,
+}
+
+fn read_recovery(am: &AutoCommit) -> Vec<(String, RecoveryRow)> {
+    let Some(kits) = map_at(am, RECOVERY) else {
+        // ADDITIVE: no map is an empty list, never an error.
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for key in am.keys(&kits) {
+        let Some(k) = child_map(am, &kits, &key) else {
+            continue;
+        };
+        out.push((
+            key.to_string(),
+            RecoveryRow {
+                kind: get_str(am, &k, "kind").unwrap_or_default(),
+                name: get_str(am, &k, "name").unwrap_or_default(),
+                created: get_u64(am, &k, "created").unwrap_or(0),
+            },
+        ));
+    }
+    out
+}
+
+/// Record a freshly minted kit.
+pub(crate) async fn recovery_put(
+    agent: &[u8],
+    kind: &str,
+    name: &str,
+    created: u64,
+) -> Result<(), String> {
+    let key = hex::encode(agent);
+    let kind = kind.to_string();
+    let name = name.to_string();
+    write(move |am| {
+        let kits = match map_at(am, RECOVERY) {
+            Some(k) => k,
+            None => am
+                .put_object(ROOT, RECOVERY, ObjType::Map)
+                .map_err(|e| format!("recovery map: {e}"))?,
+        };
+        let k = match child_map(am, &kits, &key) {
+            Some(k) => k,
+            None => am
+                .put_object(&kits, &key, ObjType::Map)
+                .map_err(|e| format!("recovery entry: {e}"))?,
+        };
+        am.put(&k, "kind", kind.as_str())
+            .map_err(|e| format!("kit kind: {e}"))?;
+        am.put(&k, "name", name.as_str())
+            .map_err(|e| format!("kit name: {e}"))?;
+        am.put(&k, "created", created as i64)
+            .map_err(|e| format!("kit created: {e}"))?;
+        Ok(())
+    })
+    .await
+}
+
+/// Every live kit, oldest first (ties broken by agent id, so two
+/// devices reading the same document list them in the same order).
+pub(crate) async fn recovery_list() -> Result<Vec<(Vec<u8>, RecoveryRow)>, String> {
+    pump().await?;
+    let mut out: Vec<(Vec<u8>, RecoveryRow)> = read_us(read_recovery)?
+        .into_iter()
+        .filter_map(|(key, row)| hex::decode(&key).ok().map(|raw| (raw, row)))
+        .collect();
+    out.sort_by(|a, b| a.1.created.cmp(&b.1.created).then_with(|| a.0.cmp(&b.0)));
+    Ok(out)
+}
+
+/// One kit's row, or `None` when the account does not name it.
+pub(crate) async fn recovery_get(agent: &[u8]) -> Result<Option<RecoveryRow>, String> {
+    let key = hex::encode(agent);
+    Ok(recovery_list()
+        .await?
+        .into_iter()
+        .find(|(raw, _)| hex::encode(raw) == key)
+        .map(|(_, row)| row))
+}
+
+/// Forget a kit: consumed at restore, or revoked from the devices sheet.
+///
+/// IDEMPOTENT — a missing entry is success, which is what
+/// `recovery-consume`'s retry contract requires. `delete` on an absent
+/// key is a no-op in automerge, and an absent MAP is nothing to delete
+/// from.
+pub(crate) async fn recovery_clear(agent: &[u8]) -> Result<(), String> {
+    let key = hex::encode(agent);
+    write(move |am| {
+        let Some(kits) = map_at(am, RECOVERY) else {
+            return Ok(());
+        };
+        let _ = am.delete(&kits, key.as_str());
         Ok(())
     })
     .await

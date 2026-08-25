@@ -96,8 +96,17 @@ export interface Driver {
   storeGrant(docId: Uint8Array, memberId: Uint8Array): Promise<string | undefined>;
   /** Human-readable guarantee note (cooperative vs. server-side hard). */
   storeRevoke(docId: Uint8Array, memberId: Uint8Array): Promise<string>;
+  /** AN EMPTY `docId` NAMES THE ACCOUNT'S USER-SYSTEM DOCUMENT
+   * (engine.wit's `bucket-flush`, the RECOVERY.md sentinel — the us id
+   * itself stays hidden, and an empty id was meaningless on every arm
+   * before this, which is what makes giving it a meaning additive). On a
+   * device with no account it REFUSES BY NAME rather than answering an
+   * empty success. Spelled `new Uint8Array(0)` through this adapter —
+   * `list<u8>` lowers to `Uint8Array`, so an empty list is an empty
+   * typed array, not `undefined`. */
   bucketFlush(docId: Uint8Array): Promise<string>;
-  /** `pickup` is the link-tier standing capability; owner tiers ignore it. */
+  /** `pickup` is the link-tier standing capability; owner tiers ignore it.
+   * The empty-`docId` sentinel applies here too, identically. */
   bucketPull(
     docId: Uint8Array,
     ownerId: Uint8Array,
@@ -219,7 +228,66 @@ export interface Driver {
    * events for its own writes. */
   usEvents(): Promise<UsEvent[]>;
 
+  // --- account recovery (#11; runtime/RECOVERY.md) --- (engine.wit's
+  // `recovery-*` block carries the whole contract — the dormant-leaf
+  // argument, the derivation, the single-use ruling and the
+  // idempotency promise. Not repeated here, to keep one authority.)
+
+  /** Mint a BUCKET kit and return its recovery phrase (10 words). THE
+   * PHRASE IS RETURNED ONCE AND PERSISTED NOWHERE — not by the guest,
+   * and not by anything downstream of this call. S3-ONLY at this rev
+   * (RECOVERY.md, "Two kit kinds"): the bucket kind needs an owner-tier
+   * PUT at a name the guest derives, and only S3 addresses objects by
+   * name. Refused by name on any other provider, and on a device with
+   * no bound store or no account. */
+  recoveryKitCreateBucket(label: string): Promise<string>;
+  /** Mint a FILE kit and return the sealed bundle bytes for download.
+   * Stores no object, so it works on every provider. */
+  recoveryKitCreateFile(label: string, passphrase: string): Promise<Uint8Array>;
+  /** Restore an account onto an UNINITIALIZED engine — INSTEAD of
+   * `init`, `identityImport` or `stateResume`. The config is a
+   * PARAMETER rather than `initStore` state because finding the bundle
+   * needs the destination first, and the destination lives inside the
+   * account the bundle unlocks; the same config is applied as
+   * `initStore` would once state exists. Resolves the restored identity
+   * id, hex. */
+  recoveryRestoreBucket(
+    config: StoreConfig,
+    phrase: string,
+    deviceName: string,
+  ): Promise<string>;
+  /** The same ceremony with the bundle handed over instead of fetched.
+   * A wrong passphrase is a clean slot failure ("unlock failed"). */
+  recoveryRestoreFile(
+    config: StoreConfig,
+    bundle: Uint8Array,
+    passphrase: string,
+    deviceName: string,
+  ): Promise<string>;
+  /** Consume the kit this instance restored from. Called by the
+   * EMBEDDER after the content fan-out and the first checkpoint
+   * succeed, never before. IDEMPOTENT BY CONTRACT: absence is success,
+   * so a failure is retried on the flush cadence's backoff loop and
+   * never blocks or undoes the restore. */
+  recoveryConsume(): Promise<void>;
+  /** The account's live kits — a projection of the us-doc's `recovery`
+   * map. Nothing here unlocks anything. */
+  recoveryKits(): Promise<RecoveryKit[]>;
+  /** Revoke a kit: the same mechanic as a lost phone, because it IS the
+   * same thing. Returns the human-readable guarantee note `storeRevoke`
+   * returns. */
+  recoveryKitRevoke(agentId: Uint8Array): Promise<string>;
+
   stats(): Promise<string>;
+}
+
+/** `recovery-kit` — a record, so it lowers to a plain object (the
+ * `{kind, value}` variant convention does not apply). `kind` is
+ * `"bucket"` or `"file"`; `created` is a WIT `u64`, hence a bigint. */
+export interface RecoveryKit {
+  agentId: Uint8Array;
+  kind: string;
+  created: bigint;
 }
 
 // --- device-pairing + user-system WIT record/variant mirrors
