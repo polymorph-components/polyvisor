@@ -93,6 +93,19 @@ import type { PrfEnrollment } from "./seal.ts";
  * the global has no WebAssembly JS Promise Integration, so the engine
  * cannot be instantiated at all; worker.ts's `PlatformError`), plus this
  * module's own "timeout", "closed" and "unclonable".
+ *
+ * AND "host-gone", which is the newest and the one worth distinguishing
+ * from its nearest neighbour. "timeout" means THIS CALL did not answer
+ * in the budget it was given and says nothing else — the call may still
+ * be running in a perfectly healthy worker. "host-gone" means the WHOLE
+ * HOST stopped answering: client.ts's heartbeat missed two consecutive
+ * pings on this port, which is what a browser evicting the SharedWorker
+ * looks like from a tab, there being no close event to hear (devstore
+ * row 52). It is raised only by client.ts, never by the worker — a dead
+ * worker cannot report its own death, which is the entire problem — and
+ * it is terminal for the connection it appears on: once one call has
+ * seen it, every later call on that connection gets it immediately.
+ * Recovery is a fresh `connectDevice`, and it is the only recovery.
  */
 export interface HostError {
   message: string;
@@ -890,6 +903,15 @@ export interface DeviceStatus {
 export type HostMethod =
   | "attach"
   | "detach"
+  /**
+   * ARE YOU ALIVE — the client heartbeat's whole vocabulary
+   * (client.ts's "THE HEARTBEAT"). It takes no arguments, touches no
+   * state, and MUST be answerable in every state this worker can be in:
+   * before attach, sealed, unsealed, mid-flush, and after an erase.
+   * Anything that could make it conditional would turn the death
+   * detector into a detector of that condition instead.
+   */
+  | "ping"
   | "unseal"
   | "promote"
   | "reseal"
