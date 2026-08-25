@@ -65,14 +65,26 @@ const DEBOUNCED = "never explicitly checkpointed";
  * MEASUREMENT of the checkpoint discipline rather than an assertion. */
 const IN_FLIGHT = "written into the last debounce window";
 /**
- * The RPC timeout rows 51-53 connect with. client.ts's default is 120 s
- * — the right production number, and far too long for a row whose whole
- * job is to measure how a pending call ends when the worker under it is
- * gone. Shortening it does not change WHAT is measured (the port is
- * silent either way, row 52); it bounds how long this harness waits to
- * say so.
+ * The RPC timeout rows 51-53 connect with, and it is now deliberately
+ * LONG rather than short.
+ *
+ * IT USED TO BE 6 s, back when the client's own deadline was the only
+ * thing that could ever end a call against a dead host: a 120 s wait
+ * was unusable in a gate, so the row shortened the deadline it was
+ * measuring. Since #114 the deadline is no longer the exit — client.ts's
+ * heartbeat detects the death in ~7 s worst case and rejects everything
+ * pending with `host-gone` — and a 6 s deadline would RACE that
+ * detector, so the row could not honestly say which of the two ended
+ * the call. Setting it well above the detection budget makes the answer
+ * unambiguous: if the call ends with `host-gone`, the heartbeat ended
+ * it, because nothing else was going to for another minute.
  */
-const EVICTION_TIMEOUT_MS = 6_000;
+const EVICTION_TIMEOUT_MS = 60_000;
+/** How long 52b will wait for the heartbeat's verdict before reporting
+ * that it never came. Comfortably above the ~7 s worst case and far
+ * below `EVICTION_TIMEOUT_MS`, so a regression to the old behaviour
+ * shows up as "never-settled" rather than as a slow pass. */
+const DEATH_PATIENCE_MS = 30_000;
 
 // --- CDP: killing a SharedWorker, and freezing a page ----------------------
 //
@@ -3277,7 +3289,14 @@ async function main() {
       // eviction is deliberately racing it. Nothing below asserts the
       // outcome — row 53 REPORTS which way it fell.
       await probe(page, "hc-add", { id, titles: [IN_FLIGHT] });
+      const killedAt = Date.now();
       const killed = await killWorkerFor(browser, id);
+      // ONE ORDINARY RPC, ISSUED AT ONCE AND LEFT PENDING. It goes in
+      // before the lock poll below so that 52b times the death from as
+      // close to the kill as this harness can get; `hc-race-await`
+      // collects it further down, and the wait is timed from the ISSUE,
+      // not from the collection.
+      await probe(page, "hc-race-start", { id });
       // BOUNDED, NOT SLEPT: the platform releases a dead holder's lock on
       // its own schedule and the wait is the measurement (see
       // `untilLockFree`).
@@ -3317,15 +3336,29 @@ async function main() {
       );
 
       const heard = await probe(page, "port-heard", { id });
-      const raced = await probe(page, "hc-race", {
-        id,
-        ms: EVICTION_TIMEOUT_MS + 6_000,
-      });
-      const timedOut = raced.outcome === "rejected" && raced.error?.code === "timeout" &&
-        // NOT EARLY EITHER: a rejection well before the deadline would
-        // mean something OTHER than the timer ended the call, which is
-        // the opposite finding wearing the same code.
-        raced.waitedMs >= EVICTION_TIMEOUT_MS - 250;
+      const raced = await probe(page, "hc-race-await", { id, ms: DEATH_PATIENCE_MS });
+      const gone = await probe(page, "hc-gone", { id });
+      // THE END-TO-END NUMBER: from the CDP kill to the moment the
+      // client told the page. `hookAt` is the page's own clock and
+      // `killedAt` is this driver's, on the same machine.
+      const detectedMs = gone.hookAt > 0 ? gone.hookAt - killedAt : -1;
+      // ~7 s is the worst case client.ts budgets for (one 3 s cadence
+      // plus two 2 s ping deadlines); 12 s is that with slack for a
+      // loaded CI machine, and it is still four times under the old
+      // 6 s-deadline story and seventeen times under the 120 s default.
+      const DETECTION_CEILING_MS = 12_000;
+      const detected = raced.outcome === "rejected" && raced.error?.code === "host-gone" &&
+        raced.waitedMs < DETECTION_CEILING_MS &&
+        // AND IT IS THE HEARTBEAT THAT DID IT, not the per-call timer
+        // wearing a new name: the connection's own deadline is a whole
+        // minute away.
+        raced.waitedMs < EVICTION_TIMEOUT_MS / 2 &&
+        gone.hookCount === 1 && detectedMs >= 0 && detectedMs < DETECTION_CEILING_MS;
+      const afterDeath = gone.after.refused === true && gone.after.error?.code === "host-gone" &&
+        // IMMEDIATELY means immediately: `send` refuses before it
+        // touches the port, so this must not cost another cycle. 250 ms
+        // is a page-round-trip allowance, not a budget.
+        gone.afterWaitedMs < 250;
       record(
         "52 eviction",
         "INFO: the port says NOTHING when its host dies — there is no peer-death event to hear",
@@ -3334,35 +3367,59 @@ async function main() {
           `\`messageerror\` listeners attached, heard ${j(heard.seen)} across the eviction — and ` +
           `\`"onclose" in port\` is ${listening.closeEventSupported} in this Chromium ` +
           `(${browser.version()}), so there is no peer-death event being missed: there is none to ` +
-          `miss. THIS IS INFO BECAUSE IT IS PLATFORM-GIVEN, not a claim device-store makes. ` +
-          `client.ts listens for \`message\` and nothing else, and the record here is that there ` +
-          `is currently nothing else to listen for — which is what makes 52b's deadline the ONLY ` +
-          `thing that can end a pending call, rather than one of two ways it might.`,
+          `miss. THIS IS INFO BECAUSE IT IS PLATFORM-GIVEN, not a claim device-store makes, and ` +
+          `it is UNCHANGED by #114: the platform still says nothing. What changed is what the ` +
+          `client does about the silence — it stopped waiting to be told and started ASKING ` +
+          `(52b). This row is the reason that had to be built: there was nothing to listen for, ` +
+          `so a detector had to generate its own signal.`,
       );
       record(
         "52b eviction",
-        "a pending RPC against an evicted host ends at the CLIENT'S OWN deadline, with the timeout code",
-        timedOut,
-        `with the host gone underneath it, an ordinary \`tasks.items()\` on the SAME live ` +
-          `connection ${
-            timedOut
-              ? `rejected after ${raced.waitedMs} ms against the ${EVICTION_TIMEOUT_MS} ms ` +
-                `deadline this connection was opened with, as ${raced.error?.name} ` +
-                `code=${j(raced.error?.code)}: ${j(raced.error?.message)}`
-              : `${raced.outcome} after ${raced.waitedMs} ms — ${j(raced.error)}, which is NOT ` +
-                `the contract`
-          }. THAT IS THE DEVICE STORE'S OWN CONTRACT and it is what this row pins, separately ` +
-          `from 52's platform fact: client.ts arms one timer per request ` +
-          `(\`spec.timeoutMs ?? 120_000\`) and its expiry rejects with a \`DeviceHostError\` ` +
-          `whose code is \`"timeout"\` — deliberately NOT a \`ComponentException\`, because "the ` +
-          `call may still be running in the worker" and a timeout "says nothing about what the ` +
-          `guest did or did not do" (client.ts's own comment at the timer). An embedder branches ` +
-          `on that code to offer a reconnect; had the seam degraded it into an engine error, an ` +
-          `app would handle a host condition as a guest err arm. The 120 s default is the right ` +
-          `production number and useless in a gate, so this connection was opened with ` +
-          `${EVICTION_TIMEOUT_MS} ms — the knob changes how long the row waits, not what it ` +
-          `measures, and 52 is the reason the deadline is the only exit: nothing else was ever ` +
-          `going to arrive.`,
+        "a pending RPC against an evicted host ends at the HEARTBEAT's verdict, promptly, with the host-gone code",
+        detected,
+        `with the host gone underneath it, an ordinary \`tasks.items()\` issued on the SAME live ` +
+          `connection immediately after the kill ${
+            detected
+              ? `rejected after ${raced.waitedMs} ms as ${raced.error?.name} ` +
+                `code=${j(raced.error?.code)}, and the client's \`onHostGone\` hook fired ` +
+                `${gone.hookCount} time ${detectedMs} ms after the CDP kill`
+              : `${raced.outcome} after ${raced.waitedMs} ms — ${j(raced.error)}, hook fired ` +
+                `${gone.hookCount}× at +${detectedMs} ms, which is NOT the contract`
+          }. THIS ROW'S CLAIM CHANGED AT #114 and the old one is worth stating to see the size ` +
+          `of the change: a pending call used to end at client.ts's OWN per-request timer, with ` +
+          `code \`"timeout"\` — 120 s in production, and this row used to shorten the deadline to ` +
+          `6 s just to be runnable. A \`timeout\` is an honest description of a timer and a ` +
+          `useless description of the world: it says the call did not answer in its budget, and ` +
+          `says nothing about whether anything is still there to answer. Now client.ts pings its ` +
+          `OWN PORT every 3 s with a 2 s deadline and declares the host dead after 2 consecutive ` +
+          `misses, so the exit is a diagnosis rather than an expiry. THE DEADLINE IS NOT WHAT ` +
+          `ENDED IT: this connection was opened with ${EVICTION_TIMEOUT_MS} ms deliberately, so ` +
+          `a rejection inside ${DETECTION_CEILING_MS} ms cannot be the timer. AND NOT A LOCK ` +
+          `PROBE EITHER, which is the detector this issue proposed first: row 51 above measured ` +
+          `the lock free again in ${release.waitedMs} ms and row 53 below respawns a host that ` +
+          `re-takes it, so a poller reading \`pm-device-${"${"}id}\` would report a healthy ` +
+          `device over a dead port. The port is what died, so the port is what gets asked.`,
+      );
+      record(
+        "52c eviction",
+        "and every call AFTER the death is refused at once, with the same code — the connection is terminal",
+        afterDeath,
+        `a \`status()\` issued on the same connection after the verdict ` +
+          `${
+            afterDeath
+              ? `was refused in ${gone.afterWaitedMs} ms as ` +
+                `${gone.after.error?.name} code=${j(gone.after.error?.code)}: ` +
+                `${j(gone.after.error?.message)}`
+              : `did ${gone.after.refused ? "refuse" : "NOT refuse"} after ` +
+                `${gone.afterWaitedMs} ms — ${j(gone.after.error)}, which is NOT the contract`
+          }. IT NEVER TOUCHES THE PORT: \`send\` checks the death flag first and rejects ` +
+          `synchronously, which is what makes the cost approximately zero rather than another ` +
+          `detection cycle per call. A dead connection is TERMINAL by design — there is no ` +
+          `reconnect on this object and deliberately no auto-respawn, because a respawned host ` +
+          `comes up SEALED and what to do about that (prompt? platform wrap? ask first?) is an ` +
+          `embedder's decision, not a library's. The message says so in as many words, and row ` +
+          `53 immediately below is the proof the deferral costs nothing: a fresh ` +
+          `\`connectDevice\` gets the whole device back.`,
       );
 
       // RESPAWN. `close()` on the dead connection is what lets the page
@@ -3374,8 +3431,15 @@ async function main() {
       const items = await probe(page, "hc-items", { id });
       const respawned = await sharedWorkersFor(browser, id);
       const inFlightKept = items.titles.includes(IN_FLIGHT);
+      // AND THE NEW CONNECTION'S DETECTOR IS ARMED AND QUIET. A fresh
+      // `onHostGone` box comes with every `connectDevice`, so a nonzero
+      // count here would mean the respawned connection declared its own
+      // brand-new host dead — the exact false positive #114's detector
+      // has to be trusted not to produce.
+      const rearmed = await probe(page, "hc-gone", { id });
 
-      const respawnOk = back.unseal.refused === false && back.status.resumed === true &&
+      const respawnOk = rearmed.hookCount === 0 && rearmed.after.refused === false &&
+        back.unseal.refused === false && back.status.resumed === true &&
         back.status.sealed === false &&
         back.hello.bootSeq > open.hello.bootSeq &&
         back.hello.instanceNonce !== open.hello.instanceNonce &&
@@ -3402,7 +3466,10 @@ async function main() {
           } (titles now ${j(items.titles)}). Either way the discipline is the one row 17 states: ` +
           `what is checkpointed survives a crash and what is inside the open window may not, ` +
           `which is why \`reseal\` and last-client-disconnect checkpoint FIRST rather than trust ` +
-          `the timer.`,
+          `the timer. AND THE HEARTBEAT CAME BACK UP WITH IT: this new connection's ` +
+          `\`onHostGone\` has fired ${rearmed.hookCount} time(s) and an ordinary \`status()\` on ` +
+          `it answered (refused=${rearmed.after.refused}) — the detector rearms per connection ` +
+          `and does not carry the previous host's death across.`,
       );
       await probe(page, "hc-close", { id });
       await probe(page, "hc-forget", { ids: [id] });
