@@ -90,16 +90,17 @@
 //   * and neither side can learn the wire died at all: `conn-status`
 //     latches the handshake's outcome and is never invalidated
 //     — the outcome goes into `conn_results` once and is never
-//     removed (engine/guest/src/lib.rs:4262, with :4198/:4255 for the
+//     removed (engine/guest/src/lib.rs:4407, with :4343/:4400 for the
 //     error outcomes), and `conn-status` reads it back for ever
-//     (:4268-4275). solo.ts:2988-3012 already writes this down for the
+//     (:4413-4420). solo.ts:2988-3012 already writes this down for the
 //     neighbouring one-sided-reload case, though by the latch's OLD
 //     line numbers — the code moved, the fact did not.
 //
 // THE MISSING PIECE, in the engine's own terms: a `conn-status` that
 // goes false when the connection drops (named as the honest fix at
-// solo.ts:3009-3012), and a page-side retry armed for the life of the
-// page rather than only on the resumed-boot path.
+// solo.ts:3009-3012 — filed as #113), and a page-side retry armed for
+// the life of the page rather than only on the resumed-boot path.
+
 //
 // NOTHING RELOADS HERE, and no storage is bound — see relay-partition.ts
 // for both, in full. A reload would enter `resumeWire` and heal (that is

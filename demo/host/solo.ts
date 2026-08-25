@@ -4332,8 +4332,10 @@ async function startApp(
   // connection handle from before, and has no way to learn that the
   // thing on the other end of it is gone. `conn-status` reports the
   // outcome of the HANDSHAKE and is never invalidated afterwards
-  // (engine/guest/src/lib.rs:3700 writes it once; :3706-3713 reads it
-  // back forever), and `sync-status` is one-shot per round rather than a
+  // (engine/guest/src/lib.rs:4407 writes it once — `s.conn_results.insert(id,
+  // outcome)`, with the error paths at :4343 and :4400 writing the same
+  // slot early — and :4413-4420's `conn_status` reads that slot back
+  // forever), and `sync-status` is one-shot per round rather than a
   // subscription's health. So the reader has no evidence of staleness at
   // all, and the only "fix" available to this file would be to re-dial
   // on a timer — a second connection and a second set of subductions for
@@ -4347,7 +4349,7 @@ async function startApp(
   // The honest fix belongs in the engine — a `conn-status` that goes
   // false when the connection drops — and until it exists this page
   // cannot tell the difference between a healthy peer and a departed
-  // one.
+  // one. Filed as #113.
 
   /** Slow on purpose: the thing being waited for is another human
    * opening a browser. */

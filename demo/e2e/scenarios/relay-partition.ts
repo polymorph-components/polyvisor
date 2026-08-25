@@ -59,9 +59,9 @@
 //     outcome of the HANDSHAKE and is never invalidated afterwards
 //     — `iroh-start`'s spawned wiring writes the outcome into
 //     `conn_results` once and nothing ever removes it
-//     (engine/guest/src/lib.rs:4262, and :4198/:4255 for the two error
+//     (engine/guest/src/lib.rs:4407, and :4343/:4400 for the two error
 //     outcomes), and `conn-status` reads that map back for ever
-//     (:4268-4275). `sync-status` is one-shot per round rather than a
+//     (:4413-4420). `sync-status` is one-shot per round rather than a
 //     subscription's health. solo.ts:2988-3012 writes this down
 //     already, for the neighbouring one-sided-reload case; the relay
 //     outage is the same engine limit reached by a different road.
@@ -70,12 +70,13 @@
 //
 // THE MISSING PIECE, in the engine's own terms: a `conn-status` that
 // goes false when the connection drops (solo.ts:3009-3012 names exactly
-// this), plus a page-side retry that is armed for the life of the page
-// rather than only on the resumed-boot path. With the first, the second
-// is cheap and cannot double-dial; without it, any re-dial-on-a-timer
-// would be the double-dialling solo.ts's direction discipline exists to
-// prevent — which is why this is pinned as a gap rather than papered
-// over in a scenario-local workaround.
+// this — filed as #113), plus a page-side retry that is armed for the
+// life of the page rather than only on the resumed-boot path. With the
+// first, the second is cheap and cannot double-dial; without it, any
+// re-dial-on-a-timer would be the double-dialling solo.ts's direction
+// discipline exists to prevent — which is why this is pinned as a gap
+// rather than papered over in a scenario-local workaround.
+
 //
 // ─── WHAT IS NOT THE SUBJECT ────────────────────────────────────────
 //
@@ -297,8 +298,8 @@ const scenario: Scenario = {
       // 2ms and each local `addTodo` in ~85ms, but the FIRST `tick`
       // after the relay dies takes ~30s — the drain runs a driver call
       // that goes out over the dead transport and unwinds on one of
-      // solo.ts's own 30s `until` deadlines (:2617, :2641). It happens
-      // ONCE; every later tick is milliseconds again, which is why the
+      // solo.ts's own 30s `until` deadlines (:2617, :2641). Filed as
+      // #115. It happens ONCE; every later tick is milliseconds again, which is why the
       // liveness act after this one costs nothing. Worth knowing before
       // anyone reads the act's wall clock as a bug in the watch window.
       

@@ -94,6 +94,8 @@ import {
   WAITS,
 } from "../solo-util.ts";
 import { startFakeDrive } from "../../host/fake-drive.ts";
+import { killSharedWorker } from "../cdp.ts";
+
 
 const ROOT = "pm-convergence-soak";
 const CLIENT_ID = "SYNTHETIC-SOAK-CLIENT";
@@ -222,91 +224,23 @@ function drawAction(rand: () => number): ActionName {
 
 // --- CDP: killing a device's SharedWorker by TITLE -------------------------
 //
-// COPIED, NOT IMPORTED, from runtime/tests/devstore/run.ts:101-144
-// (`sharedWorkersFor` / `killWorkerFor`), which in turn lifted the kill
-// sequence from demo/e2e/cdp.ts:43-86 with the same one change this
-// scenario needs: THE SELECTOR IS THE TARGET'S TITLE, NOT ITS URL.
-// demo/e2e/cdp.ts's `killSharedWorker` matches on a URL substring, and
-// both devices here run the same `./solo-worker.js`, so a URL match
-// cannot tell A's host from B's. The title is the SharedWorker's NAME,
-// which runtime/device-store/client.ts:411-413 sets to
-// `nsDbName(deviceId)` — `pm-device-<id>` on the shared_worker target
-// info. The kill itself is cdp.ts's spike finding, relied on and
-// re-confirmed by devstore row 51: `Target.closeTarget` on a
-// `shared_worker` target terminates it, with no attach/evaluate
-// fallback needed.
+// demo/e2e/cdp.ts's `killSharedWorker({ title })` does this now — see
+// its banner for why title (not URL) is the match: both devices here
+// run the same `./solo-worker.js`, so a URL substring cannot tell A's
+// host from B's, but the title IS the SharedWorker's NAME, which
+// runtime/device-store/client.ts:411-413 sets to `nsDbName(deviceId)`
+// (`pm-device-<id>`). The kill itself is cdp.ts's spike finding,
+// re-confirmed by devstore row 51.
 
-interface WorkerTarget {
-  targetId: string;
-  title: string;
-}
-
-/** Every `shared_worker` target hosting THIS device. Browser-wide —
- * `Target.getTargets` is not scoped to a page — and it detaches its own
- * browser-level session in a `finally`, cdp.ts's reason: a soak that
- * calls this once per eviction must not accumulate CDP sessions. */
-async function sharedWorkersFor(
-  browser: Browser,
-  deviceId: string,
-): Promise<WorkerTarget[]> {
-  const cdp = await browser.newBrowserCDPSession();
-  try {
-    const { targetInfos } = await cdp.send("Target.getTargets") as {
-      targetInfos: { targetId: string; type: string; title: string }[];
-    };
-    return targetInfos
-      .filter((t) =>
-        t.type === "shared_worker" && t.title === `pm-device-${deviceId}`
-      )
-      .map((t) => ({ targetId: t.targetId, title: t.title }));
-  } finally {
-    await cdp.detach().catch(() => {/* already gone */});
-  }
-}
-
-/** Terminate the SharedWorker hosting this device, NAMING what is live
- * when the match is not exactly one: a step whose whole subject is "the
- * host died" must fail loudly rather than quietly kill nothing — or
- * quietly kill an arbitrary one of several. */
+/** Terminate the SharedWorker hosting this device — thin wrapper over
+ * cdp.ts's `killSharedWorker`, kept so call sites here read by
+ * deviceId rather than assembling the title match inline. */
 async function killWorkerFor(
   browser: Browser,
   deviceId: string,
-): Promise<WorkerTarget> {
-  const targets = await sharedWorkersFor(browser, deviceId);
-  if (targets.length !== 1) {
-    // NEITHER ZERO NOR TWO. Zero means the step's whole subject —
-    // "the host died" — would be a no-op quietly reported as done. TWO
-    // means the title match is no longer the identity it is documented
-    // to be (one SharedWorker per device namespace), and killing an
-    // arbitrary one of them would make the step mean something nobody
-    // wrote down. Both fail here, naming every live shared_worker.
-    const all = await browser.newBrowserCDPSession();
-    let live = "";
-    try {
-      const { targetInfos } = await all.send("Target.getTargets") as {
-        targetInfos: { type: string; title: string }[];
-      };
-      live = JSON.stringify(
-        targetInfos.filter((t) => t.type === "shared_worker").map((t) =>
-          t.title
-        ),
-      );
-    } finally {
-      await all.detach().catch(() => {});
-    }
-    throw new Error(
-      `expected exactly one shared worker for device ${deviceId}, found ${targets.length}` +
-        ` — live shared workers: ${live}`,
-    );
-  }
-  const target = targets[0];
-  const cdp = await browser.newBrowserCDPSession();
-  try {
-    await cdp.send("Target.closeTarget", { targetId: target.targetId });
-  } finally {
-    await cdp.detach().catch(() => {});
-  }
-  return target;
+): Promise<{ targetId: string; title: string }> {
+  const target = await killSharedWorker(browser, { title: `pm-device-${deviceId}` });
+  return { targetId: target.targetId, title: target.title };
 }
 
 // --- the two ceremonies this soak needs as PRECONDITIONS -------------------
