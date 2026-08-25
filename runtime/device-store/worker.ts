@@ -3104,6 +3104,20 @@ const ports = new Set<MessagePort>();
 
 async function callHost(method: string, args: unknown[]): Promise<unknown> {
   switch (method) {
+    case "ping":
+      // THE ONE METHOD THAT ANSWERS IN EVERY STATE. It is the client
+      // heartbeat's probe (client.ts's "THE HEARTBEAT"): the browser
+      // fires no event when it evicts this global, so a tab's only way
+      // to know its host is alive is to have asked it recently. What
+      // makes the answer meaningful is that it is unconditional — no
+      // engine, no lock, no attach, no unseal, no state touched at all.
+      // A ping that could refuse would be measuring whatever it refused
+      // for instead of measuring whether this global still exists.
+      //
+      // It returns the instance nonce rather than a bare `true` for
+      // free diagnostic value: two nonces on one connection would mean
+      // something no design here allows.
+      return INSTANCE_NONCE;
     case "attach": {
       const spec = args[0] as AttachSpec;
       if (spec.deviceId !== DEVICE_ID) {
@@ -3327,8 +3341,15 @@ async function call(target: string, method: string, args: unknown[]): Promise<un
   // whole of it. `destroy` stays open because it is idempotent and a
   // retry of a partly-failed erasure is a thing a client is entitled to
   // do; `__die` stays open because closing the global is never wrong for
-  // a device that no longer exists.
-  if (destroyed && !(target === "host" && (method === "destroy" || method === "__die"))) {
+  // a device that no longer exists; and `ping` stays open because it is
+  // a question about THIS GLOBAL, not about the device — a host that has
+  // erased its namespace is still very much alive, and answering "erased"
+  // to a liveness probe would be answering a different question.
+  if (
+    destroyed &&
+    !(target === "host" &&
+      (method === "destroy" || method === "__die" || method === "ping"))
+  ) {
     throw new Error(`device-store: this device was erased (${target}.${method} refused)`);
   }
   if (target === "host") return await callHost(method, args);

@@ -968,30 +968,86 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
 
   /**
    * WHAT A STILL-ATTACHED CLIENT OBSERVES when the worker underneath it
-   * is gone: issue one ordinary RPC and report, BOUNDED, whether it
-   * resolved, rejected, or simply never settled. The bound is the
-   * harness's patience, not a claim — a call that has not settled by
-   * then is reported as exactly that.
+   * is gone — SPLIT INTO TWO PROBES, and the split is the measurement.
+   *
+   * `hc-race-start` issues one ordinary RPC and returns AT ONCE, leaving
+   * it pending; `hc-race-await` collects it, bounded, and reports
+   * whether it resolved, rejected or simply never settled, timed from
+   * the moment it was ISSUED rather than from the moment the driver
+   * came back to look. That is what lets the eviction row put the call
+   * in flight immediately after the kill and still run row 51's
+   * lock-release poll — which has to happen promptly or it stops
+   * measuring what it claims — in between. One probe that both issued
+   * and awaited would have to choose which of the two to be late for.
+   *
+   * The bound in `hc-race-await` is the harness's patience, not a
+   * claim: a call that has not settled by then is reported as exactly
+   * that.
    */
-  "hc-race": async (arg: { id: string; ms: number }) => {
+  "hc-race-start": (arg: { id: string }) => {
     const conn = conns.get(arg.id)!;
-    const started = Date.now();
-    let outcome: "resolved" | "rejected" | "never-settled" = "never-settled";
-    let error: ReturnType<typeof caught> | null = null;
-    const call = conn.tasks.items().then(
+    const state: {
+      startedAt: number;
+      outcome: "resolved" | "rejected" | "never-settled";
+      error: ReturnType<typeof caught> | null;
+      call: Promise<void>;
+    } = {
+      startedAt: Date.now(),
+      outcome: "never-settled",
+      error: null,
+      call: Promise.resolve(),
+    };
+    state.call = conn.tasks.items().then(
       () => {
-        outcome = "resolved";
+        state.outcome = "resolved";
       },
       (e) => {
-        outcome = "rejected";
-        error = caught(e);
+        state.outcome = "rejected";
+        state.error = caught(e);
       },
     );
-    await Promise.race([call, new Promise((r) => setTimeout(r, arg.ms))]);
     // A rejection that lands after the bound must not become an
     // unhandled rejection and take the page down with it.
-    call.catch(() => {});
-    return { outcome, error, waitedMs: Date.now() - started };
+    state.call.catch(() => {});
+    races.set(arg.id, state);
+    return Promise.resolve({ startedAt: state.startedAt });
+  },
+
+  "hc-race-await": async (arg: { id: string; ms: number }) => {
+    const state = races.get(arg.id)!;
+    await Promise.race([state.call, new Promise((r) => setTimeout(r, arg.ms))]);
+    return {
+      outcome: state.outcome,
+      error: state.error,
+      // FROM THE ISSUE, NOT FROM HERE. This is the number the row
+      // quotes as the detection latency, so it has to span the whole
+      // life of the call.
+      waitedMs: Date.now() - state.startedAt,
+    };
+  },
+
+  /**
+   * WHAT THE TAB WAS TOLD, and what a call issued AFTERWARDS costs.
+   *
+   * `onHostGone` is client.ts's one unsolicited callback; `connect()`
+   * above wires every connection this page makes to a counter, so a row
+   * can assert both that it fired and that it fired ONCE. The second
+   * half issues a fresh RPC on the same (now dead) connection and times
+   * it: once the death is declared, `send` refuses before it ever
+   * touches the port, so this should cost approximately nothing rather
+   * than another detection cycle.
+   */
+  "hc-gone": async (arg: { id: string }) => {
+    const seen = hostGoneSeen.get(arg.id) ?? { count: 0, at: 0 };
+    const conn = conns.get(arg.id)!;
+    const started = Date.now();
+    const after = await refuses(() => conn.status());
+    return {
+      hookCount: seen.count,
+      hookAt: seen.at,
+      after,
+      afterWaitedMs: Date.now() - started,
+    };
   },
 
   /**
@@ -2422,11 +2478,31 @@ const ARTIFACTS = {
  * re-attach, which is the point of the reload rows. */
 const conns = new Map<string, DeviceConnection>();
 
+/**
+ * WHAT `onHostGone` DID, per device. One box per connection, registered
+ * under the device id once `connectDevice` has resolved it (the anchor
+ * arm does not know its id until then). The COUNT is the point as much
+ * as the timestamp: client.ts promises the hook fires exactly once per
+ * connection however many pings were in flight when the verdict landed.
+ */
+const hostGoneSeen = new Map<string, { count: number; at: number }>();
+
+/** Pending RPCs started by `hc-race-start`, collected by
+ * `hc-race-await`. Keyed by device so the two are separate probe
+ * calls — see the pair's header for why they have to be. */
+const races = new Map<string, {
+  startedAt: number;
+  outcome: "resolved" | "rejected" | "never-settled";
+  error: ReturnType<typeof caught> | null;
+  call: Promise<void>;
+}>();
+
 function connect(
   arg: { id?: string; anchorPetname?: string; seedPosture?: boolean; timeoutMs?: number },
 ): Promise<DeviceConnection> {
   const existing = arg.id ? conns.get(arg.id) : undefined;
   if (existing) return Promise.resolve(existing);
+  const seen = { count: 0, at: 0 };
   return connectDevice({
     device: arg.id
       ? { kind: "id", id: arg.id }
@@ -2446,8 +2522,19 @@ function connect(
     // PROBE ONLY, and only the seed-back-compat row passes it: the
     // worker inits in platform posture otherwise.
     __seedPosture: arg.seedPosture === true,
+    // THE DEATH HOOK, WIRED UNDER EVERY ROW rather than only under the
+    // eviction ones. The heartbeat that raises it is armed on every
+    // connection this harness makes, so counting the hook everywhere is
+    // what turns the whole matrix into the false-positive gate: any row
+    // whose live host got declared dead would fire this, and the row
+    // would fail on the refusals that follow.
+    onHostGone: () => {
+      seen.count++;
+      if (seen.at === 0) seen.at = Date.now();
+    },
   }).then((c) => {
     conns.set(c.deviceId, c);
+    hostGoneSeen.set(c.deviceId, seen);
     return c;
   });
 }

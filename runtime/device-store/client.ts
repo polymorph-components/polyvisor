@@ -127,6 +127,29 @@ export interface ConnectSpec {
    * Instantiating the composite is ~100 ms, but a first unseal also runs
    * 600k PBKDF2 iterations and a resume reads the whole state root. */
   timeoutMs?: number;
+  /**
+   * THE HOST DIED AND NOBODY SAID SO — fired once, at the moment this
+   * client's heartbeat concludes it (see `HEARTBEAT_MS` below for how
+   * that conclusion is reached and what it is worth).
+   *
+   * It is the only unsolicited callback on this surface, and it exists
+   * because the alternative is worse: without it a tab whose
+   * SharedWorker was evicted learns nothing at all until a user-visible
+   * call has eaten the full `timeoutMs`. When it fires, every pending
+   * RPC has ALREADY rejected with `code === "host-gone"` and every
+   * subsequent call on this connection will reject the same way — the
+   * hook is a notification, not a gate, so an embedder that ignores it
+   * still gets prompt, correctly-coded rejections.
+   *
+   * WHAT AN EMBEDDER SHOULD DO WITH IT: `close()` this connection and
+   * `connectDevice()` again. Nothing here does that for you — see the
+   * no-auto-respawn note at the call site.
+   *
+   * A throw out of this hook is swallowed: it runs on a timer with no
+   * caller to report to, and an embedder's rendering bug must not be
+   * able to leave the death half-declared.
+   */
+  onHostGone?: () => void;
 }
 
 /**
@@ -497,6 +520,10 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
     helloResolve = r;
   });
   let closed = false;
+  // THE HOST IS GONE (see the heartbeat below). Separate from `closed`
+  // because they are different facts with different codes: `closed` is
+  // "this tab hung up", `hostGone` is "the other end stopped existing".
+  let hostGone = false;
 
   worker.port.onmessage = (ev: MessageEvent<Res | Hello>) => {
     const data = ev.data;
@@ -514,7 +541,26 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
   };
   worker.port.start();
 
-  function send(target: Req["target"], method: string, args: unknown[]): Promise<unknown> {
+  /**
+   * One request, one reply, one deadline.
+   *
+   * `deadlineMs` overrides the connection's for the ONE caller that
+   * needs a different budget: the heartbeat, whose whole job is to fail
+   * fast. Every application-facing call leaves it undefined and gets
+   * `spec.timeoutMs`.
+   */
+  function send(
+    target: Req["target"],
+    method: string,
+    args: unknown[],
+    deadlineMs: number = timeoutMs,
+  ): Promise<unknown> {
+    // ORDER MATTERS: the death answer wins over the closed one. A tab
+    // that calls `close()` on a connection whose host already died
+    // should still see `host-gone` on anything it issues afterwards —
+    // "the host is gone" is the diagnosis, and "I hung up" is a
+    // consequence of it rather than a competing explanation.
+    if (hostGone) return Promise.reject(hostGoneError(`${target}.${method}`));
     if (closed) {
       return Promise.reject(
         new DeviceHostError({
@@ -534,17 +580,178 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
           // `ComponentException` an app would handle as an err arm. It
           // is a host condition, and it says so.
           reject(new DeviceHostError({
-            message: `device-store: ${target}.${method} timed out after ${timeoutMs}ms`,
+            message: `device-store: ${target}.${method} timed out after ${deadlineMs}ms`,
             hostName: "TimeoutError",
             code: "timeout",
           }));
         }
-      }, timeoutMs);
+      }, deadlineMs);
       pending.set(id, { resolve, reject, timer });
       const req: Req = { id, target, method, args };
       worker.port.postMessage(req);
     });
   }
+
+  // --- THE HEARTBEAT: how a tab learns its host died ------------------------
+  //
+  // THE PROBLEM. A browser that evicts a SharedWorker tells nobody. The
+  // port fires no `close` event — `"onclose" in port` is false in this
+  // Chromium and a raw listening port hears exactly zero events across
+  // the eviction (devstore row 52, platform-given and not ours to fix) —
+  // so without something on this side, every pending and every
+  // subsequent call sits until `timeoutMs` (120 s by default) and then
+  // rejects with the generic `timeout` code, which is a description of
+  // our own timer rather than of what happened.
+  //
+  // WHY NOT A LOCK PROBE, which is the obvious cheap answer and the one
+  // this design rides on everywhere else (locks.ts: "locks are released
+  // by the platform when the holder dies"). Because the lock is a fact
+  // about THE DEVICE, and what we need is a fact about THIS PORT. Row 51
+  // measured the release at ~2 ms and row 53 measured a clean respawn
+  // immediately afterwards: another tab — or this same page's next
+  // `connectDevice` — can spawn a fresh host that re-takes
+  // `pm-device-<id>` within milliseconds, while OUR port is still
+  // attached to the corpse. A poller that happened to look after that
+  // window would read the lock as held and report the connection
+  // healthy, which is precisely and confidently wrong. The lock-free
+  // window is real but it is not ours to depend on; the port's silence
+  // is the thing we actually have to break.
+  //
+  // SO: ASK OUR OWN PORT. `host.ping` is answered by the worker's
+  // dispatch in every state it can be in — sealed, unsealed, before
+  // attach, after destroy — and touches nothing (worker.ts's `callHost`,
+  // first case). A reply proves the global is alive and that OUR port is
+  // still wired to it. Nothing else does.
+  //
+  // THE NUMBERS, and the honesty about what they can get wrong.
+  //
+  //   * `HEARTBEAT_MS` 3 s — the gap between a settled ping and the next
+  //     one. One trivial postMessage round trip per tab per 3 s is
+  //     nothing next to the lease heartbeat the worker already runs, and
+  //     3 s keeps worst-case detection inside the "within seconds" this
+  //     was asked for.
+  //   * `PING_DEADLINE_MS` 2 s — a ping is a switch statement and a
+  //     postMessage; 2 s is already three orders of magnitude of slack.
+  //     It is deliberately NOT `timeoutMs`: this call's value is in
+  //     failing fast, and an unseal's 600k PBKDF2 iterations are the
+  //     reason that budget exists for everything else.
+  //   * `MISSES_TO_DECLARE_DEAD` 2 — and this is the false-positive
+  //     mitigation, stated rather than assumed. The worker is async
+  //     (JSPI, so a long engine call yields the event loop and a ping
+  //     interleaves), but "async" is not "never blocks": a
+  //     compute-heavy synchronous stretch inside one guest step, a
+  //     synchronous IndexedDB-adjacent stall, or a badly-timed GC could
+  //     starve one ping. Requiring two CONSECUTIVE misses means a live
+  //     host has to be unresponsive for the better part of four seconds
+  //     before we will call it dead. It cannot make a false positive
+  //     impossible — nothing short of a platform death event can — it
+  //     buys an order of magnitude, and the evidence that the budget is
+  //     sufficient in practice is that the entire devstore matrix (60+
+  //     rows, every unseal, restore, flush and kill among them) runs
+  //     with this heartbeat armed under every single row.
+  //
+  // A MISS IS A TIMEOUT AND NOTHING ELSE. Any *reply* — including a
+  // refusal, including the erased-device refusal a destroyed host
+  // answers with — is proof of life and resets the count. Only silence
+  // counts against the host.
+  //
+  // Worst case from death to declaration: one full cadence plus two
+  // deadlines (~7 s); a miss is retried immediately rather than after
+  // another cadence, because the miss already cost a deadline and
+  // waiting again buys no new information.
+  const HEARTBEAT_MS = 3_000;
+  const PING_DEADLINE_MS = 2_000;
+  const MISSES_TO_DECLARE_DEAD = 2;
+  let misses = 0;
+  let beatTimer: number | undefined;
+  // ARMED/DISARMED, separately from `closed`. A ping is already in
+  // flight when `__die` asks for a deliberate kill, and `closed` does
+  // not flip until that reply lands — so without a flag the in-flight
+  // beat could time out against the dying global, count a miss and
+  // RESCHEDULE past the stop, resurrecting a heartbeat that was told to
+  // stop and eventually announcing a death the caller asked for.
+  let beating = false;
+
+  function hostGoneError(what: string): DeviceHostError {
+    return new DeviceHostError({
+      message: `device-store: the host for device ${deviceId} is gone — it stopped answering ` +
+        `${MISSES_TO_DECLARE_DEAD} consecutive ${PING_DEADLINE_MS}ms pings, which is what a ` +
+        `browser evicting the SharedWorker looks like from here (there is no close event to ` +
+        `hear). ${what} was refused rather than left to hang. A fresh connectDevice() respawns ` +
+        `the host and resumes it from its last checkpoint.`,
+      hostName: "DeviceHostError",
+      code: "host-gone",
+    });
+  }
+
+  function stopHeartbeat(): void {
+    beating = false;
+    if (beatTimer !== undefined) {
+      clearTimeout(beatTimer);
+      beatTimer = undefined;
+    }
+  }
+
+  /**
+   * THE DEATH, DECLARED ONCE. Idempotent by the `hostGone` flag, because
+   * both the pending rejections and the hook must happen exactly once
+   * however many pings are in flight when the verdict lands.
+   */
+  function declareHostGone(): void {
+    if (hostGone || closed) return;
+    hostGone = true;
+    stopHeartbeat();
+    // PENDING FIRST, HOOK SECOND. Every in-flight call rejects with the
+    // death code before anyone is told, so a hook that immediately tears
+    // the connection down finds nothing still hanging behind it.
+    const doomed = [...pending.values()];
+    pending.clear();
+    for (const entry of doomed) {
+      clearTimeout(entry.timer);
+      entry.reject(hostGoneError("the call in flight when the host died"));
+    }
+    // The port is not closed here. `close()` stays the caller's act and
+    // stays idempotent; closing underneath them would only change which
+    // error a late call gets, and `send` already answers that above.
+    //
+    // AND WE DO NOT RESPAWN. It would be one line — `connectDevice` again
+    // with the same spec — and it is deliberately not taken: a respawned
+    // host comes up SEALED, and what to do about that is an embedder
+    // question (prompt for the passphrase? fall back to the platform
+    // wrap? tell the user first?) that this module has no standing to
+    // answer silently. Row 53 is the proof the deferral is cheap rather
+    // than a burden: a fresh `connectDevice` after an eviction spawns a
+    // new host, takes the lock the dead one left free, auto-unseals from
+    // the platform wrap where the policy allows it and resumes the whole
+    // checkpointed state. The recovery is safe, fast and already
+    // written; what is missing without this hook is only the news.
+    try {
+      spec.onHostGone?.();
+    } catch {
+      // See `onHostGone`'s doc: there is no caller to report to, and a
+      // rendering bug must not leave the death half-declared.
+    }
+  }
+
+  const beat = async (): Promise<void> => {
+    if (!beating || closed || hostGone) return;
+    let missed = false;
+    try {
+      await send("host", "ping", [], PING_DEADLINE_MS);
+    } catch (e) {
+      missed = (e as { code?: unknown } | null)?.code === "timeout";
+    }
+    // RE-CHECKED AFTER THE AWAIT, and `beating` is the one that matters:
+    // a stop issued while this ping was in flight must bind the
+    // continuation too, or the beat it schedules outlives the stop.
+    if (!beating || closed || hostGone) return;
+    misses = missed ? misses + 1 : 0;
+    if (misses >= MISSES_TO_DECLARE_DEAD) {
+      declareHostGone();
+      return;
+    }
+    beatTimer = setTimeout(beat, missed ? 0 : HEARTBEAT_MS) as unknown as number;
+  };
 
   /** Build one remote surface from its method table. */
   function remote<T>(target: "driver" | "tasks", methods: readonly string[]): T {
@@ -562,10 +769,18 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
       __seedPosture: spec.__seedPosture,
     } satisfies AttachSpec,
   ]);
+  // ARMED FOR THE LIFE OF THE CONNECTION, and only once the connection
+  // exists: before `attach` there is nothing to lose, and a ping racing
+  // the handshake would only add noise to the one moment the worker is
+  // legitimately busy fetching artifacts. Torn down by `close`,
+  // `destroy`, `__die`, and by the death it declares.
+  beating = true;
+  beatTimer = setTimeout(beat, HEARTBEAT_MS) as unknown as number;
 
   const close = async (): Promise<void> => {
     if (closed) return;
     closed = true;
+    stopHeartbeat();
     try {
       // Best-effort, and short: this runs on `pagehide` too, where the
       // document may be gone before a reply could arrive. Its VALUE is
@@ -601,6 +816,7 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
     // farewell `detach` it would otherwise post — to a host that has
     // erased itself — is a no-op from here on.
     closed = true;
+    stopHeartbeat();
     for (const [, entry] of pending) clearTimeout(entry.timer);
     pending.clear();
     worker.port.close();
@@ -645,6 +861,10 @@ export async function connectDevice(spec: ConnectSpec): Promise<DeviceConnection
     close,
     destroy,
     __die: async () => {
+      // STOP THE HEARTBEAT BEFORE ASKING FOR THE CRASH, so the probe
+      // gets the death it asked for rather than a race between its own
+      // kill and the detector's verdict.
+      stopHeartbeat();
       await send("host", "__die", []);
       closed = true;
     },
