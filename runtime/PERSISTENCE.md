@@ -96,6 +96,19 @@ survival is checkpoint + rehydrate, not worker-memory luck:
   bfcache would complicate lock lifetimes, but the page already holds a
   live relay WebSocket and is bfcache-ineligible regardless — the cost
   is pre-paid.
+- **Erasure is the one ending where the device dies before the global
+  (amended 2026-08-25, #112).** The lease ⇔ lock ⇔ global lifetime
+  equivalence breaks at `destroy`: the heartbeat must be STOPPED there,
+  or its next `touchLease` recreates the just-deleted database
+  (IndexedDB open-on-missing). The general rule that fell out, three
+  gates on one oracle: **the index row is the namespace's existence
+  oracle, and no path may touch a namespace whose row is absent** — a
+  worker constructed for an erased device counts no boot and writes
+  nothing (module-evaluation `bootSeq` reads the row first), pre-attach
+  `status` and `attach` refuse (an IndexedDB *read* creates the
+  database too), and creation order is verified row-first on every
+  constructing path so a legitimate first boot still counts. Devstore
+  rows 65–66b pin all of it with negative controls.
 - **Degrade rule**: a restored tab (crash restore, reopen-closed-tab)
   can present a pointer to a legitimately swept namespace. That is a
   fresh device, silently — never an error.
