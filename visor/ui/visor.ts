@@ -909,9 +909,15 @@ export interface Visor {
    * would then persist or paint. No caller exists that early; a loud
    * failure keeps it that way. */
   committedHue(): number;
-  /** Paint, without committing (live preview). */
+  /** Paint, without committing (live preview).
+   *
+   * THROWS WHILE UNCLAIMED (`deferClaim`) — there is nothing to preview
+   * before the claim rolls the first colour; see `committedHue`. */
   applyHue(hue: number): void;
-  /** Commit: remember, paint, persist. */
+  /** Commit: remember, paint, persist.
+   *
+   * THROWS WHILE UNCLAIMED (`deferClaim`) — a pre-claim commit would
+   * persist a choice the user never made; see `committedHue`. */
   commitHue(hue: number): void;
   /** FORGET EVERYTHING THIS VISOR HOLDS ON THIS DEVICE — the storage half
    * of the reset ceremony. The identity record, the committed anchor hue
@@ -2040,8 +2046,21 @@ export function initVisor(config: VisorConfig): Visor {
       if (!claimed) throw new Error("the visor is unclaimed: no committed hue before claim()");
       return committedHue;
     },
-    applyHue: applyVisorHue,
+    applyHue: (h) => {
+      // #89: THROWS WHILE UNCLAIMED, same reasoning as `committedHue` —
+      // exactly one code path may put the first colour on the strip, and
+      // it is `claim()`'s `rollHue()` (which calls `applyVisorHue`
+      // directly, unguarded). A pre-claim preview would paint that first
+      // colour instead.
+      if (!claimed) throw new Error("the visor is unclaimed: no live preview before claim()");
+      applyVisorHue(h);
+    },
     commitHue: (h) => {
+      // #89: THROWS WHILE UNCLAIMED — same single-first-paint invariant
+      // as `applyHue`/`committedHue`, plus a persistence half: a
+      // pre-claim commit would also write the consumer's hue key before
+      // the seal opens.
+      if (!claimed) throw new Error("the visor is unclaimed: no hue commit before claim()");
       committedHue = h;
       applyVisorHue(h);
       try {
