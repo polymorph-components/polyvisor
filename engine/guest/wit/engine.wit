@@ -208,6 +208,17 @@ interface driver {
     /// signed manifest. Owner tier: rides `store-owner-fetch` (plus
     /// `store-signer` on S3). An instance wired without write authority
     /// fails with the wired instance's own refusal.
+    ///
+    /// AN EMPTY `doc-id` NAMES THE ACCOUNT'S USER-SYSTEM DOCUMENT.
+    /// SYNC.md §3 scoped a sync cycle to the pointer map and parked "the
+    /// us-doc through the bucket"; RECOVERY.md unparks it — a cold
+    /// restore reads the account out of the bucket, so the account
+    /// document has to BE in the bucket, and the worker's cycle needs a
+    /// way to say so. The id itself stays hidden (the `us-*` surface
+    /// never exposes it), so the sentinel is the naming: an empty id was
+    /// meaningless on every arm before this, which is what makes giving
+    /// it a meaning additive. On a device with no account it REFUSES BY
+    /// NAME rather than answering an empty success.
     bucket-flush: async func(doc-id: list<u8>) -> result<string, string>;
 
     /// Pull: op stream into keyhive, chunks into the sedimentree, then
@@ -218,6 +229,9 @@ interface driver {
     /// derives the K_p location instead and ignores it. Google Drive is
     /// OWNER TIER ONLY and REFUSES a `pickup` BY NAME (DRIVE.md §1): a
     /// link-tier pull is not a thing this provider has.
+    ///
+    /// An EMPTY `doc-id` names the account's user-system document, as it
+    /// does for `bucket-flush` — same sentinel, same reason.
     bucket-pull: async func(doc-id: list<u8>, owner-id: list<u8>, pickup: option<string>) -> result<string, string>;
 
     // --- the identity bundle (#20 G5; #11's persistence slice) ---
@@ -245,6 +259,168 @@ interface driver {
     /// restores identity + keyhive state and binds the tasks service to
     /// the bundled partition. Returns the identity id, hex.
     identity-import: async func(bundle: list<u8>, passphrase: option<string>, secret: option<list<u8>>) -> result<string, string>;
+
+    // --- account recovery (#11; runtime/RECOVERY.md) ---
+    //
+    // "Losing every device does not lose the account." The kit ceremony
+    // mints a DORMANT MEMBER DEVICE — a real leaf in the account's
+    // delegation graph, visible in the devices sheet, revocable like any
+    // device — whose secrets exist only inside a sealed bundle. Restore
+    // boots that device. It is NOT an export of a live device's identity:
+    // a kept device's signing key is a non-extractable platform handle,
+    // and an exportable kit from it would downgrade the posture of every
+    // device that wanted recovery coverage.
+    //
+    // WHY THE DORMANT LEAF STAYS VALID INDEFINITELY (the G5 staleness
+    // finding, answered): self-rotation secrets exist only in the
+    // archive, so a bundle exported before its device's own authoring
+    // cannot reach epochs that authoring created. The recovery device
+    // NEVER AUTHORS between mint and restore, so its leaf never
+    // self-rotates, so every later epoch reaches it through CGKA ops in
+    // the flushed oplogs, addressed to a leaf it still holds. No refresh
+    // daemon exists because none is needed.
+    //
+    // THE BOOTSTRAP is `store-grant(us-doc, recovery-id)`: SYNC.md moved
+    // the per-doc name chains INTO the us-doc, so a cold restore cannot
+    // start from the us-doc's own chain. The K_p pickup carries that
+    // chain and the author device list, sealed to the recovery device's
+    // contact-card prekeys, which ride the bundle. ONE pickup bootstraps
+    // everything.
+    //
+    // BOTH KINDS REQUIRE A BOUND STORE at creation (a kit without a
+    // bucket restores nothing — content rehydrates from the bucket) and
+    // storage credentials at restore. CREDENTIALS NEVER RIDE BUNDLES:
+    // the S3 secret is a non-extractable handle with no bytes to carry,
+    // and OAuth tokens are device-scoped by DRIVE.md's ruling.
+
+    /// One live recovery kit, as the account's `recovery` record holds
+    /// it — a projection, not the kit itself: nothing here unlocks
+    /// anything. `kind` is `"bucket"` or `"file"`.
+    record recovery-kit {
+        agent-id: list<u8>,
+        kind: string,
+        created: u64,
+    }
+
+    /// Mint a BUCKET kit and return its recovery phrase — 10 words from
+    /// the embedded EFF short wordlist, ~103.4 bits.
+    ///
+    /// THE PHRASE IS RETURNED ONCE AND PERSISTED NOWHERE. It is
+    /// generated in-guest (single authority for format and derivation),
+    /// displayed once in visor pixels, and never written to the
+    /// document, the checkpoint, or the bucket.
+    ///
+    /// EXPOSURE RULE, and it is why this arm takes no user secret: the
+    /// bundle is REPLICATED (it sits in the bucket), so its slot may
+    /// hold a GENERATED secret only. The brainwallet/LastPass lesson —
+    /// nothing the system replicates may be crackable via human memory.
+    ///
+    /// Derivation, pinned (RECOVERY.md): root =
+    /// argon2id(normalized phrase, salt = `polyvisor-recovery-v1`); the
+    /// object name is `recovery/` + hex(HKDF-SHA-256(root, info =
+    /// "polyvisor recovery name v1")); the slot KEK is
+    /// HKDF-SHA-256(root, info = "polyvisor recovery kek v1"). The salt
+    /// is FIXED because the name must derive from the phrase alone; the
+    /// phrase's generated entropy is the security and argon2id is depth.
+    ///
+    /// REFUSES BY NAME with no bound store or no account: a kit without
+    /// a bucket restores nothing, and a kit without an account has no
+    /// membership to mint.
+    recovery-kit-create-bucket: async func(label: string) -> result<string, string>;
+
+    /// Mint a FILE kit and return the sealed bundle bytes for download.
+    ///
+    /// The owner's amendment (RECOVERY.md, "Two kit kinds"): disallowing
+    /// custody would be paternalism, so the ceremony WARNS LOUDLY
+    /// instead. Custody makes this have+know, which is what sanctions
+    /// the `passphrase` keyslot (argon2id, random per-file salt) for a
+    /// file the user holds — PERSISTENCE.md's table, unchanged. The
+    /// passphrase's strength is the user's own.
+    ///
+    /// The file cannot be deleted at restore, so single-use is enforced
+    /// by the K_p instead: without it a second restore refuses cleanly
+    /// at the us bootstrap — a 404, never a fork.
+    recovery-kit-create-file: async func(label: string, passphrase: string) -> result<list<u8>, string>;
+
+    /// Restore an account from a BUCKET kit onto an UNINITIALIZED engine
+    /// (instead of `init`, `identity-import` or `state-resume`).
+    /// Returns the restored identity id, hex.
+    ///
+    /// THE CONFIG IS A PARAMETER, not `init-store` state, and the
+    /// ordering is the reason: finding the bundle needs the destination
+    /// FIRST, and the destination cannot be read out of the account
+    /// document that the bundle is what unlocks. So the fetch runs
+    /// through config-parameterized helpers BEFORE any engine state
+    /// exists, and the same config is applied as `init-store` would once
+    /// it does. (This is also why the bucket ceremony asks the user for
+    /// destination AND credentials, where the file ceremony asks for
+    /// credentials only: the file IS the bundle.)
+    ///
+    /// `device-name` is the user's own word for the machine this became.
+    /// The kit's label gives way to it in the devices sheet at the end
+    /// of the restore.
+    ///
+    /// A WRONG PHRASE derives a different name and finds nothing: the
+    /// refusal is "no recovery kit at this name", never a partial
+    /// restore. A CONSUMED kit refuses identically, which is what makes
+    /// double-restore structurally impossible.
+    recovery-restore-bucket: async func(config: store-config, phrase: string, device-name: string) -> result<string, string>;
+
+    /// Restore from a FILE kit: the same ceremony with the bundle handed
+    /// over instead of fetched. A wrong passphrase is a clean slot
+    /// failure ("unlock failed"), indistinguishable from any other
+    /// keyslot miss.
+    recovery-restore-file: async func(config: store-config, bundle: list<u8>, passphrase: string, device-name: string) -> result<string, string>;
+
+    /// CONSUME the kit this instance restored from: delete the bundle
+    /// object (bucket kind), delete the K_p (both kinds), clear the
+    /// account's `recovery` record, flush the us-doc.
+    ///
+    /// Called by the embedder AFTER the content fan-out and the first
+    /// checkpoint succeed — not before: a consume that raced the restore
+    /// would burn the kit for a restore that had not landed.
+    ///
+    /// WHY RESTORE CONSUMES (RECOVERY.md, "Single-use"): (1) dormancy is
+    /// what makes the kit trustworthy and restore ENDS it — the restored
+    /// device authors, its leaf rotates, and the bundle is permanently
+    /// behind the device it claims to restore; a reusable kit would need
+    /// a silent background re-exporter whose failure is invisible until
+    /// the disaster it exists for. (2) Double-restore is an IDENTITY
+    /// FORK: two live instances of one identity clobber each other's
+    /// keyed oplog/manifest names, and SYNC.md requires the
+    /// single-writer-per-name invariant. (3) The phrase is spent at
+    /// restore time, on the machine and at the moment least favorable to
+    /// secret hygiene.
+    ///
+    /// IDEMPOTENT BY CONTRACT: absence is success. A retry after partial
+    /// success must not error on an object that is already gone — the
+    /// embedder retries this on the flush cadence's backoff loop, and a
+    /// consume failure never blocks or undoes the restore.
+    ///
+    /// The pickup deletion FORKS ON THE PROVIDER, as `store-revoke`'s
+    /// does — but this is not a revocation and does not rotate the
+    /// name-key epoch: a device consuming its OWN kit goes on being a
+    /// full member. NOT WIRED FOR DROPBOX at this rev and it refuses by
+    /// name there, because that provider's pickup delete has no
+    /// absence-as-success path and a non-retryable consume would spin on
+    /// the backoff loop forever. A Dropbox-bound account reaches the
+    /// same end state through `recovery-kit-revoke`.
+    recovery-consume: async func() -> result<_, string>;
+
+    /// The account's live kits. Any device can read them; the devices
+    /// sheet renders each kit beside the device it minted.
+    recovery-kits: async func() -> result<list<recovery-kit>, string>;
+
+    /// Revoke a kit: the same mechanic as a lost phone, because it IS
+    /// the same thing — a leaked phrase or file is answered by revoking
+    /// the kit device. Membership revocation (which rotates every doc
+    /// the user group reaches), plus `store-revoke` on the us-doc (K_p
+    /// deleted, name-key epoch rotated), plus deletion of the bundle
+    /// object for a bucket kit, plus clearing the account's record.
+    ///
+    /// Returns the same human-readable guarantee note `store-revoke`
+    /// does — the blobstore draft's guarantee class, as prose for now.
+    recovery-kit-revoke: async func(agent-id: list<u8>) -> result<string, string>;
 
     // --- state persistence (#20 G5; runtime/PERSISTENCE.md "Engine
     // --- contract additions") ---

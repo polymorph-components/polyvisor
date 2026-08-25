@@ -37,7 +37,9 @@ wit_bindgen::generate!({
 
 mod pairing;
 mod persist;
+mod recovery;
 mod usdoc;
+mod wordlist;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -122,8 +124,8 @@ use subduction_keyhive::signed_message::SignedMessage;
 use subduction_keyhive::storage::MemoryKeyhiveStorage;
 
 use exports::polyvisor::engine::driver::{
-    Guest as DriverGuest, PairAddState, PairJoinState, PairOffer, StoreConfig, UsDevice, UsEvent,
-    UsMark, UsPartition, UsProfile, UsStorage,
+    Guest as DriverGuest, PairAddState, PairJoinState, PairOffer, RecoveryKit, StoreConfig,
+    UsDevice, UsEvent, UsMark, UsPartition, UsProfile, UsStorage,
 };
 use exports::polyvisor::tasks::tasks::{Guest as TasksGuest, Snapshot, TodoItem};
 use polymorph::iroh::endpoint::{Endpoint, EndpointOptions, RecvStream, SendStream};
@@ -633,6 +635,11 @@ struct State {
     pair: pairing::PairState,
     /// The user-system partition (#36).
     us: usdoc::UsDoc,
+    /// The recovery kit THIS instance restored from, if any
+    /// (runtime/RECOVERY.md's consume path). `None` on every device that
+    /// booted the ordinary ways. See `recovery::RestoredKit` for why it
+    /// is instance memory and not checkpointed.
+    recovery: Option<recovery::RestoredKit>,
     fetches: u32,
     next_id: u32,
 }
@@ -841,7 +848,20 @@ struct KpObject {
 struct KpPayload {
     /// (epoch, name-key) keychain: current epoch grants history names.
     name_keys: Vec<(u32, [u8; 32])>,
-    /// Devices whose oplogs/manifests to fetch (absent ones are skipped).
+    /// Devices whose oplogs/manifests to fetch (absent ones are skipped)
+    /// — THE HONEST AUTHOR SET, which since SYNC.md is no longer the
+    /// grantee set (runtime/RECOVERY.md, "`KpPayload.devices` fix").
+    ///
+    /// Pre-SYNC.md, grantees WERE the authors, because every member got
+    /// a pickup. Post-SYNC.md an account's own devices are not granted
+    /// pickups — they read the chain out of the us-doc instead — so a
+    /// fresh account's us-doc K_p filled from grantees alone would name
+    /// no real author, and a recovery restore bootstrapping through that
+    /// pickup would pull from nobody. The list is therefore the UNION of
+    /// the account device directory (`usdoc::devices_list`) and the
+    /// grantees. Unchanged in meaning for the link tier, whose grantee
+    /// is an outside reader and whose author set is this account's
+    /// devices either way.
     devices: Vec<[u8; 32]>,
 }
 
@@ -1261,11 +1281,48 @@ fn grantee_devices(doc: &[u8]) -> Result<Vec<[u8; 32]>, String> {
     })?
 }
 
+/// The device list a pickup carries: the account's own device directory
+/// UNION this doc's grantees, dedup'd, order-stable (RECOVERY.md).
+///
+/// Order is directory-first then grantees, each in its source's own
+/// order, so two devices building this list from the same state produce
+/// the same bytes — a payload that reordered per call would churn the
+/// K_p object on every republish for nothing.
+///
+/// A device WITHOUT an account contributes no directory half and this is
+/// exactly the old behavior. A directory read that FAILS is not fatal
+/// here: the grantee half is still a correct (if narrower) author set,
+/// and losing the whole grant over a transient directory read would be
+/// the worse trade.
+async fn pickup_devices(doc: &[u8]) -> Result<Vec<[u8; 32]>, String> {
+    let mut devices: Vec<[u8; 32]> = Vec::new();
+    if usdoc::has_account()? {
+        match usdoc::devices_list().await {
+            Ok(rows) => {
+                for row in rows {
+                    if let Ok(arr) = arr32(&row.agent_id, "account device") {
+                        if !devices.contains(&arr) {
+                            devices.push(arr);
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("[kp] account device directory unreadable ({e}); grantees only"),
+        }
+    }
+    for g in grantee_devices(doc)? {
+        if !devices.contains(&g) {
+            devices.push(g);
+        }
+    }
+    Ok(devices)
+}
+
 /// Publish one member's K_p: the name-key keychain + device list, sealed
 /// to a prekey DH (see `seal_to_member`).
 async fn publish_kp(st: &S3Cfg, kh: &Kh, doc: &[u8], member: &[u8]) -> Result<(), String> {
     let my_id_bytes = with_state(|s| s.my_peer.as_bytes().to_vec())?;
-    let devices = grantee_devices(doc)?;
+    let devices = pickup_devices(doc).await?;
     let payload = with_state(|s| {
         let b = s.buckets.get(doc).ok_or("no bucket state".to_string())?;
         Ok::<_, String>(KpPayload {
@@ -1348,7 +1405,10 @@ async fn dbx_publish_pickup(cfg: &DbxCfg, kh: &Kh, doc: &[u8], member: &[u8]) ->
     let doc_link = dbx_ensure_doc_container(cfg, doc).await?;
     let payload = DbxPickup {
         doc_link,
-        devices: grantee_devices(doc)?,
+        // The same union `publish_kp` carries, for the reason recorded
+        // there: post-SYNC.md the grantee set is no longer the author
+        // set, and the two providers' bootstraps must not drift.
+        devices: pickup_devices(doc).await?,
     };
     let obj = seal_to_member(
         kh,
@@ -1574,7 +1634,10 @@ async fn gd_publish_pickup(
     let folder = gd_pickup_folder(cfg).await?;
     let payload = GdrivePickup {
         name_keys: doc_keychain(doc)?,
-        devices: grantee_devices(doc)?,
+        // The same union `publish_kp` carries (RECOVERY.md): this
+        // payload's own doc comment pins that the two providers'
+        // bootstraps cannot drift.
+        devices: pickup_devices(doc).await?,
     };
     let obj = seal_to_member(
         kh,
@@ -1786,6 +1849,39 @@ fn provider() -> Result<Provider, String> {
         Some(StoreCfg::Gdrive(_)) => Ok(Provider::Gdrive),
         None => Err("store not configured (init-store first)".to_string()),
     })?
+}
+
+/// Resolve a `doc-id` from the bucket surface, where an EMPTY id names
+/// THE ACCOUNT'S USER-SYSTEM DOCUMENT.
+///
+/// WHY THIS EXISTS (a T-A interpretation call, flagged): RECOVERY.md's
+/// restore reads the us-doc out of the bucket, and its kit ceremony ends
+/// "the worker then flushes the us-doc and every named partition" — but
+/// SYNC.md §3 scopes a sync cycle to the POINTER MAP, which does not
+/// contain the us-doc, and parks "the us-doc through the bucket"
+/// explicitly. So the design this track implements needs a way to NAME
+/// the us-doc at the bucket surface, and none existed: the id is
+/// deliberately not exposed (`us-*` hides it, usdoc.rs's `UsDoc::doc`).
+///
+/// The smallest honest closure is a SENTINEL rather than a new function
+/// or a leaked id: an empty doc-id was previously meaningless on every
+/// arm (it derives object names from nothing and matches no partition),
+/// so giving it a meaning takes nothing away, adds no id to the surface,
+/// and lets the worker put the us-doc in its cycle without a second
+/// call to keep in step with the first.
+///
+/// REFUSES BY NAME on a device with no account: "flush the account
+/// document" on a device that has none is a caller error, not an empty
+/// success.
+fn resolve_doc(doc_id: Vec<u8>) -> Result<Vec<u8>, String> {
+    if !doc_id.is_empty() {
+        return Ok(doc_id);
+    }
+    with_state(|s| s.us.doc.clone())?.ok_or_else(|| {
+        "empty doc-id names the account's user-system document, and this device has none \
+         (user-create, pair, or restore first)"
+            .to_string()
+    })
 }
 
 /// Where a flush writes. The providers differ in addressing and
@@ -3293,6 +3389,7 @@ fn finish_init(
             gd_folders: HashMap::new(),
             pair: pairing::PairState::default(),
             us: usdoc::UsDoc::default(),
+            recovery: None,
             fetches: 0,
             next_id: 0,
         })
@@ -3763,6 +3860,7 @@ impl DriverGuest for Component {
     }
 
     async fn bucket_flush(doc_id: Vec<u8>) -> Result<String, String> {
+        let doc_id = resolve_doc(doc_id)?;
         ensure_bucket_state(&doc_id).await?;
         let (nk_current, epoch) = with_state(|s| {
             let b = s.buckets.get(&doc_id).expect("bucket state");
@@ -3851,6 +3949,7 @@ impl DriverGuest for Component {
         owner: Vec<u8>,
         pickup: Option<String>,
     ) -> Result<String, String> {
+        let doc_id = resolve_doc(doc_id)?;
         match provider()? {
             // S3 derives the K_p location from public ids; Dropbox
             // owner-tier pulls by path. Both ignore `pickup`.
@@ -4045,6 +4144,52 @@ impl DriverGuest for Component {
             s.active = Some(payload.partition.clone());
         })?;
         Ok(hex::encode(payload.verifying))
+    }
+
+    // --- account recovery (#11; runtime/RECOVERY.md) ---
+    //
+    // Thin delegations: the ceremony, the derivation and the restore
+    // ordering all live in `recovery.rs`, where the record's rationale
+    // is recorded beside them.
+
+    async fn recovery_kit_create_bucket(label: String) -> Result<String, String> {
+        recovery::kit_create_bucket(label).await
+    }
+
+    async fn recovery_kit_create_file(
+        label: String,
+        passphrase: String,
+    ) -> Result<Vec<u8>, String> {
+        recovery::kit_create_file(label, passphrase).await
+    }
+
+    async fn recovery_restore_bucket(
+        config: StoreConfig,
+        phrase: String,
+        device_name: String,
+    ) -> Result<String, String> {
+        recovery::restore_bucket(config, phrase, device_name).await
+    }
+
+    async fn recovery_restore_file(
+        config: StoreConfig,
+        bundle: Vec<u8>,
+        passphrase: String,
+        device_name: String,
+    ) -> Result<String, String> {
+        recovery::restore_file(config, bundle, passphrase, device_name).await
+    }
+
+    async fn recovery_consume() -> Result<(), String> {
+        recovery::consume().await
+    }
+
+    async fn recovery_kits() -> Result<Vec<RecoveryKit>, String> {
+        recovery::kits().await
+    }
+
+    async fn recovery_kit_revoke(agent_id: Vec<u8>) -> Result<String, String> {
+        recovery::kit_revoke(agent_id).await
     }
 
     // --- state persistence (#20 G5; see persist.rs for the layout and
