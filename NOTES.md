@@ -1425,6 +1425,165 @@ buy. Open questions (log granularity, witness-set composition, fork
 response semantics, publisher-key rotation via the TUF root-rotation
 crib) are enumerated in #52.
 
+**Delegated 2026-08-26: the mechanism half of this section moves to
+polymorph-pkg.** The per-publisher log, witnessing, and anchoring
+sketched above are now that project's design (an RFC 6962 Merkle log
+in tlog-tiles layout rather than a bare sigchain, riding the existing
+transparency-witness ecosystem; signed deployment manifests as the
+unit of trust; work-in-progress and pre-publication at this writing).
+[#52](../../issues/52) rescopes to what stays polyvisor's: the
+contact-graph gossip layer (polyvisor has a trust topology pkg does
+not — users comparing deployment pins over the contact graph covers
+the split-view case against *this* user), the visor's fork/rollback
+alarm and response UX, and the install-time consumption story
+([Installing and managing apps](#installing-and-managing-apps)).
+
+## Installing and managing apps
+
+Recorded 2026-08-26 from design discussion; leaning, not ruling;
+tracked in [#134](../../issues/134). The
+[App publishing](#app-publishing-transparency-without-a-registry-authority)
+entry is the many-publishers half of distribution; this is the client
+half: what "install" means under a static origin, and what living
+with many apps requires of the visor. Packaging is delegated: the
+publishing/verification/delivery stack — per-publisher transparency
+logs, signed deployment manifests (curator key, monotonic seq,
+generation-scoped rollback floors, key succession and quorum
+recovery), verified fetch by digest over untrusted mirrors
+(https/OCI/iroh, streaming verification, unverified bytes never
+entering wasm APIs), immutable caching with re-verify-on-load,
+offline launch from a cached manifest — is **polymorph-pkg**'s design
+(DISTRO-MANIFESTO.md / DISTRO-DESIGN.md in that repo; pre-publication
+at this writing, so this entry binds to its manifesto-level shape,
+never its schemas). Polyvisor extends the deployment manifest **by
+reference, never by fields** (pkg's own ruling): app-level metadata —
+requested capabilities/destinations (#7's manifest), service
+dependencies, partition declarations, UI entry — is a polyvisor-typed
+statement binding the manifest by digest.
+
+**Install = adopting a deployment.** Under a static byte-identical
+origin, installation cannot touch the origin; it is a purely
+client-side act: the user adopts a deployment — manifest location
+plus curator root pin — in one TOFU-shaped ceremony, and everything
+downstream is pure mechanism. The ceremony is the user's one judgment
+act, and it is the ceremony the visor already has: capability grants
+per the install-tier lattice (pure-local near-frictionless, the
+computed egress badge saying so; data+egress compounds get the scary
+compound prompt; services stay the HealthKit-shaped moment) plus the
+petname/mark naming ceremony — recognition vocabulary assigned before
+the first pixel. After adoption the trust-compiles rule holds:
+verification failure presents like a 404, and there is no "continue
+anyway?", because a question the user cannot evaluate is a question
+that must not be asked. One mechanism for apps, data services, and
+providers — one component kind, consent weight varying by computed
+profile — which retroactively gives the storage picker's "installed
+but unconfigured" list its missing install mechanism. The v1 ambition
+on record: full third-party install exercised end to end — launcher
+plus install/update/uninstall of curator-signed apps — not merely the
+release-carried set.
+
+**The us-apps record.** An install is an entry in replicated account
+state (a user-system partition doc, sibling to profile/marks/devices —
+[#36](../../issues/36)): deployment identity, manifest location,
+curator root pin, seq/generation floors, the grant set, partition
+bindings, and the recognition pair. Install on the laptop, appear on
+the phone; cold boot from the bucket restores the app set with the
+account. Making the rollback floors ACCOUNT state is strictly
+stronger than any single browser's storage: pkg's floors are
+per-runtime persisted state whose loss resets to TOFU, and here an
+evicted device re-learns the floor from its siblings — eviction stops
+being a rollback window.
+
+**Updates: silent adoption.** Manifest freshness IS revocation (pkg's
+posture): holding an update back re-opens the revocation hole, and
+version choice is a question users can't evaluate. The visor
+announces, never asks — framework voice, petname inline per the
+announcement policy, subject to priority-not-LWW (an update or
+equivocation notice is exactly the consequential one-shot the
+revocation-guarantee-note bug was about). Curator-root generation
+changes (succession/supersession) are announcement-grade. A root that
+changes WITHOUT a verifiable succession chain is not an update but a
+different deployment — a re-install decision, never a silent
+continuation. Pkg's manifest `version` is display-only, which lands
+exactly on the three-voices rule: manifest-derived strings — display
+name, version, self-description — are app voice (plated, quoted,
+attributed) until the user has named the thing, and announcements
+never carry them.
+
+**The origin stays app-agnostic.** The release-carried core set ships
+inside the framework's own deployment (today that set is honest: the
+todomvc example and the provider panels; the split trigger is the
+first core app needing off-cycle updates or uninstallability —
+release-carried pieces are not uninstallable). No operator catalogs: a
+mutable catalog reintroduces per-operator content variance, and
+discovery is already parked as web-of-trust shaped. Third-party apps
+are fetched from their curators' locations and verified client-side,
+so the origin never learns the install set. Two tensions recorded
+rather than hidden: **manifest polling is a per-curator phone-home**
+(each installed app's mutable-fetch endpoint learns IP, install
+status, and usage cadence — inside the metadata non-goal, but it
+deserves the explicit line in #1), and **the #2 header contract needs
+a connect-src ruling** (third-party manifest/mirror fetches from the
+visor/worker want breadth the enumerated-hosts posture doesn't have;
+app UI frames stay at zero network regardless).
+
+**Bucket replication of app bytes: deferred, with the guard.** Pkg's
+mirror model makes the user's own bucket a legal future mirror — a
+mirror is a pure content-addressed byte store, which is the
+dumb-store contract nearly verbatim — so offline independence from
+the publisher is a transport-configuration line whenever it is
+wanted, and nothing built meanwhile may preclude it. Until then,
+per-device offline is covered by pkg's cached-manifest launch plus
+immutable caching.
+
+**Lifecycle and the launcher.** Runtime linking finally exercises
+permissions-are-the-linker at launch time rather than build time:
+each app instantiates against exactly its granted imports. Apps are
+NOT visor pages: the launcher swaps the app rectangle beneath the
+persistent strip — one foreground app at a time in v1, because
+multi-window multiplies the anti-spoofing surface the strip was
+designed for — and the strip stays the one anchor across apps. A
+suspended app loses nothing by being suspended: the engine keeps
+syncing its partitions regardless, because sync was never the app's
+job. Commitment stays above the bar (the storage-picker template):
+the grant act lives in drawer sheets, armed for the heavy tiers; the
+OPENER CARRIES NO PAYLOAD rule extends to installs — an app or page
+may request the install surface but passes nothing, which closes
+app-driven install funnels by construction. The audible anchor word's
+stated growth path ("every consent ceremony") covers install and
+uninstall sheets. Suspend/kill affordances are honest only once
+[#45](../../issues/45)'s workers land — a dependency of the
+management UI, not just of execution. Two scale notes for the
+launcher pass: the back chevron's null-or-one ruling meets its second
+nesting level (launcher → management page → ceremony), and the
+28-glyph app vocabulary meets many installs — collision repair
+(us-mark already handles it) becomes routine, so the launcher leans
+on petname and glyph together. Sub-question recorded in #134: whether
+mark nomination moves from its mount-time read to the install-time
+app statement — same `isAppMarkIcon` firewall, arrival before any
+code runs.
+
+**Uninstall is two ceremonies, and data outlives the app.** Per-app
+partitions are the durable thing; apps are projections over them.
+Keep-data uninstall (grants revoked, bytes dropped, the partition
+orphaned with keep/rebind/erase) is an ordinary armed sheet;
+uninstall-with-data-erase is heavy-tenant grade — armed + dimmed +
+typed confirmation, framework policy, the erase-ceremony grammar.
+
+**Governance made install-visible.** Browser quota is origin-wide, so
+the framework does its own accounting, surfaced where installs
+happen: per-app storage attribution (partitions make it natural),
+doc-count budgets (the ~2,400-doc subduction wall multiplies with app
+count), push/wake-tag budgets, and the egress audit ("this app sent
+40MB to X today") hanging off the same per-app record.
+
+**Parked, each with its trigger:** multi-window (its own design pass —
+already parked); app-to-app intents (powerbox pickers cover the near
+term; trigger: a real consumer); background app execution (trigger:
+an app that genuinely needs liveness — #12 territory); app discovery
+(web-of-trust recommendation shaped, never adjacent-equal to
+installed lists — the picker ruling's discovery clause unchanged).
+
 ## Addressing and discovery
 
 `user@host` addressing keeps trying to sneak a dynamic lookup back onto
