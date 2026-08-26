@@ -281,6 +281,45 @@ enrollment-from-another-device is a polished, cheap ceremony (wanted
 anyway; see [Identity and devices](#identity-and-devices)). Identity
 must not be made origin-portable by making device keys extractable.
 
+## Who runs home origins
+
+Recorded 2026-08-26 from design discussion; direction, not final
+ruling. The former headline open question, answered: **both, from day
+one** — a project-affiliated public instance and first-class
+self-hosting, with the explicit goal that neither is the degraded tier.
+
+- **The flagship instance.** 1.0 ships with at least one
+  project-affiliated public instance with per-user subdomain isolation
+  (the `alice.polyvisor.app` shape): the accountless-multi-tenancy
+  dividend cashed ([Home origin contract](#home-origin-contract)) under
+  a PSL-listed parent ([Origin topology](#origin-topology),
+  [#4](../../issues/4)). Possibly, some day, à la carte paid services
+  on top — turnkey storage backend first — as the instance paying its
+  own bills and as an ecosystem booster, not as the point.
+- **Self-hosting is first class.** Minimal — ideally zero — capability
+  gap against the public instance, in two supported shapes: **turnkey
+  static deployment** (Netlify-class hosts, subject to the
+  header-control fine print above; the conformance checker
+  ([#2](../../issues/2)) is the gate, not a footgun list) and
+  **full-stack self-hosting** (home origin + iroh relay + storage
+  backend, docker-compose-class). One structural gap to state
+  honestly: per-user subdomain isolation needs wildcard DNS + cert
+  control, which turnkey static hosts do not delegate — a turnkey
+  deployment is a single origin, fine for a personal instance, and the
+  checker should report which posture it verified rather than pretend
+  the two are identical.
+- **Shells beyond the tab.** A "native" (webview) app shell,
+  eventually. A webextension is on the table in two roles, separately
+  decidable: an app shell, and a **visor trust root for hosted
+  instances** — the Code-Verify-shaped detection layer already named
+  in [Release integrity](#release-integrity), grown from monitor to
+  root. The extension-as-shell half keeps its question mark.
+- **Onboarding teaches the trust relationship.** New-user docs and the
+  first-run tutorial ([#37](../../issues/37)) state plainly what a
+  host can and cannot do — serves static bytes anyone can verify, sees
+  traffic timing, holds no keys and no content — the trust statement
+  in the user's own language, not the threat model's.
+
 ## App-frame sandboxing
 
 Mechanics:
@@ -2426,8 +2465,8 @@ pair/resume/check green, invariants 9/9.
 
 Tracked as issues; the headline ones, verbatim from the discussion:
 
-- Who runs home origins in practice — a flagship hosted service,
-  self-hosters, or both from day one?
+- Who runs home origins in practice — answered, see
+  [Who runs home origins](#who-runs-home-origins).
 - Target app developer: JS devs porting web apps, or component-native
   devs?
 - Is headless-at-provider execution in scope for v1?
