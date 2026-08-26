@@ -95,6 +95,24 @@ linker-as-permission-system, the data services, and the consent UX.
 Most of its hard problems are web-platform trust problems and
 group-crypto problems, not wasm problems.
 
+**Browser floor.** Recorded 2026-08-26 from design discussion;
+direction, not final ruling. The execution model stands on two wasm
+features: **JSPI** (the scheduler's park/resume — already a hard
+runtime requirement; the worker host refuses to boot without it, and
+the refusal is loud: the `no-jspi` code in
+runtime/device-store/worker.ts) and **wasm multi-memory**
+(runtime-linked composition). That pair is the floor, and it answers
+the Safari headline question: **Safari does not gate launch**. The
+Safari floor is a future release shipping JSPI and multi-memory —
+hopefully early 2027 — and until it exists, Safari is out of scope
+rather than half-supported. Launch targets the engines that ship the
+pair today (Chromium-class; Firefox availability varies by build and
+is tracked empirically by the worker host's refusal, never by silent
+degradation). The Safari worst cases parked below (`webrtc 'block'`
+verification, PRF availability, the 7-day eviction rule) are
+second-order behind the wasm floor: they become the re-evaluation
+checklist for the day such a Safari ships.
+
 ## Trust model
 
 Proposed organizing invariant:
@@ -2403,8 +2421,11 @@ pair/resume/check green, invariants 9/9.
   rather than let it be discovered. Related open question: relay
   operated by the origin operator (one party sees code fetches *and*
   contact timing) vs independent relays (split view).
-- **Browser support floor**: several worst cases live in Safari (the
-  `webrtc` CSP directive, PRF availability, storage persistence).
+- **Browser support floor**: answered — see the Browser floor note in
+  [The substrate](#the-substrate). Safari's floor is a future JSPI +
+  wasm multi-memory release (hoped early 2027); the worst cases that
+  lived in this bullet (the `webrtc` CSP directive, PRF availability,
+  storage persistence) become that day's re-evaluation checklist.
 - **Multi-tab / concurrency plumbing**: folded into data services.
 - **Origin portability**: design before the first user exists; folded
   into origin topology.
@@ -2470,7 +2491,9 @@ Tracked as issues; the headline ones, verbatim from the discussion:
 - Target app developer: JS devs porting web apps, or component-native
   devs?
 - Is headless-at-provider execution in scope for v1?
-- Does Safari have to work at launch?
+- Does Safari have to work at launch — answered: no; see the Browser
+  floor note in [The substrate](#the-substrate) (a future JSPI + wasm
+  multi-memory Safari, hoped early 2027).
 - Relay: bundled with the origin operator or independent by default?
 - Does the home origin ever serve per-user content?
 - `user@host` discovery: wanted, or out-of-band only?
