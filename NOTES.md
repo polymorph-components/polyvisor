@@ -1291,13 +1291,26 @@ PRF-keyed presence queries against an untrusted server.
 Sandstorm's postmortem lesson: porting friction killed the app
 ecosystem. This is existential for the app side of the design.
 
+**Target developer: answered.** Recorded 2026-08-26 from design
+discussion; direction, not final ruling. **Component-native is the
+target persona** — the WIT-first surface is the product. Porting gets
+real but bounded effort: componentize-js is the on-ramp, and the
+expectation on record is that it supports everything this design
+requires within the next few months. Framework compatibility
+(React/Angular/Vue/Svelte) with minimal adaptations would be ideal and
+is worth probing — but **drop-in compatibility is expected for nothing
+of significant complexity**, and the porting story must not promise
+it: "minimal adaptations" is the ceiling of the claim, measured
+against real apps, not toy ones.
+
 - A **componentize-js SDK** that makes a normal web app port
   mechanically: a `fetch` shim mapping to capability-checked host
   fetch, a storage shim (IndexedDB/KV-shaped) mapping to framework data
   services, templates (`polymorph create-app`). The in-family precedent
   is webcrypto-componentize (crypto.subtle over WIT imports).
 - A **WIT-first surface** for component-native developers (Rust, ...)
-  in parallel; the budget split depends on the target persona (open).
+  — the primary surface, now the persona question is answered; the
+  SDK above is the on-ramp, not the center of gravity.
 - The embedded-UI story needs an asset pipeline (bundle →
   srcdoc/blob injection) and a dev loop (local shell, hot reload).
 
@@ -2488,8 +2501,9 @@ Tracked as issues; the headline ones, verbatim from the discussion:
 
 - Who runs home origins in practice — answered, see
   [Who runs home origins](#who-runs-home-origins).
-- Target app developer: JS devs porting web apps, or component-native
-  devs?
+- Target app developer — answered: component-native, with a real
+  porting on-ramp and no drop-in promises; see
+  [Developer experience](#developer-experience).
 - Is headless-at-provider execution in scope for v1?
 - Does Safari have to work at launch — answered: no; see the Browser
   floor note in [The substrate](#the-substrate) (a future JSPI + wasm
