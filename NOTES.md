@@ -191,6 +191,22 @@ Static-only dividends worth actively exploiting:
 - **Push without a server** (see
   [Compute placement and push](#compute-placement-and-push)).
 
+**Per-user content: answered.** Recorded 2026-08-26 from design
+discussion; direction, not final ruling. The home origin serves
+per-user content **never by default**: the byte-identical model above
+is the trust story, and a host that can serve one user different
+bytes is a host that can target them — the accountless dividend and
+the constant-digest monitoring predicate
+([Release integrity](#release-integrity)) hold precisely because
+there is nothing user-specific to vary. Where per-user serving exists
+at all, it is an **explicit opt-in to a lower trust regime** — the
+"third origin class" already named under
+[Addressing and discovery](#addressing-and-discovery): live-ish,
+user-controlled, untrusted, never sharing the framework origin. The
+expectation on record: this opt-in is a **developer-oriented option**
+(publishing one's own records and content) rather than an end-user
+surface; users who never opt in keep the full trust story untouched.
+
 ## Release integrity
 
 Positioned as supply-chain hygiene and publisher/host separation — not
@@ -2548,5 +2564,8 @@ Tracked as issues; the headline ones, verbatim from the discussion:
   defaults to a public relay instance (split view preserved);
   full-stack self-hosting bundles its own and skips the public
   default.
-- Does the home origin ever serve per-user content?
+- Does the home origin ever serve per-user content? — answered: not
+  without an explicit opt-in to a lower trust regime, expected to be a
+  developer-oriented option rather than an end-user surface; see
+  [Home origin contract](#home-origin-contract).
 - `user@host` discovery: wanted, or out-of-band only?
