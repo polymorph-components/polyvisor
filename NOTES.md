@@ -1113,6 +1113,23 @@ feature — a reason to surface compute placement as a powerbox decision
 Y"), defaulting to user-owned always-on nodes (old laptop, phone
 runtime), which component-iroh's deployment matrix was built for.
 
+**Usable without the powerbox.** Recorded 2026-08-26 from design
+discussion; a goal, not a v1 ruling. At least many apps must be
+**usefully usable with no headless copy anywhere** — either because
+they implicitly don't depend on always-on sync (local-first by
+temperament, single user, one device at a time), or because
+**asynchronous sharing through a storage backend** covers their
+collaboration: the bucket path — ciphertext put/pull, offline
+authoring reconciled later, cold-start from the bucket alone — is
+exactly the machinery
+[Storage backends](#storage-backends-and-the-cryptographic-pull-layer)
+builds and the #20 demo proves. The powerbox decision above is an
+enhancement for apps that genuinely need liveness, never a
+prerequisite for ordinary use; a design where basic collaboration
+silently assumes an always-on peer is out. What stays open is only
+the smaller question: whether the powerbox version itself ships in
+v1 at all.
+
 Push, keeping the origin static: **the subscription is a capability.**
 Web Push senders need only the subscription endpoint + VAPID key —
 hand them (encrypted) to your contact group over the sync layer and
@@ -2519,7 +2536,10 @@ Tracked as issues; the headline ones, verbatim from the discussion:
 - Target app developer — answered: component-native, with a real
   porting on-ramp and no drop-in promises; see
   [Developer experience](#developer-experience).
-- Is headless-at-provider execution in scope for v1?
+- Is headless-at-provider execution in scope for v1? — narrowed: at
+  least many apps must be usefully usable with no headless copy at all
+  (see [Compute placement and push](#compute-placement-and-push));
+  only whether the powerbox version itself ships in v1 stays open.
 - Does Safari have to work at launch — answered: no; see the Browser
   floor note in [The substrate](#the-substrate) (a future JSPI + wasm
   multi-memory Safari, hoped early 2027).
