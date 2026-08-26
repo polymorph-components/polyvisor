@@ -53,6 +53,7 @@ import transportRefusal from "./scenarios/transport-refusal.ts";
 import tenantPrecedence from "./scenarios/tenant-precedence.ts";
 import storagePageNavigation from "./scenarios/storage-page-navigation.ts";
 import storagePicker from "./scenarios/storage-picker.ts";
+import drawerAnnouncements from "./scenarios/drawer-announcements.ts";
 import stripOwnership from "./scenarios/strip-ownership.ts";
 import devicePairing from "./scenarios/device-pairing.ts";
 import devicePairingMock from "./scenarios/device-pairing-mock.ts";
@@ -137,6 +138,11 @@ const SCENARIOS: Scenario[] = [
   transportRefusal,
   tenantPrecedence,
   storagePicker,
+  // THE NON-VISUAL HALF of everything the two scenarios above assert
+  // visually: the same drawer, read through #visor-live. It follows them
+  // because a failure here with those green says the fault is in the
+  // spoken channel rather than in the drawer.
+  drawerAnnouncements,
   storagePageNavigation,
   // The two pairing ceremonies, run TWICE against the two
   // implementations of the same `PairingDriver` seam (shared acts in

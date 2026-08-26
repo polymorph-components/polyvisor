@@ -872,6 +872,18 @@
                                         border-radius: 3px; cursor: pointer;
                                         border: 1px solid rgba(255,255,255,.45); }
 .settings-sheet .picked { outline: 2px solid #fff; outline-offset: 1px; }
+/* THE AUDIBLE ANCHOR ROW — the two word controls, sitting under the hue
+   swatches as the same setting on the other channel. Wrapping, ordinary
+   text buttons: unlike the swatches above there is NOTHING TO SHOW here,
+   by policy (the word is spoken and never rendered — see the pixel-policy
+   comment in sheets.ts), so the row is only its two verbs. */
+.settings-sheet .settings-word { display: flex; gap: .4em; flex-wrap: wrap;
+                                 margin: .1em 0 .6em; }
+.settings-sheet .settings-word button { font: inherit; font-size: 12px;
+                                        padding: .25em .6em; cursor: pointer;
+                                        border-radius: 4px; color: inherit;
+                                        background: rgba(255,255,255,.1);
+                                        border: 1px solid rgba(255,255,255,.35); }
 .settings-sheet .cred-line.said { opacity: .8; font-size: 11px; margin-bottom: .15em; }
 /* THE HEAD ROW: the sheet's title on the left, the erase entry in the
    upper-right corner (see buildSettingsSheet). flex-start on the cross

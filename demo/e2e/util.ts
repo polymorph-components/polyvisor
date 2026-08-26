@@ -58,6 +58,13 @@ export interface FreshOptions {
   /** Let the demo pick (and ANNOUNCE) a fresh anchor colour. Off by
    * default: see `seedHue`. */
   freshAnchor?: boolean;
+  /** Let the visor ROLL a fresh anchor WORD, and teach it out loud. Off
+   * by default for the same reason `freshAnchor` is (see `seedWord`):
+   * the teach sentence occupies `#visor-live`, which several scenarios
+   * read. Separate from `freshAnchor` because the two are independent
+   * channels — a scenario about the fresh-colour announcement has no
+   * reason to also take on an unpredictable word. */
+  freshWord?: boolean;
   /** WHICH DOCUMENT to open, as a root-relative path. Defaults to the
    * demo's own `/index.html` (i.e. the served root). The solo page
    * (`/solo.html`) is a SECOND embedder over the same served artifacts,
@@ -124,6 +131,7 @@ export function pageUrl(
  * it fails loudly — which is the point of a tripwire. */
 export const KEYS = {
   hue: "pm-demo-visor-hue",
+  word: "pm-demo-visor-word",
   identity: "pm-demo-identity",
   marks: "pm-demo-surface-marks",
   storage: "pm-demo-storage",
@@ -136,6 +144,7 @@ export const KEYS = {
  * not share an identity, or the second page is not a second device. */
 export const SOLO_KEYS = {
   hue: "pm-solo-visor-hue",
+  word: "pm-solo-visor-word",
   identity: "pm-solo-identity",
   marks: "pm-solo-surface-marks",
 } as const;
@@ -148,6 +157,20 @@ export const SOLO_KEYS = {
  * boot, and the one scenario that is about the fresh anchor opts in with
  * `freshAnchor: true`. */
 const seedHue = "265";
+
+/** CONTRACT (visor/ui/words.ts): a boot that finds no stored anchor WORD
+ * rolls one and TEACHES it through `#visor-live` — the same live region
+ * the announcement mirror writes to, and the one several scenarios
+ * assert on. So the harness seeds a committed word, exactly as it seeds
+ * a committed hue, and a boot is the ordinary second-visit boot.
+ *
+ * FIXED, and it must be: the drawer's lifecycle announcements are
+ * "<word>: <sheet> <verb>", so a scenario can only assert them against a
+ * word it chose. `walrus` is an ordinary member of the rollable list
+ * (the EFF short wordlist minus the visor's own vocabulary) — a value
+ * `loadVisorWord` accepts on read rather than a sentinel it would
+ * reject and silently re-roll. */
+export const seedWord = "walrus";
 
 // --- act discipline --------------------------------------------------------
 
@@ -242,6 +265,10 @@ export async function newContext(
   // line the scenario reads.
   const hueKey = opts.path?.includes("solo") ? SOLO_KEYS.hue : KEYS.hue;
   if (!opts.freshAnchor && seed[hueKey] === undefined) seed[hueKey] = seedHue;
+  // THE WORD SEED FOLLOWS THE PAGE for exactly the same reason, and is
+  // opted out of separately (`freshWord`).
+  const wordKey = opts.path?.includes("solo") ? SOLO_KEYS.word : KEYS.word;
+  if (!opts.freshWord && seed[wordKey] === undefined) seed[wordKey] = seedWord;
   if (Object.keys(seed).length > 0) {
     await context.addInitScript((entries: [string, string][]) => {
       // Runs before every document's own scripts, which is the only

@@ -572,6 +572,12 @@ export function registerVisorSheets(visor: Visor, config: VisorSheetsConfig): Vi
    * this object), so the host holds the object rather than a copy. */
   const namingTenant = visor.drawer.tenant<{ surface: SurfaceIdentity; icon: string }>({
     name: "naming",
+    // The sheet is the naming ceremony GROWN into everything the visor
+    // knows about one component, so it is announced by what it IS now,
+    // not by the identifier it kept. Framework vocabulary throughout:
+    // the component's own nickname is app-influenced and must never
+    // reach a flat spoken sentence.
+    spoken: "app settings",
     context: (s) => ({ ...s.surface, kind: "naming" }),
     dim: overNestedPlace,
     beforeShow: freezePlace,
@@ -603,6 +609,10 @@ export function registerVisorSheets(visor: Visor, config: VisorSheetsConfig): Vi
    * must be painted in the REAL one. */
   const settingsTenant = visor.drawer.tenant<{ hueAtOpen: number }>({
     name: "settings",
+    // "visor settings", not "settings": the app-settings sheet above is
+    // also settings, and a listener told only "settings open" cannot
+    // tell which of the two arrived.
+    spoken: "visor settings",
     context: () => ({ kind: "settings" }),
     suspendable: () => settingsSuspends,
     dim: overNestedPlace,
@@ -633,6 +643,9 @@ export function registerVisorSheets(visor: Visor, config: VisorSheetsConfig): Vi
    * while the user reads a statement of consequence). */
   const resetTenant = visor.drawer.tenant<Record<string, never>>({
     name: "reset",
+    // Named by the ACT, not by the noun: this is the one sheet where a
+    // user who mis-navigated needs to know it from the first syllable.
+    spoken: "erase this visor",
     armed: true,
     dim: true,
     context: () => ({ kind: "reset" }),
@@ -1069,6 +1082,55 @@ export function registerVisorSheets(visor: Visor, config: VisorSheetsConfig): Vi
       hueRow.append(b);
     }
 
+    // THE AUDIBLE ANCHOR — the colour row's twin, sitting directly under
+    // it because they are the same setting on two channels: one for
+    // people who see the bar, one for people who hear it. Everything
+    // above says "this is yours and no app learns it"; this row says the
+    // same thing about the word that opens every sentence the visor
+    // speaks.
+    //
+    // PIXEL POLICY, AND IT IS THE WHOLE DESIGN OF THIS ROW: THE WORD IS
+    // NEVER RENDERED. Not here, not as a hint, not in a `title`, not in
+    // an aria-label — the buttons SAY it and nothing draws it. The visor
+    // interface makes that structural rather than merely observed (there
+    // is no getter that returns the word; `speakWord`/`rerollWord` are
+    // the only doors, and both end in the live region). The reason is
+    // the leak this whole channel is chosen to avoid: pixels travel. A
+    // screenshot, a screen-recording, a shared window or a support
+    // session carries a rendered word straight to whoever is watching —
+    // and an app that learns the word can prefix its own text with it
+    // and sound exactly like the visor, which is the single failure the
+    // word exists to prevent. Audio leaks too (see words.ts), but it
+    // leaks to whoever is in the room rather than into a file, and the
+    // re-roll button is the answer when it does.
+    const wordLabel = document.createElement("div");
+    wordLabel.className = "cred-line said";
+    wordLabel.textContent =
+      "this visor's spoken word — said out loud, shown to nobody, and never given to an app";
+    const wordRow = document.createElement("div");
+    wordRow.className = "settings-word";
+    const hearWordBtn = document.createElement("button");
+    hearWordBtn.type = "button";
+    hearWordBtn.id = "visor-settings-hear-word";
+    // The text content IS the label — "hear your visor's word" says what
+    // the control does and what it produces — so no aria-label is added.
+    // A redundant one would only be a second string to keep in sync.
+    hearWordBtn.textContent = "hear your visor's word";
+    hearWordBtn.onclick = () => visor.speakWord();
+    const rollWordBtn = document.createElement("button");
+    rollWordBtn.type = "button";
+    rollWordBtn.id = "visor-settings-roll-word";
+    rollWordBtn.textContent = "roll a new word";
+    // NO ARMING AND NO CONFIRMATION, deliberately: a re-roll spends
+    // nothing and destroys nothing (the old word had no authority to
+    // lose), and the user who reaches for it is usually the user who
+    // just realised they were overheard — a delay there is a delay on a
+    // remedy. It COMMITS IMMEDIATELY for the same reason, unlike the
+    // colour swatches above: there is nothing to preview by ear, so a
+    // Save step would only be a way to forget to finish.
+    rollWordBtn.onclick = () => visor.rerollWord();
+    wordRow.append(hearWordBtn, rollWordBtn);
+
     const note = document.createElement("div");
     note.className = "cred-note";
     note.textContent =
@@ -1205,6 +1267,8 @@ export function registerVisorSheets(visor: Visor, config: VisorSheetsConfig): Vi
       iconRow,
       hueLabel,
       hueRow,
+      wordLabel,
+      wordRow,
       note,
     );
     if (actions.length > 0) root.append(actionsBlock);
