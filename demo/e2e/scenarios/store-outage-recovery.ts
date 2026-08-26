@@ -48,6 +48,15 @@
 //      before any earlier cycle succeeded necessarily carried it. That
 //      is the honest reading, stated rather than invented as a
 //      separate assertion.
+//   5. THE FAILURE LEFT AN EVENT RECORD AND THE RECOVERY DID NOT (#132).
+//      After the heal the identity circle's badge is STILL lit: the
+//      standing sync CONDITION cleared with the recovery, but the
+//      consequential failure announcement's RECORD is unseen. The event
+//      list holds that sentence, with no "ongoing" block beside it and
+//      no trace of the ambient recovery line. This is the one place in
+//      the suite where the badge's two terms — unseen records, standing
+//      conditions — can be told apart, which is why the beat lives here
+//      rather than in scenarios/visor-events.ts.
 //
 // THE "Sync now" BYPASS BEAT IS DELIBERATELY OMITTED. Driving it here
 // would mean opening the storage sheet purely to reach one button while
@@ -74,7 +83,15 @@
 
 import type { Page } from "npm:playwright@1.57.0";
 import type { Ctx, Scenario } from "../run.ts";
-import { act, assert, assertEquals, recordSurfaceLine, SOLO_KEYS, stripText } from "../util.ts";
+import {
+  act,
+  assert,
+  assertEquals,
+  assertIncludes,
+  recordSurfaceLine,
+  SOLO_KEYS,
+  stripText,
+} from "../util.ts";
 import { addTodo, appFrame, createAccount, solo, until, WAITS } from "../solo-util.ts";
 
 const BUCKET = "pm-outage-recovery";
@@ -151,6 +168,18 @@ async function closeStorageSheet(page: Page): Promise<void> {
   await page.waitForSelector("#storage-sheet", { state: "detached", timeout: 15_000 });
 }
 
+/** Is the dot on the identity circle? The event badge (#132) is a
+ * text-less child of `#visor-settings`, so its PRESENCE is the whole
+ * signal — a pure DOM read that opens nothing and waits on nothing,
+ * which is what lets it sit inside this scenario's timing-sensitive
+ * beats. Duplicated here rather than imported from another scenario,
+ * per this suite's scenario-local-helper convention. */
+function badgeLit(page: Page): Promise<boolean> {
+  return page.evaluate(() =>
+    document.querySelector("#visor-settings .visor-badge") !== null
+  );
+}
+
 /** `syncStatus`'s shape, named locally so the `until` callbacks below
  * read as claims rather than `any`-shaped guesses. */
 interface SyncStatusLike {
@@ -175,8 +204,11 @@ const scenario: Scenario = {
   },
   // Beats 2 and 3 alone budget past 100s of real backoff waiting; the
   // suite-wide deadline was never sized for that (Scenario.deadlineMs's
-  // own doc comment, run.ts).
-  deadlineMs: 420_000,
+  // own doc comment, run.ts). The trailing event-record beat adds a
+  // drawer round trip (two sheet swaps at SWAP_MS plus two selector
+  // waits) on top, so the budget grows with it rather than the new beat
+  // silently eating the old margin.
+  deadlineMs: 480_000,
 
   async run(page: Page, ctx: Ctx) {
     assert(ctx.minioDataDir !== null, "the harness did not expose MinIO's data directory");
@@ -315,6 +347,24 @@ const scenario: Scenario = {
           announced.includes("this device has stopped syncing with your storage"),
           `the strip should carry the visor's own announcement: ${JSON.stringify(announced)}`,
         );
+
+        // THE STANDING CONDITION LIT THE BADGE (#132). The failing sync
+        // is not a moment, it is a STATE, and host/solo.ts's
+        // `watchSyncFailures` now raises it as a keyed condition on the
+        // visor — the edge return is what gates the announcement above,
+        // and the same call lights the dot on the identity circle for as
+        // long as the fault stands.
+        //
+        // A PURE DOM READ, and deliberately nothing more: opening the
+        // drawer here would put a sheet over a scenario whose next beat
+        // is a multi-minute backoff wait, and the sheet's own ceremony
+        // is exactly the kind of interposed real time this scenario's
+        // timing story warns about. The list is inspected at the very
+        // END instead, where nothing is waiting on it.
+        assert(
+          await badgeLit(page),
+          "the standing sync condition must light the identity circle's badge",
+        );
       },
     );
 
@@ -423,6 +473,54 @@ const scenario: Scenario = {
           .waitFor({ state: "visible", timeout: WAITS.converge });
         await appFrame(page).locator("ul.todo-list li").filter({ hasText: FIRST_TODO }).first()
           .waitFor({ state: "visible", timeout: WAITS.converge });
+      },
+    );
+
+    await act(
+      "THE OUTAGE IS STILL ON THE RECORD: the badge stays lit for the unseen failure, and the condition is gone",
+      async () => {
+        // THE TWO HALVES OF THE BADGE COME APART HERE, which is the
+        // whole reason this beat sits at the END of this scenario rather
+        // than in visor-events.ts: the CONDITION cleared when sync
+        // recovered, and the dot is STILL lit — because the failure
+        // announcement was CONSEQUENTIAL and therefore left a record
+        // that nobody has looked at yet (#132's mechanical rule). The
+        // recovery announcement is ambient and left nothing. So "lit =
+        // unseen records ∪ standing conditions" is being read here with
+        // the first term true and the second false, which no other
+        // scenario can produce.
+        assert(
+          await badgeLit(page),
+          "the unseen failure record must keep the badge lit after the condition cleared",
+        );
+
+        await page.evaluate(() => {
+          (document.getElementById("visor-settings") as HTMLButtonElement | null)?.click();
+        });
+        await page.waitForSelector("#visor-settings-events", { timeout: 15_000 });
+        await page.click("#visor-settings-events");
+        await page.waitForSelector("#visor-drawer-inner .events-sheet", { timeout: 15_000 });
+        const text = await page.evaluate(() =>
+          document.getElementById("visor-drawer-inner")?.textContent ?? ""
+        );
+        assertIncludes(
+          text,
+          "this device has stopped syncing with your storage",
+          "the event list must hold the failure the strip announced",
+        );
+        // NO STANDING BLOCK: the condition was cleared on recovery, and
+        // conditions are session-live — nothing may still be claiming
+        // the sync is down once it demonstrably is not.
+        assert(
+          !text.includes("ongoing:"),
+          `the sync condition cleared on recovery, so nothing stands: ${JSON.stringify(text)}`,
+        );
+        // And the recovery sentence left NO record — it is ambient, and
+        // ambient lines never enter the list (#132's entry gating).
+        assert(
+          !text.includes("this device is syncing with your storage again"),
+          `an ambient recovery line must not enter the record: ${JSON.stringify(text)}`,
+        );
       },
     );
   },

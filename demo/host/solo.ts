@@ -189,6 +189,15 @@ const VISOR_KEY = "pm-solo-visor-hue";
 // and must not sound alike (visor/ui/words.ts).
 const WORD_KEY = "pm-solo-visor-word";
 const IDENTITY_KEY = "pm-solo-identity";
+/** WHERE THE EVENT RECORD LIVES (#132) — the list behind the identity
+ * circle's badge, plus its seen watermark. Its own `pm-solo-` key like
+ * every other visor key on this page: the demo page is a different
+ * device on the same origin, and one device's news is not the other's.
+ * Standing CONDITIONS are not here and never will be — they are
+ * session-live by design (visor/ui/visor.ts's `setCondition`), because a
+ * persisted condition could outlive the poller that would have cleared
+ * it. */
+const EVENTS_KEY = "pm-solo-visor-events";
 const MARKS_KEY = "pm-solo-surface-marks";
 const US_CACHE_KEYS = usCacheKeys("pm-solo");
 
@@ -458,6 +467,7 @@ async function boot() {
     hueKey: VISOR_KEY,
     wordKey: WORD_KEY,
     identityKey: IDENTITY_KEY,
+    eventsKey: EVENTS_KEY,
     deferClaim: true,
     // ONE app surface and no nested places: the strip's context falls
     // back to the app's row and there is nothing to override it with.
@@ -1477,6 +1487,17 @@ async function startApp(
   if (fresh) {
     visor.announce("new visor colour set for this device — remember it", 15000);
   }
+  // THE ONE ANNOUNCE PATH THIS PAGE HAS, and #132's recording rule rides
+  // inside it: `visorAnnounceSink` writes an event record for every
+  // CONSEQUENTIAL line before it announces (visor/ui/pairing.ts). There
+  // is deliberately no second wrapper around this one — every
+  // consequential sentence the solo page says, including everything
+  // `drainAndAdopt` drains out of the user system and everything
+  // `reconcileFromDriver` announces, goes through this single closure,
+  // so a drained event is recorded EXACTLY ONCE. A local wrapper that
+  // also called `visor.addEvent` would double every remote change in the
+  // list; a local wrapper that bypassed the sink would silently drop
+  // them from it.
   const announce: AnnounceSink = visorAnnounceSink(visor);
   note("visor:painted");
 
@@ -2325,13 +2346,22 @@ async function startApp(
    * below never repaints a detached node. */
   let syncLine: HTMLElement | null = null;
 
-  /** True while an announcement about a failing schedule is standing.
-   * ONE ANNOUNCEMENT PER CROSSING, not one per poll: the poll runs every
-   * second and a sync that is down stays down, so announcing on the
-   * fact rather than on the edge would bury every other sentence the
-   * visor has to say under a metronome. Cleared when the counts come
-   * back under the threshold, which re-arms it for the NEXT outage. */
-  let syncFailureAnnounced = false;
+  /** THE CONDITION KEY for a schedule that has stopped syncing (#132).
+   *
+   * THE EDGE USED TO LIVE IN A LOCAL BOOLEAN HERE (`syncFailureAnnounced`)
+   * and now lives in the visor's condition table, which is the same
+   * once-per-crossing discipline moved to the place that can also SHOW
+   * it. The boolean could only gate an announcement; a condition gates
+   * the announcement AND lights the badge for as long as the fault
+   * stands, which is what a state deserves — "sync is down" was never a
+   * moment, and a transient line was always the wrong medium for it.
+   * `setCondition` returns true only on the raising edge and
+   * `clearCondition` only on the lowering one, so the announce-once
+   * semantics are unchanged: the poll runs every second, a sync that is
+   * down stays down, and announcing on the fact rather than on the edge
+   * would bury every other sentence the visor has to say under a
+   * metronome. */
+  const SYNC_CONDITION = "sync";
 
   /** THE THRESHOLD, and it is the worker's own (rpc.ts's `SyncStatus`):
    * three consecutive failures is where a background failure stops
@@ -2409,7 +2439,18 @@ async function startApp(
    *
    * A RECOVERY IS ANNOUNCED TOO, and only when a failure was announced
    * — the visor should not congratulate itself for a sync nobody was
-   * told had stopped.
+   * told had stopped. That "only when" is `clearCondition`'s return
+   * value now (see `SYNC_CONDITION`), not a boolean this file keeps.
+   *
+   * TWO DIFFERENT TRACES, ON PURPOSE (#132's own open question, answered
+   * here by the mechanical rule and nothing else): the failure announce
+   * is CONSEQUENTIAL, so the sink records it and it stands in the event
+   * list until the user opens it; the recovery announce is AMBIENT, so
+   * it says its piece and leaves nothing behind. The asymmetry is right
+   * — "your work stopped going where you think it does" is news worth
+   * finding later, "it is fine again" is not — and the badge's other
+   * half covers the live case: while the fault stands, the CONDITION
+   * lights the dot even if every record has been seen.
    */
   const watchSyncFailures = async (): Promise<void> => {
     let st: DeviceStatus;
@@ -2422,16 +2463,30 @@ async function startApp(
     if (!sync) return;
     const failing = sync.flushFailures >= SYNC_VISIBLE_AFTER ||
       sync.pullFailures >= SYNC_VISIBLE_AFTER;
-    if (failing && !syncFailureAnnounced) {
-      syncFailureAnnounced = true;
-      announce(
-        `this device has stopped syncing with your storage${
-          sync.lastError === null ? "" : ` — ${sync.lastError}`
-        }`,
-        true,
+    if (failing) {
+      // RAISED ON EVERY FAILING POLL, ANNOUNCED ONLY ON THE CROSSING.
+      // The repeat calls are not waste: they REFRESH the condition's
+      // wording, so the sentence the event sheet shows carries the
+      // seam's latest error rather than whatever it happened to be
+      // saying when the fault started. The condition's own text is
+      // shorter than the announcement's, because it is a standing state
+      // read in a list ("not syncing with your storage") rather than an
+      // arrival read once on the bar.
+      const first = visor.setCondition(
+        SYNC_CONDITION,
+        `not syncing with your storage${sync.lastError === null ? "" : ` — ${sync.lastError}`}`,
       );
-    } else if (!failing && syncFailureAnnounced) {
-      syncFailureAnnounced = false;
+      if (first) {
+        announce(
+          `this device has stopped syncing with your storage${
+            sync.lastError === null ? "" : ` — ${sync.lastError}`
+          }`,
+          true,
+        );
+      }
+    } else if (visor.clearCondition(SYNC_CONDITION)) {
+      // The clear IS the test: it returns true only if the condition was
+      // standing, which is exactly "a failure was announced".
       announce("this device is syncing with your storage again");
     }
     await paintSyncLine();

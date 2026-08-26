@@ -2490,6 +2490,58 @@ credentials alone; `solo-recovery-file` catches the real download and
 proves the wrong passphrase is one clean keyslot miss),
 pair/resume/check green, invariants 9/9.
 
+**The event record: announcements split three ways; a badge on the
+identity circle** (2026-08-26; design memo
+[#132](https://github.com/polymorph-components/polyvisor/issues/132),
+executed same day). The strip's timed announcement was one transient
+line multiplexing three jobs, and every patch it has accumulated —
+the sticky/priority windows, the pulseContext retreat, the spoken
+FIFO, solo.ts's `syncFailureAnnounced` edge-trigger — was contention
+between them. Worse, ANNOUNCED-NEVER-SILENT was hollow: a remote
+revocation got 12 seconds on a strip nobody may be watching, and
+multi-device means consequential events happen while you're away by
+construction (the transparency roadmap's fork alarms make this acute:
+"detection requires a response path", and a timed line is not one).
+The split: **moment cues** stay push (announce/pulse/speak,
+record-less — the fresh-colour teach is about NOW); **standing
+conditions** become visor-held keyed state (set/clear, lit while
+standing, session-live so a stale condition cannot outlive its
+poller); **event records** become a persistent, acknowledgeable list.
+The mechanical rule that makes wiring one-line-per-host: EVERY
+CONSEQUENTIAL ANNOUNCEMENT LEAVES A RECORD — the sink already carries
+the flag, so arrival push is unchanged and the badge is the memory,
+not the alarm. The badge is a DOT (never a count) on
+`#visor-settings`: zero layout shift (strip geometry is a measured
+property), framework voice by construction (no words), lit = unseen
+records ∪ standing conditions. THE SYMMETRY RULE: the badge sits on
+the anchor of whoever the news is about — identity circle for
+me/my-system news (built now); the PET ICON for system-authored news
+about one surface (update landed, a pending version requests new
+grants — specified in #132, dormant until such events exist). THE
+AUTHOR RULE: only visor/engine-authored events light it — the subject
+may be an app, the author never is; a self-badging primitive is "look
+at me!" handed to components. Two more rules keep it meaningful:
+entry is gated to the consequential class (ambient telemetry never
+enters, or the one alarm that matters drowns in junk mail), and A
+NOTIFICATION NEVER GRANTS — an entry may point at a ceremony, the
+grant path stays the powerbox. The list itself is "recent events", a
+light drawer tenant reached from a visor-owned settings-sheet row via
+the erase entry's suspend/resume motion; conditions first, records
+newest-first with coarse ages; OPENING MARKS SEEN (per-entry
+dismissal waits for entries that carry actions); entries are flat
+framework-voice strings under exactly `announce()`'s three-voices
+policy — typed slots (petname/plated-foreign) are the recorded growth
+path and the prerequisite for the surface scope. Records persist
+under a consumer key (`erase()` wipes them); solo's sync watch now
+sets/clears a condition and the edge return replaced its hand-rolled
+boolean. Gates: e2e 36/36 (`visor-events` new — a seeded stale boot
+cache drives a real reconcile-announced event into badge → list →
+seen → reload persistence; `store-outage-recovery` extended to pin
+the condition lighting the badge, the failure record outliving the
+ambient recovery announce, and the condition block clearing;
+`strip-geometry` now takes every measurement with the badge LIT),
+invariants green, harness and hosts type-check green.
+
 ## Parked and candidate non-goals
 
 - **Metadata privacy**: relays, push services, and origins see traffic

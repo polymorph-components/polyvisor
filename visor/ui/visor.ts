@@ -396,6 +396,67 @@ export function saveIdentity(identityKey: string, rec: VisorIdentity): void {
   } catch { /* nothing durable to write to */ }
 }
 
+// --- the event record (#132) --------------------------------------------------
+
+/** ONE THING THAT HAPPENED, kept after the line that said it expired.
+ *
+ * `text` is exactly what an announcement said — a FLAT STRING under
+ * `announce`'s three-voices policy (framework voice, user-voice words
+ * admissible inline, an app-influenced string never), which is what lets
+ * the list render it with no dressing at all. `at` is wall-clock
+ * milliseconds, used only to sort and to word a coarse age; nothing here
+ * is a clock the user is asked to trust. */
+export interface VisorEvent {
+  at: number;
+  text: string;
+}
+
+/** How many records the visor keeps. The list is a RECENT-EVENTS list,
+ * not a log: past a screenful or two nobody scrolls, and an unbounded
+ * array in localStorage is a slow leak on the one storage the visor owns
+ * on this device. Oldest drops first — the newest news is the news. */
+export const EVENTS_MAX = 50;
+
+/** The persisted shape at `VisorConfig.eventsKey`: the records, plus the
+ * watermark that says which of them have been seen. Both halves in ONE
+ * key, because they are one fact — a seen-mark without its records is
+ * meaningless, and records without their mark would re-light the badge on
+ * every boot. */
+interface EventRecord {
+  seenAt: number;
+  events: VisorEvent[];
+}
+
+/** Read the record, TOLERANTLY. Missing, unparseable or hand-mangled all
+ * answer the same way — an empty record — for the same reason
+ * `loadIdentity` does: this is hand-editable storage, and a visor that
+ * threw on boot because a string in localStorage was not JSON would be
+ * bricked by a devtools typo. A corrupt record loses history; it must
+ * never lose the visor. */
+export function loadEvents(eventsKey: string): EventRecord {
+  try {
+    const raw = JSON.parse(localStorage.getItem(eventsKey) ?? "{}");
+    if (!raw || typeof raw !== "object") return { seenAt: 0, events: [] };
+    const rec = raw as Record<string, unknown>;
+    const list = Array.isArray(rec.events) ? rec.events : [];
+    const events: VisorEvent[] = [];
+    for (const item of list) {
+      if (!item || typeof item !== "object") continue;
+      const e = item as Record<string, unknown>;
+      // Both fields or neither: a record with no text is a badge with
+      // nothing behind it, which is the one failure the badge cannot
+      // afford (see the events sheet's empty state).
+      if (typeof e.text !== "string" || e.text === "") continue;
+      if (typeof e.at !== "number" || !Number.isFinite(e.at)) continue;
+      events.push({ at: e.at, text: e.text });
+    }
+    const seenAt = typeof rec.seenAt === "number" && Number.isFinite(rec.seenAt) ? rec.seenAt : 0;
+    return { seenAt, events: events.slice(-EVENTS_MAX) };
+  } catch {
+    return { seenAt: 0, events: [] };
+  }
+}
+
 /** The glyph the visor's own button wears. Unknown/absent → the default
  * shield (see VISOR_ICONS). */
 export function identityIcon(rec: VisorIdentity): string {
@@ -475,6 +536,11 @@ export type VisorContext =
   // and unlike "settings" it is a destructive act, which changes the
   // tenant's weight class (armed, dimmed) but not what the context means.
   | { kind: "reset" }
+  // THE EVENT LIST (#132, sheets.ts's "recent events" tenant). A bare
+  // kind for the same reason "settings" is: it is the visor telling the
+  // user what has happened to their own account and devices, and no
+  // component stands behind any of it.
+  | { kind: "events" }
   // THE ENTRY CEREMONIES (entry.ts): the device picker and the first-run
   // fork. Bare kinds for the same reason "settings" and "reset" are —
   // there is no component behind either. The picker is the only context
@@ -779,6 +845,18 @@ export interface VisorConfig {
   wordKey: string;
   /** Where the identity record lives. */
   identityKey: string;
+  /** Where the EVENT RECORD lives (#132) — the list behind the badge,
+   * plus its seen-watermark, under one key.
+   *
+   * OPTIONAL, and what its absence means is "this session only", not
+   * "off". The records still accumulate, the badge still lights, the
+   * sheet still lists them; nothing survives the reload. That is the
+   * honest degradation for an embedder that has not thought about where
+   * this belongs (the todomvc spike), and it keeps the feature from
+   * being a second thing a consumer can forget to turn on. A visor that
+   * silently dropped the whole mechanism because a key was missing would
+   * make announced-never-silent depend on configuration. */
+  eventsKey?: string;
   /** THE APP'S OWN ROW IN THE TRUST TABLE — what the strip's top line
    * falls back to when no secondary surface is on screen. */
   appSurface?: () => SurfaceIdentity | null;
@@ -939,6 +1017,93 @@ export interface Visor {
   setBack(action: BackAction | null): void;
   identity(): VisorIdentity;
   saveIdentity(rec: VisorIdentity): void;
+  /** RECORD SOMETHING THAT HAPPENED, so it stands until the user has
+   * seen it (#132). Appends the line to the event record, drops the
+   * oldest past `EVENTS_MAX`, persists best-effort at
+   * `VisorConfig.eventsKey`, and lights the badge.
+   *
+   * IT NEVER SPEAKS. Not `announce`, not `speak`, not a pulse — this is
+   * the MEMORY half of an announcement, and the arrival push stays the
+   * caller's. That separation is the whole shape of the split: a
+   * consequential arrival still owes the user the spoken sentence and
+   * the strip line at the moment it happens; the record is what makes
+   * announced-never-silent survive a user who was not looking. Calling
+   * this INSTEAD of announcing would trade a loud twelve seconds for a
+   * silent dot, which is the opposite of the trade.
+   *
+   * VOICE — EXACTLY `announce`'s POLICY, and for exactly its reason.
+   * `text` is a flat string and therefore cannot carry class marking, so
+   * it is spoken in FRAMEWORK VOICE and may embed USER-voice words
+   * inline (a petname, the user's word for a device). An APP-INFLUENCED
+   * string must NEVER be passed here: the sheet renders these lines
+   * undressed, so a component's own words would sit in the visor's list
+   * wearing the visor's authority. Describe the fact in the visor's
+   * vocabulary instead.
+   *
+   * THE AUTHOR RULE (#132): only the VISOR and the ENGINE author events.
+   * The SUBJECT of a record may well be an app — an update landed, a
+   * component was revoked — but the AUTHOR never is. An app that could
+   * light the user's own identity circle would have been handed "look at
+   * me!" as a primitive, which is the one attention channel the visor
+   * exists to keep unforgeable. Nothing here can check provenance, so
+   * the rule is stated at the door and enforced by who is on the visor's
+   * side of the app seam.
+   *
+   * SILENT BEFORE THE CLAIM, never a refusal. The identity cluster
+   * renders nothing while unclaimed, so there is no button to badge and
+   * the dot simply does not exist yet — the record is still kept, and
+   * the badge appears with the cluster at `claim()`. */
+  addEvent(text: string): void;
+  /** The event record, NEWEST FIRST — the order the sheet reads them in,
+   * so the list is not something every caller re-sorts. */
+  events(): readonly VisorEvent[];
+  /** ACKNOWLEDGE EVERYTHING CURRENTLY RECORDED: move the seen-watermark
+   * to now (or to the newest record, whichever is later — a record whose
+   * clock ran ahead must not stay permanently unseen), persist, and
+   * re-sync the badge.
+   *
+   * v1's whole acknowledgment model is "opening the list marks it seen".
+   * Per-entry dismissal waits until entries carry actions, because a
+   * dismiss control on an entry that does nothing else is a control
+   * whose only function is to make the user do the visor's filing.
+   *
+   * SILENT, like every method here: the badge un-lights, and nothing is
+   * said about it. */
+  markEventsSeen(): void;
+  /** How many records are newer than the seen-watermark — the number the
+   * settings row says out loud, and half of what lights the badge. */
+  unseenEventCount(): number;
+  /** RAISE A STANDING CONDITION under `key`: a state, not a moment
+   * ("sync is failing"), which stays lit for as long as it stands.
+   *
+   * THE RETURN VALUE IS THE EDGE, and it is the whole reason this
+   * returns anything: true ONLY when the key was not already standing.
+   * A poller can therefore call this on every failing tick and announce
+   * only on the crossing, which is the hand-rolled `syncFailureAnnounced`
+   * boolean (#132) moved into the one place that can hold it honestly.
+   * Re-setting a standing key UPDATES its text — a condition's wording
+   * gets better as the seam learns more — and returns false.
+   *
+   * SESSION-LIVE, NEVER PERSISTED, and that is deliberate: a persisted
+   * condition could outlive the thing that caused it with nothing left
+   * running to clear it, leaving a badge lit forever over a fault that
+   * ended while the tab was closed. Whoever raises a condition is a
+   * poller, and a poller re-asserts it a tick after the next boot.
+   *
+   * VOICE and AUTHOR: `text` is under `addEvent`'s policy, word for
+   * word. Silent, like everything here — the crossing's announcement is
+   * the caller's to make, guarded by this return. */
+  setCondition(key: string, text: string): boolean;
+  /** LOWER A STANDING CONDITION. True only if it WAS standing — the
+   * other edge, so a recovery sentence is said once and only when a
+   * failure sentence was said (the visor does not congratulate itself
+   * for fixing something nobody was told was broken). Silent. */
+  clearCondition(key: string): boolean;
+  /** The conditions currently standing, in the order they were raised —
+   * insertion order, because the sheet lists them in the order they
+   * arrived and re-sorting standing facts by anything else would make a
+   * stable list jump. */
+  conditions(): ReadonlyMap<string, string>;
   /** The hue currently COMMITTED as the user's anchor colour — as opposed
    * to a live preview a settings sheet is painting. `applyHue` paints;
    * this moves only where the choice is persisted, so a Cancel has
@@ -1002,8 +1167,16 @@ export interface Visor {
   rerollWord(): void;
   /** FORGET EVERYTHING THIS VISOR HOLDS ON THIS DEVICE — the storage half
    * of the reset ceremony. The identity record, the committed anchor hue,
-   * the committed anchor WORD and (when the consumer configured one) the
-   * legacy hue key are removed; nothing else is touched.
+   * the committed anchor WORD, the EVENT RECORD and (when the consumer
+   * configured one) the legacy hue key are removed; nothing else is
+   * touched.
+   *
+   * The event record goes with the rest because it is the visor's memory
+   * of what happened TO THIS USER on this device — a list of sentences
+   * naming their devices and their account, which is exactly the class
+   * of thing the ceremony promised to forget. Leaving it would produce
+   * the sharpest possible contradiction: a freshly erased visor whose
+   * first badge points at a list of the previous owner's news.
    *
    * The word goes with the colour, deliberately: they are the two halves
    * of one anchor, and an erase that took the colour but left the word
@@ -1183,6 +1356,88 @@ export function initVisor(config: VisorConfig): Visor {
   // narrowness, and dropping them was dropping half of what an
   // impersonating rectangle cannot reproduce, at the width where the
   // strip is most crowded.
+  // --- the event record and the standing conditions (#132) -------------
+  //
+  // TWO KINDS OF NEWS, one badge. RECORDS are moments that already
+  // happened and are kept until acknowledged; CONDITIONS are states that
+  // are true right now and clear themselves when they stop being true.
+  // They are held separately because they answer to different clocks —
+  // a record's clock is the user's attention (seen or not seen), a
+  // condition's is the world's (standing or not standing) — and the one
+  // thing they share is the dot.
+  //
+  // WHY THE STATE LIVES HERE rather than in a consumer: the badge hangs
+  // on the identity circle, which is the visor's own pixels, and the
+  // author rule (`addEvent`) is only meaningful if the list is not
+  // something an app-facing surface can reach at all.
+  const eventStore = config.eventsKey === undefined
+    // NO KEY, STILL A FEATURE: the in-memory record. See
+    // `VisorConfig.eventsKey` — the degradation is durability, not
+    // function.
+    ? { seenAt: 0, events: [] as VisorEvent[] }
+    : loadEvents(config.eventsKey);
+  /** Standing conditions, keyed, INSERTION-ORDERED by the Map itself —
+   * and deliberately not persisted (see `setCondition`). */
+  const conditions = new Map<string, string>();
+  /** The button the badge hangs on, or null while unclaimed. Held rather
+   * than looked up each time because `renderIdentity` RECREATES the
+   * button, and a stale node would silently swallow every later badge
+   * update. */
+  let settingsBtn: HTMLButtonElement | null = null;
+
+  const persistEvents = () => {
+    if (config.eventsKey === undefined) return;
+    try {
+      localStorage.setItem(config.eventsKey, JSON.stringify(eventStore));
+    } catch { /* nothing durable to write to — the session copy still stands */ }
+  };
+
+  const unseenEventCount = () => eventStore.events.filter((e) => e.at > eventStore.seenAt).length;
+
+  /** The button's standing sentence, extended while the dot is lit. The
+   * dot itself carries no text (see `syncBadge`), so this is the ONLY
+   * channel that tells a non-sighted user the badge is on — and it is a
+   * `title`/`aria-label` rather than an announcement because the badge
+   * is a standing state, not an arrival. */
+  const SETTINGS_LABEL = "your visor: name, device, colour";
+  const SETTINGS_LABEL_LIT = `${SETTINGS_LABEL} — recent events waiting`;
+
+  /** Put the dot on (or take it off) the CURRENT settings button.
+   *
+   * LIT = UNSEEN RECORDS ∪ STANDING CONDITIONS (#132). One predicate, so
+   * there is never a state where something is waiting and nothing shows.
+   *
+   * IT IS A DOT AND NEVER A COUNT, and the span is EMPTY: framework
+   * voice by construction, exactly as `pulseContext` is — there is no
+   * string here, so there is no way for any voice to leak onto the
+   * anchor. `aria-hidden` keeps it out of the accessibility tree
+   * entirely; the label above is the non-visual channel, because a bare
+   * decorative node announced as content would be noise.
+   *
+   * ZERO LAYOUT SHIFT: the span is absolutely positioned inside the
+   * button (visor.css), so it is out of flow and the strip's measured
+   * geometry — a property the `strip-geometry` scenario pins — cannot
+   * move whether the dot is there or not. Called by every mutator AND by
+   * `renderIdentity`, which is what keeps the two in step across a
+   * re-render. */
+  const syncBadge = () => {
+    const btn = settingsBtn;
+    if (!btn) return;
+    const lit = unseenEventCount() > 0 || conditions.size > 0;
+    const existing = btn.querySelector(".visor-badge");
+    if (lit && !existing) {
+      const dot = document.createElement("span");
+      dot.className = "visor-badge";
+      dot.setAttribute("aria-hidden", "true");
+      btn.append(dot);
+    } else if (!lit && existing) {
+      existing.remove();
+    }
+    const label = lit ? SETTINGS_LABEL_LIT : SETTINGS_LABEL;
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+  };
+
   const renderIdentity = () => {
     // NOTHING PERSONAL BEFORE THE CLAIM, enforced HERE rather than at
     // the call sites. The cluster is the one place the user's own name,
@@ -1222,10 +1477,17 @@ export function initVisor(config: VisorConfig): Visor {
     // The face is a glyph from the visor's fixed vocabulary — never a
     // string out of the record (see VISOR_ICONS).
     btn.textContent = identityIcon(rec);
-    btn.title = "your visor: name, device, colour";
-    btn.setAttribute("aria-label", "your visor: name, device, colour");
+    btn.title = SETTINGS_LABEL;
+    btn.setAttribute("aria-label", SETTINGS_LABEL);
     btn.onclick = () => requestSettings();
     identityBox.append(btn);
+    // THE BADGE IS RE-HUNG HERE, not carried over: the button above is a
+    // NEW node, and the dot is a child of it. `syncBadge` also owns the
+    // label (lit or not), which is why the two assignments above are the
+    // unlit default rather than the final word — this call is. It runs
+    // AFTER `textContent`, which replaces every child the button has.
+    settingsBtn = btn;
+    syncBadge();
   };
   renderIdentity();
 
@@ -1253,7 +1515,9 @@ export function initVisor(config: VisorConfig): Visor {
    * place to stop naming what is drawn underneath. */
   const topSurface = (ctx: VisorContext): SurfaceIdentity | null => {
     if (ctx === null) return appSurface();
-    if (ctx.kind === "settings" || ctx.kind === "reset") return appSurface();
+    if (ctx.kind === "settings" || ctx.kind === "reset" || ctx.kind === "events") {
+      return appSurface();
+    }
     // THE ENTRY CEREMONIES, same answer for the same reason: they are
     // the visor talking about the device and the account, not about a
     // component, so the cluster keeps naming whatever is installed. In
@@ -1283,7 +1547,7 @@ export function initVisor(config: VisorConfig): Visor {
     const kind = ctx === null ? "app" : (ctx.kind ?? "panel");
     const sheet = kind === "credentials" || kind === "naming" ||
       kind === "settings" || kind === "storage" || kind === "reset" ||
-      kind === "device-picker" || kind === "first-run";
+      kind === "events" || kind === "device-picker" || kind === "first-run";
 
     // --- the TOP line: THE USER'S RECOGNITION PAIR ---------------------
     // The mark the user picked and the word the user chose, side by side,
@@ -1418,6 +1682,12 @@ export function initVisor(config: VisorConfig): Visor {
         // with it.
         : kind === "reset"
         ? "erase this visor"
+        // THE EVENT LIST, named on the strip with the same words its
+        // entry row and its spoken name use — the anchor, the button
+        // that opened the sheet and the sentence a screen reader hears
+        // must not each have their own name for one place.
+        : kind === "events"
+        ? "recent events"
         // THE ENTRY CEREMONIES. Both lines are the visor naming its own
         // sheet, in the plainest words it has: at picker time the strip
         // is the ONLY thing on screen that is not the sheet, so this
@@ -2347,6 +2617,48 @@ export function initVisor(config: VisorConfig): Visor {
     setBack,
     identity: () => loadIdentity(config.identityKey),
     saveIdentity: (rec) => saveIdentity(config.identityKey, rec),
+    addEvent: (text) => {
+      eventStore.events.push({ at: Date.now(), text });
+      // OLDEST OUT, and only ever by one per call, so the cap is a
+      // sliding window rather than a periodic purge.
+      if (eventStore.events.length > EVENTS_MAX) {
+        eventStore.events.splice(0, eventStore.events.length - EVENTS_MAX);
+      }
+      persistEvents();
+      syncBadge();
+    },
+    // A COPY, REVERSED: the caller gets newest-first without the stored
+    // array — the one the cap and the watermark are computed against —
+    // being handed out to be mutated from outside.
+    events: () => [...eventStore.events].reverse(),
+    markEventsSeen: () => {
+      const newest = eventStore.events.length === 0
+        ? 0
+        : eventStore.events[eventStore.events.length - 1].at;
+      // MAX, not `Date.now()`: a record written by a machine whose clock
+      // is ahead (or restored from storage across a clock change) would
+      // otherwise sit permanently above the watermark, and the badge
+      // would re-light the instant it was cleared.
+      eventStore.seenAt = Math.max(Date.now(), newest);
+      persistEvents();
+      syncBadge();
+    },
+    unseenEventCount,
+    setCondition: (key, text) => {
+      const fresh = !conditions.has(key);
+      // `set` on an existing key keeps its INSERTION position, which is
+      // what makes a re-assert a text refresh rather than a re-ordering
+      // of a list the user is reading.
+      conditions.set(key, text);
+      syncBadge();
+      return fresh;
+    },
+    clearCondition: (key) => {
+      const had = conditions.delete(key);
+      syncBadge();
+      return had;
+    },
+    conditions: () => new Map(conditions),
     committedHue: () => {
       // A LOUD REFUSAL, not a plausible number. Pre-claim there is no
       // committed hue; anything returned here would be painted or
@@ -2403,7 +2715,15 @@ export function initVisor(config: VisorConfig): Visor {
       // and one key refusing must not leave the others behind — a
       // partial erase should be as small as the failure, not as large as
       // whatever happened to be first in the list.
-      for (const key of [config.identityKey, config.hueKey, config.legacyHueKey, config.wordKey]) {
+      for (
+        const key of [
+          config.identityKey,
+          config.hueKey,
+          config.legacyHueKey,
+          config.wordKey,
+          config.eventsKey,
+        ]
+      ) {
         if (key === undefined) continue;
         try {
           localStorage.removeItem(key);

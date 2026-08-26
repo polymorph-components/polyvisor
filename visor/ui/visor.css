@@ -429,7 +429,45 @@
                    justify-content: center;
                    width: 2.4em; height: 2.4em;
                    min-width: 44px; min-height: 44px;
-                   font-size: 1.5em; line-height: 1; }
+                   font-size: 1.5em; line-height: 1;
+                   /* The badge's containing block (see .visor-badge).
+                      Positioning context only — it changes no geometry
+                      by itself. */
+                   position: relative; }
+
+/* THE EVENT BADGE (#132): a dot on the identity circle, meaning
+   "something is waiting" — unseen event records, or a condition that is
+   standing right now.
+
+   A DOT AND NEVER A COUNT, and the element is EMPTY. That makes it
+   FRAMEWORK VOICE BY CONSTRUCTION, the same trick #visor-ctx's pulse
+   uses: there is no string here, so there is nothing that could carry
+   another voice's marking onto the anchor. `aria-hidden` in the markup
+   keeps it out of the accessibility tree; the button's own label gains
+   "— recent events waiting" instead, which is a standing state read on
+   demand rather than an interruption.
+
+   ABSOLUTE, AND THAT IS THE POINT: out of flow inside the button, so
+   the strip's MEASURED GEOMETRY (the `strip-geometry` e2e scenario) is
+   identical lit and unlit. A badge that reflowed the identity cluster
+   would move the one region whose position is a trust anchor.
+
+   IT DOES NOT WEAR THE PLATE'S DRESS AND IT DOES NOT WEAR THE BUTTON'S.
+   No border (a bordered rectangle is this visor's control dress) and no
+   inset shadow (that is the app-voice plate's "recessed" marking, and
+   this is the visor talking about the visor). A solid, near-white disc
+   with a dark ring around it instead: the ring is a SEPARATOR from the
+   glyph and the button's own edge, not a border in the control sense,
+   and it is what makes the dot read at 12px type on all ten anchor hues
+   at 38% lightness — light-on-any-hue plus a dark halo works where a
+   single alpha value does not, because the badge must stay visible
+   against both the button's own lightened fill and the glyph beneath
+   it. */
+.visor-badge { position: absolute; top: 0; right: 0;
+                width: .34em; height: .34em; border-radius: 50%;
+                background: rgba(255,255,255,.96);
+                box-shadow: 0 0 0 1.5px rgba(0,0,0,.45);
+                pointer-events: none; }
 
 /* --- the drawer host's own chrome (no sheet CONTENT here) -----------------
    Credential/naming/settings entry — every consumer's version of it —
@@ -917,6 +955,39 @@
                                                border: 1px solid rgba(255,140,140,.6); }
 .settings-sheet .settings-reset .hint { font-size: 10px; opacity: .75;
                                         text-align: right; }
+
+/* --- the event list (#132) -------------------------------------------
+   The sheet behind the badge: what the visor said, kept after the line
+   that said it expired. It wears the shared `.cred-sheet` shape and adds
+   only these two blocks.
+
+   NEITHER BLOCK WEARS THE PLATE'S DRESS OR THE BUTTON'S. The plate (an
+   alpha fill plus an inset shadow) is APP VOICE, and every line here is
+   the visor's own sentence; a bordered rectangle is this visor's CONTROL
+   dress, and none of these lines can be pressed. What separates them is
+   spacing, a quiet lead word and — for the standing block — a rule down
+   the left edge, which is the visor's explanatory register rather than
+   another voice.
+
+   STANDING CONDITIONS read at full strength: they are true right now,
+   and dimming a live fault to make a list look calm would be the visor
+   choosing its own composure over the user's information. The AGE on a
+   record is `.said` (the visor's commentary register, .85), because it
+   is the visor talking about the entry rather than the entry itself. */
+.events-sheet .events-standing { display: flex; flex-direction: column;
+                                  gap: .3em; margin: .7em 0 .2em;
+                                  padding-left: .7em;
+                                  border-left: 2px solid rgba(255,255,255,.35); }
+.events-sheet .events-standing-line { font-size: 13px; line-height: 1.4;
+                                       display: flex; gap: .4em; }
+.events-sheet .events-list { display: flex; flex-direction: column;
+                              gap: .35em; margin: .8em 0 .2em; }
+.events-sheet .events-row { font-size: 13px; line-height: 1.4;
+                             display: flex; gap: .5em; align-items: baseline; }
+/* The age column is narrow and does not wrap: the sentences beside it
+   should start on one vertical line, so the list reads as a list. */
+.events-sheet .events-row .events-when { flex: none; min-width: 7.5em;
+                                          white-space: nowrap; }
 
 /* --- the reset sheet -------------------------------------------------
    THE HEAVY TENANT of the same drawer, and the only one of the three

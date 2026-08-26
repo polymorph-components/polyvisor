@@ -223,7 +223,36 @@ export function visorAnnounceSink(visor: Visor, key = "visor-strip"): AnnounceSi
   return (line, consequential = false) => {
     const now = performance.now();
     if (!consequential && (stickyUntil.get(key) ?? 0) > now) return;
-    if (consequential) stickyUntil.set(key, now + STICKY_MS);
+    if (consequential) {
+      stickyUntil.set(key, now + STICKY_MS);
+      // THE MECHANICAL RULE (#132): EVERY CONSEQUENTIAL ANNOUNCEMENT
+      // LEAVES A RECORD, and ambient lines never do.
+      //
+      // It lives HERE, in the one place a consumer's consequential
+      // traffic already funnels through, because that is what makes the
+      // wiring a rule rather than a habit: a host does not have to
+      // remember to record anything, and a new consequential event
+      // source is recorded the day it is written. The gate is the flag
+      // the sink already carried — ambient telemetry stays out, or the
+      // list becomes junk mail and the one alarm that matters drowns in
+      // it.
+      //
+      // BEFORE the announce, so that if `announce` ever throws (a
+      // detached strip, a consumer mid-teardown) the memory has already
+      // been written — the record is the half that has to survive.
+      //
+      // THE AUTHOR RULE HOLDS BY CONSTRUCTION on this path: everything
+      // that reaches a sink is visor- or engine-authored (see
+      // `AnnounceSink`'s "where the boundary sits" — a `PairingDriver`
+      // is host code on the visor's side of the app seam, not a
+      // sandboxed component), so nothing an app influenced can light the
+      // user's own identity circle.
+      //
+      // NOT IN `statusWriter`: that sink writes a caller-owned status
+      // ELEMENT on the standalone pairing page, which has no visor and
+      // therefore no badge and no list to record into.
+      visor.addEvent(line);
+    }
     visor.announce(line, consequential ? STICKY_MS : undefined);
   };
 }
