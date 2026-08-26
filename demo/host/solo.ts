@@ -4794,6 +4794,12 @@ async function startApp(
       // endpoint having died (`Closed`), and that is a fact about the
       // transport rather than about the peer: it is `rebindEndpoint`'s to
       // answer, not the re-dial path's.
+      //
+      // Since #123 that leave-alone arm also catches a TIMED-OUT sync
+      // outcome, and deliberately: a timeout says the wire is alive and
+      // the peer is silent — the one situation where re-dialling would
+      // mint the #78 double-dial against a connection that is working
+      // fine. Only `gone:` re-dials.
       if (dialledPeer) {
         const h = await probeConn(dialledPeer.conn);
         if (h.kind === "gone") {
