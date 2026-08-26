@@ -10,6 +10,13 @@
 // These are the claims a hand-drive checks by squinting. Here they are
 // numbers: cluster widths as a fraction of the bar, a real tap-target
 // floor, and zero horizontal overflow on the DOCUMENT.
+//
+// AND ALL OF IT IS MEASURED WITH THE EVENT BADGE LIT (#132). The dot on
+// the identity circle promises zero layout shift, and that promise is
+// pure CSS — absolute positioning, out of flow — so this scenario seeds
+// an unseen record (see `SEEDED_EVENT`) and takes every number above
+// with the dot rendered. A badge that ever started costing layout would
+// move these numbers rather than passing unnoticed.
 
 import type { Scenario } from "../run.ts";
 import { act, assert, hook, KEYS, waitForSheet } from "../util.ts";
@@ -31,6 +38,7 @@ interface Metrics {
   lines: { h: number; scrollW: number; clientW: number }[];
   docOverflow: number;
   idLines: { scrollW: number; clientW: number }[];
+  badge: boolean;
 }
 
 function measure(page: Page): Promise<Metrics> {
@@ -76,18 +84,52 @@ function measure(page: Page): Promise<Metrics> {
       idLines: Array.from(document.querySelectorAll("#visor-identity .id-lines .who")).map(
         (e) => ({ scrollW: (e as HTMLElement).scrollWidth, clientW: (e as HTMLElement).clientWidth }),
       ),
+      // THE EVENT BADGE (#132), read alongside the geometry rather than
+      // in a beat of its own: every number above is measured WITH the
+      // dot rendered, and this is what says so.
+      badge: btn.querySelector(".visor-badge") !== null,
     };
   });
 }
 
+/** The demo page's event-record key (visor/ui/visor.ts's `eventsKey`, as
+ * host/demo.ts sets it). Mirrored here rather than imported for the same
+ * reason `KEYS` is — a rename there should fail this scenario loudly
+ * rather than quietly stop lighting the badge. */
+const EVENTS_KEY = "pm-demo-visor-events";
+
+/** ONE UNSEEN RECORD, seeded so the identity circle's badge (#132) is
+ * LIT for every measurement below.
+ *
+ * WHY IT BELONGS IN THIS SCENARIO. The badge's zero-layout-shift claim
+ * is made in CSS — an absolutely positioned, out-of-flow span — and a
+ * claim that rests only on a stylesheet is a claim nobody is checking.
+ * Seeding it here means the strip's whole measured geometry (two lines,
+ * the 44px tap floor, the 45/45/10 split, zero document overflow, the
+ * identity lines' ellipsis behaviour at 390) is taken with the dot on
+ * the button. If the badge ever starts costing layout, THESE numbers
+ * move, which is the only place in the suite where that would be
+ * caught.
+ *
+ * `seenAt: 0` is what makes the record unseen; the timestamp is a fixed
+ * point in the past (2024-01-01T00:00:00Z) rather than a computed one,
+ * so the seed is a literal and the sheet's coarse age never enters this
+ * scenario's business. */
+const SEEDED_EVENT = JSON.stringify({
+  seenAt: 0,
+  events: [{ at: 1_704_067_200_000, text: "seeded for geometry" }],
+});
+
 /** Seeded state shared by both widths: pathological words in every
- * variable slot the strip has. */
+ * variable slot the strip has, plus the unseen event that lights the
+ * badge (see `SEEDED_EVENT`). */
 const hostileStorage = {
   [KEYS.identity]: JSON.stringify({
     name: "Ada Lovelace-Byron the Countess",
     device: "the study PC under the stairs",
     icon: "⚑",
   }),
+  [EVENTS_KEY]: SEEDED_EVENT,
 };
 
 const scenario: Scenario = {
@@ -123,6 +165,19 @@ const scenario: Scenario = {
         `${label}: strip height ${m.stripHeight.toFixed(1)}px exceeds ${
           budget.toFixed(1)
         }px + padding — something wrapped`,
+      );
+
+      // THE BADGE IS ACTUALLY LIT while all of this is being measured
+      // (see `SEEDED_EVENT`). Asserted rather than assumed: if the seed
+      // ever stopped taking — a renamed key, a changed record shape, a
+      // boot that marks seen on its own — every geometry number above
+      // would quietly go back to measuring the unlit strip, and the
+      // zero-layout-shift claim would rest on the stylesheet again with
+      // nothing to notice.
+      assert(
+        m.badge,
+        `${label}: the seeded unseen event did not light the badge — the geometry above is being ` +
+          `measured on an UNLIT strip (check ${EVENTS_KEY} and the record shape)`,
       );
 
       // A real tap target. 44×44 is the floor a thumb needs, and this

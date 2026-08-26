@@ -273,6 +273,13 @@ const LEGACY_CHROME_KEY = "pm-demo-chrome-hue";
 // and must not sound alike (visor/ui/words.ts).
 const WORD_KEY = "pm-demo-visor-word";
 const IDENTITY_KEY = "pm-demo-identity";
+/** WHERE THE EVENT RECORD LIVES (#132) — the list behind the identity
+ * circle's badge, plus its seen watermark. Nothing on this page has to
+ * write to it: the us-events drain and `reconcileFromDriver` both speak
+ * through `usAnnounce`, which is a `visorAnnounceSink`, and that sink
+ * records every consequential line it announces. This key is only where
+ * that record survives a reload. */
+const EVENTS_KEY = "pm-demo-visor-events";
 
 // The trust table: the surface marks, the first-sight timestamps and the
 // user's petnames. The TABLE ITSELF — the assignment rule, the local
@@ -976,6 +983,7 @@ async function boot() {
     legacyHueKey: LEGACY_CHROME_KEY,
     wordKey: WORD_KEY,
     identityKey: IDENTITY_KEY,
+    eventsKey: EVENTS_KEY,
     appSurface: () => appSurface,
     contextOverride: () => activePanel?.surface ?? null,
   });

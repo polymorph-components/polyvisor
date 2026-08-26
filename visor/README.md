@@ -37,6 +37,33 @@ Three layers, one trust story:
   (`#visor-strip` and friends) are fixed — position is a trust anchor.
   `visor.css` carries the visor-owned styles both pages link.
 
+  THE EVENT RECORD lives here too (#132), because the strip's
+  announcement was doing three jobs on one transient line. Moment cues
+  stay push; **standing conditions** become keyed state the visor holds
+  (`setCondition`/`clearCondition`, whose return value is the EDGE, so a
+  poller announces once per crossing instead of once per tick) and are
+  session-live, never persisted — a stored condition could outlive the
+  poller that would have cleared it; **event records** become a
+  persistent, acknowledgeable list under the consumer's `eventsKey`,
+  wiped with everything else by `erase()`. The mechanical rule is one
+  line per host: EVERY CONSEQUENTIAL ANNOUNCEMENT LEAVES A RECORD, and
+  ambient lines never do — it sits inside `visorAnnounceSink`, which
+  already carried the flag, so a new event source is recorded the day it
+  is written and ambient telemetry cannot silt the list up. What
+  advertises it is a DOT on the identity circle (`#visor-settings`):
+  absolutely positioned so the strip's measured geometry cannot move,
+  carrying no text at all so it is framework voice by construction, and
+  lit exactly when there are unseen records OR a condition standing.
+  Behind it is the "recent events" sheet, reached from a visor-owned row
+  on the settings sheet through the erase entry's suspend/resume motion,
+  and OPENING IT MARKS EVERYTHING SEEN (the badge then goes out unless a
+  condition still stands). Entries are flat strings under `announce()`'s
+  voice policy exactly — framework voice, user-voice words inline, app
+  voice never — and under one further rule: THE AUTHOR IS ALWAYS THE
+  VISOR OR THE ENGINE. The subject of a record may be an app; letting an
+  app light the user's own identity circle would be handing components
+  "look at me!" as a primitive.
+
   Device pairing lives here too (`pairing.ts`, PAIRING.md §5): the join
   flow's QR and 79-char code, the SAS screens, the add flow's heavy
   ceremony (statement of consequence, the drawer host's own `ARM_MS`

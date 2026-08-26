@@ -524,12 +524,46 @@ export interface VisorSheets {
    * sheet's danger entry; exposed here for a consumer's driving hooks and
    * for the e2e suite. */
   requestReset(): void;
+  /** Open the visor's own event list (#132). Reachable in the UI ONLY
+   * from the settings sheet's "recent events" row — the badge that
+   * advertises it is a dot on the settings button, and the way in is
+   * therefore through settings, exactly as the erase ceremony's is.
+   * Exposed here for a consumer's driving hooks and for the e2e suite. */
+  requestEvents(): void;
   closeNaming(opts?: { context?: boolean }): void;
   closeSettings(opts?: { context?: boolean; commit?: boolean }): void;
   closeReset(opts?: { context?: boolean }): void;
+  closeEvents(opts?: { context?: boolean }): void;
   namingOpen(): boolean;
   settingsOpen(): boolean;
   resetOpen(): boolean;
+  eventsOpen(): boolean;
+}
+
+/** A COARSE AGE, in the visor's own words — "how long ago" at the
+ * resolution a person actually reads a notification list at.
+ *
+ * DELIBERATELY COARSE, and deliberately not a clock. An exact timestamp
+ * invites the user to reason about ordering and causation from a
+ * device-local wall clock that may have jumped, been set by hand, or
+ * disagreed with the device the event came FROM; "3 hours ago" makes the
+ * weaker claim the visor can actually support. Rendered once, when the
+ * sheet opens (there is no ticking timer behind it): a list that
+ * silently rewrote itself while being read would be motion in the one
+ * place that is supposed to hold still.
+ *
+ * A future timestamp — a record written by a device whose clock ran
+ * ahead — reads as "just now" rather than as a negative age, which is
+ * the smallest honest thing to say about it. */
+function agoWords(at: number, now: number): string {
+  const secs = Math.max(0, Math.round((now - at) / 1000));
+  if (secs < 60) return "just now";
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins} minute${mins === 1 ? "" : "s"} ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
 }
 
 /** Register the visor's naming and settings ceremonies on a visor.
@@ -623,9 +657,39 @@ export function registerVisorSheets(visor: Visor, config: VisorSheetsConfig): Vi
     afterCollapse: thawPlace,
   });
 
+  /** THE EVENT LIST'S SESSION (#132), registered BETWEEN settings and
+   * reset because registration order IS precedence here: the list is a
+   * lightweight sheet exactly like settings — nothing is typed on it,
+   * nothing is destroyed by it, and the worst a mis-tap costs is a sheet
+   * the user closes — so it must not outrank anything settings does not,
+   * and the erase ceremony must keep sitting behind both.
+   *
+   * NOT SUSPENDABLE, and that asymmetry is the point of the pair. The
+   * SETTINGS sheet suspends under this one (see the entry row's handler
+   * in `buildSettingsSheet`), because the user stepped one level further
+   * into an errand they will come back from. This sheet suspends under
+   * nothing: there is no deeper step to take from a list, and anything
+   * that displaces it is a separate errand started from elsewhere.
+   *
+   * It carries no session state at all — the list is rendered from the
+   * visor at open, and the ages are wall-clock at that instant (see
+   * `buildEventsSheet`: no ticking timers). */
+  const eventsTenant = visor.drawer.tenant<Record<string, never>>({
+    name: "events",
+    // The same three words the entry button, the strip's bottom line and
+    // the sheet's heading use. One place, one name.
+    spoken: "recent events",
+    context: () => ({ kind: "events" }),
+    dim: overNestedPlace,
+    beforeShow: freezePlace,
+    afterCollapse: thawPlace,
+  });
+
   /** THE ERASE SESSION, registered AFTER settings so the two lightweight
-   * tenants keep the precedence they had and this one sits behind them
-   * in `restoreContext`'s order. It carries no state: there is nothing to
+   * tenants keep the precedence they had — and after the event list,
+   * which joined them as a third of the same weight class (see its
+   * registration above) — so this one sits behind all of them in
+   * `restoreContext`'s order. It carries no state: there is nothing to
    * preview, nothing to revert, and the only thing the user can put into
    * it is the typed confirmation, which must never outlive the sheet.
    *
@@ -655,6 +719,7 @@ export function registerVisorSheets(visor: Visor, config: VisorSheetsConfig): Vi
   const closeSettings = (opts: { context?: boolean; commit?: boolean } = {}) =>
     settingsTenant.close(opts);
   const closeReset = (opts: { context?: boolean } = {}) => resetTenant.close(opts);
+  const closeEvents = (opts: { context?: boolean } = {}) => eventsTenant.close(opts);
 
   /** Build the visor's App settings sheet — the naming ceremony GROWN into
    * the one place the visor says everything it knows about a component.
@@ -1139,6 +1204,50 @@ export function registerVisorSheets(visor: Visor, config: VisorSheetsConfig): Vi
     // CONSUMER ACTIONS (see `extraActions`). Nothing is rendered at all
     // when there are none, so a consumer that passes no actions gets the
     // sheet exactly as it was before this hook existed.
+    // THE VISOR'S OWN ROW, and it sits BEFORE the consumer's actions
+    // block deliberately: what it opens is the visor's own record of
+    // what the visor said, so it belongs with the framework's rows
+    // rather than below whatever a consumer contributed. It is framework
+    // policy for the same reason the erase entry is — a consumer that
+    // had to contribute this button could decline to, leaving a badge on
+    // the strip with no way in.
+    const eventsBlock = document.createElement("div");
+    eventsBlock.className = "cred-field";
+    const eventsBtn = document.createElement("button");
+    eventsBtn.type = "button";
+    eventsBtn.id = "visor-settings-events";
+    eventsBtn.className = "settings-extra-action";
+    // THE COUNT IS INLINE, IN THE VISOR'S OWN WORDS, and it is here
+    // rather than on the badge on purpose (#132): the badge is a DOT,
+    // never a number — it says "something is waiting" on a 12px circle
+    // where a numeral would be unreadable and a growing number would
+    // read as a demand. This row is where the user has already chosen to
+    // look, so it can afford the arithmetic.
+    const unseen = visor.unseenEventCount();
+    eventsBtn.textContent = unseen > 0
+      ? `recent events — ${unseen} unseen`
+      : "recent events";
+    eventsBtn.onclick = () => {
+      // THE ERASE ENTRY'S MOTION, EXACTLY (see the reset button below
+      // and its long comment, which is the authority for every line
+      // here): revert the live hue preview by hand, because suspension
+      // deliberately bypasses the tenant's `beforeCollapse` and an
+      // uncommitted colour would otherwise ride into the list's frame
+      // and then disagree with the swatch the rebuilt sheet re-selects;
+      // then SUSPEND rather than close, so this sheet slides back in
+      // when the list closes and the host speaks "«word»: visor settings
+      // back". try/finally so a throw on the way in cannot leave every
+      // later displacer suspending settings instead of evicting it.
+      visor.applyHue(hueAtOpen);
+      settingsSuspends = true;
+      try {
+        requestEvents();
+      } finally {
+        settingsSuspends = false;
+      }
+    };
+    eventsBlock.append(eventsBtn);
+
     const actions = config.extraActions ?? [];
     const actionsBlock = document.createElement("div");
     // NOT `cred-row`: that class is the Save/Cancel pair, and both this
@@ -1271,6 +1380,7 @@ export function registerVisorSheets(visor: Visor, config: VisorSheetsConfig): Vi
       wordRow,
       note,
     );
+    root.append(eventsBlock);
     if (actions.length > 0) root.append(actionsBlock);
     root.append(row);
     return {
@@ -1550,6 +1660,149 @@ export function registerVisorSheets(visor: Visor, config: VisorSheetsConfig): Vi
     });
   };
 
+  /** THE EVENT LIST (#132): what the visor has said, kept after the line
+   * that said it expired.
+   *
+   * WHY THE SHEET EXISTS AT ALL. An announcement is twelve seconds on a
+   * strip the user may not be watching, and on a multi-device account
+   * consequential things happen while you are away BY CONSTRUCTION. The
+   * strip's line is still the arrival — this is the memory, so that
+   * "announced, never silent" becomes "spoken at arrival, standing until
+   * seen".
+   *
+   * TWO SECTIONS, IN THIS ORDER, and the order is the argument:
+   * CONDITIONS first because they are true RIGHT NOW (a sync that is
+   * down is a thing to act on, not a thing that happened), then the
+   * records newest-first because the newest news is the news.
+   *
+   * EVERY LINE HERE IS FRAMEWORK VOICE and is rendered undressed —
+   * `textContent` into a plain element, no plate, no quoting. That is
+   * only safe because of the rule at the door (`Visor.addEvent`): these
+   * strings are the visor's and the engine's own sentences, under
+   * exactly `announce`'s policy, and an app-influenced string is not
+   * admissible into the record in the first place. If that ever changes,
+   * it changes here too — the growth path is typed slots, not a plate
+   * bolted onto a flat string.
+   *
+   * AGES ARE RENDERED ONCE, at open (see `agoWords`). No interval, no
+   * re-render: nothing here is urgent enough to justify a list that
+   * moves while it is being read, and a timer left behind by a closed
+   * sheet is a leak waiting to be found. */
+  const buildEventsSheet = () => {
+    const root = document.createElement("div");
+    root.className = "cred-sheet events-sheet armed";
+    root.style.maxWidth = "72rem"; // rem: aligns with the page's --content-max column
+    root.style.marginLeft = "auto";
+    root.style.marginRight = "auto";
+
+    const h = document.createElement("h2");
+    h.textContent = "Recent events";
+    root.append(h);
+
+    const conditions = visor.conditions();
+    const events = visor.events();
+
+    // THE STANDING CONDITIONS. Visually a block of their own, dressed as
+    // neither a plate nor a button: the plate is APP VOICE (these
+    // sentences are the visor's), and a button dress on a line the user
+    // cannot press is a control that does nothing. What marks them is
+    // the lead word — "ongoing:" — plus a quiet rule down the left, in
+    // the visor's own explanatory register.
+    if (conditions.size > 0) {
+      const standing = document.createElement("div");
+      standing.className = "events-standing";
+      for (const text of conditions.values()) {
+        const line = document.createElement("div");
+        line.className = "events-standing-line";
+        const lead = document.createElement("span");
+        lead.className = "said";
+        lead.textContent = "ongoing:";
+        const body = document.createElement("span");
+        body.textContent = text;
+        line.append(lead, body);
+        standing.append(line);
+      }
+      root.append(standing);
+    }
+
+    if (events.length > 0) {
+      const now = Date.now();
+      const list = document.createElement("div");
+      list.className = "events-list";
+      for (const e of events) {
+        const row = document.createElement("div");
+        row.className = "events-row";
+        const when = document.createElement("span");
+        // `.said` is the visor's commentary register (visor/README.md's
+        // three voices) — the age is the visor talking ABOUT the entry,
+        // and the entry itself is the sentence.
+        when.className = "said events-when";
+        when.textContent = agoWords(e.at, now);
+        const what = document.createElement("span");
+        what.textContent = e.text;
+        row.append(when, what);
+        list.append(row);
+      }
+      root.append(list);
+    }
+
+    // THE EMPTY STATE. Said plainly and said at all: a sheet that opened
+    // onto a heading and nothing else would read as a failure to load
+    // rather than as good news.
+    if (conditions.size === 0 && events.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "cred-note";
+      empty.textContent = "nothing to report";
+      root.append(empty);
+    }
+
+    const note = document.createElement("div");
+    note.className = "cred-note";
+    note.textContent =
+      "this list is the visor's own — every line here was said by the visor or the system behind it, never by an app";
+    root.append(note);
+
+    // The same row dress the settings sheet's Save/Cancel pair wears, so
+    // the way out of a visor sheet is one learnable shape. One button:
+    // there is nothing to commit or to cancel on a list.
+    const row = document.createElement("div");
+    row.className = "cred-row";
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.textContent = "Close";
+    row.append(closeBtn);
+    root.append(row);
+
+    return { root, closeBtn };
+  };
+
+  const openEventsDrawer = () => {
+    const session: Record<string, never> = {};
+    eventsTenant.open(session, () => {
+      // OPENING IS THE ACKNOWLEDGMENT (#132's v1 model), and it happens
+      // BEFORE the sheet is built for a reason that is not merely
+      // ordering: the rows carry no seen/unseen marking of their own, so
+      // a list built first and marked seen afterwards would be
+      // indistinguishable — and marking first means the badge is already
+      // correct by the time the sheet finishes sliding in. What survives
+      // the mark is any STANDING CONDITION, which is exactly right: a
+      // condition is not news to be acknowledged, it is a state that is
+      // still true, and the dot stays lit until it stops being.
+      visor.markEventsSeen();
+      const built = buildEventsSheet();
+      built.closeBtn.onclick = () => {
+        if (!eventsTenant.owns(session)) return;
+        // A plain close. The settings sheet that opened this one is
+        // SUSPENDED, not closed (see the entry row), so the drawer host
+        // resumes it here — rebuilt, sliding back in, and the host
+        // speaks "«word»: visor settings back". Re-opening it from here
+        // would race the host into a second settings session.
+        closeEvents();
+      };
+      return { root: built.root };
+    });
+  };
+
   // The visor's naming ceremony, reachable ONLY from the strip's own
   // pixels — and the consumer's preconditions, in that order: the refusal
   // first (so a click while an exclusive sheet is up is a pure no-op),
@@ -1583,6 +1836,12 @@ export function registerVisorSheets(visor: Visor, config: VisorSheetsConfig): Vi
   // `open` outright, and nothing happens.
   const requestReset = () => openResetDrawer();
 
+  // THE EVENT LIST, and it does NOT re-run the consumer's preconditions
+  // either, for exactly `requestReset`'s reason: it is reached only from
+  // the settings sheet, which paid `canOpen`/`beforeOpen` a moment ago.
+  // The refusal that still applies is the drawer host's own.
+  const requestEvents = () => openEventsDrawer();
+
   // THE STRIP'S LATE-BOUND CONTROLS. The strip is built by `initVisor`,
   // long before the drawer's tenants exist, so the "name it" affordance,
   // the context cluster and the settings button call through the visor's
@@ -1594,11 +1853,14 @@ export function registerVisorSheets(visor: Visor, config: VisorSheetsConfig): Vi
     requestNaming,
     requestSettings,
     requestReset,
+    requestEvents,
     closeNaming,
     closeSettings,
     closeReset,
+    closeEvents,
     namingOpen: () => namingTenant.isOpen(),
     settingsOpen: () => settingsTenant.isOpen(),
     resetOpen: () => resetTenant.isOpen(),
+    eventsOpen: () => eventsTenant.isOpen(),
   };
 }

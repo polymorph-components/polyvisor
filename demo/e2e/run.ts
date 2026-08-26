@@ -47,6 +47,7 @@ import { type SeverableProxy, startTcpProxy } from "./proxy.ts";
 import bootAppSurface from "./scenarios/boot-app-surface.ts";
 import petnameCeremony from "./scenarios/petname-ceremony.ts";
 import settingsIdentity from "./scenarios/settings-identity.ts";
+import visorEvents from "./scenarios/visor-events.ts";
 import stripGeometry from "./scenarios/strip-geometry.ts";
 import credentialFlow from "./scenarios/credential-flow.ts";
 import transportRefusal from "./scenarios/transport-refusal.ts";
@@ -130,6 +131,13 @@ const SCENARIOS: Scenario[] = [
   harnessFaults,
   petnameCeremony,
   settingsIdentity,
+  // THE EVENT RECORD (#132), beside the other two visor-sheet scenarios:
+  // it drives the same drawer and the same settings sheet. It proves the
+  // badge LIGHTS and clears; the strip's geometry under a lit badge is
+  // `stripGeometry`'s own business — it seeds an unseen record and takes
+  // every measurement with the dot rendered, so the two are independent
+  // rather than one relying on the other's leftovers.
+  visorEvents,
   stripGeometry,
   // The credential beats come before the refusal beat: one needs the
   // store up, the next needs it down, and a scenario that has to bring
