@@ -42,7 +42,7 @@ mod usdoc;
 mod wordlist;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -51,7 +51,7 @@ use automerge::transaction::Transactable;
 use automerge::{AutoCommit, Change, ObjType, ReadDoc, ScalarValue, Value, ROOT};
 use ed25519_dalek::VerifyingKey as DalekVerifyingKey;
 use future_form::{FutureForm, Local};
-use futures::future::{AbortHandle, Abortable, LocalBoxFuture};
+use futures::future::{select, AbortHandle, Abortable, Either, LocalBoxFuture};
 
 use polymorph_webcrypto_guest::{
     aes_gcm::{self, AesVariant},
@@ -156,7 +156,7 @@ type Sd = Subduction<
     Hdl,
     Auth,
     WebcryptoSigner,
-    NeverTimeout,
+    MonotonicTimeout,
     WitSpawn,
     CountLeadingZeroBytes,
     256,
@@ -306,16 +306,84 @@ impl Spawn<Local> for WitSpawn {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct NeverTimeout;
+/// Sleep `dur` on the host's monotonic clock.
+///
+/// `wasi:clocks/monotonic-clock@0.3.0`'s `wait-for` is an `async func`,
+/// so awaiting it is the whole implementation — no reactor, no polling
+/// loop, no `pollable` bridging (which is why the world imports the
+/// @0.3 track and not the @0.2.9 one that `std` already drags in; see
+/// the import's note in wit/engine.wit).
+///
+/// Saturating on the nanosecond conversion, not wrapping: a duration
+/// past `u64::MAX` nanoseconds (~584 years) is nobody's real deadline,
+/// and truncating one into a SHORT sleep would turn an absurd bound
+/// into a spuriously firing one.
+async fn sleep_for(dur: Duration) {
+    let nanos = u64::try_from(dur.as_nanos()).unwrap_or(u64::MAX);
+    wasi::clocks::monotonic_clock::wait_for(nanos).await;
+}
 
-impl Timeout<Local> for NeverTimeout {
+/// The bound on every subduction call (#123).
+///
+/// WHAT IT BOUNDS. One whole request/response ROUNDTRIP — the send plus
+/// the wait for that request's response — per call, not a sync round and
+/// not an idle timer. `sync_with_peer` makes several calls; each gets
+/// its own fresh `dur`.
+///
+/// WHERE THE DURATION COMES FROM. Every call site here passes
+/// `CallTimeout::Default`, which subduction resolves to its own
+/// `DEFAULT_ROUNDTRIP_TIMEOUT` — 30s, subduction_core/src/multiplexer.rs:47,
+/// deliberately the Erlang/OTP `GenServer.call` convention: calls are
+/// BOUNDED BY DEFAULT even on a transport whose recv loop never notices
+/// a byte-alive but protocol-silent peer. This impl supplies the clock
+/// that constant was always assuming; the engine simply had none.
+///
+/// WHY DROPPING THE LOSER IS SAFE. Subduction's calls are cancel-safe by
+/// documented design: `ManagedConnection::call` registers its pending
+/// response under an RAII `PendingGuard`
+/// (subduction_core/src/connection/managed.rs:110-155) whose `Drop`
+/// removes the multiplexer entry — named there as making the call safe
+/// against exactly this, "an outer deadline elapsed, a `select!` arm
+/// lost". Request IDs are never reused, so a straggling response can
+/// never be mismatched onto a later call. Ingestion and subscription
+/// happen only in the success arm, so a timed-out call cannot have
+/// half-applied anything.
+///
+/// WHAT A `TimedOut` OUTCOME MEANS, AND WHAT IT IS NOT. It means the
+/// wire is alive and the PEER IS SILENT — a diagnosis in its own right,
+/// distinct from `gone:` (the wire itself is dead, see `conn_status`).
+/// The page must NOT re-dial on it: re-dialling a live wire is the #78
+/// double-dial hazard, and the wire-keeper (demo/host/solo.ts) keeps
+/// timeouts in its leave-alone arm on purpose.
+///
+/// RETIRED HERE: `NeverTimeout`, which returned `Ok(fut.await)` — no
+/// bound, ever. It was a co-conspirator in the #113 stale-transport
+/// hang (fixed in #122): `sync_with_peer` walks a peer's connections
+/// serially, and a call parked on a dead-but-unfailable transport
+/// wedged the sync forever where a real bound would have made it a 30s
+/// stall with a name.
+#[derive(Clone, Debug, PartialEq)]
+struct MonotonicTimeout;
+
+impl Timeout<Local> for MonotonicTimeout {
     fn timeout<'a, T2: 'a>(
         &'a self,
-        _dur: Duration,
+        dur: Duration,
         fut: <Local as FutureForm>::Future<'a, T2>,
     ) -> <Local as FutureForm>::Future<'a, Result<T2, TimedOut>> {
-        Box::pin(async move { Ok(fut.await) })
+        // The shape upstream uses for the same job, with `wait-for`
+        // where it has `futures_timer::Delay`
+        // (subduction_websocket/src/timeout.rs's `FuturesTimerTimeout`,
+        // and subduction_wasm's `JsTimeout` over a `setTimeout`
+        // promise). `select` — not `select!` — so the winner is taken by
+        // value and the loser is DROPPED, which is what arms the
+        // `PendingGuard` above.
+        Box::pin(async move {
+            match select(fut, Box::pin(sleep_for(dur))).await {
+                Either::Left((val, _sleep)) => Ok(val),
+                Either::Right(((), _fut)) => Err(TimedOut),
+            }
+        })
     }
 }
 
@@ -618,6 +686,11 @@ struct State {
     conn_inbound: HashMap<u32, Vec<async_channel::Sender<Vec<u8>>>>,
 
     syncs: HashMap<u32, Result<String, String>>,
+    /// Insertion order over `syncs`, so the oldest outcome can be
+    /// evicted when the table is over `SYNCS_CAP`. See
+    /// `record_sync_outcome` for why an outcome map that is read
+    /// one-shot still needs a cap.
+    sync_order: VecDeque<u32>,
     endpoint: Option<Rc<Endpoint>>,
     /// The relay this endpoint bound to. Pairing has no relay hint in the
     /// code (PAIRING.md §1), so both sides use their configured one.
@@ -663,6 +736,41 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Result<R, String> {
             .map(f)
             .ok_or_else(|| "not initialized (call init first)".to_string())
     })
+}
+
+/// How many sync outcomes may sit unread before the oldest is dropped.
+///
+/// THE ABANDONED-HANDLE PATTERN (#123). `syncs` is one-shot — an entry
+/// is REMOVED as it is read (see `sync_status`) — and that was enough
+/// while a stuck sync simply never inserted anything: the task parked
+/// forever and its handle's row never existed. A real bound reverses
+/// that. Every sync the page gave up on (the page polls for ~30s and
+/// then stops asking) now lands an outcome nobody will ever read, and
+/// "removed on read" bounds nothing when the read never comes. The map
+/// once grew without bound for the neighbouring reason and the demo
+/// starts ~48 syncs/minute, forever; leaving the new leak in would be
+/// re-earning the same bug from the other side.
+///
+/// 256 is a ceiling, not a working set: the honest in-flight count is a
+/// handful, so an eviction here means outcomes are being abandoned far
+/// faster than read — worth noticing, never worth wedging over.
+const SYNCS_CAP: usize = 256;
+
+/// Record a sync outcome, evicting the OLDEST if the table is over
+/// `SYNCS_CAP`. Eviction costs the abandoning caller its outcome, which
+/// it was never going to read; a live poller's entry is minutes newer
+/// than anything at the front.
+fn record_sync_outcome(s: &mut State, handle: u32, outcome: Result<String, String>) {
+    s.syncs.insert(handle, outcome);
+    s.sync_order.push_back(handle);
+    // The DEQUE is what is capped, not the map: an entry already read
+    // still holds its slot until it reaches the front, so both stay
+    // bounded by `SYNCS_CAP` without a second pass to find the holes.
+    while s.sync_order.len() > SYNCS_CAP {
+        if let Some(oldest) = s.sync_order.pop_front() {
+            s.syncs.remove(&oldest);
+        }
+    }
 }
 
 fn now_ts() -> TimestampSeconds {
@@ -759,6 +867,25 @@ async fn nudge_keyhive_sync() {
 
 // --- shared handshake + iroh pumps (unchanged from the skeleton) ---
 
+/// How long the INITIATOR's keyhive/subduction handshake gets before it
+/// is called silent (#123).
+///
+/// Derived from the caller above it, not invented: the page's dial has a
+/// 30s `until` on `conn-status` (demo/host/solo.ts's wire-keeper), so a
+/// handshake still parked at 30s has already lost its audience — the
+/// page has given up and moved on, and every second past that is a task
+/// held open for nobody. Matching the page keeps one number in play
+/// instead of two disagreeing ones, and it happens to coincide with
+/// subduction's own `DEFAULT_ROUNDTRIP_TIMEOUT` (30s), which is the same
+/// judgement about how long a live wire may stay silent.
+///
+/// The RESPONDER side is deliberately not touched: `handshake::respond`
+/// below already carries its own 300s accept deadline (an anti-replay
+/// window over the peer's timestamp, not a liveness bound), and an
+/// acceptor waiting on a dialler is the cheap direction — it holds a
+/// queue, not a user.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[allow(clippy::too_many_arguments)]
 async fn subduction_handshake(
     transport: QueueTransport,
@@ -774,16 +901,73 @@ async fn subduction_handshake(
         let expected = arr32(&expected_peer, "expected peer")?;
         let audience = Audience::known(PeerId::new(expected));
         let nonce = Nonce::from_bytes(rand::random::<[u8; 16]>());
-        handshake::initiate::<Local, _, _, _, _>(
-            QueueHandshake(transport),
-            |h, _peer| (MessageTransport::new(h.0), ()),
-            &signer,
-            audience,
-            now,
-            nonce,
+        // BOUNDED (#123). The handshake runs BEFORE the connection is
+        // handed to subduction, so it is outside `MonotonicTimeout`'s
+        // reach entirely: `initiate` writes its hello and then awaits
+        // the peer's reply on a queue that a byte-alive but silent peer
+        // never feeds — parking this task, and the dial with it,
+        // forever. Same machinery as the call bound: race it against
+        // the monotonic clock and drop the loser.
+        //
+        // Dropping a half-finished `initiate` is safe in the way that
+        // matters here: nothing has been registered with subduction
+        // yet — the authenticated connection only reaches it via the
+        // `add_connection` below, in the success arm.
+        //
+        // THE WIRE, THOUGH, IS OURS TO END, and the timeout arm does it
+        // EXPLICITLY (see the `close` there). Nothing else would: this
+        // is by definition the case where the peer is ALIVE, so QUIC
+        // raises no error, `wait-closed` never resolves on its own, and
+        // `conn_gone_monitor` — which only ever runs after
+        // `wait-closed` — never gets to do its job. Left alone, a
+        // timed-out dial would leak the whole chain: an open connection
+        // the wire-keeper re-dials past every ~30s, plus an
+        // `iroh_reader` still shovelling frames into a `conn_inbound`
+        // queue whose only consumer died with the dropped handshake
+        // future.
+        //
+        // THE TEARDOWN CHAIN, once we close: `close(code, reason)` makes
+        // this connection's own `wait-closed` resolve, which wakes the
+        // `conn_gone_monitor` already spawned for it by the wiring task,
+        // which closes the registered `conn_inbound` senders (so the
+        // reader's writes fail and it exits) and then applies its rule 1
+        // to `conn_results` — where it finds the timeout `Err` this
+        // function is about to return and leaves it in place, because a
+        // named error outranks `gone:`. One mechanism, the ordinary one;
+        // this arm only supplies the close the peer was never going to.
+        let conn_id = transport.id;
+        match select(
+            Box::pin(handshake::initiate::<Local, _, _, _, _>(
+                QueueHandshake(transport),
+                |h, _peer| (MessageTransport::new(h.0), ()),
+                &signer,
+                audience,
+                now,
+                nonce,
+            )),
+            Box::pin(sleep_for(HANDSHAKE_TIMEOUT)),
         )
         .await
-        .map_err(|e| format!("initiate: {e:?}"))
+        {
+            Either::Left((res, _sleep)) => res.map_err(|e| format!("initiate: {e:?}")),
+            Either::Right(((), _initiate)) => {
+                // An honest application close: the code is ours (1 =
+                // "this side gave up on the handshake") and the reason
+                // is what the peer's `wait-closed` will report, so a
+                // remote engine debugging its own silence is told why
+                // rather than left with a bare transport close.
+                let _ = with_state(|s| {
+                    if let Some(conn) = s.iroh_conns.get(&conn_id) {
+                        conn.close(1, "handshake timed out");
+                    }
+                });
+                Err(format!(
+                    "initiate: handshake timed out after {}s (peer silent; the wire is not \
+                     reported dead)",
+                    HANDSHAKE_TIMEOUT.as_secs()
+                ))
+            }
+        }
     } else {
         handshake::respond::<Local, _, _, _, _>(
             QueueHandshake(transport),
@@ -908,11 +1092,17 @@ async fn iroh_reader(in_tx: async_channel::Sender<Vec<u8>>, recv: RecvStream, se
 /// alongside it), so after an endpoint rebind the peer owns a dead
 /// connection at index 0 and the live one at index 1. `sync_with_peer`
 /// walks that list IN ORDER (subduction.rs:2190) and calls on the dead
-/// one first; with this engine's `NeverTimeout` (see it above — the
-/// `Timeout` impl that never fires) that call parks forever and the
-/// live connection is never reached. Net effect before this fix: after
-/// a relay outage, `conn-status` said LIVE within a second and no sync
+/// one first; with the `NeverTimeout` this engine carried at the time
+/// (a `Timeout` impl that never fired — retired in #123, see
+/// `MonotonicTimeout` above) that call parked forever and the live
+/// connection was never reached. Net effect before this fix: after a
+/// relay outage, `conn-status` said LIVE within a second and no sync
 /// ever completed again, for the life of the page.
+///
+/// The bound added in #123 does not replace this repair, and was never
+/// an alternative to it: it would have turned the wedge into a 30s
+/// stall per stale connection, which is a diagnosis, not a fix. Closing
+/// the queues is still what removes the corpse.
 ///
 /// The asymmetry that made it confusing: only the side that CALLS
 /// `sync_with_peer` walks the stale list. An acceptor answering an
@@ -3797,7 +3987,7 @@ fn finish_init(
         .signer(signer.clone())
         .storage(sd_storage.clone(), policy)
         .spawner(WitSpawn)
-        .timer(NeverTimeout)
+        .timer(MonotonicTimeout)
         .build::<Local, Conn>();
     wit_bindgen::spawn_local(async move {
         let _ = listener.await;
@@ -3820,6 +4010,7 @@ fn finish_init(
             conn_results: HashMap::new(),
             conn_inbound: HashMap::new(),
             syncs: HashMap::new(),
+            sync_order: VecDeque::new(),
             endpoint: None,
             relay_url: None,
             iroh_identity: None,
@@ -4940,7 +5131,7 @@ impl DriverGuest for Component {
                 )),
                 Err(e) => Err(format!("sync_with_peer: {e:?}")),
             };
-            let _ = with_state(|s| s.syncs.insert(handle, outcome));
+            let _ = with_state(|s| record_sync_outcome(s, handle, outcome));
         });
         Ok(handle)
     }
@@ -4951,6 +5142,12 @@ impl DriverGuest for Component {
         // REMOVED as it is read, so the table holds only in-flight syncs.
         // Leaving completed entries in made the map grow without bound —
         // the demo starts ~48 syncs/minute, forever.
+        //
+        // One-shot is no longer the WHOLE bound: since #123 a sync can
+        // settle after its caller stopped polling, and an outcome that
+        // is never read is never removed here. `record_sync_outcome`
+        // caps the table for exactly that case; this stays the fast
+        // path for outcomes somebody is waiting on.
         match with_state(|s| s.syncs.remove(&handle))? {
             Some(Ok(summary)) => Ok(Some(summary)),
             Some(Err(e)) => Err(e),

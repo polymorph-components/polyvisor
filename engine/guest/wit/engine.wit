@@ -915,6 +915,21 @@ interface store-fetch-types {
 }
 
 world engine {
+    /// The clock every BOUND in this engine is measured against (#123).
+    /// Before it, subduction calls ran under a `Timeout` impl that never
+    /// fired, so "slow or silent peer" meant "wedged forever" (the #113
+    /// latch's co-conspirator). `wait-for` is the whole need: race it
+    /// against the call and the loser is dropped.
+    ///
+    /// The @0.3.0 track, not @0.2.9: only 0.3's `wait-for` is an `async
+    /// func` a guest can await directly (0.2 hands back a `pollable`,
+    /// which is a different — blocking — shape). The composite already
+    /// imported this exact interface for the iroh endpoint, so every
+    /// embedder that instantiates us today already satisfies it;
+    /// `@polyengine/wasi`'s batteries serve it from one union provider
+    /// (wasi/src/clocks.ts, the D-1 note), which is what both the Deno
+    /// host and the browser worker instantiate through.
+    import wasi:clocks/monotonic-clock@0.3.0;
     import polymorph:iroh/endpoint@0.1.0;
     import polymorph:iroh/identity-generate@0.1.0;
     /// The other half of the endpoint-identity story: minting an iroh
