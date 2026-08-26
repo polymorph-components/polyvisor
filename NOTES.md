@@ -326,6 +326,18 @@ self-hosting, with the explicit goal that neither is the degraded tier.
   deployment is a single origin, fine for a personal instance, and the
   checker should report which posture it verified rather than pretend
   the two are identical.
+- **Relay posture follows the delivery artifact.** Recorded 2026-08-26
+  from design discussion; direction, not final ruling. The turnkey
+  static scripts/instructions default to a public relay instance
+  (project-affiliated), so the static path keeps the **split view**
+  from the metadata note under
+  [Parked and candidate non-goals](#parked-and-candidate-non-goals) by
+  default: the origin operator sees code fetches, an unrelated relay
+  sees contact timing, and no one party holds both. The full-stack
+  self-host bundles its own relay and skips the public default — one
+  operator does see both halves there, and that is acceptable because
+  the operator is the user. A configurable default, not a hardwired
+  one, in both artifacts.
 - **Shells beyond the tab.** A "native" (webview) app shell,
   eventually. A webextension is on the table in two roles, separately
   decidable: an app shell, and a **visor trust root for hosted
@@ -2431,9 +2443,12 @@ pair/resume/check green, invariants 9/9.
 
 - **Metadata privacy**: relays, push services, and origins see traffic
   timing and contact-graph shape. State as an explicit v1 non-goal
-  rather than let it be discovered. Related open question: relay
-  operated by the origin operator (one party sees code fetches *and*
-  contact timing) vs independent relays (split view).
+  rather than let it be discovered. The related relay question is
+  answered — see the relay-posture bullet in
+  [Who runs home origins](#who-runs-home-origins): the static path
+  keeps the split view by default (origin sees code fetches, an
+  independent relay sees contact timing); the full-stack self-host
+  knowingly collapses it onto the user themselves.
 - **Browser support floor**: answered — see the Browser floor note in
   [The substrate](#the-substrate). Safari's floor is a future JSPI +
   wasm multi-memory release (hoped early 2027); the worst cases that
@@ -2508,6 +2523,10 @@ Tracked as issues; the headline ones, verbatim from the discussion:
 - Does Safari have to work at launch — answered: no; see the Browser
   floor note in [The substrate](#the-substrate) (a future JSPI + wasm
   multi-memory Safari, hoped early 2027).
-- Relay: bundled with the origin operator or independent by default?
+- Relay — answered: posture follows the delivery artifact; see
+  [Who runs home origins](#who-runs-home-origins). Turnkey static
+  defaults to a public relay instance (split view preserved);
+  full-stack self-hosting bundles its own and skips the public
+  default.
 - Does the home origin ever serve per-user content?
 - `user@host` discovery: wanted, or out-of-band only?
