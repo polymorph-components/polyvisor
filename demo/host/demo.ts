@@ -268,6 +268,10 @@ const VISOR_KEY = "pm-demo-visor-hue";
 // CONTRACT: rename-only migration (chrome -> visor, GitHub issue #22); the
 // legacy key is read once by `initVisor` and then removed, never re-created.
 const LEGACY_CHROME_KEY = "pm-demo-chrome-hue";
+// The AUDIBLE anchor: the spoken twin of the colour, on its own key for
+// exactly the same reason — two embedders on one origin are two devices
+// and must not sound alike (visor/ui/words.ts).
+const WORD_KEY = "pm-demo-visor-word";
 const IDENTITY_KEY = "pm-demo-identity";
 
 // The trust table: the surface marks, the first-sight timestamps and the
@@ -970,6 +974,7 @@ async function boot() {
   const visor = initVisor({
     hueKey: VISOR_KEY,
     legacyHueKey: LEGACY_CHROME_KEY,
+    wordKey: WORD_KEY,
     identityKey: IDENTITY_KEY,
     appSurface: () => appSurface,
     contextOverride: () => activePanel?.surface ?? null,
@@ -1851,6 +1856,7 @@ async function boot() {
    * nor race the entry. */
   const credentialTenant = visor.drawer.tenant<CredentialSession>({
     name: "credentials",
+    spoken: "credentials",
     exclusive: true,
     armed: true,
     dim: true,
@@ -2805,6 +2811,7 @@ async function boot() {
 
   const pickerTenant = visor.drawer.tenant<PickerSession>({
     name: "storage-picker",
+    spoken: "storage picker",
     // NOT EXCLUSIVE: the credential sheet this one hands off to is, and
     // an exclusive picker would refuse its own successor. Not `dim`med
     // either — the picker deliberately survives a walk to a config page
@@ -3485,6 +3492,7 @@ async function boot() {
    * delay means nothing. */
   const addDeviceTenant = visor.drawer.tenant<{ container: HTMLElement }>({
     name: "add-device",
+    spoken: "add a device",
     exclusive: true,
     dim: true,
     context: () => ({ kind: "settings" }),

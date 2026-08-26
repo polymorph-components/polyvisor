@@ -120,6 +120,41 @@ the user's word for it — its petname, clamped at 40 — or described
 without naming when there is no petname; its provenance key and its
 nickname never ride an announcement.
 
+**The three voices are marked in pixels — and a screen reader has
+none.** AT linearizes the page: app-frame text and visor text arrive in
+one undifferentiated stream, the plate and the weight and the quoting
+are gone, and iframe boundaries are not announced at all. An app can
+therefore render, inside its own rectangle, a sentence that *sounds*
+exactly like the visor speaking. The answer is the **audible anchor
+word** (`ui/words.ts`): a word rolled once per identity by the same
+`claim()` that rolls the hue, from the EFF short wordlist 2.0 (chosen
+for phonetic distinctness) minus the visor's own spoken vocabulary. It
+prefixes every drawer lifecycle sentence the host speaks — "«word»:
+storage picker open", `closed`, `back` — with everything after the
+colon coming from `DrawerTenantSpec.spoken`, framework vocabulary fixed
+at registration and subject to the same one-directional rule as
+`announce()`. Before the claim there is no word yet and the prefix is
+the literal "visor", which is the honest sentence for a `deferClaim`
+embedder whose unseal picker lives in the drawer.
+
+**The channel decision: `speak()`, never `announce()`, and never
+pixels.** These sentences go only to the visually-hidden `#visor-live`
+region. Not `announce()`, because that spends the strip's bottom line,
+and a lifecycle sentence at every sheet transition would steal the
+visual line from the context it is meant to be holding. And never
+rendered at all — not in a sheet, not in a `title`, not in an
+`aria-label` — because pixels travel: a screenshot, a recording or a
+screen-share hands a drawn word straight to whoever is watching, and an
+app that learns the word can wear it. That is enforced structurally
+rather than by convention: there is deliberately **no getter** for the
+word on the `Visor` interface (contrast `committedHue()`, which exists
+because consumers must paint with it). `speakWord()` and `rerollWord()`
+are the only doors, and both end in the live region. Audio capture and
+shoulder-listening remain accepted residual leaks; `rerollWord()` is
+the remedy. `speak()` is a FIFO queue with a short dwell so that two
+sentences emitted in one synchronous block — a close that resumes the
+sheet underneath — both survive.
+
 **Pet icons are user voice by construction**, which is why they carry no
 marker of their own: a glyph reaches the strip or a sheet only after the
 user adopted it in the naming ceremony. A component may *nominate* a

@@ -184,6 +184,10 @@ if (isAuthPopup) {
 // `usCacheKeys`), and because a colour and a name are exactly the two
 // things a boot must be able to paint the INSTANT the seal opens.
 const VISOR_KEY = "pm-solo-visor-hue";
+// The AUDIBLE anchor: the spoken twin of the colour, on its own key for
+// exactly the same reason — two embedders on one origin are two devices
+// and must not sound alike (visor/ui/words.ts).
+const WORD_KEY = "pm-solo-visor-word";
 const IDENTITY_KEY = "pm-solo-identity";
 const MARKS_KEY = "pm-solo-surface-marks";
 const US_CACHE_KEYS = usCacheKeys("pm-solo");
@@ -452,6 +456,7 @@ async function boot() {
   const appSlot: AppSlot = { surface: null };
   const visor = initVisor({
     hueKey: VISOR_KEY,
+    wordKey: WORD_KEY,
     identityKey: IDENTITY_KEY,
     deferClaim: true,
     // ONE app surface and no nested places: the strip's context falls
@@ -939,6 +944,7 @@ interface RestoreCeremonyHost {
 function mountRestore(visor: Visor, host: RestoreCeremonyHost): void {
   const tenant = visor.drawer.tenant<{ root: HTMLElement }>({
     name: "restore",
+    spoken: "restore",
     // EXCLUSIVE: this is a way IN, the same weight class as the picker,
     // and nothing may displace a half-entered recovery phrase.
     exclusive: true,
@@ -1809,6 +1815,7 @@ async function startApp(
 
   const deviceTenant = visor.drawer.tenant<{ container: HTMLElement }>({
     name: "this-device",
+    spoken: "this device",
     exclusive: true,
     dim: true,
     context: () => ({ kind: "settings" }),
@@ -2286,6 +2293,7 @@ async function startApp(
 
   const storageTenant = visor.drawer.tenant<{ container: HTMLElement }>({
     name: "storage",
+    spoken: "storage",
     exclusive: true,
     dim: true,
     context: () => ({ kind: "settings" }),
@@ -4916,6 +4924,7 @@ async function startApp(
 
   const addTenant = visor.drawer.tenant<{ container: HTMLElement }>({
     name: "add-device",
+    spoken: "add a device",
     exclusive: true,
     dim: true,
     context: () => ({ kind: "settings" }),

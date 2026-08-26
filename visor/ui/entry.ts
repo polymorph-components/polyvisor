@@ -189,6 +189,10 @@ export function mountDevicePicker(
 ): { close(): void } {
   const tenant = visor.drawer.tenant<{ root: HTMLElement }>({
     name: "device-picker",
+    // Pre-claim, so this is the sheet most often heard under the generic
+    // "visor" prefix (there is no anchor word until the seal opens — see
+    // `wordPrefix` in visor.ts).
+    spoken: "device picker",
     // EXCLUSIVE: this is the login. Nothing may displace it, and it
     // displaces everything — though in practice there is nothing to
     // displace, since it opens before any other tenant can exist.
@@ -530,6 +534,9 @@ export function offerFirstRun(
 ): { joinHandle: JoinPaneHandle; close(): void } {
   const tenant = visor.drawer.tenant<{ root: HTMLElement }>({
     name: "first-run",
+    // The resting state of an account-less device, described as what it
+    // offers rather than as the lifecycle stage it is named for.
+    spoken: "getting started",
     // NOT EXCLUSIVE, and SUSPENDABLE — a RULING, and the pair goes
     // together.
     //

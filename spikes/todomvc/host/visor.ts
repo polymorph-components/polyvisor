@@ -39,6 +39,10 @@ import { registerVisorSheets } from "../../../visor/ui/sheets.ts";
 // No legacy key here — todomvc never had a pre-rename ("chrome") key to
 // migrate, unlike the demo spike's #22 migration.
 const HUE_KEY = "pm-todomvc-visor-hue";
+// The AUDIBLE anchor: the spoken twin of the colour, on its own key for
+// exactly the same reason — two embedders on one origin are two devices
+// and must not sound alike (visor/ui/words.ts).
+const WORD_KEY = "pm-todomvc-visor-word";
 const IDENTITY_KEY = "pm-todomvc-identity";
 const MARKS_KEY = "pm-todomvc-surface-marks";
 
@@ -59,6 +63,7 @@ export function initTodoVisor(artifactName: string): void {
 
   const visor = initVisor({
     hueKey: HUE_KEY,
+    wordKey: WORD_KEY,
     identityKey: IDENTITY_KEY,
     // The strip's fallback surface: this page has exactly one artifact,
     // so there is exactly one row, and it is always the one on the strip.

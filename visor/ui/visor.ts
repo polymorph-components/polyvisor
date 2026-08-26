@@ -21,6 +21,14 @@
 // `initVisor` returns; the module holds only constants. Two visors in
 // two documents therefore cannot collide.
 
+// The anchor colour's AUDIBLE TWIN lives next door, in its own module,
+// because it is 1296 lines of borrowed wordlist and one roll helper —
+// but it is the same idea on the other channel, and visor.ts is the only
+// file that ever reads it. See words.ts's header for the threat (screen
+// readers linearise the page, so the three voices are marked in pixels
+// and silent in speech) and for what the word deliberately is NOT.
+import { loadVisorWord, rollVisorWord } from "./words.ts";
+
 // --- visor appearance: the personal, undisclosed anchor -----------------------
 //
 // The strip's colour is the user's own: RANDOMISED on first run, pickable
@@ -596,6 +604,30 @@ export interface DrawerCloseOptions {
 export interface DrawerTenantSpec<S> {
   /** Diagnostic only; the host does not render it. */
   name: string;
+  /** WHAT THIS SHEET IS CALLED OUT LOUD — the noun the drawer's
+   * lifecycle announcements put after the anchor word ("walrus: storage
+   * picker open"). Lower-case, a short noun phrase, no punctuation and
+   * no verb: the host supplies the verb.
+   *
+   * REQUIRED, and required rather than defaulted from `name` on purpose.
+   * `name` is a diagnostic identifier ("add-device", "first-run"); this
+   * is a sentence fragment a person hears. Defaulting would have shipped
+   * hyphenated identifiers into a user's ear and nobody would have
+   * noticed, because the people it fails are the people who cannot see
+   * the sheet it mislabels.
+   *
+   * VOICE — THE SAME ONE-DIRECTIONAL RULE AS `announce`, and it binds
+   * harder here because the string is baked in at registration. This is
+   * FRAMEWORK VOICE. It may embed USER-voice words inline (the user's
+   * own word for a device), because the user's vocabulary is already
+   * something the visor may say in its own sentence. An APP-INFLUENCED
+   * string must NEVER appear here: the announcement is a flat spoken
+   * sentence, so there is no `foreignToken` to plate it with and no
+   * marking a listener could hear — a component's nickname placed here
+   * would arrive prefixed by the user's own anchor word, which is
+   * precisely the provenance claim the word exists to make
+   * unforgeable. Describe the sheet in the visor's vocabulary instead. */
+  spoken: string;
   /** THE HIGHEST PRECEDENCE. An exclusive tenant is never evicted — every
    * other tenant's `open` refuses while it holds the drawer — and its own
    * open evicts everything else. In the demo this is the credential
@@ -735,6 +767,16 @@ export interface VisorConfig {
   hueKey: string;
   /** Rename-only migration source, read once and removed. */
   legacyHueKey?: string;
+  /** Where the committed anchor WORD lives — the audible twin of
+   * `hueKey`, and REQUIRED for the same reason that one is: a visor
+   * whose non-visual users have no provenance token is a visor with a
+   * hole in exactly the population that cannot see the colour, and an
+   * optional key would let an embedder ship that hole by omission.
+   *
+   * Its own key, not a field inside the identity record, so it obeys the
+   * same per-embedder rule the hue does: two pages on one origin are two
+   * devices and must not share a word. */
+  wordKey: string;
   /** Where the identity record lives. */
   identityKey: string;
   /** THE APP'S OWN ROW IN THE TRUST TABLE — what the strip's top line
@@ -919,10 +961,53 @@ export interface Visor {
    * THROWS WHILE UNCLAIMED (`deferClaim`) — a pre-claim commit would
    * persist a choice the user never made; see `committedHue`. */
   commitHue(hue: number): void;
+  /** SAY THE USER'S ANCHOR WORD, to assistive tech only — "remind me
+   * what my word is", for a user who has stopped hearing it as a word
+   * and started hearing it as noise, or who has just switched devices.
+   *
+   * NOTE WHAT IS MISSING HERE, and that its absence is the design: there
+   * is NO `committedWord()` to match `committedHue()`. The hue can be
+   * returned because a consumer needs to paint with it; the word has no
+   * such use — the only thing anyone does with it is HEAR it — so the
+   * value never crosses this interface at all. A getter would let a
+   * consumer render the word into pixels, and a rendered word is a word
+   * that a screenshot, a screen-recording or a screen-share hands
+   * straight to an app, which is the one thing that would end the
+   * mechanism. The channel is audible-only by construction, not by
+   * convention.
+   *
+   * THROWS WHILE UNCLAIMED (`deferClaim`), same discipline as
+   * `committedHue`: pre-claim there is no word, and speaking a
+   * placeholder would teach the user a token the visor will not use. */
+  speakWord(): void;
+  /** MINT A NEW ANCHOR WORD and say it, for a user who believes the old
+   * one was overheard.
+   *
+   * The word's accepted residual leak is AUDIO — a screen-share carrying
+   * system sound, a call, a person within earshot (see words.ts). None
+   * of those are defended against, so the answer to all of them is the
+   * same one the anchor colour has: the user can change it. The new word
+   * is GUARANTEED DIFFERENT from the old one — a re-roll that returned
+   * the same word would look like a control that does nothing, and, far
+   * worse, would leave a user believing they had rotated away from a
+   * token that is still live.
+   *
+   * Persisted immediately (there is no Save step and no preview: unlike
+   * a colour, there is nothing to look at while deciding), and spoken —
+   * never rendered, and never through `announce`.
+   *
+   * THROWS WHILE UNCLAIMED (`deferClaim`) — a pre-claim re-roll would
+   * write the consumer's word key before the seal opens, exactly as
+   * `commitHue` would write the hue key. */
+  rerollWord(): void;
   /** FORGET EVERYTHING THIS VISOR HOLDS ON THIS DEVICE — the storage half
-   * of the reset ceremony. The identity record, the committed anchor hue
-   * and (when the consumer configured one) the legacy hue key are
-   * removed; nothing else is touched.
+   * of the reset ceremony. The identity record, the committed anchor hue,
+   * the committed anchor WORD and (when the consumer configured one) the
+   * legacy hue key are removed; nothing else is touched.
+   *
+   * The word goes with the colour, deliberately: they are the two halves
+   * of one anchor, and an erase that took the colour but left the word
+   * would leave a re-minted visor still answering to the old one.
    *
    * THE CEREMONY IS NOT HERE. sheets.ts owns it — the statement of
    * consequence, the arming delay, the typed confirmation, and the OTHER
@@ -971,6 +1056,31 @@ export function initVisor(config: VisorConfig): Visor {
   };
   if (!deferred) rollHue();
 
+  /** THE COMMITTED ANCHOR WORD, or "" while unclaimed.
+   *
+   * IT IS NEVER EXPOSED AS A STRING. There is no getter for it on the
+   * `Visor` interface and there deliberately never will be: the moment a
+   * consumer can read the word, a consumer can RENDER the word, and a
+   * word that reaches pixels is a word a screenshot, a screen-share or a
+   * compositing trick can carry to an app. Everything a caller may do
+   * with it — hear it, replace it — is a method that SPEAKS, and speech
+   * is a channel no app-side code can read back. This module-private
+   * binding is the whole extent of its reach.
+   *
+   * The empty string is not a placeholder to be spoken: every read site
+   * below either runs post-claim or falls back to the literal word
+   * "visor" (see `wordPrefix`). */
+  let committedWord = "";
+  let wordFresh = false;
+  /** Rolled EXACTLY WHERE `rollHue` is rolled, and for the same reason —
+   * the colour and the word are one identity arriving, and a word that
+   * could be rolled at a second site could be rolled twice. */
+  const rollWord = () => {
+    const rolled = loadVisorWord(config.wordKey);
+    committedWord = rolled.word;
+    wordFresh = rolled.fresh;
+  };
+  if (!deferred) rollWord();
   // FIXED IDS. They are part of the trust model and of the e2e contract —
   // "the visor's pixels" is a claim about named elements a component
   // cannot reach — so they are not parameterised.
@@ -1399,16 +1509,108 @@ export function initVisor(config: VisorConfig): Visor {
     return el;
   })();
 
+  /** THE MINIMUM TIME A SENTENCE OWNS THE LIVE REGION, in ms. Long
+   * enough that a typical screen reader has begun (and mostly finished)
+   * speaking it before the next one replaces the text. */
+  const SPEAK_DWELL_MS = 1400;
+  /** How many sentences may wait. A cap rather than an unbounded queue:
+   * a burst that outruns speech is a burst nobody can listen to anyway,
+   * and an unbounded one would keep talking about the past long after
+   * the screen moved on. OLDEST IS DROPPED, not newest — the most
+   * recent sentences are the ones describing what is on screen now. */
+  const SPEAK_QUEUE_MAX = 8;
+  const speakQueue: string[] = [];
+  let speaking = false;
+
   /** Say something to assistive tech only. CLEAR THEN SET, in two turns:
    * writing the same string a live region already holds is not a change,
    * and an unchanged live region announces nothing — so a repeated
-   * identical sentence would be silently dropped. */
+   * identical sentence would be silently dropped.
+   *
+   * AND A FIFO QUEUE AROUND THAT, which is the part that is not obvious.
+   * A live region has ONE slot, and the screen reader reads it
+   * asynchronously, on its own schedule; writing twice in quick
+   * succession does not queue two announcements, it destroys the first.
+   * Two sites in this file do exactly that, synchronously, and both are
+   * correct behaviour that must not be made to take turns by hand:
+   *
+   *   (a) `close()` on a non-suspended tenant speaks its own "closed"
+   *       and then, in the same synchronous block, resumes the
+   *       occupant that was waiting underneath — which speaks "back".
+   *       Unqueued, a non-visual user hears only "back" and is never
+   *       told the ceremony they were in ended.
+   *   (b) `claim()` teaches a freshly-rolled word, and the consumer's
+   *       very next statement is the fresh-anchor colour announcement.
+   *       Unqueued, the teach — the one sentence the whole mechanism
+   *       depends on the user hearing — is the one that loses.
+   *
+   * So each message holds the region for `SPEAK_DWELL_MS` before the
+   * next is written. `announce` and `pulseContext` call this exactly as
+   * they did and are ordered by it for free. */
   const speak = (text: string) => {
     if (!text) return;
-    liveRegion.textContent = "";
-    setTimeout(() => {
-      liveRegion.textContent = text;
-    }, 30);
+    speakQueue.push(text);
+    // Drop from the FRONT when full: see SPEAK_QUEUE_MAX.
+    while (speakQueue.length > SPEAK_QUEUE_MAX) speakQueue.shift();
+    if (speaking) return;
+    const pump = () => {
+      const next = speakQueue.shift();
+      if (next === undefined) {
+        speaking = false;
+        return;
+      }
+      speaking = true;
+      liveRegion.textContent = "";
+      setTimeout(() => {
+        liveRegion.textContent = next;
+        // The dwell is measured from the moment the text LANDS, not from
+        // the enqueue — the 30ms blank is part of delivering this
+        // sentence, not part of the previous one's time on air.
+        setTimeout(pump, SPEAK_DWELL_MS);
+      }, 30);
+    };
+    pump();
+  };
+
+  /** THE PROVENANCE PREFIX every drawer lifecycle sentence opens with:
+   * the user's own word once there is one, and the literal word "visor"
+   * before that.
+   *
+   * THE PRE-CLAIM CASE IS REAL, not a defensive default. A `deferClaim`
+   * embedder (the solo page) puts its UNSEAL PICKER in the drawer — the
+   * login is trusted UI and trusted UI lives in visor territory — so the
+   * drawer opens and closes, and therefore speaks, before any identity
+   * exists. There is deliberately NO WORD YET at that point: the word is
+   * the user's, and nothing of the user's may be on screen (or in the
+   * ear) before the seal opens. "visor: this device open" is the honest
+   * sentence there — it names the speaker without claiming a provenance
+   * token that has not been minted. A user learns quickly that the
+   * generic prefix belongs to the pre-login world; an app that imitates
+   * it gains nothing, because after the claim the generic prefix is
+   * exactly what a spoofed sentence sounds like. */
+  const wordPrefix = () => (committedWord === "" ? "visor" : committedWord);
+
+  /** True once the fresh-word teach has been spoken, so it cannot be
+   * said twice by a second claim (or by a consumer that claims a visor
+   * that was never deferred). */
+  let wordTaught = false;
+  /** THE ONE SENTENCE THE WHOLE MECHANISM DEPENDS ON. A word the user
+   * was never told is a word they cannot use to tell the visor from an
+   * app imitating it, so a FRESH roll teaches itself out loud.
+   *
+   * `speak`, NEVER `announce`: the visual line is not this sentence's to
+   * take. Sighted users already have the anchor colour, and an
+   * announcement here would spend the strip's bottom line — the line a
+   * fresh boot owes to the fresh-COLOUR announcement — on words that
+   * mean nothing to someone reading them. And the word must never reach
+   * pixels at all (see `committedWord`), which rules the visual channel
+   * out on its own. Routing through the queue is what guarantees the
+   * consumer's colour announcement, which follows within the same tick,
+   * does not clobber it. */
+  const teachFreshWord = () => {
+    if (!wordFresh || wordTaught || committedWord === "") return;
+    wordTaught = true;
+    speak(`your visor's word is ${committedWord} — it will start everything your visor says`);
   };
 
   /** The pulse's total on-screen life, in ms. MUST match the
@@ -1705,6 +1907,30 @@ export function initVisor(config: VisorConfig): Visor {
      * if the predicate's answer changed while the sheet was up. */
     let dimmedNow = false;
 
+    /** THE DRAWER'S NON-VISUAL LIFECYCLE LINE: "«word»: «sheet» «verb»".
+     *
+     * IMPLEMENTED IN THE HOST, ONCE, rather than left to each tenant —
+     * which is the same argument the live region itself was built on. A
+     * tenant that has to remember to announce its own open is a tenant
+     * that can forget to, and the failure is invisible to everyone who
+     * reviews the sheet by looking at it. Registering a tenant is what
+     * buys the announcement; `spoken` being REQUIRED is what makes it
+     * impossible to register one that cannot be announced.
+     *
+     * The prefix is the whole reason this exists. A sighted user knows
+     * this sheet is the visor's because it hangs off a strip no
+     * component can draw in; a listening user knows it because the
+     * sentence opens with a word only their visor knows. Everything
+     * after the colon is FRAMEWORK VOCABULARY (see `spoken`), so the
+     * sentence carries no string an app could have influenced.
+     *
+     * `speak`, never `announce`: the visual bottom line already says
+     * what the drawer is doing by SHOWING the sheet, and spending it on
+     * a lifecycle sentence at every sheet transition would trample the
+     * context the strip is meant to be holding — plus the word must
+     * never reach pixels at all. */
+    const speakDrawer = (verb: string) => speak(`${wordPrefix()}: ${spec.spoken} ${verb}`);
+
     const detach = () => {
       if (anchor) {
         globalThis.removeEventListener("resize", anchor);
@@ -1867,6 +2093,13 @@ export function initVisor(config: VisorConfig): Visor {
       // named surface.
       restoreContext();
       present(s, "left");
+      // THE SHEET IS BACK, said out loud. A resume is invisible to a
+      // non-visual user otherwise: nothing about it changes focus, and
+      // the strip context it restores is RECOMPUTED (it may not even be
+      // this tenant's). "back" rather than "open" because it is the
+      // second half of a displacement the user already heard the first
+      // half of — the displacing tenant's own open.
+      speakDrawer("back");
     };
 
     const tenant: TenantImpl<S> = {
@@ -1912,6 +2145,17 @@ export function initVisor(config: VisorConfig): Visor {
         if (opts.context !== false && !wasSuspended) restoreContext();
         spec.afterRestore?.(s, opts);
         if (!wasSuspended) {
+          // SPOKEN ONLY ON THE NON-SUSPENDED PATH. A suspended tenant
+          // does not own the drawer — its session is ending off-screen,
+          // and nothing a listener can perceive is happening — so
+          // announcing "closed" there would describe a sheet that left
+          // the screen some time ago, under a ceremony that is still up.
+          //
+          // STRICTLY BEFORE the resume below, and the pair is the reason
+          // `speak` had to become a queue: these two sentences are
+          // emitted in the same synchronous block, and against a bare
+          // live region the second would silently destroy the first.
+          speakDrawer("closed");
           // THE SUSPENDED OCCUPANT COMES BACK, if there is one: this
           // close is the end of the ceremony that displaced it. Done
           // synchronously, before the deferred blank below, so the
@@ -1953,6 +2197,30 @@ export function initVisor(config: VisorConfig): Visor {
         // it keeps its session and slides out (the travel is run by the
         // presentation below, which needs both sheets in the DOM at
         // once), and it comes back when this one closes.
+        // KNOWN WART, RECORDED RATHER THAN GUARDED — a PHANTOM "back".
+        // The two branches below interact through `close`, which resumes
+        // whatever is suspended: if this loop suspends tenant A (the
+        // first branch) and then evicts tenant B (the second), B's
+        // `close` finds A waiting and RESUMES it — mid-loop, on behalf
+        // of an opener that is itself about to displace A again. A is
+        // therefore suspended, resumed and re-suspended inside one
+        // `open`, and since the word change the resume is AUDIBLE: the
+        // user hears "«word»: «A» back" for a sheet that never came back.
+        //
+        // It needs a tenant configuration the demo never builds — an
+        // open NON-SUSPENDABLE, NON-EXCLUSIVE occupant, a suspended
+        // SUSPENDABLE one, and a third tenant opening over both — so
+        // there is nothing to fix against today. Note also that the
+        // STRUCTURE is pre-existing: the spurious resume (with its
+        // rebuild and its `restoreContext`) has always happened here;
+        // the announcement only made it perceptible, which is arguably
+        // the announcement doing its job.
+        //
+        // THE FOLLOW-UP SHAPE, if a real embedder ever grows that
+        // configuration: a suppress-during-eviction flag raised around
+        // this loop and read by `close`'s resume (and by `speakDrawer`),
+        // so a resume that is immediately undone by the same `open`
+        // neither speaks nor rebuilds.
         let displaced = false;
         for (const other of tenants) {
           if (other === tenant) continue;
@@ -1989,6 +2257,25 @@ export function initVisor(config: VisorConfig): Visor {
         // right; one opening into an empty (or evicted) drawer grows up
         // out of the bar as it always has.
         present(s, displaced ? "right" : "up");
+        // AFTER `present`, so the sentence is emitted only once the open
+        // has actually succeeded — every refusal path above returns
+        // before here, and a listener must not be told a sheet opened
+        // that an exclusive occupant turned away.
+        //
+        // A DISPLACEMENT SPEAKS ONCE, not twice: `suspend` is silent by
+        // design, because this very sentence is what tells the user
+        // something new took the drawer. `update` and `rebuild` are
+        // silent for the same economy — the sheet did not arrive or
+        // leave, it changed, and narrating every re-present would bury
+        // the transitions that matter.
+        //
+        // CONTRACT: this fires on every successful `open`, including the
+        // re-entry-with-the-same-session case (a reserved `claim` being
+        // revealed). That is the sheet's first appearance on screen, so
+        // one announcement is correct there; a caller that re-opened an
+        // ALREADY-PRESENTED session would get a second one, and should
+        // be calling `rebuild` instead.
+        speakDrawer("open");
         return true;
       },
     };
@@ -2005,6 +2292,14 @@ export function initVisor(config: VisorConfig): Visor {
       noteEl = el;
     },
   };
+
+  // THE TEACH FOR AN ORDINARY (NON-DEFERRED) EMBEDDER. Its word was
+  // rolled up at `rollWord()` above, where `speak` did not exist yet, so
+  // the teaching half waits until here — the last thing `initVisor`
+  // does, and still strictly BEFORE the consumer's own fresh-anchor
+  // announcement, which cannot run until this function has returned.
+  // (A deferred embedder is taught by `claim()` instead; see there.)
+  if (!deferred) teachFreshWord();
 
   return {
     // A GETTER, not the boot's value captured: under `deferClaim` the
@@ -2024,6 +2319,19 @@ export function initVisor(config: VisorConfig): Visor {
       if (claimed) return { fresh };
       claimed = true;
       rollHue();
+      // THE WORD ARRIVES WITH THE COLOUR, in the same call, for the same
+      // reason the identity cluster does: they are one identity becoming
+      // this user's, and a word rolled at any other moment would either
+      // exist before the seal opened (something personal, pre-login) or
+      // arrive later as a second, unexplained event. Same once-only
+      // guarantee, too — `claimed` gates both rolls, so neither the
+      // colour nor the word can be re-minted by a second call.
+      rollWord();
+      // Taught BEFORE `renderIdentity`, and — because `speak` is a
+      // queue — strictly before whatever the consumer announces about
+      // the fresh colour on the very next line of its own claim
+      // handler.
+      teachFreshWord();
       renderIdentity();
       return { fresh };
     },
@@ -2067,13 +2375,35 @@ export function initVisor(config: VisorConfig): Visor {
         localStorage.setItem(config.hueKey, String(h));
       } catch { /* not durable here */ }
     },
+    speakWord: () => {
+      // A LOUD REFUSAL, not silence and not a placeholder: same reasoning
+      // as `committedHue`. Pre-claim there is no word to say, and a
+      // sentence naming any other token would teach the user something
+      // false about what the visor will sound like.
+      if (!claimed) throw new Error("the visor is unclaimed: no anchor word before claim()");
+      speak(`your visor's word is ${committedWord}`);
+    },
+    rerollWord: () => {
+      if (!claimed) throw new Error("the visor is unclaimed: no word re-roll before claim()");
+      // DIFFERENT BY CONSTRUCTION (see `rollVisorWord`'s `avoid`): the
+      // whole point of the control is that the old token stops working,
+      // and the user has to be able to hear that it did.
+      committedWord = rollVisorWord(committedWord);
+      try {
+        localStorage.setItem(config.wordKey, committedWord);
+      } catch { /* not durable here */ }
+      // "new", so a user who fires this twice can tell the second
+      // sentence from an echo of the first — and so the sentence itself
+      // says what just happened rather than merely reporting state.
+      speak(`your visor's new word is ${committedWord}`);
+    },
     erase() {
       // Best-effort per key, and each in its own try: storage can throw
       // (a locked-down embedding, a quota-ish failure on some engines),
       // and one key refusing must not leave the others behind — a
       // partial erase should be as small as the failure, not as large as
       // whatever happened to be first in the list.
-      for (const key of [config.identityKey, config.hueKey, config.legacyHueKey]) {
+      for (const key of [config.identityKey, config.hueKey, config.legacyHueKey, config.wordKey]) {
         if (key === undefined) continue;
         try {
           localStorage.removeItem(key);

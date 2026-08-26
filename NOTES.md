@@ -1572,6 +1572,88 @@ app voice never — a component is referred to by the user's word for
 it (the petname, resolved per drained batch) or described without
 naming; its provenance key and nickname never ride an announcement.
 
+**Non-visual provenance: the audible anchor word** (2026-08-25). The
+three voices above are marked in PIXELS, and a screen reader has no
+pixels. AT linearizes the document: app-frame text and visor text
+arrive in one stream, the plate and the weight and the quoting are all
+gone, and iframe boundaries are not announced at all — so the entire
+visor/app boundary, which sighted users read off position and colour
+and an opaque frame background, is simply absent. An app can render,
+inside its own rectangle, a sentence that SOUNDS exactly like the
+visor speaking, and nothing in the audio stream contradicts it. The
+anchor colour's whole secondary job — a spoof lottery an app cannot
+read and can only guess — had no counterpart on this channel.
+
+So the colour gets an audible twin. A **word** is rolled once per
+identity, at the same moment and by the same `claim()` the hue is
+(`visor/ui/words.ts`, `loadVisorWord`), out of the EFF short wordlist
+2.0 minus the visor's own spoken vocabulary — the EFF list really does
+contain "visor", "device" and "anchor", and a word that IS vocabulary
+destroys the seam the mechanism runs on. That list was chosen for
+PHONETIC distinctness (unique three-letter prefixes, edit distance ≥
+2), which is the property a token learned by ear needs and a random
+dictionary sample does not have. The word becomes the first token of
+every drawer lifecycle sentence the host speaks — "«word»: storage
+picker open", closed, back — with everything after the colon drawn
+from `DrawerTenantSpec.spoken`, framework vocabulary fixed at tenant
+registration. The announcements are emitted BY THE HOST, once, so no
+tenant can forget one, and `spoken` is required rather than defaulted
+from the diagnostic `name` because a default would have shipped
+hyphenated identifiers into the ear of exactly the people who cannot
+see the sheet it mislabels. Suspends are silent (audibly covered by
+the displacing tenant's own open); the resume closes the pair with
+"back".
+
+What makes it unguessable is the same structure that protects the
+hue, one step stricter. It is **never rendered in pixels** — not in a
+sheet, not in a title, not in an aria-label — so no screenshot,
+recording, screen-share or compositing trick carries it; it never
+leaves the device; it lives in visor-realm `localStorage` an
+opaque-origin frame cannot read; and — the strictest part — **it never
+crosses the visor API at all**. There is deliberately no
+`committedWord()` to match `committedHue()`: the hue is returned
+because consumers must paint with it, the word has no such use, and a
+getter would be a door to rendering it. `speakWord()` and
+`rerollWord()` are the only doors and both end in the live region.
+Pre-claim the prefix is the literal word "visor" — a `deferClaim`
+embedder puts its unseal picker in the drawer, so the drawer speaks
+before any identity exists, and there is deliberately nothing personal
+to say yet.
+
+The delivery needed one mechanism change: `speak()` became a FIFO
+queue with a ~1.4s dwell. A live region holds one string and is read
+asynchronously, so two writes in one synchronous block are not two
+announcements — the second destroys the first. Two real sites do
+exactly that: a close that resumes the occupant underneath (else the
+user is never told the ceremony they were in ended), and the
+fresh-word teach followed immediately by the consumer's fresh-colour
+announcement. The queue is capped at 8, dropping oldest — a burst that
+outruns speech is a burst nobody can listen to, and the recent
+sentences are the ones describing the screen now.
+
+**Accepted residual leaks, recorded rather than hidden.** Anything
+that captures AUDIO captures the word: a screen-share carrying system
+sound, a call, a person in earshot. This is the same class of limit
+the anchor colour has against someone looking over the user's
+shoulder, and it is why `rerollWord()` exists — a user who believes
+they were overheard can mint a new one (guaranteed different) without
+erasing the visor. The word also does nothing for an app that never
+tries to imitate the visor's voice; it is a provenance token, not a
+capability.
+
+**Growth path.** The word currently prefixes drawer lifecycle
+announcements only. It should extend to every CONSENT CEREMONY —
+anything where the answer to "is this really the visor asking?"
+decides whether a secret gets typed — which is the same reasoning that
+put those ceremonies in the drawer in the first place. Beyond that,
+the missing piece is a chokepoint for APP voice on the audio channel:
+`foreignToken` is the visual funnel and has no spoken counterpart, so
+there is currently no way to hear that a string came from a component.
+A labeled landmark region around the app rectangle (so AT announces
+entering and leaving app territory, which iframes fail to do) is the
+structural half of the same fix, and the two together would give the
+spoken channel something like the three voices rather than one token.
+
 **The strip reorganized around the user's pair; "me" is a circle; the
 user's vocabulary opens wide** (2026-08-21, #22, executed same day).
 Three rulings. (1) The context cluster's lines SWAP: the top line is
