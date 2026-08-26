@@ -1439,6 +1439,24 @@ the origin. Options:
   model.
 - Nothing in v1.
 
+**Answered: deferred, with a guard.** Recorded 2026-08-26 from design
+discussion; direction, not final ruling. "Nothing in v1" is the
+selection — contact exchange stays out-of-band (QR / links through
+the sharing layer) — **unless deferral would preclude the feature
+architecturally**, which is the actual content of this ruling: nothing
+built in the meantime may foreclose `user@host` later. What the guard
+means with today's vocabulary: the per-user static records option
+stays adoptable (per-user serving is already specced as an opt-in
+lower trust regime — see
+[Home origin contract](#home-origin-contract) — and a discovery record
+would be a developer/user opt-in of exactly that class); contact cards
+remain self-certifying artifacts whose delivery channel is orthogonal,
+so a host-served record later is a new transport for the same bytes,
+not a new format; and first-contact verification ceremonies bind
+regardless of how the card arrived, so a future host-served
+introduction path inherits the existing backstop against prekey
+substitution rather than needing a new one.
+
 Related: the static share-link viewer (reader page + ciphertext + key
 in fragment) covers "share with a non-user" without discovery
 infrastructure.
@@ -2568,4 +2586,7 @@ Tracked as issues; the headline ones, verbatim from the discussion:
   without an explicit opt-in to a lower trust regime, expected to be a
   developer-oriented option rather than an end-user surface; see
   [Home origin contract](#home-origin-contract).
-- `user@host` discovery: wanted, or out-of-band only?
+- `user@host` discovery — deferred: out-of-band only for now, with the
+  explicit guard that nothing built meanwhile may preclude it
+  architecturally; see
+  [Addressing and discovery](#addressing-and-discovery).
