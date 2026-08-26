@@ -191,6 +191,22 @@ Static-only dividends worth actively exploiting:
 - **Push without a server** (see
   [Compute placement and push](#compute-placement-and-push)).
 
+**Per-user content: answered.** Recorded 2026-08-26 from design
+discussion; direction, not final ruling. The home origin serves
+per-user content **never by default**: the byte-identical model above
+is the trust story, and a host that can serve one user different
+bytes is a host that can target them — the accountless dividend and
+the constant-digest monitoring predicate
+([Release integrity](#release-integrity)) hold precisely because
+there is nothing user-specific to vary. Where per-user serving exists
+at all, it is an **explicit opt-in to a lower trust regime** — the
+"third origin class" already named under
+[Addressing and discovery](#addressing-and-discovery): live-ish,
+user-controlled, untrusted, never sharing the framework origin. The
+expectation on record: this opt-in is a **developer-oriented option**
+(publishing one's own records and content) rather than an end-user
+surface; users who never opt in keep the full trust story untouched.
+
 ## Release integrity
 
 Positioned as supply-chain hygiene and publisher/host separation — not
@@ -1423,6 +1439,24 @@ the origin. Options:
   model.
 - Nothing in v1.
 
+**Answered: deferred, with a guard.** Recorded 2026-08-26 from design
+discussion; direction, not final ruling. "Nothing in v1" is the
+selection — contact exchange stays out-of-band (QR / links through
+the sharing layer) — **unless deferral would preclude the feature
+architecturally**, which is the actual content of this ruling: nothing
+built in the meantime may foreclose `user@host` later. What the guard
+means with today's vocabulary: the per-user static records option
+stays adoptable (per-user serving is already specced as an opt-in
+lower trust regime — see
+[Home origin contract](#home-origin-contract) — and a discovery record
+would be a developer/user opt-in of exactly that class); contact cards
+remain self-certifying artifacts whose delivery channel is orthogonal,
+so a host-served record later is a new transport for the same bytes,
+not a new format; and first-contact verification ceremonies bind
+regardless of how the card arrived, so a future host-served
+introduction path inherits the existing backstop against prekey
+substitution rather than needing a new one.
+
 Related: the static share-link viewer (reader page + ciphertext + key
 in fragment) covers "share with a non-user" without discovery
 infrastructure.
@@ -2548,5 +2582,11 @@ Tracked as issues; the headline ones, verbatim from the discussion:
   defaults to a public relay instance (split view preserved);
   full-stack self-hosting bundles its own and skips the public
   default.
-- Does the home origin ever serve per-user content?
-- `user@host` discovery: wanted, or out-of-band only?
+- Does the home origin ever serve per-user content? — answered: not
+  without an explicit opt-in to a lower trust regime, expected to be a
+  developer-oriented option rather than an end-user surface; see
+  [Home origin contract](#home-origin-contract).
+- `user@host` discovery — deferred: out-of-band only for now, with the
+  explicit guard that nothing built meanwhile may preclude it
+  architecturally; see
+  [Addressing and discovery](#addressing-and-discovery).
