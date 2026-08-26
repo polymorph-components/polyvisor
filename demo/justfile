@@ -71,6 +71,17 @@ rebind-sync: translate
     deno check host/rebind-sync-check.ts
     deno run -A host/rebind-sync-check.ts
 
+# #123: the third wire shape — alive, and silent. Bob's relay path is
+# blackholed through the e2e severable proxy (bytes stop moving; no RST,
+# no FIN), so his engine keeps running while nothing it says arrives.
+# Alice's sync against him must reach a NAMED outcome instead of parking
+# forever, which is what `NeverTimeout` used to guarantee it did not.
+# The probe asserts bounded-not-parked and reports which mechanism won
+# (the call bound, or the QUIC idle timeout racing it) — see its banner.
+timeout-check: translate
+    deno check host/timeout-check.ts
+    deno run -A host/timeout-check.ts
+
 # The #20 G5 kill-and-resume beat: the engine checkpoints into a real
 # directory (@polyengine/wasi's `filesystem-node` backend) and a FRESH
 # DENO PROCESS resumes from it. Needs no infra at all — the assertion is

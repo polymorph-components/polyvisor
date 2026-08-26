@@ -116,7 +116,12 @@
 //      index 1.
 //   4. And `sync_with_peer` walks that list IN ORDER, under this
 //      engine's never-firing timeout — so it called the dead one first
-//      and parked there for ever, never reaching the live one.
+//      and parked there for ever, never reaching the live one. That
+//      timeout is CAPPED since #123 (subduction's 30s default, on the
+//      monotonic clock): the same stall would now end with a name
+//      instead of never — and a sync that times out means the wire is
+//      alive and the PEER IS SILENT, which is not `gone:` and must not
+//      be re-dialled on.
 //
 //   THE ASYMMETRY EXPLAINED: only the side that CALLS `sync_with_peer`
 //   walks the stale list. An acceptor answering an inbound request
