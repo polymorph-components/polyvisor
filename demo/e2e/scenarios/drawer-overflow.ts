@@ -21,6 +21,20 @@
 //     be worked around (solo-gdrive.ts used to carry that workaround,
 //     and it was this bug seen at desk width).
 //
+//   * THE REVEAL ITSELF MUST ANIMATE. The height this scenario measures
+//     is the endpoint of a CSS transition, and that transition was once
+//     silently cancelled: `retarget()` used to write `height: auto` onto
+//     `#visor-drawer-inner` and read `offsetHeight` back to measure the
+//     content, and the read forces a style/layout flush, so `auto`
+//     genuinely reached computed style. `auto` is not interpolable
+//     against a length, so per CSS Transitions the running height
+//     transition was cancelled outright and the drawer snapped open in
+//     one frame instead of growing. Measured identically in Chromium and
+//     Firefox — never Gecko-specific — which is why the regression gate
+//     below lives on the ordinary Chromium lane rather than `firefox`.
+//     The fix measures the in-flow `.visor-slide` child, never the
+//     animating container at `auto` (visor.ts's `measure`/`aimed`).
+//
 //   * THE APP-REVEAL BAND. A drawer permitted to grow until it covers
 //     the last of the app surface makes the visor's whole claim
 //     uncheckable: a full-screen sheet is indistinguishable from a page
@@ -32,7 +46,7 @@
 //     surface.
 
 import type { Ctx, Scenario } from "../run.ts";
-import { act, assert, assertEquals, SOLO_KEYS } from "../util.ts";
+import { act, assert, assertEquals, settleDrawer, SOLO_KEYS } from "../util.ts";
 import { solo, until, WAITS } from "../solo-util.ts";
 import type { Page } from "npm:playwright@1.57.0";
 
@@ -45,6 +59,15 @@ const VIEWPORT = { width: 390, height: 664 };
  * this is a claim about a visible boundary, not about an exact
  * constant, and a rounding difference must not read as a regression. */
 const REVEAL_FLOOR = 40;
+/** How many of the sampled per-frame heights must land strictly between
+ * 0 and the largest sampled height for the reveal to count as animated.
+ * A cancelled transition (the `auto`-reaches-computed-style regression
+ * described above) yields exactly ZERO such samples — the box goes
+ * straight from 0 to full height in one frame — so this gate is
+ * decisive at any positive threshold. It is kept at 3, rather than 1,
+ * only so a loaded CI machine that drops a frame or two still passes;
+ * it is not evidence the transition ran for any particular duration. */
+const MIN_INTERMEDIATE_SAMPLES = 3;
 
 interface Geometry {
   vh: number;
@@ -102,8 +125,42 @@ const scenario: Scenario = {
       // Same order rule as solo-gdrive.ts: the entry ceremony is a
       // drawer sheet mounted only at first run, so it is driven BEFORE
       // any other sheet has ever opened.
+      //
+      // This is also the drawer's very first "up" reveal — the fresh
+      // 0 → measured-height growth (visor.ts's `reveal`), as opposed to
+      // the `retarget` a swap or a resize triggers later. The sampler is
+      // started BEFORE the click that opens the sheet, so it catches the
+      // whole curve including its very first frame off zero.
+      //
+      // FAILURE HERE MEANS THE HEIGHT TRANSITION WAS CANCELLED: some
+      // write in the open path reached a non-interpolable value (`auto`,
+      // most concretely) on the animating property while the transition
+      // was running, per CSS Transitions that cancels it outright, and
+      // the drawer opened in a single frame instead of growing into
+      // view.
+      const sampler = page.evaluate(() =>
+        new Promise<number[]>((resolve) => {
+          const inner = document.getElementById("visor-drawer-inner")!;
+          const out: number[] = [];
+          const tick = () => {
+            out.push(Math.round(parseFloat(getComputedStyle(inner).height)));
+            if (out.length >= 20) resolve(out);
+            else requestAnimationFrame(tick);
+          };
+          requestAnimationFrame(tick);
+        })
+      );
       assertEquals(await solo(page, "newAccount"), true, "the entry sheet's button was clicked");
       await until([page], "the account", async () => await solo(page, "hasAccount"), WAITS.boot);
+      const heights = await sampler;
+      const max = Math.max(...heights);
+      const between = heights.filter((h) => h > 0 && h < max).length;
+      assert(
+        between >= MIN_INTERMEDIATE_SAMPLES,
+        `only ${between} of ${heights.length} sampled heights fell strictly between 0 and ` +
+          `${max}px (samples: ${heights.join(",")}) — the drawer opened in one frame instead ` +
+          `of animating, which is what a cancelled height transition looks like`,
+      );
     });
 
     await act("the storage sheet, filled in from the worker", async () => {
@@ -131,6 +188,13 @@ const scenario: Scenario = {
     });
 
     await act("the sheet's TOP is on screen, and so is the gdrive radio", async () => {
+      // A claim about where the sheet comes to REST, not about a frame
+      // of the growth `until` above merely tolerated (its own check is
+      // `innerHeight >= sheetHeight - 1`, loose enough to exit while the
+      // curve is still a pixel short) — settle first, or an occasional
+      // still-moving pixel reads as the clipped-top regression this act
+      // exists to catch.
+      await settleDrawer(page);
       const g = await geometry(page);
       assert(
         g.sheetTop >= -0.5,
@@ -154,6 +218,9 @@ const scenario: Scenario = {
     });
 
     await act("a band of app surface stays visible under the assembly", async () => {
+      // Same reasoning as the previous act: the boundary this checks is
+      // where the assembly comes to rest, not wherever it is mid-growth.
+      await settleDrawer(page);
       const g = await geometry(page);
       assert(
         g.zoneBottom <= g.vh - REVEAL_FLOOR,

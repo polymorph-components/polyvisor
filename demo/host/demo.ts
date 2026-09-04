@@ -3801,13 +3801,15 @@ async function boot() {
           ? "suspended"
           : pickerMode,
       /** What the band shrink-wraps, or null when the band is not the
-       * drawer's OCCUPANT. `:not(.visor-swap-out)` is the difference
-       * between the two: a band that is travelling off-stage is still on
-       * screen for the length of the motion (that is the motion), and it
-       * has already stopped being the occupant. */
+       * drawer's OCCUPANT. The travel classes sit on `.visor-slide`, the
+       * full-width wrapper each occupant is mounted in, not on the sheet
+       * itself — so the test is spelled against the slide. That is the
+       * difference between the two: a band that is travelling off-stage
+       * is still on screen for the length of the motion (that is the
+       * motion), and it has already stopped being the occupant. */
       band: () => {
         const el = drawerInner.querySelector(
-          ".picker-band:not(.visor-swap-out) .band-entry",
+          ".visor-slide:not(.visor-swap-out) .picker-band .band-entry",
         ) as HTMLElement | null;
         return el === null ? null : {
           provider: el.dataset.provider ?? "",
@@ -3815,7 +3817,7 @@ async function boot() {
            * band's entry is deliberately not one. */
           isControl: el.tagName === "BUTTON",
           entries: drawerInner.querySelectorAll(
-            ".picker-band:not(.visor-swap-out) .band-entry",
+            ".visor-slide:not(.visor-swap-out) .picker-band .band-entry",
           ).length,
         };
       },
