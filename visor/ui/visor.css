@@ -508,14 +508,23 @@
 #visor-zone:has(#visor-drawer:not([hidden])) #visor-strip {
   border-top: 1px solid rgba(255,255,255,.22);
 }
-/* Pixel-height animation set from JS at open (0 → measured target):
-   the same single-property curve the todomvc visor spike settled on.
-   flex-end keeps the growing content glued to the sheet's BOTTOM edge
-   — i.e. to the strip's top edge — so the sheet unfurls upward out of
-   the bar rather than sliding down over the page. The ARMING DELAY is
-   visor/ui/visor.ts's ARM_MS, never this transition — reduced motion
-   drops the animation and keeps the delay. */
+/* Pixel-height animation set from JS at open (0 → the measured height
+   of the in-flow slide): the same single-property curve the todomvc
+   visor spike settled on. The height is NEVER animated from or to
+   `auto` — see `measure` in visor/ui/visor.ts for why that cancels the
+   transition outright. flex-end keeps the growing content glued to the
+   sheet's BOTTOM edge — i.e. to the strip's top edge — so the sheet
+   unfurls upward out of the bar rather than sliding down over the page.
+   The ARMING DELAY is visor/ui/visor.ts's ARM_MS, never this transition
+   — reduced motion drops the animation and keeps the delay.
+
+   THE DURATION AND CURVE ARE CUSTOM PROPERTIES so that the swap's
+   horizontal travel, which inherits them from here, is literally the
+   same motion as the height change that accompanies it: one duration,
+   one curve, no height still settling after the slide has arrived. */
 #visor-drawer-inner { height: 0; overflow: hidden;
+                       --visor-motion: 700ms;
+                       --visor-curve: cubic-bezier(.2,.8,.2,1);
                        display: flex; flex-direction: column;
                        justify-content: flex-end;
                        /* THE BACKSTOP FOR THE SHEET'S OWN CONTAINMENT.
@@ -529,7 +538,15 @@
                           containing here catches the gesture whether the
                           sheet scrolls or not. */
                        overscroll-behavior: contain;
-                       transition: height 700ms cubic-bezier(.2,.8,.2,1); }
+                       transition: height var(--visor-motion) var(--visor-curve); }
+/* PAIRED WITH visor.ts's SWAP_MS, which must equal this. Set for the
+   length of a travel only. */
+#visor-drawer-inner.swapping { --visor-motion: 420ms; }
+/* THE INVARIANT `measure` RESTS ON: a slide may never be squeezed by a
+   container that is mid-animation and therefore shorter than its
+   contents. Were it allowed to shrink, the measurement would read the
+   clipped height and the drawer would animate to the wrong target. */
+#visor-drawer-inner > * { flex: 0 0 auto; }
 @media (prefers-reduced-motion: reduce) {
   #visor-drawer-inner { transition: none; }
 }
@@ -544,30 +561,34 @@
    region and not a stack. "One expanded occupant at a time" stays
    literally true.
 
-   The OUTGOING sheet is taken out of flow for the travel, which is what
+   A FULL TRAVEL, and no cross-fade. Each occupant is mounted in a
+   `.visor-slide` that spans the drawer, so `translateX(100%)` really is
+   the whole width: the two slides are exactly adjacent at every instant
+   and never overlap, which is why neither needs to fade and neither
+   needs to paint over the other. (Travelling the sheet itself would not
+   do — `.cred-sheet` is a centred 34em column, so it would come to rest
+   still visible in the drawer's margins on a wide viewport.)
+
+   The OUTGOING slide is taken out of flow for the travel, which is what
    lets the drawer's existing height curve animate to the INCOMING
-   sheet's height while both are on screen. `left/right: 0` rather than
-   a width, so the departing sheet keeps the width it had. It is removed
-   by the host once the travel is done (visor.ts's SWAP_MS). */
+   sheet's height while both are on screen — on the same duration and
+   curve as the travel, inherited from the inner. `left/right: 0` gives
+   the departing slide the drawer's width, which is the width it had. It
+   is removed by the host once the travel is done (visor.ts's
+   SWAP_MS). */
 #visor-drawer-inner { position: relative; }
 .visor-swap-out { position: absolute; left: 0; right: 0; bottom: 0;
-                  pointer-events: none; z-index: 0;
-                  transition: transform 420ms cubic-bezier(.2,.8,.2,1),
-                              opacity 420ms linear; opacity: 0; }
-.visor-swap-out.to-left { transform: translateX(-12%); }
-.visor-swap-out.to-right { transform: translateX(12%); }
-/* The arriving sheet paints OVER the departing one — they overlap for
-   the length of the travel, and "the new thing is coming in on top of
-   the old one leaving" is the reading that matches the page track. */
-.visor-swap-in { position: relative; z-index: 1;
-                 transition: transform 420ms cubic-bezier(.2,.8,.2,1),
-                             opacity 420ms linear; transform: translateX(0); opacity: 1; }
-.visor-swap-in.from-right { transform: translateX(12%); opacity: 0; }
-.visor-swap-in.from-left { transform: translateX(-12%); opacity: 0; }
+                  pointer-events: none;
+                  transition: transform var(--visor-motion) var(--visor-curve); }
+.visor-swap-out.to-left { transform: translateX(-100%); }
+.visor-swap-out.to-right { transform: translateX(100%); }
+.visor-swap-in { transition: transform var(--visor-motion) var(--visor-curve); }
+.visor-swap-in.from-right { transform: translateX(100%); }
+.visor-swap-in.from-left { transform: translateX(-100%); }
 /* REDUCED MOTION: the swap still HAPPENS — it is a state change, not a
    decoration — it simply does not travel. The outgoing sheet is still
-   removed on the host's timer; it just never moves or fades on the way.
-   Same discipline as the reveal above: motion drops, timing does not. */
+   removed on the host's timer; it just never moves on the way. Same
+   discipline as the reveal above: motion drops, timing does not. */
 @media (prefers-reduced-motion: reduce) {
   /* The DIRECTIONAL rules have to be overridden by name: they are one
      class more specific than the base, so a bare `.visor-swap-out
@@ -579,8 +600,11 @@
   .visor-swap-in.from-right, .visor-swap-in.from-left {
     transition: none; transform: none;
   }
+  /* Hidden HERE ONLY. With the travel dropped, the outgoing slide would
+     otherwise sit stationary on top of the incoming one for the whole
+     of SWAP_MS — a visibly doubled sheet. With the travel in place it
+     is never overlapping anything, so it stays fully opaque there. */
   .visor-swap-out { opacity: 0; }
-  .visor-swap-in.from-right, .visor-swap-in.from-left { opacity: 1; }
 }
 
 /* The dim layer sits BETWEEN the page and the visor assembly: the
@@ -676,10 +700,9 @@
    off the bottom of the viewport — losing the anchor exactly when it
    matters. It scrolls internally instead; --visor-sheet-max is the
    measured viewport-minus-strip budget, set from JS at open/resize.
-   `width:100%` is load-bearing now that the container is a flex
-   column: `margin:0 auto` is an AUTO cross-axis margin, which
-   suppresses the default stretch and would size the sheet to its
-   content instead of to the page's centered column.
+   `width:100%` with `margin:0 auto` is what gives the page's centered
+   column: the sheet takes the full width its slide offers and the
+   max-width caps it.
 
    THE SCROLL STOPS HERE. A drag inside the sheet that ran the sheet to
    its end and then carried on into the PAGE would move the app surface
@@ -690,7 +713,6 @@
 .cred-sheet { box-sizing: border-box; width: 100%; max-width: 34em; margin: 0 auto;
               max-height: var(--visor-sheet-max, 80dvh); overflow-y: auto;
               overscroll-behavior: contain;
-              flex-shrink: 0;
               padding: .8em 1.1em 1.1em; font-size: 13px; line-height: 1.45; }
 .cred-sheet h2 { margin: 0 0 .35em; font-size: 15px; font-weight: 600; }
 .cred-sheet .cred-line { display: flex; align-items: baseline; gap: .4em;

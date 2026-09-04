@@ -2114,34 +2114,63 @@ export function initVisor(config: VisorConfig): Visor {
     if (el === null || el.scrollHeight - el.clientHeight <= 1) e.preventDefault();
   }, { passive: false });
 
-  /** Animate 0 → the measured content height. One property drives the
-   * whole assembly: the sheet's growth pushes the strip down and the
-   * page content with it, on one curve (spikes/todomvc/host/visor.ts:82-90
-   * — scrollHeight misses the flex-end top-overflow, so measure at auto).
+  /** THE SLIDE THE DRAWER'S HEIGHT IS AIMED AT: the one still IN FLOW.
+   * A slide already travelling out is absolutely positioned and
+   * contributes no height of its own, so measuring it would aim the
+   * drawer at the occupant that is leaving rather than the one
+   * arriving. */
+  const aimed = () =>
+    Array.from(drawerInner.children)
+      .find((el) => !el.classList.contains("visor-swap-out")) as HTMLElement | undefined;
+
+  /** The height to animate to: the in-flow slide's NATURAL height,
+   * clamped structurally.
+   *
+   * MEASURED ON THE SLIDE, NEVER ON THE ANIMATING CONTAINER. The
+   * obvious way to measure content is to put `height: auto` on the
+   * container and read it back — and that is exactly what must not
+   * happen here, because reading the box back forces a style and layout
+   * flush, so `auto` genuinely reaches computed style. `auto` is not
+   * interpolable against a length, so per CSS Transitions the running
+   * height transition is CANCELLED and the pixel write that follows
+   * cannot start a new one (auto → length is non-interpolable too): the
+   * drawer snaps to full height instead of animating. Measured
+   * identically in Chromium and Firefox. The slide reports its natural
+   * height regardless of the container's current animated height,
+   * because `#visor-drawer-inner > * { flex: 0 0 auto }` forbids it to
+   * shrink under a short container — that CSS rule is the invariant
+   * this measurement rests on. (scrollHeight is not an alternative: it
+   * misses the flex-end top-overflow — spikes/todomvc/host/visor.ts:82-90.)
    *
    * CLAMPED STRUCTURALLY, not only by the sheet's own max-height: the
    * cap has to hold for whatever is in the drawer, and the sheet is not
-   * guaranteed to be the only child of the inner (a swap puts two there
-   * for the length of a travel) nor to have finished resolving its
-   * max-height at the moment we measure. */
+   * guaranteed to have finished resolving its max-height at the moment
+   * we measure. */
+  const measure = () => Math.min(aimed()?.offsetHeight ?? 0, budget());
+
+  /** Animate 0 → the measured content height. One property drives the
+   * whole assembly: the sheet's growth pushes the strip down and the
+   * page content with it, on one curve.
+   *
+   * The forced layout between the two writes is REQUIRED. The drawer
+   * was `display: none` (`#visor-drawer[hidden]`), so without it the
+   * element's first-ever resolved style would be the target and no
+   * transition would run at all; the flush is what establishes `0` as
+   * the before-change style. */
   const reveal = () => {
-    drawerInner.style.height = "auto";
-    const target = Math.min(drawerInner.offsetHeight, budget());
     drawerInner.style.height = "0px";
     void drawerInner.offsetHeight;
-    drawerInner.style.height = `${target}px`;
+    drawerInner.style.height = `${measure()}px`;
   };
 
   /** Animate the CURRENT height to a newly measured one, for a drawer
    * that is already open (a rebuilt sheet, an occupant swap, a resize,
    * or a sheet whose content arrived late — see `contentWatch`). Same
-   * single-property curve as `reveal`, same structural clamp; the
-   * momentary `auto` is never rendered, since style is only resolved at
-   * frame time. Which is also why this is safe to call DURING a reveal:
-   * the transition simply re-aims from wherever it currently is. */
+   * single-property curve as `reveal`, same structural clamp. Safe to
+   * call DURING a reveal: a length-to-length write simply re-aims the
+   * running transition from wherever it currently is. */
   const retarget = () => {
-    drawerInner.style.height = "auto";
-    drawerInner.style.height = `${Math.min(drawerInner.offsetHeight, budget())}px`;
+    drawerInner.style.height = `${measure()}px`;
   };
 
   /** THE SWAP: how one occupant replaces another INSIDE the drawer.
@@ -2158,8 +2187,19 @@ export function initVisor(config: VisorConfig): Visor {
    * (`.visor-swap-out` is absolutely positioned), so the drawer's height
    * animates to the INCOMING sheet's height while both are on screen —
    * one height curve, the existing one, and a real frame in which the
-   * two occupants are side by side. Under prefers-reduced-motion the
-   * transforms are dropped and the outgoing element simply goes. */
+   * two occupants are side by side. The travel is a FULL 100% of the
+   * drawer's width, which is why each occupant is mounted inside a
+   * full-width `.visor-slide` wrapper rather than travelling as the
+   * sheet itself: `.cred-sheet` is a centred 34em column, so moving it
+   * by its own width would leave it visible in the drawer's margins on
+   * a wide viewport. At a full travel the two slides are exactly
+   * adjacent and never overlap. Under prefers-reduced-motion the
+   * transforms are dropped and the outgoing element simply goes.
+   *
+   * PAIRED WITH CSS: this must equal the `.swapping` duration of
+   * `#visor-drawer-inner` in visor/ui/visor.css, which is what makes
+   * the height change and the horizontal travel one motion rather than
+   * two of different lengths. */
   const SWAP_MS = 420;
 
   function makeTenant<S>(spec: DrawerTenantSpec<S>): TenantImpl<S> {
@@ -2223,8 +2263,15 @@ export function initVisor(config: VisorConfig): Visor {
      * not still be armed when it re-expands on the user's return. */
     const present = (s: S, enter: "up" | "none" | "right" | "left") => {
       const sheet = builder!(s);
+      // THE TRAVELLING ELEMENT is a full-width wrapper, not the sheet:
+      // see SWAP_MS's note. It also gives `measure()` a child that
+      // spans the drawer, so the in-flow/out-of-flow test there reads
+      // slides rather than sheets.
+      const slide = document.createElement("div");
+      slide.className = "visor-slide";
+      slide.append(sheet.root);
       // THE CURRENT OCCUPANT, which is NOT simply the first child: a
-      // sheet that is already travelling out is still in the DOM for the
+      // slide that is already travelling out is still in the DOM for the
       // length of its own motion, and a second swap started inside that
       // window would otherwise animate the wrong element and leave the
       // real occupant sitting there. Ceremonies opened and closed in
@@ -2239,29 +2286,33 @@ export function initVisor(config: VisorConfig): Visor {
       }
       const outgoing = (enter === "right" || enter === "left") ? occupantEl ?? null : null;
       if (outgoing) {
+        // The shorter swap duration is put on the inner BEFORE the
+        // direction classes come off, so the travel starts on it — and
+        // it is still set when the height retarget below starts, which
+        // is what runs the two on one duration and one curve.
+        drawerInner.classList.add("swapping");
         // OUT OF FLOW for the travel, so the drawer's height animates to
         // the INCOMING sheet's height while both are visible.
         outgoing.classList.add("visor-swap-out", enter === "right" ? "to-left" : "to-right");
-        drawerInner.append(sheet.root);
+        drawerInner.append(slide);
         // Start off-stage, then release in the next style resolution:
         // the class removal is what the transition runs on.
-        sheet.root.classList.add("visor-swap-in", enter === "right" ? "from-right" : "from-left");
-        void sheet.root.offsetWidth;
-        sheet.root.classList.remove("from-right", "from-left");
+        slide.classList.add("visor-swap-in", enter === "right" ? "from-right" : "from-left");
+        void slide.offsetWidth;
+        slide.classList.remove("from-right", "from-left");
         setTimeout(() => {
           outgoing.remove();
-          sheet.root.classList.remove("visor-swap-in");
+          slide.classList.remove("visor-swap-in");
+          drawerInner.classList.remove("swapping");
         }, SWAP_MS);
-      } else if (enter !== "none") {
-        drawerInner.replaceChildren(sheet.root);
       } else {
-        drawerInner.replaceChildren(sheet.root);
+        drawerInner.replaceChildren(slide);
       }
 
       const refit = () => {
         fit();
         // The animated height is a pixel target, so it goes stale when
-        // the budget changes under it; re-measure at auto and retarget.
+        // the budget changes under it; re-measure and retarget.
         if (session !== s) return;
         retarget();
       };

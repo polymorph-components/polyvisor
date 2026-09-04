@@ -675,6 +675,58 @@ export async function waitForDrawerHidden(page: Page, timeout = UI_TIMEOUT): Pro
   );
 }
 
+/** Wait for the drawer's height to come to REST: two samples of
+ * `#visor-drawer-inner`'s bounding-rect height, taken ~100ms apart,
+ * that round to the same whole pixel (rounded so ordinary sub-pixel
+ * layout jitter on a settled box can never look like still-moving).
+ *
+ * WHY THIS EXISTS. The drawer's height is a CSS transition
+ * (visor.ts's `reveal`/`retarget`), not an instant write, so any
+ * assertion about a RESTING shape — a sheet's top edge being on
+ * screen, the collapsed band's chrome budget — read before the curve
+ * finishes is really asserting a frame of the motion, not the state
+ * the transition is settling into. That distinction used to be moot:
+ * `retarget()` wrote `height: auto` and read `offsetHeight` back to
+ * measure content, and the read forced a style/layout flush, so `auto`
+ * genuinely reached computed style — which, being non-interpolable
+ * against a length, CANCELLED the running transition outright (CSS
+ * Transitions) and made every height change land in a single frame.
+ * The suite's timing assumptions were built on that: nothing ever had
+ * to wait for a height change, because nothing ever took more than one
+ * frame. Now that the transition runs for real (the fix measures the
+ * in-flow `.visor-slide` child instead), a caller that skips this wait
+ * is reading geometry that is still moving. */
+export async function settleDrawer(page: Page, timeout = UI_TIMEOUT): Promise<void> {
+  await driverBounded(
+    page,
+    page.evaluate((timeoutMs: number) =>
+      new Promise<void>((resolve, reject) => {
+        const inner = document.getElementById("visor-drawer-inner")!;
+        const deadline = Date.now() + timeoutMs;
+        let last = Math.round(inner.getBoundingClientRect().height);
+        const check = () => {
+          const now = Math.round(inner.getBoundingClientRect().height);
+          if (now === last) {
+            resolve();
+            return;
+          }
+          if (Date.now() > deadline) {
+            reject(new Error(`the drawer's height is still moving (last seen ${now}px)`));
+            return;
+          }
+          last = now;
+          setTimeout(check, 100);
+        };
+        setTimeout(check, 100);
+      }), timeout)
+      .catch((e) => {
+        throw new Error(`waiting for the drawer to settle: ${e.message}`);
+      }),
+    timeout,
+    "the drawer's height to settle",
+  );
+}
+
 /** The text of the sheet currently in the drawer. */
 export function sheetText(page: Page): Promise<string> {
   return page.evaluate(() =>

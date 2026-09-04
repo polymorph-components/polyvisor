@@ -35,6 +35,7 @@ import {
   hook,
   KEYS,
   onStoragePage,
+  settleDrawer,
   sheetOpen,
   stripText,
   SWAP_MS,
@@ -57,6 +58,15 @@ import type { Page } from "npm:playwright@1.57.0";
  * the other scenarios use, and it is the only kind of assertion that can
  * catch the failure that matters — a component-influenced string
  * rendered as if the visor had said it. */
+/** How many DISTINCT per-frame samples a travelling value must take for
+ * the motion to count as real rather than a jump. A cut (no transition
+ * at all, or one property jumping while another animates) yields 1
+ * distinct value across the whole window; this is kept at 3 rather than
+ * 2 only so a loaded machine that coalesces a couple of frames still
+ * passes — it is not a claim about how many frames the transition
+ * actually takes. */
+const MIN_DISTINCT_SAMPLES = 3;
+
 async function entries(page: Page): Promise<
   Array<{
     provider: string;
@@ -438,6 +448,13 @@ const scenario: Scenario = {
       // heights, so the ceremony is legible and still not the thing on
       // screen. (Asserted as a ratio, since the strip's own height is a
       // measured property that varies with viewport.)
+      //
+      // A claim about the BAND's budget, not about the mid-collapse
+      // sheet's — the collapse from full sheet to band is itself a
+      // height transition, so this has to wait for the band to actually
+      // come to rest before reading its chrome, or it is measuring
+      // whatever height the collapse happened to be passing through.
+      await settleDrawer(page);
       const chrome = await chromeGeometry(page);
       assert(
         chrome.total <= chrome.strip * 3,
@@ -482,6 +499,40 @@ const scenario: Scenario = {
       // acceptable — one would put two ceremonies on the anchor at once,
       // the other would destroy a choice the user is halfway through —
       // so the band slides out and WAITS.
+      // THE SAMPLER STARTS BEFORE THE HOOK: the swap is triggered by
+      // `hook` below, and the whole point is to catch the motion from
+      // its first frame, not just its settled end state. It samples two
+      // numbers per frame for ~25 frames: the outgoing slide's
+      // translated X (read off the CSS transform matrix, since that is
+      // what `.visor-slide.to-left`/`.to-right` actually animates) and
+      // the drawer inner's computed height, because the rework put both
+      // on the SAME curve — a swap whose height jumped while its sheets
+      // slid would be the exact regression this guards, distinct from
+      // either motion being individually present.
+      //
+      // `document.querySelector("#visor-drawer-inner .visor-swap-out")`
+      // is a bare descendant selector, deliberately: the travelling
+      // element is a `.visor-slide` wrapper now (mounted around the
+      // sheet so the travel is a full 100% of the drawer's width — see
+      // visor.ts's SWAP_MS comment), not the `.picker-band` itself, so
+      // querying `.picker-band.visor-swap-out` would find nothing.
+      const motionSampler = page.evaluate(() =>
+        new Promise<{ x: number[]; height: number[] }>((resolve) => {
+          const inner = document.getElementById("visor-drawer-inner")!;
+          const x: number[] = [];
+          const height: number[] = [];
+          const tick = () => {
+            const out = inner.querySelector(".visor-swap-out") as HTMLElement | null;
+            if (out) {
+              x.push(Math.round(new DOMMatrixReadOnly(getComputedStyle(out).transform).m41));
+            }
+            height.push(Math.round(parseFloat(getComputedStyle(inner).height)));
+            if (height.length >= 25) resolve({ x, height });
+            else requestAnimationFrame(tick);
+          };
+          requestAnimationFrame(tick);
+        })
+      );
       await hook(page, "naming.openCluster");
       await waitForSheet(page, "naming", true);
       // SUSPENDED: session alive, drawer someone else's. The structural
@@ -495,6 +546,27 @@ const scenario: Scenario = {
       // removes it when the travel is done. Both halves are claims: a
       // swap with no overlap would be a cut, and a leftover element
       // would be a leak.
+      //
+      // AND THE MOTION IS REAL, ON BOTH AXES: distinct X samples mean
+      // the outgoing slide actually travelled rather than being cut in
+      // place, and distinct height samples over the same window mean
+      // the drawer's height moved WITH that travel rather than snapping
+      // to the incoming sheet's size the instant the swap began.
+      const motion = await motionSampler;
+      const distinctX = new Set(motion.x).size;
+      assert(
+        distinctX >= MIN_DISTINCT_SAMPLES,
+        `the outgoing slide's X took only ${distinctX} distinct value(s) over ` +
+          `${motion.x.length} samples (${motion.x.join(",")}) — it was cut out rather than ` +
+          `travelling`,
+      );
+      const distinctHeight = new Set(motion.height).size;
+      assert(
+        distinctHeight >= MIN_DISTINCT_SAMPLES,
+        `the drawer's height took only ${distinctHeight} distinct value(s) over ` +
+          `${motion.height.length} samples (${motion.height.join(",")}) — it jumped instead of ` +
+          `moving on the same curve as the travel`,
+      );
       await page.waitForFunction(
         () => document.querySelectorAll("#visor-drawer-inner .visor-swap-out").length === 0,
         undefined,

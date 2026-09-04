@@ -124,13 +124,17 @@ function lastAt(log: string[], sentence: string): number {
  * `drawer` handle, and the erase ceremony's `__demo.reset.open` is the
  * sheets module's predicate rather than a tenant one). `.reset-sheet` is
  * the class the ceremony's own sheet carries, and `:not(.visor-swap-out)`
- * is the same distinction the demo's picker handle draws: a sheet
- * travelling off-stage is still in the DOM for the length of the motion
- * and has already stopped being the occupant. */
+ * qualifies the `.visor-slide` wrapper around it — that is where the
+ * travel classes live — drawing the same distinction as the demo's
+ * picker handle: a sheet travelling off-stage is still in the DOM for
+ * the length of the motion and has already stopped being the
+ * occupant. */
 async function waitForResetSheet(page: Page, want: boolean): Promise<void> {
   await page.waitForFunction(
     (want: boolean) =>
-      (document.querySelectorAll("#visor-drawer-inner .reset-sheet:not(.visor-swap-out)").length >
+      (document.querySelectorAll(
+            "#visor-drawer-inner .visor-slide:not(.visor-swap-out) .reset-sheet",
+          ).length >
           0) === want,
     want,
     { timeout: UI_TIMEOUT },
