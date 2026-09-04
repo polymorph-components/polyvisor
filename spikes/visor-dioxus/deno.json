@@ -1,0 +1,22 @@
+{
+  "imports": {
+    "@deltic/runtime/embedder": "../../../polyengine-dioxus/.deps/polyengine/runtime/src/embedder/mod.ts",
+    "@deltic/runtime/shim": "../../../polyengine-dioxus/.deps/polyengine/runtime/src/shim/mod.ts",
+    "@deltic/protocol": "../../../polyengine-dioxus/.deps/polyengine/protocol/src/mod.ts",
+    "@deltic/translator": "../../../polyengine-dioxus/.deps/polyengine/translator/mod.ts",
+    "@polyengine/wasi": "../../../polyengine-dioxus/.deps/polyengine/wasi/src/mod.ts",
+    "@polyengine/dioxus-host/": "../../../polyengine-dioxus/host/src/",
+    "@playwright/test": "npm:@playwright/test@1.62.1"
+  },
+  "compilerOptions": {
+    "lib": [
+      "deno.ns",
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ]
+  },
+  "tasks": {
+    "check": "deno check host/mount.ts web/entry.ts web/build.ts e2e/server.ts e2e/tests/spike.spec.ts"
+  }
+}
