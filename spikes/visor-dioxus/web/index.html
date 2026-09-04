@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>visor-spike harness</title>
+    <!-- KNOWN BROKEN, FIXED: visor.css is the authority the component
+         renders to fit (governing doc 2). Served at /visor.css by
+         e2e/server.ts (visor/ui/visor.css is read-only and lives outside
+         this spike's tree). Without it nothing is styled and no CSS
+         transition exists, so the drawer's timing-dependent behaviour
+         cannot be observed at all. -->
+    <link rel="stylesheet" href="/visor.css" />
+  </head>
+  <body>
+    <pre id="status">loading…</pre>
+    <div id="app"></div>
+    <script type="module" src="./dist/entry.js"></script>
+  </body>
+</html>

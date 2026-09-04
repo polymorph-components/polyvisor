@@ -1,0 +1,286 @@
+/// polymorph:visor-spike — the visor's strip and drawer host as a component.
+///
+/// THE QUESTION THIS SPIKE ASKS: can the framework's trusted UI be a wasm
+/// component rendering through `polymorph:dioxus`, instead of ~6.5k lines of
+/// TypeScript running as the page's own script? Scope is the STRIP and the
+/// DRAWER HOST only (visor/ui/visor.ts); sheets, pairing and entry stay in
+/// TypeScript and mount into the drawer as foreign DOM.
+///
+/// The base world `polymorph:dioxus/app` gives the guest a batched DOM
+/// mutation channel and DOM event dispatch. Three things the visor needs are
+/// not expressible on it, and each becomes an interface here:
+///
+///   - `store`   — the visor persists five things; localStorage is a host
+///                 capability.
+///   - `chrome`  — viewport height, and the measured height of foreign sheet
+///                 DOM the guest did not render and therefore cannot address
+///                 through `polymorph:dioxus/dom` (which resolves ElementIds
+///                 only).
+///   - `control` — the visor's own API, re-expressed as data. In TypeScript
+///                 it trades in `HTMLElement`; across a component boundary it
+///                 cannot, which is the point of running the spike.
+///
+/// THE TERRITORY. The guest renders the WHOLE of the visor's pixels into its
+/// mount root: `#visor-zone` (containing `#visor-drawer` and `#visor-strip`)
+/// and `#visor-dim`. Today those elements are skeleton markup in each
+/// consumer's index.html (demo/web/index.html:202-230) and `initVisor()`
+/// fills them in by id. Moving them here makes the ids one definition rather
+/// than one per consumer page — the ids are a trust anchor, and a trust
+/// anchor duplicated across consumer HTML is a trust anchor each consumer can
+/// get wrong.
+package polymorph:visor-spike@0.1.0;
+
+/// The visor's persistence, scoped to the five things it stores.
+///
+/// NOT a general key/value capability: the guest names a `slot`, and the host
+/// maps that to its own consumer-prefixed key (`pm-demo-*`, `pm-todomvc-*` —
+/// the keys have always been the consumer's, see visor/README.md). A
+/// component that cannot spell a key cannot read the page's other storage,
+/// which the TypeScript visor — running as page script with the whole origin's
+/// localStorage in reach — has no way to promise.
+interface store {
+    /// The anchor colour, the audible anchor word, the identity record, the
+    /// event record. `legacy-hue` is the pre-rename hue key, read once at
+    /// boot and cleared (`loadVisorHue`'s migration).
+    enum slot { hue, word, identity, events, legacy-hue }
+
+    /// `none` = never written (distinct from written-empty).
+    get: func(key: slot) -> option<string>;
+    set: func(key: slot, value: string);
+    remove: func(key: slot);
+    /// The erase ceremony: every slot at once, so a slot added later cannot
+    /// be forgotten by a caller enumerating them by hand.
+    clear-all: func();
+}
+
+/// Geometry the guest cannot obtain from the mutation surface.
+interface chrome {
+    /// `globalThis.innerHeight` in CSS pixels — the drawer's height budget is
+    /// `innerHeight - strip height - 48`, and only the strip half of that is
+    /// a guest-rendered element `polymorph:dioxus/dom` can measure.
+    viewport-height: func() -> f64;
+
+    /// WHAT USED TO BE HERE, AND WHY IT IS NOT. A `measure-sheet` query, for
+    /// the guest to ask the host how tall the foreign sheet DOM is — the
+    /// guest never rendered it, so it has no ElementId and
+    /// `dom.get-client-rect` cannot see it. The spike built it and then found
+    /// it had no caller: the host is the side that mounts the sheet, so the
+    /// host is already holding the measurement, and every path that needs the
+    /// height gets it pushed in-band through `control.mount-sheet` /
+    /// `control.resize-sheet`. A pull query alongside a push that already
+    /// carries the value is a second way to know one thing.
+    ///
+    /// Recorded rather than silently dropped because the reasoning generalises:
+    /// on this seam, geometry about foreign DOM flows from whoever owns the
+    /// DOM, and the guest never needs to ask.
+}
+
+/// The vocabulary `control` (exported) and `embedder` (imported) share.
+///
+/// A separate interface rather than types defined in `control`, because
+/// `use control.{...}` from `embedder` would make the world IMPORT `control`
+/// as well as export it — and `control` has functions, so the host would be
+/// asked to implement the very interface it calls. A functionless interface
+/// imported for its types costs nothing.
+interface types {
+    /// `SurfaceIdentity`, trimmed to what the strip renders. `meta` and
+    /// `first-seen` are sheet-only and stay out of the spike.
+    record surface {
+        name: string,
+        /// APP VOICE. The component's self-declared nickname; rendered only
+        /// through the guest's `foreign-token`, which in Rust is a private
+        /// constructor rather than a grep (invariant (h) of
+        /// demo/scripts/check-invariants.sh).
+        nickname: string,
+        /// USER VOICE. "" = unmarked, which renders nothing.
+        icon: string,
+        is-new: bool,
+        petname: option<string>,
+    }
+
+    /// `VisorContext`. The bare kinds carry no surface because no component
+    /// stands behind them.
+    variant context {
+        none,
+        panel(surface),
+        credentials(surface),
+        naming(surface),
+        storage(surface),
+        settings,
+        reset,
+        events,
+        device-picker,
+        first-run,
+    }
+
+    /// `DrawerCloseOptions`, reduced to what the drawer host itself reads.
+    /// The demo's custom keys (`commit`) were consumer state riding on the
+    /// visor's option bag; a consumer can keep them on its own side.
+    record close-reason {
+        /// `context: false` — close without touching the strip's context.
+        restore-context: bool,
+    }
+}
+
+/// What the visor tells its embedder. The TypeScript `VisorHandlers` and the
+/// `DrawerTenantSpec` lifecycle callbacks, as one-way notifications.
+///
+/// One-way on purpose: a callback that returned a value would be a synchronous
+/// host call inside a guest activation, and the host's reentrancy gate
+/// (host/src/dispatch.ts) exists because that is exactly what the component
+/// model forbids.
+interface embedder {
+    use types.{surface, close-reason};
+
+    /// The strip's naming affordance was used ("name it", or the petname).
+    request-naming: func(target: surface);
+    /// The identity circle was pressed.
+    request-settings: func();
+    /// The back chevron was pressed.
+    ///
+    /// CONTRACT BUG, FOUND BY THE SPIKE: this was missing from the first cut,
+    /// which left `#visor-back` rendered but inert — precisely what
+    /// visor/ui/visor.ts:1294-1297 forbids ("an affordance that is present
+    /// but inert teaches the user to distrust the ones that are present and
+    /// live"), on the control visor.css:128-143 calls the unforgeable exit.
+    /// The destination is the embedder's, exactly as `BackAction.on-back` is
+    /// a consumer closure today; the guest owns only the chevron and the
+    /// press.
+    request-back: func();
+
+    /// `DrawerTenantSpec.before-show`: the sheet is about to be revealed.
+    /// The demo pauses its component runners here (input suspension).
+    tenant-before-show: func(tenant: string);
+    /// `before-collapse` / `after-collapse` / `after-restore`, in that order.
+    tenant-before-collapse: func(tenant: string, reason: close-reason);
+    tenant-after-collapse: func(tenant: string, reason: close-reason);
+    tenant-after-restore: func(tenant: string, reason: close-reason);
+    /// The arming delay elapsed; the sheet's controls are now live.
+    tenant-armed: func(tenant: string);
+
+    /// A sheet is wanted in the drawer: build it and hand its root to
+    /// `control.mount-sheet`. The host cannot render into the guest's tree,
+    /// so the guest asks and then waits for the mount.
+    tenant-build: func(tenant: string);
+    /// The slide holding the foreign sheet is going away; drop the reference.
+    tenant-unmount: func(tenant: string);
+}
+
+/// The visor's API, as data.
+///
+/// Everything here is a method the TypeScript `Visor`/`DrawerHost` interface
+/// has today (visor/ui/visor.ts:791-1209), minus the members whose type is
+/// `HTMLElement`. Those are the interesting deletions and each is recorded at
+/// its site.
+interface control {
+    use types.{surface, context, close-reason};
+
+    /// `BackAction`, minus the `on-back` closure: the guest renders the
+    /// chevron and reports the press through `embedder`. `label` is the
+    /// visor's own wording, used as title/aria-label and never as text.
+    record back-action { label: option<string> }
+
+    /// `DrawerTenantSpec`, minus the callbacks (they are `embedder`
+    /// notifications) and minus `context`, which was a closure over the
+    /// session and becomes an explicit argument to `open-tenant`.
+    record tenant-spec {
+        /// Diagnostic id; the key every other call names this tenant by.
+        name: string,
+        /// Framework vocabulary, fixed at registration — the noun phrase the
+        /// drawer's spoken lifecycle sentence uses. Subject to the
+        /// one-directional rule: never app-influenced.
+        spoken: string,
+        /// Refuses every other tenant's open while it holds the drawer.
+        exclusive: bool,
+        /// Holds the sheet's controls disabled for ARM-MS.
+        armed: bool,
+        /// Dims and freezes the page behind the sheet.
+        dim: bool,
+        /// Suspends (keeps its session, loses the drawer) instead of closing
+        /// when another tenant opens over it.
+        suspendable: bool,
+    }
+
+    record event-record { at: u64, text: string }
+    record identity { name: string, device: string, icon: string }
+
+    // --- identity and the claim ---------------------------------------
+
+    /// Roll the anchor colour and the audible anchor word, and let the
+    /// cluster render. Returns whether this is a fresh identity.
+    claim: func() -> bool;
+    get-identity: func() -> identity;
+    save-identity: func(rec: identity);
+
+    /// The committed hue, for consumers that must paint with it.
+    committed-hue: func() -> u16;
+    /// Live preview (not persisted) / commit (painted and persisted).
+    apply-hue: func(hue: u16);
+    commit-hue: func(hue: u16);
+
+    /// THERE IS NO GETTER FOR THE ANCHOR WORD, and that is the same
+    /// structural decision the TypeScript interface makes (visor/README.md,
+    /// "The channel decision"): the word must never reach pixels, so nothing
+    /// may read it back. These two are the only doors, and both end in the
+    /// visually-hidden live region.
+    speak-word: func();
+    reroll-word: func();
+
+    // --- the strip ----------------------------------------------------
+
+    set-context: func(ctx: context);
+    /// Framework voice, flat string: it cannot carry class marking, so it
+    /// cannot carry an app-influenced token. `ms` = 0 uses the default dwell.
+    announce: func(text: string, ms: u32);
+    pulse-context: func(sr-text: option<string>);
+    set-back: func(action: option<back-action>);
+
+    // --- the event record and standing conditions ---------------------
+
+    add-event: func(text: string);
+    list-events: func() -> list<event-record>;
+    mark-events-seen: func();
+    unseen-event-count: func() -> u32;
+    /// Return value is the EDGE, so a poller announces once per crossing.
+    set-condition: func(key: string, text: string) -> bool;
+    clear-condition: func(key: string) -> bool;
+    list-conditions: func() -> list<tuple<string, string>>;
+
+    // --- the drawer host ----------------------------------------------
+
+    /// Registration order is precedence order, exactly as the TypeScript
+    /// drawer host's tenant array is.
+    register-tenant: func(spec: tenant-spec);
+    /// Opens (or re-presents) `tenant` with `ctx` on the strip. Returns false
+    /// when an exclusive tenant refused it. The sheet itself arrives later:
+    /// the guest emits `embedder.tenant-build` and waits for `mount-sheet`.
+    open-tenant: func(tenant: string, ctx: context) -> bool;
+    close-tenant: func(tenant: string, reason: close-reason);
+    /// Re-present at a new size (same session, same sheet).
+    rebuild-tenant: func(tenant: string);
+    tenant-is-open: func(tenant: string) -> bool;
+    tenant-is-suspended: func(tenant: string) -> bool;
+    /// Recompute the strip's context from the tenant stack.
+    restore-context: func();
+
+    /// The host has appended the built sheet root into the live slide and
+    /// measured it; `height` is its natural height in CSS pixels. This
+    /// completes the `tenant-build` round trip and starts the reveal.
+    mount-sheet: func(tenant: string, height: f64);
+    /// The sheet's content changed size (the ResizeObserver the host keeps on
+    /// the foreign root, and viewport resizes).
+    resize-sheet: func(height: f64);
+
+    /// Wipe every stored slot and return to the unclaimed grey dress.
+    erase: func();
+}
+
+world visor {
+    include polymorph:dioxus/app@0.5.0;
+
+    import store;
+    import chrome;
+    import embedder;
+
+    export control;
+}

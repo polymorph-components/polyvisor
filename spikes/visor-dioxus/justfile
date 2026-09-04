@@ -1,0 +1,47 @@
+# visor-spike — build/serve/e2e for the walking skeleton.
+#
+# The sibling renderer checkout (polyengine-dioxus) must sit next to this
+# repo's root: `../../../polyengine-dioxus`. Its `.deps/polyengine` checkout
+# supplies the translator and the runtime; this spike neither builds nor
+# modifies it.
+
+SIBLING := "../../../polyengine-dioxus"
+
+default: build
+
+# Compile the component, validate it, and translate it to a deploy envelope.
+#
+# wasm32-wasip2 emits a COMPONENT directly, so there is no
+# `wasm-tools component new` step. Translation happens at BUILD time
+# (embedder-api.md amendment A4): the envelope is the blessed deploy
+# artifact, so nothing ships a translator.
+build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p build
+    cargo build --target wasm32-wasip2 --release
+    cp target/wasm32-wasip2/release/visor_spike.wasm build/visor-spike.component.wasm
+    wasm-tools validate --features component-model,cm-async build/visor-spike.component.wasm
+    deno run --allow-read --allow-write --config {{SIBLING}}/.deps/polyengine/deno.json \
+      {{SIBLING}}/.deps/polyengine/tools/translate/main.ts \
+      build/visor-spike.component.wasm \
+      -o build/visor-spike.plan.json
+    raw=$(stat -c%s build/visor-spike.component.wasm)
+    gz=$(gzip -9 -c build/visor-spike.component.wasm | wc -c)
+    echo "visor-spike.component.wasm: ${raw} bytes raw, ${gz} bytes gzipped"
+
+# Serve the harness on an EPHEMERAL port (bound 0; the server prints it).
+serve: build
+    deno run -A web/build.ts
+    deno run --allow-net --allow-read e2e/server.ts
+
+# Real-Chromium E2E. First run: cd e2e && npm install && npx playwright install chromium.
+e2e: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    deno run -A web/build.ts
+    cd e2e && npx playwright test
+
+check:
+    cargo build --target wasm32-wasip2 --release
+    deno task check

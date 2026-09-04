@@ -1,0 +1,582 @@
+/// polymorph:dioxus — a batched DOM-mutation surface for Dioxus apps running
+/// as components on polyengine.
+///
+/// Design: the guest queues DOM mutations as `mutations.operation` values and
+/// delivers whole batches across the boundary in one stream write; the host
+/// applies them to a live DOM subtree. Strings cross the boundary two ways:
+/// `&'static` names (tags, attribute names, event names) are interned once
+/// and referenced by u16 id thereafter (`cache-string`); dynamic text rides
+/// in the operations themselves.
+///
+/// The `mutations` interface is the normative schema and versions with this
+/// WIT package: any change to the operation vocabulary or its record shapes
+/// bumps the package version (instantiation is digest-checked, so a mismatch
+/// fails loudly and early).
+package polymorph:dioxus@0.5.0;
+
+/// Typed event payloads, host-serialized at dispatch. One snapshot per
+/// event; fields not applicable to an event family are simply absent by
+/// construction (the family is chosen host-side by event name, mirroring
+/// dioxus-html's name→data-type mapping). Drag events reuse the `mouse`
+/// family (DOM drag events are MouseEvents). Some families dispatch as
+/// `empty` because there is nothing to carry: focus, cancel, clipboard,
+/// media, selection and toggle events have data types in dioxus-html that
+/// expose no accessors at all, so a handler can observe nothing beyond the
+/// fact that the event fired — that is the whole `empty` set.
+///
+/// Two families are not DOM events at all: `resize` and `visible` are
+/// synthesized, by the host, from a ResizeObserver and an
+/// IntersectionObserver attached when the guest registers a listener for
+/// them (this mirrors what dioxus-web's interpreter does in-browser). They
+/// carry the observer entry's snapshot like any other family.
+///
+/// `onmounted` also carries an `empty` payload, but is
+/// not "uncovered": its handler's value is the `MountedData` handle the
+/// guest builds from the dispatch's `target`, backed by the `dom`
+/// interface below.
+///
+/// Also home to the host-implemented `dom-event` resource — the live-event
+/// handle lent to `handle-event`.
+interface events {
+  /// The observer-backed families below report geometry, in the same CSS
+  /// pixel spaces the `dom` interface's queries use; reusing its records
+  /// keeps one definition of each shape (`dom` does not name `events`, so
+  /// there is no cycle).
+  use dom.{rect, size};
+
+  flags modifiers { alt, ctrl, meta, shift }
+
+  record mouse-data {
+    client-x: f64,
+    client-y: f64,
+    page-x: f64,
+    page-y: f64,
+    screen-x: f64,
+    screen-y: f64,
+    offset-x: f64,
+    offset-y: f64,
+    /// Which button changed state (MouseEvent.button; -1 when not applicable).
+    button: s16,
+    /// Currently depressed buttons bitmask (MouseEvent.buttons).
+    buttons: u16,
+    mods: modifiers,
+  }
+
+  record pointer-data {
+    mouse: mouse-data,
+    pointer-id: s32,
+    width: f64,
+    height: f64,
+    pressure: f64,
+    tangential-pressure: f64,
+    tilt-x: f64,
+    tilt-y: f64,
+    twist: f64,
+    /// "mouse" | "pen" | "touch"
+    pointer-type: string,
+    is-primary: bool,
+  }
+
+  record keyboard-data {
+    key: string,
+    code: string,
+    /// KeyboardEvent.location (0 standard, 1 left, 2 right, 3 numpad).
+    location: u8,
+    repeat: bool,
+    is-composing: bool,
+    mods: modifiers,
+  }
+
+  record wheel-data {
+    mouse: mouse-data,
+    delta-x: f64,
+    delta-y: f64,
+    delta-z: f64,
+    /// WheelEvent.deltaMode (0 pixel, 1 line, 2 page).
+    delta-mode: u8,
+  }
+
+  record form-data {
+    /// The control's current value (input/textarea/select) or "" when not
+    /// applicable.
+    value: string,
+    /// Present for checkable controls.
+    checked: option<bool>,
+    /// Form entries, populated for submit-shaped events on a form element
+    /// (name → values, multi-valued controls preserved).
+    values: list<tuple<string, list<string>>>,
+  }
+
+  record scroll-data {
+    scroll-top: f64,
+    scroll-left: f64,
+    scroll-width: f64,
+    scroll-height: f64,
+    client-width: f64,
+    client-height: f64,
+  }
+
+  record image-data {
+    /// Whether the dispatched event was `error` rather than `load`. The DOM
+    /// gives these two names to one dioxus-html family, and this bool is the
+    /// only thing that distinguishes them for `ImageData::load_error()`;
+    /// without it an `onerror` handler is told the image loaded fine.
+    load-error: bool,
+  }
+
+  record composition-data {
+    /// The text the IME contributed for this compositionstart/update/end
+    /// (CompositionEvent.data), behind `CompositionData::data()`. Empty
+    /// string is legitimate — a composition can be cancelled to nothing.
+    data: string,
+  }
+
+  record animation-data {
+    /// Which @keyframes animation fired (AnimationEvent.animationName); the
+    /// only way a handler on an element with several animations can tell
+    /// them apart. `AnimationData::animation_name()`.
+    animation-name: string,
+    /// The pseudo-element the animation ran on ("::before", …), or "" when
+    /// it ran on the element itself (AnimationEvent.pseudoElement).
+    pseudo-element: string,
+    /// Seconds the animation had been running when the event fired,
+    /// excluding paused time (AnimationEvent.elapsedTime). f32 because
+    /// `AnimationData::elapsed_time()` is f32.
+    elapsed-time: f32,
+  }
+
+  record transition-data {
+    /// Which CSS property finished transitioning
+    /// (TransitionEvent.propertyName); a single `ontransitionend` listener
+    /// fires once per animated property. `TransitionData::property_name()`.
+    property-name: string,
+    /// The pseudo-element the transition ran on, or "" for the element
+    /// itself (TransitionEvent.pseudoElement).
+    pseudo-element: string,
+    /// Seconds the transition had been running when the event fired
+    /// (TransitionEvent.elapsedTime); f32, matching
+    /// `TransitionData::elapsed_time()`.
+    elapsed-time: f32,
+  }
+
+  /// One finger, mirroring the DOM `Touch` object. The field set is
+  /// dioxus-html's own `SerializedTouchPoint` (dioxus-html-0.7.10
+  /// src/events/touch.rs:272-284) — i.e. exactly what its
+  /// `HasTouchPointData` implementation needs and nothing more.
+  record touch-point {
+    /// Stable for the life of one finger's contact, so a handler can track
+    /// a finger across touchmove events (Touch.identifier).
+    identifier: s32,
+    /// The three coordinate spaces `InteractionLocation` requires of a touch
+    /// point: viewport, document, and physical screen.
+    client-x: f64,
+    client-y: f64,
+    page-x: f64,
+    page-y: f64,
+    screen-x: f64,
+    screen-y: f64,
+    /// Half-axes of the ellipse approximating the contact area
+    /// (Touch.radiusX/radiusY); `TouchPoint::radius()` returns them as one
+    /// point. 0 on hardware that does not report contact geometry.
+    radius-x: f64,
+    radius-y: f64,
+    /// Degrees (0..90) that the contact ellipse is rotated by
+    /// (Touch.rotationAngle), behind `TouchPoint::rotation()`.
+    rotation-angle: f64,
+    /// Contact pressure in 0..1 (Touch.force); 0 when unsupported.
+    force: f64,
+  }
+
+  record touch-data {
+    /// Every finger currently on the screen (TouchEvent.touches).
+    touches: list<touch-point>,
+    /// Only the fingers whose state this event reports
+    /// (TouchEvent.changedTouches) — behind
+    /// `TouchData::touches_changed()`, and the list a touchend handler
+    /// needs to know which finger lifted.
+    changed-touches: list<touch-point>,
+    /// The subset of `touches` that started on the event's target element
+    /// (TouchEvent.targetTouches).
+    target-touches: list<touch-point>,
+    /// Touch events carry keyboard modifiers too; `HasTouchData` requires
+    /// `ModifiersInteraction`.
+    mods: modifiers,
+  }
+
+  /// One ResizeObserver entry for the observed element.
+  ///
+  /// The DOM reports both boxes writing-mode-relative
+  /// (`blockSize`/`inlineSize`); the host resolves that to width/height
+  /// before sending, so the guest never has to know the element's writing
+  /// mode. Backs `ResizeData::get_border_box_size()` /
+  /// `get_content_box_size()` (dioxus-html-0.7.10 src/events/resize.rs:22-30).
+  record resize-data {
+    /// Padding plus border included (ResizeObserverEntry.borderBoxSize).
+    border-box: size,
+    /// The content box alone, borders and padding excluded
+    /// (ResizeObserverEntry.contentBoxSize).
+    content-box: size,
+  }
+
+  /// One IntersectionObserver entry for the observed element; every field
+  /// backs one accessor of dioxus-html's `VisibleData`
+  /// (dioxus-html-0.7.10 src/events/visible.rs:24-52).
+  record visible-data {
+    /// The target's own box at the moment of the observation
+    /// (IntersectionObserverEntry.boundingClientRect) — the denominator the
+    /// ratio below is a fraction of.
+    bounding-client-rect: rect,
+    /// How much of the target is visible, 0..1
+    /// (IntersectionObserverEntry.intersectionRatio); what a threshold-based
+    /// handler actually tests.
+    intersection-ratio: f64,
+    /// The visible part of the target (IntersectionObserverEntry
+    /// .intersectionRect); all-zero when nothing intersects.
+    intersection-rect: rect,
+    /// Whether the target intersects the root at all
+    /// (IntersectionObserverEntry.isIntersecting). Distinct from a nonzero
+    /// ratio: an entry fires on the transition *out* of view too.
+    is-intersecting: bool,
+    /// The root's clipping box (IntersectionObserverEntry.rootBounds).
+    /// `none` because the DOM reports null here when the root is the
+    /// implicit viewport and the document is in a cross-origin frame: the
+    /// viewport's geometry belongs to the parent document, so the browser
+    /// withholds it rather than leak it.
+    root-bounds: option<rect>,
+    /// Milliseconds since the Unix epoch, NOT since the page's time origin.
+    /// Fixed by dioxus-html: `VisibleData::get_time()` returns
+    /// `UNIX_EPOCH + Duration::from_millis(time_ms)`
+    /// (dioxus-html-0.7.10 src/events/visible.rs:203).
+    ///
+    /// DELIBERATE DEVIATION FROM UPSTREAM — do not "fix" this back.
+    /// `IntersectionObserverEntry.time` is a DOMHighResTimeStamp measured
+    /// from the page's time origin, so the host sends
+    /// `performance.timeOrigin + entry.time`. dioxus-web's own serializer
+    /// sends `Date.now() + detail.time` (dioxus-interpreter-js-0.7.10
+    /// src/ts/serialize.ts:164), which adds an epoch time to a
+    /// time-origin-relative one and so overshoots by the page's uptime.
+    time-ms: u64,
+  }
+
+  variant payload {
+    /// Events with no serialized data (focus/blur, select,
+    /// toggle, click on non-interactive targets never carries less than
+    /// mouse — see family mapping in the host).
+    empty,
+    mouse(mouse-data),
+    pointer(pointer-data),
+    keyboard(keyboard-data),
+    wheel(wheel-data),
+    form(form-data),
+    scroll(scroll-data),
+    image(image-data),
+    composition(composition-data),
+    animation(animation-data),
+    transition(transition-data),
+    touch(touch-data),
+    resize(resize-data),
+    visible(visible-data),
+  }
+
+  /// A live DOM event, lent to the guest for the duration of one
+  /// `handle-event` call (the cancelable window). Calling either method
+  /// after the originating dispatch has completed is a harmless no-op
+  /// (relevant when the guest was busy and the event was queued).
+  resource dom-event {
+    /// Call the native `preventDefault()`. The renderer invokes this
+    /// synchronously (still inside the host's DOM listener frame) when the
+    /// app's handler called `Event::prevent_default()` — Dioxus semantics
+    /// require that flag to be set before the handler's first await.
+    prevent-default: func();
+
+    /// Call the native `stopPropagation()`. Dioxus bubbling is synthetic
+    /// (guest-side); this affects only non-Dioxus listeners on the page.
+    stop-propagation: func();
+  }
+}
+
+/// The mutation protocol: the op vocabulary the guest renders through,
+/// spelled as WIT records and one `operation` variant, delivered as
+/// `stream<operation>` by the world's `run` export. This interface is
+/// normative — there is no other encoding of a mutation.
+///
+/// The vocabulary mirrors dioxus-core 0.7's `WriteMutations` trait plus two
+/// protocol ops (`cache-string`, `register-template`). Element ids are
+/// Dioxus ElementIds (slab indices, dense; id 0 is the mount root — the
+/// host-designated element the app renders into), `m` is the "top m nodes of
+/// the stack" count, `path` is a list of child indices, and stack semantics
+/// are Dioxus's mutation-stack semantics, identical to its own web
+/// interpreter. `bubbles` on the listener ops is dioxus-html's
+/// `event_bubbles` verdict, looked up guest-side: the host delegates
+/// bubbling events at the mount root and attaches non-bubbling listeners per
+/// element, so it needs the same bit on removal to find the registration.
+///
+/// Interning: a `str-ref` is an id defined by a prior `cache-string`
+/// operation, in this batch or any earlier one, and the guest emits each
+/// definition exactly once per instance. Event names cross back on
+/// `handle-event` as the same interned u16, so steady-state event dispatch
+/// transfers no string data at all.
+///
+/// **`register-template` carries an arena, not a tree.** The natural shape
+/// is recursive — `record template-element { children: list<template-node> }`
+/// — and WIT forbids it: recursive type definitions are rejected outright
+/// (`wasm-tools`: "type `template-node` depends on itself"). So `nodes` is a
+/// flat pre-order list, `roots` and every element's `children` are `u32`
+/// indices into it, and the host rebuilds the tree by indexing. The arena
+/// therefore admits malformed index graphs — out-of-range or cyclic indices —
+/// that a recursive shape could not express, and the host must validate them
+/// rather than trust them.
+
+interface mutations {
+  /// An interned string id, defined by a prior `cache-string` operation.
+  type str-ref = u16;
+  /// A Dioxus ElementId (slab index; dense). 0 is the mount root.
+  type element-id = u32;
+
+  /// Define (or overwrite) interned slot `id`. Ids are guest-managed and
+  /// assigned monotonically from 0.
+  record cache-string { id: str-ref, str: string }
+
+  /// One *static* template attribute. Dynamic template attributes are not
+  /// part of the template; they arrive later as `set-attribute`.
+  record template-attr { name: str-ref, ns: option<str-ref>, value: string }
+
+  /// `children` are indices into the enclosing `register-template`'s
+  /// `nodes` arena — see the interface doc for why this is not a tree.
+  record template-element {
+    tag: str-ref,
+    ns: option<str-ref>,
+    attrs: list<template-attr>,
+    children: list<u32>,
+  }
+
+  variant template-node {
+    element(template-element),
+    text(string),
+    /// A runtime-supplied node slot; the host materializes a placeholder
+    /// that later ops (`assign-id` / `replace-placeholder`) address by path.
+    dynamic,
+  }
+
+  /// Register a static template, which the host materializes once
+  /// (detached) so `load-template` can clone root subtrees from it. Each
+  /// distinct template is sent once, before its first use.
+  ///
+  /// `nodes` is the arena; `roots` indexes into it.
+  record register-template {
+    id: u16,
+    nodes: list<template-node>,
+    roots: list<u32>,
+  }
+
+  /// An element id plus a stack count ("top m nodes").
+  record stack-op { id: element-id, m: u32 }
+  /// A template path plus a stack count.
+  record path-op { path: list<u8>, m: u32 }
+  record assign-id { path: list<u8>, id: element-id }
+  record create-text-node { id: element-id, text: string }
+  record load-template { id: element-id, tmpl: u16, root: u16 }
+  record set-text { id: element-id, text: string }
+
+  /// An attribute's new value. `none` removes the attribute
+  /// unconditionally — it is not an empty text value.
+  variant attr-value {
+    text(string),
+    float(f64),
+    int(s64),
+    boolean(bool),
+    none,
+  }
+
+  /// Set (or, with `value: none`, remove) one attribute on a live element.
+  ///
+  /// The host applies Dioxus's attribute semantics: value/checked/selected
+  /// as properties, the style namespace via the style object,
+  /// dangerous_inner_html, and boolean-attribute removal on false.
+  ///
+  /// `none` routes via removeAttribute/removeAttributeNS/
+  /// style.removeProperty as the name and namespace dictate; the
+  /// boolean-attribute truthiness table governs only text/bool VALUES.
+  /// Property-backed fields get the same reset the truthy-value path uses
+  /// instead of a bare removeAttribute, since removeAttribute alone does not
+  /// clear a live element's property: value -> "" (+ removeAttribute),
+  /// checked -> false, selected -> false, dangerous_inner_html -> innerHTML
+  /// = "". (Ported from dioxus v0.7.10's `remove_attribute` sledgehammer op
+  /// in packages/interpreter/src/unified_bindings.rs.)
+  record set-attribute {
+    id: element-id,
+    name: str-ref,
+    ns: option<str-ref>,
+    value: attr-value,
+  }
+
+  record event-listener { id: element-id, name: str-ref, bubbles: bool }
+
+  /// One mutation. Arms whose only operand is an element id carry it bare.
+  variant operation {
+    cache-string(cache-string),
+    register-template(register-template),
+    append-children(stack-op),
+    assign-id(assign-id),
+    create-placeholder(element-id),
+    create-text-node(create-text-node),
+    load-template(load-template),
+    replace-with(stack-op),
+    replace-placeholder(path-op),
+    insert-after(stack-op),
+    insert-before(stack-op),
+    set-attribute(set-attribute),
+    set-text(set-text),
+    new-event-listener(event-listener),
+    remove-event-listener(event-listener),
+    remove(element-id),
+    push-root(element-id),
+  }
+}
+
+/// Operations on live elements the guest cannot express declaratively.
+///
+/// Everything else in this world flows one way: the guest describes DOM
+/// mutations and the host applies them. A few things resist that shape —
+/// "which element has focus" is browser state, not a property of the tree
+/// the guest rendered; "how tall is this element" is a layout answer that
+/// only exists after the browser has laid it out — so they need a
+/// request/response import instead. This interface is the home for those.
+///
+/// These back dioxus-html's `MountedData` (its `RenderedElementBacking`
+/// trait, dioxus-html-0.7.10 src/events/mounted.rs:13-55), whose handle the
+/// guest obtains from an `onmounted` event. The trait's six methods are
+/// covered here in full: this renderer is a library, so a method left
+/// unimplemented is not a local simplification, it is a `NotSupported` that
+/// surfaces at runtime in somebody else's app.
+///
+/// Convention: queries return `option` (none = no live node holds that id),
+/// commands return `bool` (false = same). Every operation takes `target`,
+/// the ElementId the guest assigned in a prior mutation batch; ids are
+/// reused slab indices, so a handle an app stashed can outlive its element
+/// and the miss case is ordinary, not exceptional.
+///
+/// All synchronous: each maps to one synchronous DOM call (a smooth scroll
+/// is dispatched synchronously and animates afterwards), and a sync import
+/// spares the guest an await inside an event handler.
+interface dom {
+  /// A position or displacement in CSS pixels.
+  record point { x: f64, y: f64 }
+
+  /// A 2D extent in CSS pixels.
+  record size { width: f64, height: f64 }
+
+  /// An axis-aligned box in CSS pixels: origin plus extent.
+  record rect { x: f64, y: f64, width: f64, height: f64 }
+
+  /// dioxus-html `ScrollBehavior`; the DOM's `ScrollBehavior`.
+  enum scroll-behavior { instant, smooth }
+
+  /// dioxus-html `ScrollLogicalPosition`; the DOM's `block`/`inline`
+  /// alignment for `scrollIntoView`.
+  enum scroll-alignment { start, center, end, nearest }
+
+  /// dioxus-html `ScrollToOptions`. `vertical`/`horizontal` are the DOM's
+  /// `block`/`inline` respectively.
+  record scroll-to-options {
+    behavior: scroll-behavior,
+    vertical: scroll-alignment,
+    horizontal: scroll-alignment,
+  }
+
+  /// How far the element's content is scrolled (`scrollLeft`/`scrollTop`).
+  get-scroll-offset: func(target: u32) -> option<point>;
+
+  /// The size of the element's content including the part overflowing the
+  /// visible box (`scrollWidth`/`scrollHeight`).
+  get-scroll-size: func(target: u32) -> option<size>;
+
+  /// The element's bounding box relative to the viewport, excluding scroll
+  /// position (`getBoundingClientRect`).
+  get-client-rect: func(target: u32) -> option<rect>;
+
+  /// Scroll the element into view (`scrollIntoView`).
+  scroll-to: func(target: u32, options: scroll-to-options) -> bool;
+
+  /// Scroll the element's own content to `offset` (`scrollTo`).
+  scroll: func(target: u32, offset: point, behavior: scroll-behavior) -> bool;
+
+  /// Focus (or blur) the element.
+  ///
+  /// NOTE for host implementors: `.focus()` fires `focusout`/`focusin`
+  /// SYNCHRONOUSLY on the elements involved, and those are delegated events
+  /// the host would otherwise dispatch straight back into a guest that is
+  /// still on the stack inside this very call. The host must defer such
+  /// dispatches (see the guest-entry serialization in
+  /// host/src/dispatch.ts).
+  set-focus: func(target: u32, focus: bool) -> bool;
+}
+
+/// A Dioxus application component. The host instantiates it, calls `run`
+/// once — which returns the mutation stream the app renders through — and
+/// dispatches DOM events via `handle-event`.
+world app {
+  use events.{payload, dom-event};
+  use mutations.{operation};
+
+  import events;
+  import dom;
+
+  /// Start the app and return the mutation channel: the host receives the
+  /// read end, reads batches of `operation`s from it for the life of the
+  /// instance, and applies them to the mount root. The app's scheduler keeps
+  /// running after the return as a spawned task: initial mount (rebuild →
+  /// one batch), then re-renders forever. One batch is one stream write of
+  /// the whole `list<operation>`.
+  ///
+  /// Returning the stream (rather than passing it to a host import) makes
+  /// the channel's lifecycle structural: it exists iff the app started,
+  /// exactly once, tied to this instance. It also means nothing may be
+  /// written before the reader is returned — such a write would park while
+  /// the host is still awaiting `run`'s promise for the reader it needs in
+  /// order to read — and that the scheduler cannot live in this export's own
+  /// body, since an async export's body returning is task.return followed by
+  /// task exit.
+  ///
+  /// The scheduler task's persistent park between renders (a plain Rust
+  /// future woken cross-task, no WIT waitable) is legal because the host
+  /// retains the lifted readable end of this stream for the instance's
+  /// lifetime. Under polyengine's retention rule — issue #162,
+  /// `.deps/polyengine/contracts/embedder-api.md` §"Streams and futures",
+  /// "while the host retains a way to act on a stream/future — a retained
+  /// end, a parked host operation, or an unfinished producer pump — a
+  /// stalled guest is reported as the documented embedder-may-act hang,
+  /// never a deadlock trap" — a retained end alone suffices; the host need
+  /// not also have a read parked. That is exactly what the runtime
+  /// implements: `HostActivity`
+  /// (`.deps/polyengine/runtime/src/exec/host_streams.ts`) arms on the
+  /// retained end and disarms only when that end is lowered back into a
+  /// guest. So a quiescent instance is the documented embedder-may-act
+  /// state, and app failure still surfaces on the channel the host watches:
+  /// a trap rejects the host's pending read (`PeerTrappedError`).
+  ///
+  /// (Historical: earlier revisions passed this stream to a host import
+  /// `surface.open`, alongside a since-retired synchronous call transport —
+  /// see bench/README.md for the retirement record.)
+  export run: async func() -> stream<operation>;
+
+  /// Dispatch one DOM event to the listener registered on `target` (the
+  /// ElementId carried by new-event-listener) for the interned event name
+  /// `name`.
+  ///
+  /// The name `mounted` is SYNTHETIC: no such DOM event exists, and the
+  /// host must fire it itself, once, for each element that registered a
+  /// `mounted` listener — after the batch that created the element has
+  /// been fully applied, so the node is in the document and the handler's
+  /// `MountedData` queries see a real element. dioxus-core registers it
+  /// like any other listener (`event_bubbles("mounted")` is false), which
+  /// is why it arrives here rather than through a separate export. Its
+  /// payload is `empty`; what the handler actually wants is `target`,
+  /// which is the handle the `dom` interface's operations take. The guest runs matching handlers synchronously (Dioxus
+  /// synthetic bubbling included) and, if a handler prevented the default,
+  /// calls `ev.prevent-default()` before returning. Renders triggered by
+  /// the event flush through the mutation channel (same task or the
+  /// scheduler task, before this call's completion is observable
+  /// host-side).
+  export handle-event: async func(target: u32, name: u16, payload: payload, ev: borrow<dom-event>);
+}

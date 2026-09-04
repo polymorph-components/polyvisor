@@ -1,0 +1,68 @@
+[package]
+name = "visor-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The sibling renderer checkout. Path is relative and assumes polyvisor and
+# polyengine-dioxus are siblings under ~/p/polymorph — which is true of the
+# canonical checkout, and NOT true inside a git worktree (a worktree sits at
+# ~/.paseo/worktrees/<id>/<name>, six levels down). See the spike report: a
+# symlink next to the worktree restores the invariant; there is no
+# cargo-native way to express "the sibling of my repo root".
+polyengine-dioxus = { path = "../../../polyengine-dioxus" }
+
+# Pins mirrored EXACTLY from the sibling's Cargo.toml. dioxus-core is shared
+# state between this crate and the renderer (we hand it a `fn() -> Element`);
+# a version skew would compile two incompatible copies and fail at the
+# `driver::run(App)` call site.
+wit-bindgen = { version = "=0.60.0", features = ["async-spawn", "inter-task-wakeup"] }
+dioxus = { version = "=0.7.10", default-features = false, features = [
+  "macro",
+  "html",
+  "signals",
+  "hooks",
+] }
+
+# THE CLOCK. `wasm32-wasip2` has no JavaScript host to call `setTimeout` on,
+# and `dioxus-sdk-time`'s stock wasm backend reaches `setTimeout` through
+# wasm-bindgen — whose imports are only resolvable on `wasm32-unknown-unknown`
+# with the wasm-bindgen CLI in the pipeline, so on this target they compile to
+# stubs that abort the instance when called. The fork's `wasip3` feature waits
+# on `wasi:clocks/monotonic-clock` instead, which keeps the timing path inside
+# the component model and inside an interface the host already serves
+# (../../../polyengine-dioxus/.deps/polyengine/wasi/src/clocks.ts).
+#
+# The pin is the SIBLING'S, verbatim: polyengine-dioxus/Cargo.toml:43-55. A rev
+# and not a branch, for the reason stated there — it is a fork we can push to,
+# so a branch reference would let a push silently change what everyone builds.
+[patch.crates-io]
+dioxus-sdk-time = { git = "https://github.com/lannbot/dioxus-sdk", rev = "390acec245754a3ad54217a0b625ff121d2c95f2" }
+
+# WASM-ONLY, deliberately. The crate's non-wasm backend is `tokio::time`, and
+# the whole point of the `state`/`drawer`/`voice` split is that `cargo test`
+# runs the state machines on the host with no runtime underneath them — the
+# arming delay is TESTED there by driving the machine's timer edge directly
+# (`DrawerState::arm_elapsed`), which is what makes the delay's RULES checkable
+# without a clock at all. The clock itself is only ever needed by `component`,
+# which is wasm-only for the same reason.
+#
+# The `wasip3` feature has to be switched on by a crate in the graph, which is
+# why the crate is named here rather than merely inherited: the workspace patch
+# above redirects it to the fork that has the feature, and this turns it on.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+dioxus-sdk-time = { version = "0.7.0", features = ["wasip3"] }
+
+[workspace]
+
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
