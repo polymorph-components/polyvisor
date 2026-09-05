@@ -12,7 +12,7 @@
 /// WIT package: any change to the operation vocabulary or its record shapes
 /// bumps the package version (instantiation is digest-checked, so a mismatch
 /// fails loudly and early).
-package polymorph:dioxus@0.5.0;
+package polymorph:dioxus@0.6.0;
 
 /// Typed event payloads, host-serialized at dispatch. One snapshot per
 /// event; fields not applicable to an event family are simply absent by
@@ -412,6 +412,37 @@ interface mutations {
 
   record event-listener { id: element-id, name: str-ref, bubbles: bool }
 
+  /// Adopt server-rendered HTML: bind already-present DOM nodes to the
+  /// element ids the guest just assigned, instead of creating nodes.
+  ///
+  /// The payload is the guest's traversal of its own template tree, in the
+  /// order `dioxus-ssr`'s `pre-render` numbered the markers it wrote into
+  /// the HTML: `ids[n]` is the element id for hydration marker `n`. Neither
+  /// side compares HTML against the vdom — the correspondence is positional,
+  /// and both orders come from the same template walk.
+  ///
+  /// The host finds marker `n` by walking the mount root: elements carry
+  /// `data-node-hydration="n[,event:bubbles]..."`, dynamic text is bracketed
+  /// by `<!--node-idN-->text<!--#-->` and a placeholder is `<!--placeholderN-->`
+  /// (no space before the number, and the host accepts no other spelling).
+  /// The marker comments are consumed (removed) by the walk, and an
+  /// empty dynamic text gets a real text node inserted for the id to bind
+  /// to. The listener suffix of the element marker is IGNORED here: listener
+  /// registrations arrive as ordinary `new-event-listener` operations later
+  /// in the same batch, which is the only form that carries the interned
+  /// name id, and is what lets `mounted` and the observer-backed families
+  /// work exactly as they do on a fresh mount.
+  ///
+  /// Every index in 0..len(ids) must be matched by exactly one marker. A
+  /// missing, duplicated or out-of-range marker means the served HTML and
+  /// the running component disagree — a build skew, not a recoverable
+  /// condition — and the host reports it rather than binding a wrong node.
+  ///
+  /// Valid only as the first operation of the first batch, and only when
+  /// `run` was called with `render-mode.hydrate`; in that mode the guest
+  /// emits no node-creating operations for the initial render at all.
+  type hydrate = list<element-id>;
+
   /// One mutation. Arms whose only operand is an element id carry it bare.
   variant operation {
     cache-string(cache-string),
@@ -431,6 +462,7 @@ interface mutations {
     remove-event-listener(event-listener),
     remove(element-id),
     push-root(element-id),
+    hydrate(hydrate),
   }
 }
 
@@ -512,6 +544,79 @@ interface dom {
   set-focus: func(target: u32, focus: bool) -> bool;
 }
 
+/// Arbitrary JavaScript evaluation in the host page: the back end of
+/// dioxus's `document::eval` (dioxus-document-0.7.10 src/document.rs,
+/// `Document::eval`; src/eval.rs, `Evaluator`).
+///
+/// OPT-IN, ON BOTH SIDES. A browser cannot sandbox arbitrary JS well enough
+/// for a host that runs untrusted components — polyvisor permits eval to the
+/// visor, which is part of its trusted computing base, and to no app, ever.
+/// So:
+///
+/// - Guest: the renderer crate references this interface only under its
+///   `eval` Cargo feature. A component built without that feature does not
+///   import `polymorph:dioxus/eval` at all (wit-component encodes only the
+///   interfaces the core module actually imports); `document::eval` there
+///   resolves to dioxus's `NoOpDocument` and answers `EvalError::Unsupported`.
+///   The justfile's `example` recipe asserts the absence.
+/// - Host: `mountApp` supplies this import only when asked
+///   (`MountOptions.eval`, host/src/host.ts). A component that imports it
+///   against a host that did not opt in fails to instantiate. Failure is the
+///   safe direction, and it is loud.
+///
+/// Semantics follow dioxus-web's `WebEvaluator` and dioxus-desktop's
+/// `DesktopEvaluator` where the two agree, so app code written for those
+/// renderers behaves the same here:
+///
+/// - The script is the BODY of an async function taking one parameter,
+///   `dioxus`, so `await` and `return` are legal at top level. `dioxus.send(v)`
+///   queues `v` for the guest's `recv`; `await dioxus.recv()` yields the next
+///   value the guest `send`s. (dioxus-web: `PROMISE_WRAPPER`, src/document.rs;
+///   dioxus-desktop: `AsyncFunction("dioxus", script)`, src/query.rs.)
+/// - Values cross as JSON text, both ways. The script's return value is
+///   `JSON.stringify`'d; `undefined` (a script with no `return`) crosses as
+///   `null`, as dioxus-desktop's does, so `eval("...").await` on a statement
+///   script succeeds.
+/// - The script runs in the host's realm with whatever that realm can reach —
+///   `document`, `window`, the mount root. That is the point, and the reason
+///   for the opt-in.
+interface eval {
+  /// Why an evaluation could not deliver a value. The cases the host can
+  /// actually produce; the guest maps them onto dioxus-document's
+  /// `EvalError`.
+  variant error {
+    /// The script did not compile (a `SyntaxError` constructing the
+    /// function). Reported by `join` — a constructor cannot fail.
+    invalid-js(string),
+    /// The script threw, or a value could not be represented as JSON.
+    communication(string),
+    /// The script has completed and nothing more will arrive: `recv` with an
+    /// empty queue after completion, or `join` a second time.
+    finished,
+  }
+
+  /// One running script. Construction starts it; the synchronous prefix
+  /// (everything before the script's first `await`) runs INSIDE the
+  /// constructor, on the calling guest's stack — so it is bracketed by the
+  /// host's dispatch gate like `dom.set-focus` is (host/src/dispatch.ts,
+  /// window 3), since that prefix can mutate the DOM and fire delegated
+  /// events. Continuations after an `await` run on their own microtasks,
+  /// outside any guest turn, and need no bracket.
+  ///
+  /// Dropping the handle does not stop the script (nothing could — this is
+  /// a JS promise, not a task); it only releases the host's queues.
+  resource evaluation {
+    constructor(js: string);
+    /// Queue a JSON value for the script's next `await dioxus.recv()`.
+    send: func(json: string);
+    /// The next value the script passed to `dioxus.send`, as JSON. Parks
+    /// until one is available.
+    recv: async func() -> result<string, error>;
+    /// The script's completion: its return value as JSON, or how it failed.
+    join: async func() -> result<string, error>;
+  }
+}
+
 /// A Dioxus application component. The host instantiates it, calls `run`
 /// once — which returns the mutation stream the app renders through — and
 /// dispatches DOM events via `handle-event`.
@@ -521,6 +626,30 @@ world app {
 
   import events;
   import dom;
+  /// Opt-in; see the interface doc. Present in a component's imports only
+  /// when the renderer was built with its `eval` feature.
+  import eval;
+
+  /// How the app's initial render meets the mount root.
+  variant render-mode {
+    /// The mount root is empty (or its contents are to be discarded): the
+    /// guest builds the tree from nothing and the host applies the creating
+    /// operations.
+    fresh,
+    /// The mount root already contains this same component's markup,
+    /// prerendered by `dioxus-ssr`'s `pre-render`. The guest still runs the
+    /// initial render — element ids are assigned exactly as in `fresh` —
+    /// but emits no node-creating operations for it. Instead the first
+    /// batch opens with a `hydrate` operation binding those ids to the
+    /// nodes already in the document, followed by the listener
+    /// registrations. Every render after the first is identical in both
+    /// modes.
+    ///
+    /// Hydration is positional: the served HTML must come from this same
+    /// component at this same initial state. A disagreement surfaces as a
+    /// host-side error, not as a silent repair.
+    hydrate,
+  }
 
   /// Start the app and return the mutation channel: the host receives the
   /// read end, reads batches of `operation`s from it for the life of the
@@ -558,7 +687,7 @@ world app {
   /// (Historical: earlier revisions passed this stream to a host import
   /// `surface.open`, alongside a since-retired synchronous call transport —
   /// see bench/README.md for the retirement record.)
-  export run: async func() -> stream<operation>;
+  export run: async func(mode: render-mode) -> stream<operation>;
 
   /// Dispatch one DOM event to the listener registered on `target` (the
   /// ElementId carried by new-event-listener) for the interned event name

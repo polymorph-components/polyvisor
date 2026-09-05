@@ -18,7 +18,8 @@
   "workspace": {
     "packageJson": {
       "dependencies": [
-        "npm:@playwright/test@1.62.1"
+        "npm:@playwright/test@1.62.1",
+        "npm:jsqr@1.4.0"
       ]
     }
   }

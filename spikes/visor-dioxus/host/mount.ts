@@ -33,6 +33,7 @@ import { ComponentException } from "@deltic/protocol";
 import { DomApplier } from "@polyengine/dioxus-host/applier.ts";
 import { DispatchGate } from "@polyengine/dioxus-host/dispatch.ts";
 import { createDomImports } from "@polyengine/dioxus-host/host.ts";
+import { createEvalImports } from "@polyengine/dioxus-host/eval.ts";
 import {
   EventDispatcher,
   serializePayload,
@@ -42,12 +43,26 @@ import { applyOperations } from "@polyengine/dioxus-host/operations.ts";
 import type { Operation } from "@polyengine/dioxus-host/operations.ts";
 
 import { ForeignSlotHost } from "./sheets.ts";
+import { createPairingDriverImports } from "./pairing.ts";
+import type { PairingCallLog, PairingTestControls } from "./pairing.ts";
+import { createEntryHostImports, defaultEntryTestControls } from "./entry.ts";
+import type { EntryCallLog, EntryTestControls } from "./entry.ts";
 
 // -- `polymorph:visor-spike/store` -------------------------------------------
 
 /** WIT `store.slot` — an enum lifts as the bare kebab-case case name
- * (contract:"Value mapping"). */
-export type Slot = "hue" | "word" | "identity" | "events" | "marks" | "legacy-hue";
+ * (contract:"Value mapping"). `account` is the USER-SYSTEM BOOT CACHE
+ * (wit/world.wit's `store.slot` doc: "the last-known profile, device list
+ * and account marks, reconciled against the partition at boot") — a slot
+ * of its own, not a corner of `marks`, for the reason the WIT doc gives. */
+export type Slot =
+  | "hue"
+  | "word"
+  | "identity"
+  | "events"
+  | "marks"
+  | "account"
+  | "legacy-hue";
 
 /** The slot -> storage-key mapping lives HERE, not in the guest. That is the
  * whole point of naming slots rather than keys: a component that cannot
@@ -59,6 +74,7 @@ const KEYS: Record<Slot, string> = {
   identity: "pm-spike-identity",
   events: "pm-spike-events",
   marks: "pm-spike-marks",
+  account: "pm-spike-account",
   "legacy-hue": "pm-spike-visor-hue",
 };
 
@@ -351,6 +367,33 @@ export interface Marks {
   collision(provenance: string, petname: string): Clash | undefined;
 }
 
+/** `polymorph:visor-spike/pairing`, in full — the pairing ceremonies as the
+ * consumer drives them. */
+export interface Pairing {
+  requestJoin(): void;
+  requestAdd(): void;
+  joinOpen(): boolean;
+  addOpen(): boolean;
+  closePairing(restoreContext: boolean): void;
+  drainUsEvents(): Promise<void>;
+  reconcile(): Promise<void>;
+}
+
+/** `entry.picker-row`, camelCased — re-exported from `./entry.ts`'s WIT
+ * mirror so a consumer of this module names one type for both the export's
+ * argument and the `entry-host` import's record. */
+export type { PickerRow } from "./entry.ts";
+import type { PickerRow } from "./entry.ts";
+
+/** `polymorph:visor-spike/entry`, in full — the entry ceremonies as the
+ * consumer drives them. */
+export interface Entry {
+  mountDevicePicker(rows: PickerRow[], problem?: string): void;
+  offerFirstRun(): void;
+  pickerOpen(): boolean;
+  firstRunOpen(): boolean;
+}
+
 export interface MountVisorOptions {
   source: InstantiateSource;
   root: Element;
@@ -361,11 +404,21 @@ export interface MountedVisor {
   control: Control;
   sheets_api: Sheets;
   marks: Marks;
+  pairing: Pairing;
+  entryApi: Entry;
   store: StoreLog;
   embedder: EmbedderLog;
   /** The e2e's own knobs onto `embedder`'s query/fallible half — see
    * `EmbedderTestControls`. */
   embedderTest: EmbedderTestControls;
+  /** The e2e's knobs onto the pairing-driver mock — see
+   * `./pairing.ts`'s `PairingTestControls`. */
+  pairingTest: PairingTestControls;
+  pairingCalls: PairingCallLog;
+  /** The e2e's knobs onto the entry-host mock — see `./entry.ts`'s
+   * `EntryTestControls`. */
+  entryTest: EntryTestControls;
+  entryCalls: EntryCallLog;
   /** Raw export record, for the e2e's naming assertion. */
   // deno-lint-ignore no-explicit-any
   exports: Record<string, any>;
@@ -380,6 +433,8 @@ export interface MountedVisor {
 export const CONTROL_ID = "polymorph:visor-spike/control@0.1.0";
 export const SHEETS_ID = "polymorph:visor-spike/sheets@0.1.0";
 export const MARKS_ID = "polymorph:visor-spike/marks@0.1.0";
+export const PAIRING_ID = "polymorph:visor-spike/pairing@0.1.0";
+export const ENTRY_ID = "polymorph:visor-spike/entry@0.1.0";
 
 /** The three demo tenants, mirroring demo/host/demo.ts's shapes
  * (credentialTenant / pickerTenant / the settings tenant): "credentials" is
@@ -401,6 +456,10 @@ export async function mountVisor(opts: MountVisorOptions): Promise<MountedVisor>
     nestedPlaceActive: false,
     onResetFail: false,
   };
+  const pairingCalls: PairingCallLog = { calls: [] };
+  const pairingTest: PairingTestControls = { pendingUsEvents: [] };
+  const entryCalls: EntryCallLog = { calls: [] };
+  const entryTest: EntryTestControls = defaultEntryTestControls();
   let disposed = false;
   let control: Control | undefined;
   const sheets = new ForeignSlotHost({
@@ -427,18 +486,36 @@ export async function mountVisor(opts: MountVisorOptions): Promise<MountedVisor>
   // (contract:"Module wiring and instantiation").
   const instance = await instantiate(opts.source, {
     ...wasi(),
-    "polymorph:dioxus/events@0.5.0": { DomEvent },
-    "polymorph:dioxus/dom@0.5.0": createDomImports(applier, gate),
+    "polymorph:dioxus/events@0.6.0": { DomEvent },
+    "polymorph:dioxus/dom@0.6.0": createDomImports(applier, gate),
+    // THE HOST HALF OF THE TWO-SIDED EVAL OPT-IN (the renderer's wit/world.wit,
+    // `interface eval`; `MountOptions.eval` is `mountApp`'s spelling of the
+    // same choice). Unconditional here, and that is the policy statement: this
+    // host mounts exactly one component, the visor, which is in the trusted
+    // computing base. An app host must never supply this key — a component
+    // that imports `eval` against a host that did not opt in fails to
+    // instantiate, which is the loud, safe direction.
+    "polymorph:dioxus/eval@0.6.0": createEvalImports(gate),
     "polymorph:visor-spike/store@0.1.0": createStoreImports(storeLog),
     "polymorph:visor-spike/chrome@0.1.0": createChromeImports(sheets),
     "polymorph:visor-spike/embedder@0.1.0": createEmbedderImports(embedderLog, sheets, embedderTest),
+    "polymorph:visor-spike/pairing-driver@0.1.0": createPairingDriverImports(pairingTest, pairingCalls),
+    "polymorph:visor-spike/entry-host@0.1.0": createEntryHostImports(entryTest, entryCalls),
   });
 
   // deno-lint-ignore no-explicit-any
   const exports = instance.exports as Record<string, any>;
   handleEventExport = exports.handleEvent;
 
-  const ops = await (exports.run as () => Promise<Stream<Operation>>)();
+  // `render-mode`, added in 0.6.0. A payload-less variant lowers as
+  // `{ kind: "..." }` (contract:"Value mapping"). `fresh` unconditionally: the
+  // spike serves an empty mount root, and hydration would require this page to
+  // serve `dioxus-ssr` prerendered markup from the SAME component at the SAME
+  // initial state — which the visor's initial state (read out of localStorage
+  // at boot) is not, per origin or per user. Mirrors `mountApp`'s default.
+  const ops = await (exports.run as (m: unknown) => Promise<Stream<Operation>>)({
+    kind: "fresh",
+  });
 
   const MAX_READ = 1 << 22;
   (async () => {
@@ -474,6 +551,18 @@ export async function mountVisor(opts: MountVisorOptions): Promise<MountedVisor>
       `no ${MARKS_ID} on instance.exports; got: ${Object.keys(exports).join(", ")}`,
     );
   }
+  const pairing = exports[PAIRING_ID] as Pairing | undefined;
+  if (!pairing) {
+    throw new Error(
+      `no ${PAIRING_ID} on instance.exports; got: ${Object.keys(exports).join(", ")}`,
+    );
+  }
+  const entryApi = exports[ENTRY_ID] as Entry | undefined;
+  if (!entryApi) {
+    throw new Error(
+      `no ${ENTRY_ID} on instance.exports; got: ${Object.keys(exports).join(", ")}`,
+    );
+  }
 
   // Register the three demo tenants now the export is live. Registration
   // order is precedence order (wit/world.wit:250-251), so this order is
@@ -484,9 +573,15 @@ export async function mountVisor(opts: MountVisorOptions): Promise<MountedVisor>
     control,
     sheets_api: sheetsApi,
     marks,
+    pairing,
+    entryApi,
     store: storeLog,
     embedder: embedderLog,
     embedderTest,
+    pairingTest,
+    pairingCalls,
+    entryTest,
+    entryCalls,
     exports,
     sheets,
     dispose() {

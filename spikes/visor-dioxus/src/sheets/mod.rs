@@ -180,8 +180,18 @@ pub const RESET: &str = "reset";
 /// Is this one of the visor's own guest-rendered ceremonies? The predicate
 /// `component::apply_effects` routes on, and the one `app.rs` asks before
 /// deciding whether a slide is a leaf.
+///
+/// PAIRING WAVE HOOK (one of two; see [`Sheet`] for the other). The pairing
+/// ceremonies are guest-rendered on exactly the same terms as these four —
+/// they use [`SheetRoot`], they are keyed by presentation, and they must not
+/// emit `tenant-build` — so the predicate has to recognise them or `app.rs:209`
+/// would leave their slides as leaves awaiting foreign DOM that never arrives.
+/// Delegated rather than spelled out here, so the two tenant names stay
+/// defined in one place (`crate::pairing`).
 pub fn is_visor_tenant(name: &str) -> bool {
     matches!(name, NAMING | SETTINGS | EVENTS | RESET)
+        || crate::pairing::is_pairing_tenant(name)
+        || crate::entry::is_entry_tenant(name)
 }
 
 /// The four specs, IN REGISTRATION ORDER — which is PRECEDENCE ORDER
@@ -509,6 +519,19 @@ pub fn Sheet(tenant: String) -> Element {
         SETTINGS => rsx! { settings::SettingsSheet {} },
         EVENTS => rsx! { events::EventsSheet {} },
         RESET => rsx! { reset::ResetSheet {} },
+        // PAIRING WAVE HOOK (two of two; see [`is_visor_tenant`]). Guarded on
+        // the same predicate that let the tenant through, so this arm cannot
+        // swallow an unknown name.
+        _ if crate::pairing::is_pairing_tenant(&tenant) => {
+            rsx! { crate::pairing::export::PairingSheet { tenant } }
+        }
+        // ENTRY WAVE HOOK, on the same terms as the pairing one above. The
+        // device picker is the one sheet that can be up BEFORE the visor is
+        // claimed, so it must route like the rest or the pre-claim shell has
+        // no pixels at all.
+        _ if crate::entry::is_entry_tenant(&tenant) => {
+            rsx! { crate::entry::export::EntrySheet { tenant } }
+        }
         _ => rsx! {},
     }
 }

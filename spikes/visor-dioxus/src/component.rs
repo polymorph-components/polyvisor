@@ -34,9 +34,25 @@ wit_bindgen::generate!({
     // interface modules live at `polyengine_dioxus::bindings::<pkg
     // namespace>::<pkg name>::<interface>`, snake_cased.
     with: {
-        "polymorph:dioxus/events@0.5.0": polyengine_dioxus::bindings::polymorph::dioxus::events,
-        "polymorph:dioxus/mutations@0.5.0": polyengine_dioxus::bindings::polymorph::dioxus::mutations,
-        "polymorph:dioxus/dom@0.5.0": polyengine_dioxus::bindings::polymorph::dioxus::dom,
+        "polymorph:dioxus/events@0.6.0": polyengine_dioxus::bindings::polymorph::dioxus::events,
+        "polymorph:dioxus/mutations@0.6.0": polyengine_dioxus::bindings::polymorph::dioxus::mutations,
+        "polymorph:dioxus/dom@0.6.0": polyengine_dioxus::bindings::polymorph::dioxus::dom,
+        // REUSED BUT NOW INERT, and worth keeping for the day it is not.
+        //
+        // The base world declares `import eval` unconditionally, so a mapping
+        // has to name something; this points at the renderer's module rather
+        // than generating a second copy of the interface, whose `Evaluation`
+        // resource would be a nominally different type from the one
+        // `polyengine_dioxus::document` holds.
+        //
+        // NOTHING CALLS IT. The renderer's `eval` Cargo feature is OFF
+        // (`Cargo.toml`, which carries the argument), so `WitDocument` is never
+        // installed and `document::eval` answers `Unsupported`. Verified rather
+        // than assumed: `wasm-tools component wit` on the built artifact shows
+        // no `polymorph:dioxus/eval` import at all, which is the property that
+        // actually matters — an unused mapping is bookkeeping, an unused
+        // IMPORT would still be a capability the host had to grant.
+        "polymorph:dioxus/eval@0.6.0": polyengine_dioxus::bindings::polymorph::dioxus::eval,
     },
     generate_all,
 });
@@ -624,6 +640,8 @@ fn context_in(ctx: &WitContext) -> Context {
         WitContext::Events => Context::Events,
         WitContext::DevicePicker => Context::DevicePicker,
         WitContext::FirstRun => Context::FirstRun,
+        WitContext::PairingJoin => Context::PairingJoin,
+        WitContext::PairingAdd => Context::PairingAdd,
     }
 }
 
@@ -703,8 +721,29 @@ pub(crate) fn report_back() {
 pub(crate) struct VisorComponent;
 
 impl Guest for VisorComponent {
-    async fn run() -> polyengine_dioxus::driver::MutationStream {
-        polyengine_dioxus::driver::run(crate::app::App).await
+    /// `mode` is PASSED THROUGH, not decided here. The spike's harness always
+    /// asks for `fresh` (host/mount.ts), but the choice is the host's — the
+    /// world says so — and a guest that ignored it would silently emit
+    /// node-creating operations against a prerendered root, which the WIT
+    /// describes as surfacing host-side rather than being silently repaired
+    /// (wit/deps/polymorph-dioxus/world.wit:650-656).
+    ///
+    /// The `match` is not ceremony. `render-mode` is declared in the WORLD, not
+    /// in an interface, and `wit_bindgen::generate!`'s `with:` remaps
+    /// interfaces only — so our world's `RenderMode` is a nominally distinct
+    /// type from the renderer's `polyengine_dioxus::bindings::RenderMode` that
+    /// `driver::run` takes, even though the two are structurally identical.
+    /// Every other type on this seam (`Operation`, `Payload`, `DomEvent`)
+    /// crosses free because each is an interface type the `with:` above
+    /// reuses. A new `render-mode` case upstream therefore breaks this build
+    /// loudly, which is the right failure.
+    async fn run(mode: RenderMode) -> polyengine_dioxus::driver::MutationStream {
+        use polyengine_dioxus::bindings::RenderMode as DriverMode;
+        let mode = match mode {
+            RenderMode::Fresh => DriverMode::Fresh,
+            RenderMode::Hydrate => DriverMode::Hydrate,
+        };
+        polyengine_dioxus::driver::run(crate::app::App, mode).await
     }
 
     async fn handle_event(target: u32, name: u16, payload: Payload, ev: &DomEvent) {

@@ -47,7 +47,16 @@ interface store {
     /// slot like the rest, so the same scoping holds — the component names
     /// the slot, the host owns the key, and two consumers on one origin do
     /// not share a table.
-    enum slot { hue, word, identity, events, marks, legacy-hue }
+    /// `account` is the USER-SYSTEM BOOT CACHE: the last-known profile,
+    /// device list and account marks, reconciled against the partition at boot
+    /// so the difference can be ANNOUNCED rather than silently adopted.
+    ///
+    /// A SLOT OF ITS OWN, not a corner of `marks`. `marks` is the LOCAL trust
+    /// table keyed by provenance; this is account state replicated between the
+    /// user's devices. Two different facts sharing one key is exactly the
+    /// failure the slot enum exists to prevent, and the pairing wave correctly
+    /// refused to reuse one rather than quietly overloading it.
+    enum slot { hue, word, identity, events, marks, account, legacy-hue }
 
     /// `none` = never written (distinct from written-empty).
     get: func(key: slot) -> option<string>;
@@ -171,6 +180,19 @@ interface types {
         events,
         device-picker,
         first-run,
+        /// THE PAIRING CEREMONIES. Bare kinds for the same reason `settings`
+        /// and `reset` are: no component stands behind either, and the strip's
+        /// honest answer is the name of the ceremony.
+        ///
+        /// ADDED AFTER THE PAIRING WAVE, which had to borrow the context of
+        /// whatever surface the ceremony was reached FROM — so the strip read
+        /// "visor settings" while a comparison screen was up. Borrowing was
+        /// the safe direction (it still reported a sheet as open, so the
+        /// cluster stayed untappable) but it was not a true sentence, and the
+        /// strip naming the sheet it is anchoring is the whole point of the
+        /// two-line context.
+        pairing-join,
+        pairing-add,
     }
 
     /// The identity record: the user's own name, their word for this device,
@@ -527,13 +549,228 @@ interface control {
 }
 
 world visor {
-    include polymorph:dioxus/app@0.5.0;
+    include polymorph:dioxus/app@0.6.0;
 
     import store;
     import chrome;
     import embedder;
+    import pairing-driver;
+    import entry-host;
 
     export control;
     export marks;
     export sheets;
+    export pairing;
+    export entry;
+}
+
+/// THE BACKEND CONTRACT FOR DEVICE ENROLLMENT (visor/ui/pairing-driver.ts).
+///
+/// A device joins an existing account, or an enrolled device admits a new one.
+/// Both halves end in a SHORT AUTHENTICATION STRING the two humans compare out
+/// of band: the point of the ceremony is that a relay which can see and modify
+/// everything on the wire still cannot get a device enrolled without the two
+/// people reading the same digits to each other. The visor's job is to render
+/// those digits in visor pixels and to make the comparison an explicit human
+/// act; everything cryptographic belongs to the backend.
+///
+/// Already async-and-fallible in TypeScript, which is why this interface is
+/// nearly a transcription: every method there returns
+/// `{ok: true, value} | {ok: false, error}`, i.e. exactly `result<T, string>`.
+/// The visor is written against this and nothing wider — the demo satisfies it
+/// twice, with a mock and with an engine adapter, and they are interchangeable.
+interface pairing-driver {
+    /// The join code and how long it stays valid. Rendered ONLY in visor
+    /// pixels, as a QR and as its text form.
+    record pair-offer { code: string, expires-ms: u64 }
+    record pair-enrollment { user-group-id: string, partition-id: string }
+
+    /// The joining device's view. `claimed` carries the digits to compare;
+    /// `enrolled` is the ceremony completing.
+    variant pair-join-state {
+        waiting,
+        claimed(string),
+        confirmed-waiting,
+        enrolled(pair-enrollment),
+        expired,
+        failed(string),
+    }
+
+    /// The admitting device's view. `sas-ready` carries the same digits the
+    /// other side is showing.
+    variant pair-add-state {
+        connecting,
+        sas-ready(string),
+        waiting-peer,
+        enrolled,
+        failed(string),
+    }
+
+    /// The account profile, synced across the user's own devices.
+    record us-profile { display-name: string, hue: u16, icon: option<list<u8>> }
+    /// One trust-table row as the ACCOUNT holds it (distinct from the local
+    /// `marks` table): the same subject, replicated between devices.
+    record us-mark {
+        provenance: string,
+        petname: string,
+        icon: string,
+        nickname: option<string>,
+        created-at: u64,
+        /// The partition's conflict repair cleared one side; the user is asked
+        /// to confirm rather than having a silent winner picked for them.
+        needs-reconfirm: bool,
+    }
+    record us-device {
+        agent-id: string,
+        name: string,
+        enrolled-at: u64,
+        revoked: bool,
+        endpoint: string,
+        enrolled-by: string,
+    }
+
+    /// A change made on ANOTHER of the user's devices. Local-echo suppression
+    /// is the backend's job, so the visor may announce every event it drains
+    /// without second-guessing provenance — announced-never-silent.
+    variant us-event {
+        profile-changed,
+        mark-added(string),
+        mark-changed(string),
+        /// provenance, then which field the repair cleared.
+        mark-conflict-repaired(tuple<string, string>),
+        device-added(string),
+        device-revoked(string),
+        /// The account's storage destination changed elsewhere. The payload is
+        /// the ENGINE's own word for the provider — framework vocabulary, not
+        /// app-influenced, so it is admissible inline in an announcement.
+        /// Other devices ANNOUNCE such a change and never silently adopt it.
+        storage-changed(string),
+    }
+
+    pair-join-start: async func() -> result<pair-offer, string>;
+    pair-join-status: async func() -> result<pair-join-state, string>;
+    /// The human said the digits matched. This is the whole ceremony.
+    pair-join-confirm: async func() -> result<_, string>;
+
+    pair-add-start: async func(code: string) -> result<_, string>;
+    pair-add-status: async func() -> result<pair-add-state, string>;
+    /// The human said the digits matched, and named the device being admitted.
+    /// The name is TYPED BY THE USER and never prefilled.
+    pair-add-confirm: async func(device-name: string) -> result<_, string>;
+    pair-abort: async func() -> result<_, string>;
+
+    us-profile-get: async func() -> result<us-profile, string>;
+    us-marks-list: async func() -> result<list<us-mark>, string>;
+    us-devices-list: async func() -> result<list<us-device>, string>;
+
+    // WHAT THIS INTERFACE DELIBERATELY DOES NOT CARRY. The first cut
+    // transcribed `PairingDriver` whole — nineteen functions — and the port
+    // calls ten. The other nine are not the visor's: `user-create`,
+    // `us-profile-set`, `us-mark-put`/`-forget`/`-confirm`,
+    // `us-contacts-list`/`-put` and `us-device-revoke` are called by CONSUMER
+    // surfaces (the demo's device management and contact list), which are not
+    // in visor/ui/ and are not ported here.
+    //
+    // They are gone rather than kept-for-completeness. An import is a
+    // capability the host must grant and a promise the guest may call; a
+    // contract wider than its caller is a standing invitation to widen the
+    // caller. If a consumer surface is ported later it should state the
+    // functions it needs, at that point, with a caller to justify each.
+    //
+    // (`us-devices-list` stays despite having no caller in the Rust yet: the
+    // TypeScript visor DOES call it — pairing.ts renders the account's device
+    // list — so its absence from the port is a gap in the port, not evidence
+    // that the visor does not need it.)
+
+    /// Drain remotely-caused changes, for the announced-never-silent rule.
+    us-events: async func() -> result<list<us-event>, string>;
+}
+
+/// THE ENTRY CEREMONIES' BACKEND (visor/ui/entry.ts): how a browser becomes a
+/// device with an account. The picker is the one sheet that opens BEFORE the
+/// visor has been claimed, so it renders on the unclaimed grey dress with
+/// index content only — petnames and times, nothing personal.
+interface entry-host {
+    /// One row of the on-device index. `id` is opaque and never rendered.
+    record picker-row {
+        id: string,
+        /// The user's own word for this device — the index rests in the clear
+        /// and this is the one thing in it that is the user's vocabulary.
+        petname: string,
+        /// 0 = never opened.
+        last-used: u64,
+        /// The unseal policy, read BEFORE anything is attached, so the sheet
+        /// can predict the ceremony. Mutually exclusive with `asks-passkey` by
+        /// construction: a policy names exactly ONE ceremony to OFFER — and
+        /// the offered one is not the only door, because the rungs are
+        /// additive and a passkey row still reaches the passphrase field
+        /// through the fallback control.
+        asks-passphrase: bool,
+        asks-passkey: bool,
+    }
+
+    /// A refusal that can land IN the sheet. `needs-passphrase` says the
+    /// device is ASKING rather than FAILING, so the sheet reveals the field
+    /// instead of merely reporting. A refusal that is not this shape is still
+    /// reported — a backend failing unexpectedly must not leave the user
+    /// staring at a dead sheet.
+    record picker-refusal { needs-passphrase: bool, message: string }
+
+    /// Open `row`, with the passphrase once its rung demanded one. `ok` = the
+    /// device is open and the visor closes the sheet.
+    open: async func(row: picker-row, passphrase: option<string>) -> result<_, picker-refusal>;
+    /// Open `row` through its passkey ceremony. THE CEREMONY IS THE HOST'S,
+    /// NOT THE VISOR'S: the host runs the platform assertion and derives the
+    /// key that unwraps the device. `none` from `supports-passkey` means this
+    /// page cannot, and the sheet says so rather than offering a dead control.
+    open-with-passkey: async func(row: picker-row) -> result<_, picker-refusal>;
+    supports-passkey: func() -> bool;
+    /// Start a device that has no account yet.
+    open-new: async func() -> result<_, string>;
+    /// Recover an account onto this device. `supports-restore` false renders
+    /// no control at all rather than an inert one.
+    restore: async func() -> result<_, string>;
+    supports-restore: func() -> bool;
+    /// `FirstRunHost.newAccount` — the first-run fork's own half.
+    new-account: async func() -> result<_, string>;
+}
+
+/// The pairing ceremonies, as the consumer drives them.
+interface pairing {
+    /// Join THIS device to an existing account: shows the code and the QR,
+    /// then the digits to compare.
+    request-join: func();
+    /// Admit ANOTHER device to this account. Heavy ceremony: a statement of
+    /// consequence, the drawer's arming delay, and a device name the user
+    /// types that nothing ever prefills.
+    request-add: func();
+    join-open: func() -> bool;
+    add-open: func() -> bool;
+    close-pairing: func(restore-context: bool);
+    /// Drain the account's remote-change events once and announce the
+    /// difference. The consumer polls; the visor owns the words.
+    drain-us-events: async func();
+
+    /// Reconcile the boot cache against the partition and announce the
+    /// difference — the other half of announced-never-silent, for changes that
+    /// happened while this device was not running and so produced no event to
+    /// drain. Called once at boot by the consumer.
+    ///
+    /// An EXPORT because the TypeScript's equivalent was simply called by the
+    /// consumer; the port had the logic implemented and tested with no door to
+    /// call it through, which is a contract omission rather than a port gap.
+    reconcile: async func();
+}
+
+/// The entry ceremonies, as the consumer drives them.
+interface entry {
+    use entry-host.{picker-row};
+
+    /// The device picker, on the unclaimed grey dress. `problem` seeds a
+    /// refusal line for a consumer that already knows something went wrong.
+    mount-device-picker: func(rows: list<picker-row>, problem: option<string>);
+    /// The first-run fork: no account on this device yet.
+    offer-first-run: func();
+    picker-open: func() -> bool;
+    first-run-open: func() -> bool;
 }
