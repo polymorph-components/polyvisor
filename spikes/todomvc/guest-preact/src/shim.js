@@ -8,8 +8,8 @@
 import {
   createElement as surfaceCreateElement,
   createTextNode as surfaceCreateTextNode,
-} from "polymorph:todomvc-spike/dom@0.0.1";
-import { listen } from "polymorph:todomvc-spike/events@0.0.1";
+} from "polyvisor:surface/dom@0.1.0";
+import { listen } from "polyvisor:surface/events@0.1.0";
 
 const tokens = new Map(); // token -> SNode
 let nextToken = 1;

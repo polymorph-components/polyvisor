@@ -1,8 +1,8 @@
 // World exports: wire Preact + the DOM shim to the todomvc world.
 
 import { h, render } from "preact";
-import { createElement } from "polymorph:todomvc-spike/dom@0.0.1";
-import { root } from "polymorph:todomvc-spike/shell@0.0.1";
+import { createElement } from "polyvisor:surface/dom@0.1.0";
+import { root } from "polyvisor:surface/shell@0.1.0";
 import { dispatchRecord, document, wrapRoot } from "./shim.js";
 import { App, setRoute } from "./app.js";
 

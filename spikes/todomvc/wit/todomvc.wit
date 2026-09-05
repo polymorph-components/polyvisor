@@ -1,94 +1,35 @@
-/// TodoMVC spike surface — polymorph-apps#16 (app execution model) and
-/// #15 (WIT shape rules) drive every choice here.
+/// TodoMVC spike WORLDS — polymorph-apps#16 (app execution model) and #15
+/// (WIT shape rules) drive every choice here.
 ///
-/// Two kinds of interface, deliberately kept distinct (#15 "scope split"):
-///   - `dom` is a WebIDL-MIRROR SUBSET: kebab-case names camelCase to the
-///     real platform names (`set-attribute` -> setAttribute), IDL
-///     attributes take the get-x/set-x convention, handles are resources.
-///     Someday satisfiable by (scoped) real platform objects; today
-///     implemented by the framework shim.
-///   - `events` and `shell` are FRAMEWORK-SHAPED: subscription tokens and
-///     record-shaped event delivery (no callbacks — #15 rule 5), and the
-///     capability grant (`root` hands the app its subtree; `route` is the
-///     shell-owned hash route).
+/// THIS FILE DEFINES NO INTERFACES. It used to define `dom`, `events` and
+/// `shell` inline, as a copy of the framework's surface contract. That copy
+/// went stale: #74 ("Split the WIT contracts", 2026-08-21) moved the real
+/// definitions to the repo root as `polyvisor:surface@0.1.0` and moved the
+/// host onto those import keys, while this file kept saying
+/// `polymorph:todomvc-spike@0.0.1` — so every guest built from it asked for
+/// keys the host no longer registered, and none of them could instantiate.
+/// See README.md's "Known-broken" entry for the full record.
 ///
-/// In the full framework these split into separate packages
-/// (`polymorph:dom` vs app-world glue); one package keeps the spike small.
+/// The fix is for the spike to STOP OWNING A SECOND DEFINITION. `deps/
+/// polyvisor-surface` is a SYMLINK to `<repo>/wit/surface`, not a vendored
+/// copy: the surface lives in this same repository, so there is no reason
+/// for a snapshot that can drift again. What remains here is what the spike
+/// genuinely owns — its two worlds.
+///
+/// The interfaces those worlds import are documented at their definition
+/// (`../../../wit/surface/surface.wit`): `dom` is a WebIDL-mirror subset,
+/// `events` and `shell` are framework-shaped (subscription tokens and
+/// record-shaped event delivery — #15 rule 5 — plus the capability grant,
+/// where `root` hands the app its subtree and `route` is the shell-owned
+/// hash route).
 package polymorph:todomvc-spike@0.0.1;
 
-/// WebIDL-mirror subset. The host validates every call: tag allowlist,
-/// per-(tag, attribute) validation, URL-typed values never cross raw (the
-/// one `a[href]` case admits fragment routes only).
-interface dom {
-  resource element {
-    set-attribute: func(name: string, value: string);
-    remove-attribute: func(name: string);
-    append-child: func(child: borrow<element>);
-    remove: func();
-    /// ChildNode.before / ChildNode.after mirrors — insert `node` as a
-    /// sibling immediately before/after this node. One node per call;
-    /// n-node inserts iterate (reversed, for `after`).
-    before: func(node: borrow<element>);
-    after: func(node: borrow<element>);
-    /// IDL attributes (not content attributes) use get-x/set-x (#15 r5).
-    set-text-content: func(text: string);
-    set-value: func(value: string);
-    set-checked: func(checked: bool);
-    focus: func();
-  }
-
-  create-element: func(tag: string) -> element;
-
-  /// Document.createTextNode mirror. The returned handle is a NODE with
-  /// restricted ops: text content, structural moves, remove. Attributes,
-  /// listeners, focus, and appending children INTO it are surface
-  /// violations (framework prerequisite: mixed content needs first-class
-  /// text nodes).
-  create-text-node: func(data: string) -> element;
-}
-
-/// Framework-shaped: event subscription and delivery. Events cross the
-/// boundary as records; the guest correlates via tokens it chose at
-/// `listen` time. No live platform objects, no callbacks.
-interface events {
-  use dom.{element};
-
-  enum event-kind { click, dblclick, input, change, keydown, blur }
-
-  record event {
-    /// The guest-chosen listener token passed to `listen`.
-    token: u32,
-    kind: event-kind,
-    /// `keydown` only: the KeyboardEvent key ("Enter", "Escape", ...).
-    key: option<string>,
-    /// Present when the target carries a value (input elements).
-    value: option<string>,
-    /// Present when the target is a checkbox.
-    checked: option<bool>,
-  }
-
-  listen: func(el: borrow<element>, kind: event-kind, token: u32);
-}
-
-/// Framework-shaped: the capability grant. The shell hands the app one
-/// subtree root (the subtree-scoping grant from #16's open questions) and
-/// owns routing.
-interface shell {
-  use dom.{element};
-
-  /// The app's mount point. Everything the app renders lives under it.
-  root: func() -> element;
-
-  /// Current hash route: "" | "active" | "completed".
-  route: func() -> string;
-}
-
 world todomvc {
-  import dom;
-  import events;
-  import shell;
+  import polyvisor:surface/dom@0.1.0;
+  import polyvisor:surface/events@0.1.0;
+  import polyvisor:surface/shell@0.1.0;
 
-  use events.{event};
+  use polyvisor:surface/events@0.1.0.{event};
 
   /// Build the initial UI (called once, after instantiation).
   export run: func();
@@ -108,9 +49,9 @@ world todomvc {
 /// one boundary, application is atomic with respect to paint. Ops emitted
 /// before a trap are applied; the instance is then dead.
 world lab {
-  import dom;
-  import events;
-  import shell;
+  import polyvisor:surface/dom@0.1.0;
+  import polyvisor:surface/events@0.1.0;
+  import polyvisor:surface/shell@0.1.0;
 
   /// Attempt one violation case (or the legal baseline, id 0). Illegal
   /// cases must trap — at the same call site on every backend.

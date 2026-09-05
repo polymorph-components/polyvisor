@@ -11,10 +11,16 @@ use std::cell::RefCell;
 wit_bindgen::generate!({
     path: "../wit",
     world: "lab",
+    // `generate_all`: the surface interfaces now live in a DEPENDENCY
+    // package (`polyvisor:surface@0.1.0`, symlinked at ../wit/deps), and
+    // wit-bindgen does not generate bindings for a dep unless told to —
+    // it demands either this or a `with:` mapping per interface. Bindings
+    // for all three are wanted here, so this is the one-word form.
+    generate_all,
 });
 
-use crate::polymorph::todomvc_spike::dom::{create_element, create_text_node, Element};
-use crate::polymorph::todomvc_spike::shell;
+use crate::polyvisor::surface::dom::{create_element, create_text_node, Element};
+use crate::polyvisor::surface::shell;
 
 thread_local! {
     static LIST: RefCell<Option<Element>> = const { RefCell::new(None) };

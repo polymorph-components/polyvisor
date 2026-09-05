@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "bundle": "esbuild src/index.js --bundle --format=esm --external:polymorph:* --outfile=build/bundled.js",
+    "bundle": "esbuild src/index.js --bundle --format=esm --external:polyvisor:* --outfile=build/bundled.js",
     "componentize": "jco componentize build/bundled.js --wit ../wit --world-name todomvc --disable all -o build/todomvc-preact.component.wasm",
     "build": "npm run bundle && npm run componentize"
   },

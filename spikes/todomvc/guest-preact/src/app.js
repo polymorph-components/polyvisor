@@ -6,7 +6,7 @@
 import { h, options } from "preact";
 import { useLayoutEffect, useRef, useState } from "preact/hooks";
 import htm from "htm";
-import { route as currentRoute } from "polymorph:todomvc-spike/shell@0.0.1";
+import { route as currentRoute } from "polyvisor:surface/shell@0.1.0";
 
 // Synchronous rerenders: state updates flush inside the same guest
 // invocation, matching the surface's flush-per-invocation ordering spec.

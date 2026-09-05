@@ -13,10 +13,8 @@ validated op protocol, and the event-record path. The permission linker and
 asset pipeline are deliberately left as seams; the worker/frame split is no
 longer one (both surfaces mount into a real sandboxed frame). Quarantined
 and delete-at-will, but no longer gate-less: see [Gates](#gates), two
-Playwright suites, one of which is currently RED for a
-[pre-existing reason](#known-broken-the-surface-guests-do-not-instantiate-pre-existing).
-The built demo is committed at `docs/spike-todomvc/` (the repo's Pages
-root).
+Playwright suites, both green. The built demo is committed at
+`docs/spike-todomvc/` (the repo's Pages root).
 
 [#16]: https://github.com/polymorph-components/polyvisor/issues/16
 [#15]: https://github.com/polymorph-components/polyvisor/issues/15
@@ -41,7 +39,11 @@ guest (Rust → wasm component)            trusted host (JS)
                                       └───────────────────────────┘
 ```
 
-- **`wit/todomvc.wit`** is the contract. `dom` is a WebIDL-mirror subset
+- **`../../wit/surface/surface.wit`** is the contract — the framework's, not
+  a copy of it. `wit/todomvc.wit` here declares only this spike's two
+  *worlds* and imports `polyvisor:surface@0.1.0` through
+  `wit/deps/polyvisor-surface`, which is a **symlink** to that file. `dom` is
+  a WebIDL-mirror subset
   (#15 rules: `set-attribute` → `setAttribute`, get-x/set-x for IDL
   attributes, handles are resources). `events`/`shell` are framework-shaped:
   record events correlated by guest-chosen tokens (no callbacks), and the
@@ -91,12 +93,10 @@ from a violation guest (`lab/`) compared as trap vectors, including the
 flush-on-trap rule (a visible legal mutation before the violating call must
 land on every backend).
 
-Status: **RED** since 2026-08-21 — and only observably so since it acquired
-a gate (`e2e/tests/harness.spec.ts`). The three surface guests do not
-instantiate at all; the cause is a WIT package rename that predates this
-wave and is unrelated to it. See
-[Known-broken](#known-broken-the-surface-guests-do-not-instantiate-pre-existing).
-Before that commit it passed, 3 backends.
+Status: **PASS**, 3 backends — including across the runtime bump (see
+[Gates](#gates)). It was RED from 2026-08-21 to 2026-09-05 and nobody knew,
+because the harness had no gate behind it; see
+[Once-broken](#once-broken-the-surface-guests-could-not-instantiate-for-15-days).
 
 `frame` is deliberately EXCLUDED from the harness (and from `bench.ts`'s
 churn sweep): both compare backends by reading the DOM directly, and a
@@ -298,8 +298,8 @@ switch that ignores three of its four values.
 ## Gates
 
 The spike had **no automated gate** before this wave — which is why the
-break recorded under "Known-broken" below went unnoticed for three weeks.
-It now has two, in `e2e/` (Playwright, real Chromium):
+break recorded under "Once-broken" below sat undetected for 15 days. It now
+has two, in `e2e/` (Playwright, real Chromium), and both are green:
 
 ```sh
 cd e2e && npm install && npx playwright install chromium   # first run
@@ -309,9 +309,12 @@ just e2e                                                    # build + both gates
 - **`tests/harness.spec.ts`** wraps the existing differential harness
   (`web/harness.html`): the same guests over the three same-realm surface
   backends, 15 scripted steps compared stepwise plus 8 trap-vector probes,
-  asserted PASS. This is the gate that would prove the runtime bump did not
-  disturb the surface guests. **Currently RED**, for the pre-existing reason
-  below.
+  asserted PASS. **Green**, 1/1 — and this is the gate that proves the
+  **runtime bump** left the surface guests alone. That verification could not
+  actually run until the package rename below landed: before it, the guests
+  failed to instantiate for an unrelated reason, which masked the question
+  entirely. Now it has run, on the new runtime, and the three backends are
+  stepwise identical.
 - **`tests/dioxus-frame.spec.ts`** drives the re-targeted dioxus guest on
   the default frame backend through real interaction — add, toggle, edit via
   dblclick+Enter, cancel via Escape, destroy, and the three hash routes in
@@ -320,15 +323,13 @@ just e2e                                                    # build + both gates
   opaque-origin), and that the artifact **does not import `eval`**. **Green**,
   4/4.
 
-## Known-broken: the surface guests do not instantiate (pre-existing)
+## Once-broken: the surface guests could not instantiate, for 15 days
 
-`guest/`, `guest-preact/` and `lab/` have been unable to instantiate since
-**2026-08-21**, commit `4ec8d2f` ("Split the WIT contracts:
-polyvisor:surface, polyvisor:panel…", #74). That commit moved
-`visor/surface/surface.ts` onto import keys `polyvisor:surface/{dom,events,
-shell}@0.1.0`, but `wit/todomvc.wit` here still declares
-`package polymorph:todomvc-spike@0.0.1`, so the components ask for keys the
-host does not register:
+**Kept as a record, not deleted.** From **2026-08-21** (commit `4ec8d2f`,
+"Split the WIT contracts: polyvisor:surface, polyvisor:panel…", #74) to
+**2026-09-05**, `guest/`, `guest-preact/` and `lab/` could not instantiate
+*at all*. Not "behaved oddly" — the demo page and the harness both died on
+the first import resolution:
 
 ```
 PlanError: host import 'polymorph:todomvc-spike/dom@0.0.1/element' not provided
@@ -336,18 +337,48 @@ PlanError: host import 'polymorph:todomvc-spike/dom@0.0.1/element' not provided
    registered: polyvisor:surface/dom@0.1.0, …)
 ```
 
-This is **not** the runtime bump: the identical failure reproduces on the
-old `jsr:@deltic/runtime@0.1.0-pre.gc4043e6` with old-format envelopes.
-Nothing caught it because the spike had no gate; the new harness gate found
-it on its first honest run.
+**What broke.** #74 moved the surface's real definitions to the repo root as
+`polyvisor:surface@0.1.0` and moved `visor/surface/surface.ts` onto those
+import keys. `wit/todomvc.wit` here was a *second copy* of the same
+interfaces under `package polymorph:todomvc-spike@0.0.1`, and it was not
+moved with them. The two definitions were byte-identical in body, so nothing
+looked wrong on inspection; only the package name differed, and the package
+name is exactly what the import key is made of.
 
-The fix is mechanical but not one line: the interface bodies of
-`wit/todomvc.wit` and the repo-root `wit/surface/surface.wit` are
-byte-identical, so it is a package rename — which then cascades into every
-surface guest's source (`crate::polymorph::todomvc_spike::*` in `guest/` and
-`lab/`, and the `"polymorph:todomvc-spike/…"` import specifiers in
-`guest-preact/`). It is left for its own change rather than folded into the
-dioxus re-target.
+**Why it survived 15 days.** Because nothing ran. The spike was explicitly
+"wired into no CI", its correctness lived in a harness page a human had to
+open, and nobody opened it. This is the whole argument for the gates above,
+made concretely and at this spike's expense.
+
+**A gate would have caught it — and did.** `e2e/tests/harness.spec.ts` was
+written for a different purpose (proving the runtime bump harmless) and
+found this on its very first honest run, before it could serve that purpose
+at all.
+
+**Not the runtime bump.** Ruled out by isolation rather than by argument: the
+identical failure reproduces on the old
+`jsr:@deltic/runtime@0.1.0-pre.gc4043e6` with old-format envelopes
+regenerated by the old translator.
+
+**The fix**: stop keeping a second definition. `wit/todomvc.wit` now declares
+**only this spike's two worlds** and imports `polyvisor:surface@0.1.0`
+through `wit/deps/polyvisor-surface`, which is a **symlink** to
+`<repo>/wit/surface` — not a vendored copy, because the surface lives in
+this same repository and a snapshot is just a future drift waiting to
+happen. (`spikes/visor-dioxus/wit/deps` vendors a copy only because its
+dependency is a checkout outside this repo.) The consequences were
+mechanical and are the entire remainder of the change:
+
+| where | from | to |
+|---|---|---|
+| `guest/`, `lab/` (Rust) | `crate::polymorph::todomvc_spike::*` | `crate::polyvisor::surface::*` |
+| `guest/`, `lab/` (bindgen) | — | `generate_all` added: wit-bindgen will not generate bindings for a *dependency* package without it |
+| `guest-preact/` (JS) | `"polymorph:todomvc-spike/dom@0.0.1"` | `"polyvisor:surface/dom@0.1.0"` |
+| `guest-preact/package.json` | `--external:polymorph:*` | `--external:polyvisor:*` |
+
+No guest *behaviour* was touched, which is what let the harness's stepwise
+DOM comparison serve as the check that the rename was purely mechanical.
+
 
 
 ### The preact guest (JS as userland)
