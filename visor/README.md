@@ -21,9 +21,16 @@ Three layers, one trust story:
 - **`frame/`** — iframe isolation. `frame-backend.ts` (trusted side)
   creates a `sandbox="allow-scripts"` iframe — no `allow-same-origin`,
   so the app's document gets an OPAQUE ORIGIN and structurally cannot
-  read the visor's DOM, styles, or storage. `frame.ts` + `frame.html`
-  are the code the visor ships INTO that frame: the applier wired to a
-  MessagePort, height reporting, coarse theme (never the anchor
+  read the visor's DOM, styles, or storage. It gets no `src`: the
+  backend assembles the frame's document as a `srcdoc` string from
+  `frame.html` (a template), the stylesheet, and the bundled
+  `frame.js`, all fetched in the visor's own realm — pinned by value,
+  where a real URL would be invisible to the verifying service worker
+  and unpinnable (#142). Into that document it inserts a `<meta>` CSP
+  of `default-src 'none'` with the script hash-listed; CSP policies
+  compose, so the frame is network-dead whatever the visor's own policy
+  allows. `frame.ts` is the code that runs there: the applier wired to
+  a MessagePort, height reporting, coarse theme (never the anchor
   colour). The queued-op protocol is identical to `channel`; only the
   realm changes.
 

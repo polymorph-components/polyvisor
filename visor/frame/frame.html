@@ -1,20 +1,33 @@
 <!doctype html>
-<!-- The sandboxed UI frame (#16's architecture, #5's zero-network frame).
-     One document per app surface: the guest's DOM is applied HERE, in a
-     realm the shell cannot be reached from and which cannot reach the
-     shell — the iframe is created WITHOUT `allow-same-origin`, so this
-     document runs on an opaque origin. The visor's strip colour, its CSS
-     custom properties, its classes and its storage are structurally
-     out of reach rather than merely un-allowlisted.
+<!-- The sandboxed UI frame's TEMPLATE (#16's architecture, #5's
+     zero-network frame). This file is never navigated to: the visor
+     fetches it as text, inlines ./todomvc-app.css and ./frame.js into
+     it, and hands the result to the iframe as `srcdoc`
+     (../../visor/frame/frame-backend.ts). One document per app surface:
+     the guest's DOM is applied HERE, in a realm the shell cannot be
+     reached from and which cannot reach the shell — the iframe is
+     created WITHOUT `allow-same-origin`, so this document runs on an
+     opaque origin. The visor's strip colour, its CSS custom properties,
+     its classes and its storage are structurally out of reach rather
+     than merely un-allowlisted.
 
-     In the framework proper this skeleton is served from a dedicated
-     sandbox origin with real CSP and COOP/COEP response headers (#2/#5),
-     including a network policy that gives the frame no fetch/XHR/WS at
-     all. A <meta http-equiv="Content-Security-Policy"> is DELIBERATELY
-     omitted here: under an opaque origin `'self'` matches nothing
-     meaningful, so a meta policy would either be vacuous or would have
-     to hardcode the shell's origin — misleading either way. The real
-     policy belongs in headers, on the real sandbox origin. -->
+     WHY srcdoc RATHER THAN A REAL URL (#142, measured in both engines).
+     A service worker never sees a sandboxed frame's navigation, so a
+     real-URL skeleton is served raw by the origin — outside the release
+     integrity path (#3), with whatever headers the host happens to
+     send, unpinnable. `srcdoc` content is pinned BY VALUE: every byte
+     comes from the visor's own bundle-fetched assets.
+
+     WHY THE POLICY IS NOT WRITTEN HERE. The frame's real policy is a
+     <meta http-equiv="Content-Security-Policy"> that the backend
+     inserts as the first thing in this document's head, because its
+     `script-src` is a sha256 hash of the bundled ./frame.js text, which
+     only exists at runtime. CSP policies COMPOSE — every policy must
+     pass — so that meta's `default-src 'none'` makes this frame
+     network-dead no matter what the visor's own inherited policy allows
+     (#142: zero requests leave the frame; the meta-less control leaked
+     three). `img-src data:` is in it because TodoMVC's stylesheet uses
+     data-URL SVG glyphs. -->
 <html lang="en">
 <head>
   <meta charset="utf-8">

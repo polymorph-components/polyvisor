@@ -13,6 +13,25 @@
 // grow next. A separate document on an OPAQUE ORIGIN closes that whole
 // class structurally: there is nothing to read, not merely nothing
 // allowed to be read.
+//
+// The frame's document is a `srcdoc` string this module ASSEMBLES, never
+// a URL it navigates to (#142). A sandboxed frame's navigation is
+// invisible to a service worker in both engines, so a real-URL skeleton
+// would be served raw by the origin, outside the release-integrity path,
+// with whatever headers the host sends — unpinnable. Assembling the
+// document here means every byte of it came through the visor's own
+// asset path, and lets us insert a <meta> CSP whose `script-src` is a
+// hash of the bundled frame.js text. CSP policies compose, so that
+// policy's `default-src 'none'` makes the frame network-dead regardless
+// of what the visor's own inherited policy allows.
+//
+// CONTRACT (#142's correction comment, 2026-09-05): the hash below is
+// computed at RUNTIME and lives only in the frame's own meta. That is
+// sufficient exactly as long as the visor's page carries no header
+// `script-src` — the inherited policy must also admit the inline
+// script, and a header cannot know a runtime-assembled hash. When the
+// visor starts shipping a header CSP, the same hash has to be emitted
+// into it at build/serve time from the same frame.js bytes.
 
 import type { Backend } from "../surface/backend.ts";
 import { createQueuedBackend, type Op } from "../surface/backend-queued.ts";
@@ -31,6 +50,84 @@ type FrameMsg =
  * a frame that reports 0 before its first paint would otherwise collapse
  * to invisible. */
 const MIN_HEIGHT_PX = 48;
+
+/** The three texts the frame document is assembled from, at the same
+ * relative URLs the template used to reference: they are served
+ * alongside whatever page loaded the visor. Fetched in the VISOR's
+ * realm — that is what puts them on the same path as every other visor
+ * asset, and hence what makes the frame's content pinned. */
+const TEMPLATE_URL = "./frame.html";
+const STYLE_TAG = `<link rel="stylesheet" href="./todomvc-app.css">`;
+const SCRIPT_TAG = `<script type="module" src="./frame.js"></script>`;
+
+/** One assembly per page, shared by every surface. */
+let srcdocOnce: Promise<string> | null = null;
+
+function frameSrcdoc(): Promise<string> {
+  return (srcdocOnce ??= buildSrcdoc());
+}
+
+async function fetchText(url: string): Promise<string> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url}: ${res.status} ${res.statusText}`);
+  return await res.text();
+}
+
+async function buildSrcdoc(): Promise<string> {
+  const [template, css, js] = await Promise.all([
+    fetchText(TEMPLATE_URL),
+    fetchText("./todomvc-app.css"),
+    fetchText("./frame.js"),
+  ]);
+
+  // Inlining is by exact tag match against the template, so a template
+  // edit that moves an asset fails LOUDLY here instead of yielding a
+  // frame that is silently missing its stylesheet or its script.
+  for (const tag of [STYLE_TAG, SCRIPT_TAG]) {
+    if (!template.includes(tag)) {
+      throw new Error(`frame.html no longer contains ${tag}`);
+    }
+  }
+  // An inline script is terminated by the first `</script` in the text,
+  // whatever it is nested inside; a bundle containing one would break
+  // out of the frame document rather than run.
+  if (/<\/script/i.test(js)) {
+    throw new Error("frame.js contains </script and cannot be inlined");
+  }
+
+  // The hash is over the EXACT text content of the inline <script>
+  // element — every byte between the tags, INCLUDING the surrounding
+  // newlines. Build that string once and hash the same value we embed.
+  const inlineScript = `\n${js}\n`;
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(inlineScript),
+  );
+  const hash = btoa(String.fromCharCode(...new Uint8Array(digest)));
+  // `img-src data:` is not laxity: TodoMVC's stylesheet draws its
+  // glyphs from data-URL SVGs, and `data:` is not a network scheme, so
+  // the zero-exfiltration property is untouched (#142).
+  const meta = `<meta http-equiv="Content-Security-Policy" content="` +
+    `default-src 'none'; script-src 'sha256-${hash}'; ` +
+    `style-src 'unsafe-inline'; img-src data:">`;
+
+  // Insert as the first child of <head>, so the policy is in force from
+  // the first thing the parser sees after it. Anchored PAST `<html`:
+  // the template's leading comment is prose about this very tag, and a
+  // naive first-match replace buries the policy inside that comment
+  // (where it is inert and invisible — this bit once).
+  const headAt = template.indexOf("<head>", template.indexOf("<html"));
+  if (headAt < 0) throw new Error("frame.html has no <head> after <html>");
+  const withMeta = template.slice(0, headAt) +
+    `<head>\n  ${meta}` + template.slice(headAt + "<head>".length);
+
+  return withMeta
+    .replace(STYLE_TAG, `<style>\n${css}\n</style>`)
+    // `type="module"` is required, not stylistic: `deno bundle` emits
+    // `import.meta.url`, which is a syntax error in a classic script.
+    // Inline module scripts are hash-addressable in both engines.
+    .replace(SCRIPT_TAG, `<script type="module">${inlineScript}</script>`);
+}
 
 export interface FrameBackend {
   /** Resolves once the port is live — i.e. once ops posted through the
@@ -65,12 +162,10 @@ export function createFrameBackend(
   const frame = document.createElement("iframe");
   // THE load-bearing attribute. `allow-scripts` and NOTHING else: with
   // no `allow-same-origin`, the frame's document gets an opaque origin,
-  // so it cannot touch the visor's DOM, styles, cookies or storage even
-  // though it was served from the visor's own URL space. Adding
-  // `allow-same-origin` here would silently undo the entire point of
-  // this file.
+  // so it cannot touch the visor's DOM, styles, cookies or storage.
+  // Adding `allow-same-origin` here would silently undo the entire
+  // point of this file.
   frame.setAttribute("sandbox", "allow-scripts");
-  frame.src = "./frame.html";
   frame.style.cssText =
     `width: 100%; border: none; display: block; height: ${MIN_HEIGHT_PX}px;`;
   frame.setAttribute("scrolling", "no");
@@ -94,6 +189,17 @@ export function createFrameBackend(
   // first; keep the rejection from surfacing as an unhandled rejection
   // when they don't.
   backend.catch(() => {});
+
+  // The document arrives BY VALUE, one turn later (assembly needs three
+  // fetches and a digest, both async). The `frame-ready` handshake below
+  // is already listening by then, and a surface torn down while the
+  // assembly was in flight must not get a document at all.
+  frameSrcdoc().then((html) => {
+    if (destroyed) return;
+    frame.srcdoc = html;
+  }, (err) => {
+    if (!destroyed) rejectBackend(new Error(`frame document: ${err}`));
+  });
 
   // Faults arrive on the WINDOW channel, which outlives the handshake —
   // the handshake listener below removes itself, and a diagnostic that

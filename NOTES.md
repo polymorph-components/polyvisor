@@ -370,16 +370,24 @@ self-hosting, with the explicit goal that neither is the degraded tier.
 
 Mechanics:
 
-- `srcdoc`/`blob:` documents **inherit the embedder's header CSP** —
-  stronger than any meta-tag policy. But the shell needs `connect-src`
-  (home origin, relays) that app UI must not have, and the iframe `csp`
-  embedded-enforcement attribute is Chromium-only. The clean shape is
-  the **dedicated sandbox origin**: the app-frame skeleton served as a
-  real document with its own `default-src 'none'`-class headers.
-  Opaque-origin `srcdoc` frames remain a viable alternative (app UI
-  needs no storage — all state flows over RPC); real-origin vs
-  opaque-origin frames is an open decision with API-availability
-  consequences.
+- **The app frame is an opaque-origin `srcdoc` document carrying its
+  own `<meta>` CSP** (ruled 2026-09-05, [#142](../../issues/142),
+  measured in Chromium and Firefox). `srcdoc` documents inherit the
+  embedder's header policy — which must allow `connect-src` to the home
+  origin and relays — but CSP policies COMPOSE: every policy must pass,
+  so a meta `default-src 'none'` inside the frame makes it network-dead
+  regardless (zero requests out, against three for the meta-less
+  control). The formerly "clean" alternative, a dedicated sandbox
+  origin serving the skeleton with real headers, is ruled out on a
+  different axis: a service worker never sees a sandboxed frame's
+  navigation, so a real-URL skeleton is served raw by the host, outside
+  the release-integrity path and unpinnable. `srcdoc` is pinned by
+  value. A second origin therefore buys only Firefox process isolation,
+  never confinement. Standing constraint: the srcdoc's inline script
+  must also satisfy the visor's own header `script-src`, so its hash is
+  known to whoever emits that header (build time on a static host,
+  serve time from the bootstrap SW) — the loader is a constant;
+  everything variable arrives by `postMessage`.
 - The app UI frame gets **zero direct network**; assets arrive via
   RPC/blob injection from the component's embedded bundle.
 - App logic runs in workers on the framework side (polyengine,
