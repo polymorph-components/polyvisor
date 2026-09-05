@@ -80,7 +80,7 @@ guests:
     cd guest && cargo build --release --target wasm32-unknown-unknown
     cd lab && cargo build --release --target wasm32-unknown-unknown
     cd guest-dioxus && cargo build --release --target wasm32-wasip2
-    cd guest-preact && npm run build
+    cd guest-preact && npm ci && npm run build
 
 # Report the dioxus component's size, raw and gzipped (README's table).
 size:

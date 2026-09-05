@@ -47,6 +47,15 @@ JUST_VERSION="${JUST_VERSION:-1.54.0}"
 WEBRTC_REPO=https://github.com/polymorph-components/polymorph-webrtc-datachannels.git
 WEBRTC_PIN=db187f4b7d9d72bdc673ddb91c3170f0d9c7e325 # v0.5.0 — A22-clean: no runtime pin of its own, couples to @polyengine/protocol; the 0.5.1 bump needs it
 
+# spikes/todomvc's guest-dioxus is `polyengine-dioxus = { path =
+# "../../../../polyengine-dioxus" }` (see that Cargo.toml's comment) — a
+# sibling PATH dependency, not a git rev, because the spike builds against
+# the sibling's own crate source directly (mirrors spikes/visor-dioxus's
+# identical arrangement). The pin below is the commit the spike's guest and
+# deno.json (@deltic/* import map) were last verified against.
+DIOXUS_REPO=https://github.com/lannbot/polyengine-dioxus.git
+DIOXUS_PIN=fdc0d52adef7a301aa38030ab49b12af3284fb33 # spikes/todomvc's guest-dioxus + translate step
+
 log() { printf '\n==> %s\n' "$1"; }
 
 pin_repo() { # url pin dir
@@ -64,6 +73,33 @@ pin_repo() { # url pin dir
 
 mkdir -p "$SIBLINGS_DIR"
 pin_repo "$WEBRTC_REPO" "$WEBRTC_PIN" "$SIBLINGS_DIR/polymorph-webrtc-datachannels"
+pin_repo "$DIOXUS_REPO" "$DIOXUS_PIN" "$SIBLINGS_DIR/polyengine-dioxus"
+
+# The sibling has its own sibling: `.deps/polyengine` (the runtime +
+# translator spikes/todomvc's deno.json and justfile build-time-translate
+# step both reach through, per its README/`just deps`). Cloned here (blob-
+# less, same as the pins above); the cargo build of its translator shim is
+# cargo work and belongs in the tools phase below, past the
+# SIBLINGS_ONLY gate. POLYENGINE_REV is read from the pinned sibling's own
+# justfile rather than duplicated here, so bumping the sibling pin above
+# carries its polyengine pin forward automatically.
+DIOXUS_DIR="$SIBLINGS_DIR/polyengine-dioxus"
+POLYENGINE_REPO=https://github.com/polymorph-components/polyengine.git
+POLYENGINE_REV="$(sed -n 's/^POLYENGINE_REV := "\(.*\)"$/\1/p' "$DIOXUS_DIR/justfile")"
+if [ -z "$POLYENGINE_REV" ]; then
+    echo "setup: could not read POLYENGINE_REV from $DIOXUS_DIR/justfile" >&2
+    exit 1
+fi
+if [ ! -d "$DIOXUS_DIR/.deps/polyengine/.git" ]; then
+    log "Cloning polyengine-dioxus's polyengine dependency"
+    mkdir -p "$DIOXUS_DIR/.deps"
+    git clone --filter=blob:none "$POLYENGINE_REPO" "$DIOXUS_DIR/.deps/polyengine"
+fi
+if ! git -C "$DIOXUS_DIR/.deps/polyengine" cat-file -e "$POLYENGINE_REV^{commit}" 2>/dev/null; then
+    git -C "$DIOXUS_DIR/.deps/polyengine" fetch --filter=blob:none origin
+fi
+log "Pinning polyengine-dioxus's polyengine at ${POLYENGINE_REV}"
+git -C "$DIOXUS_DIR/.deps/polyengine" checkout --quiet --detach "$POLYENGINE_REV"
 
 if [ "${SIBLINGS_ONLY:-0}" = "1" ]; then
     log "Siblings pinned (SIBLINGS_ONLY=1); stopping before tools and builds"
@@ -187,6 +223,29 @@ EOF
         echo "wac already present: $(wac --version)"
     else
         binstall "wac-cli@${WAC_VERSION}"
+    fi
+
+    # The translator shim spikes/todomvc's build-time translate step needs
+    # (deno.json's @deltic/translator resolves into this same checkout).
+    # Cargo work, so it lives here rather than in the siblings phase above;
+    # mirrors polyengine-dioxus/justfile's `deps` recipe exactly (same env,
+    # same target, same output path) so a future upstream change is a diff
+    # against that recipe, not a divergent reimplementation. wasm32-unknown-
+    # unknown was already added above; polyengine carries no rust-toolchain
+    # of its own, so the shim builds with whatever toolchain is active here.
+    SHIM="$SIBLINGS_DIR/polyengine-dioxus/.deps/polyengine/translator/translator_shim.wasm"
+    log "Ensuring polyengine-dioxus's translator shim is built"
+    if [ -f "$SHIM" ]; then
+        echo "translator_shim.wasm already present: $SHIM"
+    else
+        (cd "$SIBLINGS_DIR/polyengine-dioxus/.deps/polyengine" && \
+            CARGO_PROFILE_RELEASE_OPT_LEVEL=z \
+            CARGO_PROFILE_RELEASE_LTO=fat \
+            CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+            CARGO_PROFILE_RELEASE_PANIC=abort \
+            CARGO_PROFILE_RELEASE_STRIP=symbols \
+            cargo build -p translator-shim --target wasm32-unknown-unknown --release && \
+            cp target/wasm32-unknown-unknown/release/translator_shim.wasm translator/translator_shim.wasm)
     fi
 fi
 

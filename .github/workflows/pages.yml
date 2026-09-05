@@ -69,6 +69,9 @@ jobs:
             examples/todomvc/guest
             providers/s3/panel
             providers/dropbox/panel
+            spikes/todomvc/guest
+            spikes/todomvc/guest-dioxus
+            spikes/todomvc/lab
           # No registry pruning: the sibling workspace sits outside the
           # repo, and its deps must survive the post-job save.
           cache-all-crates: true
@@ -107,14 +110,26 @@ jobs:
         working-directory: demo
         run: just pages
 
+      - name: Build the TodoMVC spike
+        # Writes into ../../docs/spike-todomvc (spikes/todomvc/justfile's
+        # `out`) — gitignored, generated fresh here same as docs/demo.
+        working-directory: spikes/todomvc
+        run: just build
+
       - name: Assemble the site
         # docs/ is the site root: docs/index.html is the only committed
-        # build; docs/demo is the one this workflow rebuilds.
+        # build; docs/demo and docs/spike-todomvc are the two this
+        # workflow rebuilds.
         run: |
           test -f docs/demo/engine.component.wasm
           test -f docs/demo/panel-dropbox.component.wasm
           test -f docs/demo/solo.html
           test -f docs/demo/solo-worker.js
+          test -f docs/spike-todomvc/index.html
+          test -f docs/spike-todomvc/frame-dioxus.html
+          test -f docs/spike-todomvc/frame.js
+          test -f docs/spike-todomvc/todomvc-dioxus.component.wasm
+          test -f docs/spike-todomvc/todomvc-dioxus.plan.json
           test -f docs/index.html
           du -sh docs
 

@@ -6,15 +6,20 @@ conversion-checkpoint artifact for [#16] (app execution model: no app JS),
 under the shape rules of [#15], running on [deltic].
 
 **Live demo (mobile-friendly):**
-https://polymorph-components.github.io/polymorph-apps/spike-todomvc/
+https://polymorph-components.github.io/polyvisor/spike-todomvc/
+([`?guest=dioxus`](https://polymorph-components.github.io/polyvisor/spike-todomvc/?guest=dioxus)
+for the re-targeted dioxus guest; its sandboxed frame document is served
+standalone at
+[`frame-dioxus.html`](https://polymorph-components.github.io/polyvisor/spike-todomvc/frame-dioxus.html)).
 
 **Scope.** Validates the wasm→DOM plumbing only: the WIT surface, the
 validated op protocol, and the event-record path. The permission linker and
 asset pipeline are deliberately left as seams; the worker/frame split is no
 longer one (both surfaces mount into a real sandboxed frame). Quarantined
 and delete-at-will, but no longer gate-less: see [Gates](#gates), two
-Playwright suites, both green. The built demo is committed at
-`docs/spike-todomvc/` (the repo's Pages root).
+Playwright suites, both green. The site is built by `.github/workflows/
+pages.yml` on every push to `main` (`cd spikes/todomvc && just build`,
+same as `docs/demo`) — nothing under `docs/spike-todomvc/` is committed.
 
 [#16]: https://github.com/polymorph-components/polyvisor/issues/16
 [#15]: https://github.com/polymorph-components/polyvisor/issues/15
@@ -84,7 +89,7 @@ Phase C). **These four are the `polyvisor:surface` guests' backends only**
 — the dioxus guest is a different world with one transport; see
 [Two surfaces, four guests](#two-surfaces-four-guests).
 
-**The equivalence harness** ([harness.html](https://polymorph-components.github.io/polymorph-apps/spike-todomvc/harness.html))
+**The equivalence harness** ([harness.html](https://polymorph-components.github.io/polyvisor/spike-todomvc/harness.html))
 makes "semantically equivalent" a checked property: the same guests run the
 same scripts on every backend — 15 TodoMVC steps (synthetic event records
 plus real DOM clicks) with full-DOM serialization compared stepwise
@@ -107,7 +112,7 @@ renders the same app — is covered by the demo spike's e2e suite
 (`spikes/demo/e2e`'s `frameProbe` and boot scenarios), not by this
 same-realm harness.
 
-**The churn bench** ([bench.html](https://polymorph-components.github.io/polymorph-apps/spike-todomvc/bench.html),
+**The churn bench** ([bench.html](https://polymorph-components.github.io/polyvisor/spike-todomvc/bench.html),
 `?n=` rows; li+span per row ≈ 6 surface calls) — Chromium, aarch64 linux,
 2026-08-16, n=5000 (30k surface calls in one invocation):
 
