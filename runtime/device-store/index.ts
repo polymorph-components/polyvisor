@@ -37,7 +37,8 @@ export type Posture = "seed" | "platform";
 
 /** Which unseal ceremony the picker should offer. The tag lives in the
  * index precisely so the picker can decide WITHOUT opening anything.
- * See seal.ts for what each rung actually buys. */
+ * See the device seal component's wit/world.wit for what each rung
+ * actually buys. */
 export type UnsealPolicy = "every-session" | "while-open" | "until-reseal" | "passkey";
 
 /** One row of the index. Every field here rests in the clear. */
@@ -185,7 +186,8 @@ export async function touchDevice(id: string): Promise<void> {
  * everything goes — so a refusal is a warning, never a failure of the
  * promotion.
  *
- * Promotion does not carry the DEK: sealing the device is seal.ts's
+ * Promotion does not carry the DEK: sealing the device is the seal
+ * component's
  * job, and the caller runs it around this call. A device whose row says
  * `t1` and which has no wrap yet is a legal intermediate state — the
  * next boot's unseal ceremony sees "no rung" and can ask again.

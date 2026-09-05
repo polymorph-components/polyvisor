@@ -39,14 +39,29 @@ relative path.
   is this module family's vocabulary.** The unsealed `index.ts` (what
   may exist before unseal, and the long list of what may never),
   `namespace.ts` (one IndexedDB database plus one OPFS directory per
-  device, strictly partitioned), `seal.ts` (the per-device DEK and the
-  KEK ladder's v1 rungs), `identity-keys.ts` (non-extractable signing
-  handles persisted per device, with validate-on-load — absorbed here
-  from the webcrypto port by the #391 ruling: storing a handle is a
-  browser capability, not a WebCrypto one), `sealed-fs.ts` (an OPFS
-  directory proxy that seals the engine's state root while the guest
-  sees plaintext), `locks.ts` (the device lock, the lease, and the T0
-  sweep) and `anchor.ts` (the tab's sessionStorage pointer).
+  device, strictly partitioned), `seal-records.ts` (the record shapes the
+  seal writes, the IndexedDB keys they rest under, the typed `SealError`,
+  and `getPrfEnrollment` — the one reader that needs no key),
+  `seal-component.ts` (the adapter over the DEVICE SEAL COMPONENT, which
+  is where the per-device DEK, the KEK ladder's v1 rungs, the PMSEALv1
+  file format and the non-extractable signing handles now live —
+  `device-seal/`, `polyvisor:device-seal@0.1.0`), `sealed-fs.ts` (an OPFS
+  directory proxy that seals the engine's state root while the guest sees
+  plaintext, calling the component for the bytes), `locks.ts` (the device
+  lock, the lease, and the T0 sweep) and `anchor.ts` (the tab's
+  sessionStorage pointer).
+
+  **The seal is a component** (`device-seal/wit/world.wit` is its
+  contract, and every doc comment in it is normative). What the boundary
+  buys is that THE UNSEALED DEK EXISTS NOWHERE IN JAVASCRIPT: the worker
+  holds a component and asks it to seal and open bytes, with no handle to
+  export. Its reach is its imports — it can spell five record kinds and
+  four key slots of ONE device's namespace, through the host-implemented
+  `namespace` interface seal-component.ts builds, and cannot name
+  another. The on-disk format is UNCHANGED, which is a requirement rather
+  than a convenience: `tests/devstore/fixtures/legacy-seal-v1.json` is a
+  device sealed by the pre-component TypeScript, and the matrix's
+  `legacy-unseal` row opens it through the component every run.
 
   **The worker host** sits on top of all of it and changes none of it:
   `worker.ts` is a SharedWorker ENTRY POINT — one worker per device, the
@@ -81,12 +96,15 @@ relative path.
     nothing in the device store writes one to storage.
   - **Platform posture is the default.** At attach the worker loads (or
     mints) the device's non-extractable Ed25519 pair from the namespace
-    (`identity-keys.ts`) and hands it to the engine through the
-    app-owned `polyvisor:engine/device-identity@0.1.0` import, built
-    with `SigningKey.fromCryptoKey`/`VerifyingKey.fromCryptoKey` off the
-    SAME `@polymorph/webcrypto` module `newEngine` builds the port's own
-    fragment from — module identity matters here, because a wrapper from
-    a second copy of the package is not one the port recognizes. So the
+    (the seal component's `identity` interface) and hands it to the
+    engine through the app-owned
+    `polyvisor:engine/device-identity@0.1.0` import. The pair arrives
+    ALREADY as `SigningKey`/`VerifyingKey`, because seal-component.ts
+    instantiates the seal with the SAME `@polymorph/webcrypto` module
+    `newEngine` builds the port's own fragment from — module identity
+    matters here, because a wrapper from a second copy of the package is
+    not one the port recognizes, and one class family for both
+    components is what makes the handoff a no-op. So the
     device's private key is never written into a checkpoint; a resumed
     device is the same device because the platform still holds its key.
     A checkpoint written in the older `seed` posture still resumes: the
@@ -125,13 +143,18 @@ example of that mapping so far.
 
 **Package-free** (only the platform and their own siblings, so they
 type-check under any embedder's config and cannot be mis-pinned):
-`index.ts`, `namespace.ts`, `names.ts`, `idb.ts`, `seal.ts`,
-`sealed-fs.ts`, `identity-keys.ts`, `locks.ts`, `anchor.ts` — and
-`rpc.ts`, whose only imports are types, which erase. `sealed-fs.ts`
-declares the OPFS handle interfaces `@polyengine/wasi/filesystem-web`
-consumes rather than importing them, which is what buys its place here.
+`index.ts`, `namespace.ts`, `names.ts`, `idb.ts`, `seal-records.ts`,
+`sealed-fs.ts`, `locks.ts`, `anchor.ts` — and `rpc.ts`, whose only
+imports are types, which erase. `sealed-fs.ts` declares the OPFS handle
+interfaces `@polyengine/wasi/filesystem-web` consumes rather than
+importing them, which is what buys its place here; it takes the sealing
+functions as a parameter for the same reason, so the proxy stays
+package-free while the bytes come from the component.
 
-**Needs the embedder pin**: `worker.ts` always did — hosting a device
+**Needs the embedder pin**: `seal-component.ts` does, and unavoidably —
+instantiating the seal means the polyengine embedder and the webcrypto
+port, so it is NOT re-exported from `mod.ts` (a consumer that only reads
+the index to render a picker still needs no pins). `worker.ts` always did — hosting a device
 means instantiating the engine, which is exactly why it is an entry
 point the embedder bundles rather than something `mod.ts` re-exports.
 `client.ts` joined it at 0.4.0, for one import: `fromCloneable`, which

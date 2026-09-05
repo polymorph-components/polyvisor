@@ -23,7 +23,7 @@
 //   * THE UNSEALED DEK. "Unsealed while the app is open anywhere" is
 //     exactly this global's lifetime; there is no extra machinery and
 //     there is deliberately no way to read the key back out (every
-//     handle seal.ts hands over is non-extractable).
+//     DEK is parked inside the seal component and never crosses).
 //   * one engine instance, mounted on the sealed state root, and the
 //     checkpoint cadence over it.
 //
@@ -78,36 +78,40 @@ import {
   normalizeOrigin,
 } from "../store-egress.ts";
 import { getSigningKey, makeSigner, type Signer } from "../keystore.ts";
-// THE SAME MODULE INSTANCE THE ENGINE'S OWN IMPORTS COME FROM. `newEngine`
-// builds the port's fragment with `webcryptoImports()` out of
-// `@polymorph/webcrypto-polyengine` (engine.ts:13), and these two statics
-// are exports of THAT module — so a handle minted here lands in the same
-// class family the port's own imports serve. Reaching for a second copy
-// of the package (a different specifier, an unpinned range) would mint
-// wrappers the port does not recognize, and the failure would arrive as
-// an unhelpful lowering error deep inside a call. The specifier is
-// spelled identically to engine.ts's on purpose; demo/deno.json maps it
-// once for the whole graph, which is that file's stated reason for
-// existing.
-import { SigningKey, VerifyingKey } from "@polymorph/webcrypto-polyengine";
+// THE MODULE-IDENTITY CONSTRAINT MOVED WITH THE KEYS. This file no longer
+// mints webcrypto wrappers at all: the device identity arrives from the
+// seal component ALREADY as `SigningKey`/`VerifyingKey`, because
+// seal-component.ts instantiates that component with the same
+// `webcryptoImports()` out of the same `@polymorph/webcrypto-polyengine`
+// specifier engine.ts:13 uses. That is what makes the handoff to the
+// engine's `device-identity` fragment a no-op rather than a conversion —
+// one class family, served to both components. demo/deno.json maps the
+// specifier once for the whole graph, which is that file's stated reason
+// for existing.
 import { getDevice } from "./index.ts";
-import { DEVICE_ENDPOINT_KEY, DEVICE_IDENTITY_KEY, loadOrMintIdentity } from "./identity-keys.ts";
 import { type DeviceNamespace, destroyNamespace, openNamespace } from "./namespace.ts";
 import {
-  createSealedDek,
-  enablePrf,
-  enableUntilReseal,
-  rekeyFromPlatform,
-  reseal as resealNamespace,
+  KEY_PASSPHRASE_WRAP,
+  KEY_PLATFORM_WRAP,
+  KEY_PRF_WRAP,
+  type PassphraseWrap,
+  type PlatformWrap,
+  type PrfWrap,
+  SEAL_STORE,
   SealError,
-  sealedDelete,
-  sealedGet,
-  sealedPut,
-  sealState,
-  unsealFromPlatform,
-  unsealWithPassphrase,
-  unsealWithPrf,
-} from "./seal.ts";
+  type SealState,
+} from "./seal-records.ts";
+// THE SEAL IS A COMPONENT (runtime/device-seal/). `openSeal` instantiates
+// it over THIS device's namespace and hands back the ladder, the sealed
+// KV/file surface and the device's signing handles. No DEK crosses back:
+// where this file used to hold a `CryptoKey` in `dek`, it holds `seal`
+// and asks it to spend the key it parked.
+import {
+  type DeviceSeal,
+  type IdentityPair,
+  openSeal,
+  sealArtifacts,
+} from "./seal-component.ts";
 import { sealedDirectory } from "./sealed-fs.ts";
 import {
   type DeviceLock,
@@ -296,14 +300,84 @@ async function takeLock(): Promise<void> {
 //                  `navigator.credentials` is window-only, so no code in
 //                  this global can assert a passkey. What arrives here
 //                  is the DERIVED KEK HANDLE (`UnsealOptions.prfKek`) —
-//                  non-extractable, validated in seal.ts before use.
+//                  non-extractable, validated by the seal before use.
 //                  The worker never sees the raw PRF output and never
 //                  persists the handle. device-store/passkey.ts is the
 //                  window half; PERSISTENCE.md's "The PRF rung: passkey
 //                  unseal" is the record.
 
-/** The unwrapped DEK, or null while sealed. THE WHOLE UNSEALED STATE. */
-let dek: CryptoKey | null = null;
+/**
+ * THE DEVICE SEAL — this device's component instance, and the whole
+ * unsealed state.
+ *
+ * WHAT REPLACED `dek`. This file used to hold the unwrapped DEK in a
+ * `CryptoKey` variable and hand it to two modules; the export ban in
+ * demo/scripts/check-invariants.sh (4) was what stood between that
+ * variable and the platform's own key-export verb. Now the DEK is
+ * parked INSIDE the component
+ * (world.wit:13-18) and this global holds only a handle to the thing
+ * that spends it: `seal.unsealed()` is the old `dek !== null`,
+ * `seal.forget()` is the old `dek = null`, and `seal.sealed.*` is what
+ * `sealedPut`/`sealedGet`/`sealedDirectory` used to be given the key
+ * for. There is no key here to export.
+ *
+ * Null until `attach`, which is where the artifacts to instantiate it
+ * arrive.
+ */
+let seal: DeviceSeal | null = null;
+
+/** The seal, or a refusal naming why there is none. Every ceremony below
+ * goes through this rather than through `seal!`: "no client has attached"
+ * and "the device is sealed" are different facts and a bare non-null
+ * assertion would collapse them into a TypeError. */
+function requireSeal(): DeviceSeal {
+  if (!seal) {
+    throw new SealError(
+      "no-rung",
+      "device-store: the host was never attached (no seal artifacts)",
+    );
+  }
+  return seal;
+}
+
+/** Whether this device is open — the successor to `dek !== null`, and
+ * synchronous as that test was (seal-component.ts's `unsealed()` carries
+ * the reason it can be). */
+const unsealed = (): boolean => seal !== null && seal.unsealed();
+
+/**
+ * WHICH RUNGS THIS DEVICE HAS, answerable BEFORE `attach`.
+ *
+ * CONTRACT: the component owns this question (`seal.state()`), and every
+ * ceremony below asks it that way. `status()` cannot, in one case: it is
+ * reachable on a raw port before any client has attached (see its own
+ * note), and `attach` is where the artifacts to instantiate the
+ * component arrive. Refusing there would turn a defensive path that used
+ * to answer into a throw.
+ *
+ * So the pre-attach arm reads the three record keys directly. It is the
+ * SAME three existence checks the component makes — `state()` does no
+ * shape validation either, deliberately, because the picker's question
+ * is "does a record exist" (component.rs's `state`) — plus the one
+ * `origin === "user"` rule, cited here rather than re-reasoned. Once a
+ * client has attached, the component answers and this arm is dead.
+ */
+async function sealRungs(): Promise<SealState> {
+  if (seal) return await seal.state();
+  const [p, k, r] = await Promise.all([
+    ns.get<PassphraseWrap>(SEAL_STORE, KEY_PASSPHRASE_WRAP),
+    ns.get<PlatformWrap>(SEAL_STORE, KEY_PLATFORM_WRAP),
+    ns.get<PrfWrap>(SEAL_STORE, KEY_PRF_WRAP),
+  ]);
+  return {
+    passphrase: p !== undefined,
+    // `origin` absent means `generated` — a door with no key
+    // (seal-records.ts's `PassphraseWrap.origin`).
+    userPassphrase: p !== undefined && p.origin === "user",
+    untilReseal: k !== undefined,
+    prf: r !== undefined,
+  };
+}
 
 /**
  * The engine and how it came up. `resumed` is `true` when
@@ -354,7 +428,7 @@ let destroyed = false;
  * not a race to lose.
  */
 async function unseal(opts: UnsealOptions = {}): Promise<DeviceStatus> {
-  if (dek) return await status();
+  if (unsealed()) return await status();
   const record = await getDevice(DEVICE_ID);
   if (!record) {
     // The degrade rule's storage half (PERSISTENCE.md, "T0 reload
@@ -366,7 +440,7 @@ async function unseal(opts: UnsealOptions = {}): Promise<DeviceStatus> {
     throw new SealError("no-rung", `device-store: no device ${DEVICE_ID} in the index`);
   }
 
-  const rungs = await sealState(ns);
+  const rungs = await requireSeal().state();
   // `!rungs.prf` IS A TRIPWIRE, not a reachable branch: every path that
   // writes a PRF wrap starts from a device that already has rungs. But
   // if a namespace ever DID hold only a PRF wrap, falling into
@@ -375,9 +449,9 @@ async function unseal(opts: UnsealOptions = {}): Promise<DeviceStatus> {
   // `already-sealed` refusal exists to prevent. Climb instead; the worst
   // a climb can do is refuse.
   if (!rungs.passphrase && !rungs.untilReseal && !rungs.prf) {
-    dek = await firstSeal(record.tier, opts);
+    await firstSeal(record.tier, opts);
   } else {
-    dek = await climbRung(record.unsealPolicy, rungs, opts);
+    await climbRung(record.unsealPolicy, rungs, opts);
   }
 
   // UNSEALING IS ATOMIC: KEY *AND* ENGINE, OR NEITHER.
@@ -404,7 +478,10 @@ async function unseal(opts: UnsealOptions = {}): Promise<DeviceStatus> {
   try {
     await bringUpEngine();
   } catch (e) {
-    dek = null;
+    // FORGET rather than merely dropping a reference: the DEK is parked
+    // inside the component now, so nulling a variable would leave the
+    // device open. `forget()` is what re-seals it.
+    await requireSeal().forget();
     engine = null;
     resumed = null;
     // THE GRANT GOES BACK TOO. `bringUpEngine` arms the grant BEFORE the
@@ -434,13 +511,13 @@ async function unseal(opts: UnsealOptions = {}): Promise<DeviceStatus> {
  * the point of the worker: the key is generated inside this global and
  * never leaves it.
  */
-async function firstSeal(tier: string, opts: UnsealOptions): Promise<CryptoKey> {
+async function firstSeal(tier: string, opts: UnsealOptions): Promise<void> {
   if (opts.passphrase !== undefined) {
-    const key = await createSealedDek(ns, opts.passphrase);
-    if (opts.untilReseal) await enableUntilReseal(ns, opts.passphrase);
-    return key;
+    await requireSeal().createSealedDek(opts.passphrase);
+    if (opts.untilReseal) await requireSeal().enableUntilReseal(opts.passphrase);
+    return;
   }
-  if (tier === "t0") return await sealT0(ns);
+  if (tier === "t0") return await sealT0();
   // A T1 device with no rung and no passphrase offered is the legal
   // intermediate state index.ts's `promoteDevice` documents ("a device
   // whose row says t1 and which has no wrap yet … the next boot's unseal
@@ -472,7 +549,7 @@ async function firstSeal(tier: string, opts: UnsealOptions): Promise<CryptoKey> 
  * enough to open a T0 device. It is also exactly as strong as what T0
  * promises, which is nothing durable.
  *
- * The implementation uses ONLY seal.ts's exported ceremonies rather than
+ * The implementation uses ONLY the seal's exported ceremonies rather than
  * duplicating its record layout: `enableUntilReseal` requires a
  * passphrase rung to re-wrap from, so one is minted from 32 random bytes
  * and then dropped on the floor. Nothing holds it, nothing persists it,
@@ -481,17 +558,16 @@ async function firstSeal(tier: string, opts: UnsealOptions): Promise<CryptoKey> 
  * able to open a T0 device with a passphrase is not a feature anyone
  * asked for; if it ever is, that is a promotion.)
  */
-async function sealT0(namespace: DeviceNamespace): Promise<CryptoKey> {
+async function sealT0(): Promise<void> {
   const throwaway = Array.from(
     crypto.getRandomValues(new Uint8Array(32)),
     (b) => b.toString(16).padStart(2, "0"),
   ).join("");
   // `generated`: nothing kept this passphrase and nothing can reproduce
-  // it, and the record says so — see seal.ts's `PassphraseWrap.origin`
+  // it, and the record says so — see seal-records.ts's `PassphraseWrap.origin`
   // and the reseal ceremony that consults it.
-  const key = await createSealedDek(namespace, throwaway, "generated");
-  await enableUntilReseal(namespace, throwaway);
-  return key;
+  await requireSeal().createSealedDek(throwaway, "generated");
+  await requireSeal().enableUntilReseal(throwaway);
 }
 
 /** Climb the rung the DEVICE RECORD names — never the one the caller
@@ -500,14 +576,14 @@ async function climbRung(
   policy: string,
   rungs: { passphrase: boolean; untilReseal: boolean; prf: boolean },
   opts: UnsealOptions,
-): Promise<CryptoKey> {
+): Promise<void> {
   // THE PASSKEY POLICY IS TRIED FIRST AND NEVER FALLS TO THE PLATFORM
   // WRAP. Promotion deleted that wrap precisely so this device asks; if
   // a stale one somehow survived, using it would open the device without
   // the ceremony the user chose — the `every-session` arm's
   // asked-to-be-asked rule, applied to the rung that replaced it.
   if (policy === "passkey") {
-    if (opts.prfKek) return await unsealWithPrf(ns, opts.prfKek);
+    if (opts.prfKek) return await requireSeal().unsealWithPrf(opts.prfKek);
     // The explicit fallback the design record allows: rungs are ADDITIVE,
     // so a device switched to passkey unseal on the this-device sheet may
     // still carry the user's own passphrase, and the picker offers "use
@@ -515,9 +591,9 @@ async function climbRung(
     // not a door — `rungs.passphrase` alone would let one through — so
     // the caller must have offered a passphrase AND the device must have
     // a passphrase rung for this to be tried at all; a wrong one refuses
-    // in seal.ts as it always does.
+    // in the seal as it always does.
     if (opts.passphrase !== undefined && rungs.passphrase) {
-      return await unsealWithPassphrase(ns, opts.passphrase);
+      return await requireSeal().unsealWithPassphrase(opts.passphrase);
     }
     throw new SealError(
       "no-rung",
@@ -528,7 +604,7 @@ async function climbRung(
     if (opts.passphrase === undefined) {
       throw new SealError("no-rung", "this device is opened with its passphrase, every session");
     }
-    return await unsealWithPassphrase(ns, opts.passphrase);
+    return await requireSeal().unsealWithPassphrase(opts.passphrase);
   }
   // `until-reseal` and `while-open` both try the persisted wrap first.
   // For `while-open` that is a degradation to be honest about: this
@@ -536,10 +612,11 @@ async function climbRung(
   // session it was "open for" has ended, and the only remaining doors
   // are the ones on disk.
   if (rungs.untilReseal) {
-    const auto = await unsealFromPlatform(ns);
-    if (auto) return auto;
+    if (await requireSeal().unsealFromPlatform()) return;
   }
-  if (opts.passphrase !== undefined) return await unsealWithPassphrase(ns, opts.passphrase);
+  if (opts.passphrase !== undefined) {
+    return await requireSeal().unsealWithPassphrase(opts.passphrase);
+  }
   throw new SealError(
     "no-rung",
     "this device's persisted wrap is gone (resealed?); it needs its passphrase",
@@ -578,19 +655,19 @@ async function climbRung(
  *
  * THE HONEST SENTENCE travels with the choice and belongs in the UI:
  * `until-reseal` is login convenience, not protection against someone
- * holding your profile. See `unseal` above and seal.ts's
+ * holding your profile. See `unseal` above and the seal's
  * `enableUntilReseal`.
  */
 async function promote(opts: PromoteOptions): Promise<DeviceStatus> {
-  if (!dek) throw new SealError("no-rung", "the device is sealed; open it before keeping it");
+  if (!unsealed()) throw new SealError("no-rung", "the device is sealed; open it before keeping it");
   if (opts.policy === "every-session") {
     if (opts.passphrase === undefined) {
       throw new SealError("no-rung", "this rung is the passphrase; the ceremony needs one");
     }
-    await rekeyFromPlatform(ns, opts.passphrase);
-    await resealNamespace(ns);
+    await requireSeal().rekeyFromPlatform(opts.passphrase);
+    await requireSeal().reseal();
   } else if (opts.policy === "until-reseal") {
-    const rungs = await sealState(ns);
+    const rungs = await requireSeal().state();
     if (!rungs.untilReseal) {
       if (opts.passphrase === undefined) {
         throw new SealError(
@@ -598,7 +675,7 @@ async function promote(opts: PromoteOptions): Promise<DeviceStatus> {
           "this device's platform wrap is gone (resealed?); re-arming it needs the passphrase",
         );
       }
-      await enableUntilReseal(ns, opts.passphrase);
+      await requireSeal().enableUntilReseal(opts.passphrase);
     }
   } else if (opts.policy === "passkey") {
     // The page has already run the enrollment ceremony (passkey.ts) and
@@ -612,18 +689,17 @@ async function promote(opts: PromoteOptions): Promise<DeviceStatus> {
       );
     }
     const { credentialId, transports, rpId, prfInput, hkdfSalt } = opts.prf;
-    await enablePrf(
-      ns,
+    await requireSeal().enablePrf(
       opts.prf.kek,
       { credentialId, transports, rpId, prfInput, hkdfSalt },
-      { passphrase: opts.passphrase },
+      opts.passphrase,
     );
     // THE PLATFORM DOOR SHUTS, for the `every-session` arm's reason
     // verbatim: a user who chose to be asked — here, asked for their
     // passkey — must not leave a door standing that skips the question.
     // `reseal()`'s durable half is exactly that deletion, and the PRF
-    // wrap just written survives it by design (seal.ts's `reseal`).
-    await resealNamespace(ns);
+    // wrap just written survives it by design (world.wit's `reseal`).
+    await requireSeal().reseal();
   } else {
     // `while-open` is the T0 rung and is not a thing to be promoted TO
     // (PERSISTENCE.md's ladder offers two rungs at the promotion
@@ -675,7 +751,7 @@ async function promote(opts: PromoteOptions): Promise<DeviceStatus> {
  * in-flight call still holds its own closure until it settles.
  */
 async function reseal(opts: ResealOptions = {}): Promise<DeviceStatus> {
-  const rungs = await sealState(ns);
+  const rungs = await requireSeal().state();
   // WHOSE PASSPHRASE RUNG IS IT? Not a question the index can answer:
   // its policy tag says which ceremony to OFFER, and a device may sit on
   // `until-reseal` and also have the user's own passphrase (that is what
@@ -697,7 +773,7 @@ async function reseal(opts: ResealOptions = {}): Promise<DeviceStatus> {
         "sealing this device means choosing what unseals it: this ceremony needs a passphrase",
       );
     }
-    await rekeyFromPlatform(ns, opts.passphrase);
+    await requireSeal().rekeyFromPlatform(opts.passphrase);
   }
   // THE FINAL CHECKPOINT, and it is the FALLIBLE HALF, taken first.
   //
@@ -759,8 +835,10 @@ async function reseal(opts: ResealOptions = {}): Promise<DeviceStatus> {
   // would leave exactly that state uncheckpointed.
   await syncFlushNow();
   if (engine !== null) await checkpoint();
-  await resealNamespace(ns);
-  dek = null;
+  await requireSeal().reseal();
+  // THE PARKED DEK GOES, not just a reference to it: the durable half is
+  // above, and this is the in-memory half the old `dek = null` was.
+  await requireSeal().forget();
   engine = null;
   resumed = null;
   // The timestamp goes too: a sealed device has no engine, and reporting
@@ -847,8 +925,8 @@ const STORE_BINDING_KEY = "storage";
 /** Read the binding out of the sealed namespace, or undefined if this
  * device has none. Propagates `SealError "tampered"` — see `readBinding`
  * callers. */
-async function readBinding(key: CryptoKey): Promise<StoreBinding | undefined> {
-  const bytes = await sealedGet(ns, key, STORE_BINDING_KEY);
+async function readBinding(): Promise<StoreBinding | undefined> {
+  const bytes = await requireSeal().sealed.get(STORE_BINDING_KEY);
   if (!bytes) return undefined;
   return JSON.parse(new TextDecoder().decode(bytes)) as StoreBinding;
 }
@@ -892,14 +970,14 @@ interface OauthRow {
   obtainedAt: number;
 }
 
-async function readOauth(key: CryptoKey): Promise<OauthRow | undefined> {
-  const bytes = await sealedGet(ns, key, OAUTH_KEY);
+async function readOauth(): Promise<OauthRow | undefined> {
+  const bytes = await requireSeal().sealed.get(OAUTH_KEY);
   if (!bytes) return undefined;
   return JSON.parse(new TextDecoder().decode(bytes)) as OauthRow;
 }
 
-async function writeOauth(key: CryptoKey, row: OauthRow): Promise<void> {
-  await sealedPut(ns, key, OAUTH_KEY, new TextEncoder().encode(JSON.stringify(row)));
+async function writeOauth(row: OauthRow): Promise<void> {
+  await requireSeal().sealed.put(OAUTH_KEY, new TextEncoder().encode(JSON.stringify(row)));
 }
 
 /**
@@ -932,7 +1010,7 @@ async function applyBinding(b: StoreBinding): Promise<string | null> {
   if (b.kind === "gdrive") {
     const origin = normalizeOrigin(b.apiBase);
     if (origin === null) return null;
-    const row = dek ? await readOauth(dek) : undefined;
+    const row = unsealed() ? await readOauth() : undefined;
     if (!row) {
       // No consent rests: leave the grant EMPTY. The device knows where
       // its store is and has no authority to reach it, which is the
@@ -1185,7 +1263,7 @@ async function oauthStart(spec: OauthStartSpec): Promise<OauthStartResult> {
   // A ceremony that succeeded on a sealed device would end holding
   // tokens with nowhere sealed to put them, so it refuses at the front
   // rather than at the seal.
-  if (!dek) {
+  if (!unsealed()) {
     throw new SealError("no-rung", "the device is sealed; open it before connecting an account");
   }
   const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)));
@@ -1221,7 +1299,7 @@ async function oauthStart(spec: OauthStartSpec): Promise<OauthStartResult> {
  * is still `bindStore`'s job: consent and commitment stay two acts.
  */
 async function oauthComplete(code: string, state: string): Promise<DeviceStatus> {
-  if (!dek) {
+  if (!unsealed()) {
     throw new SealError("no-rung", "the device is sealed; open it before connecting an account");
   }
   const pending = pendingCeremony;
@@ -1276,7 +1354,7 @@ async function oauthComplete(code: string, state: string): Promise<DeviceStatus>
   if (parsed.refresh_token) row.refresh = parsed.refresh_token;
   if (spec.clientSecret !== undefined) row.clientSecret = spec.clientSecret;
   if (spec.tokenUrl !== undefined) row.tokenUrl = spec.tokenUrl;
-  await writeOauth(dek, row);
+  await writeOauth(row);
   // The code was one-shot and is now spent; the verifier has nothing
   // left to be bound to.
   pendingCeremony = null;
@@ -1305,10 +1383,17 @@ async function oauthComplete(code: string, state: string): Promise<DeviceStatus>
  * actually issued one.
  */
 function onTokenRefreshed(token: string, refreshToken?: string): void {
-  const key = dek;
-  if (!key) return;
+  if (seal === null) return;
+  // THE GENERATION THIS REFRESH BELONGS TO, snapshotted SYNCHRONOUSLY
+  // — this function is called in the middle of a 401→refresh→retry and
+  // cannot await (see the header). A reseal, or a reseal and a fresh
+  // unseal, between here and the write below makes this row the wrong
+  // device-session's, and the counter is what says so: `unsealed()`
+  // alone could not, since it reads `true` at both ends of such a pair.
+  const generation = seal.epoch();
   void (async () => {
-    const row = await readOauth(key);
+    if (!unsealed()) return;
+    const row = await readOauth();
     if (!row) return;
     row.access = token;
     if (refreshToken) row.refresh = refreshToken;
@@ -1321,8 +1406,8 @@ function onTokenRefreshed(token: string, refreshToken?: string): void {
     // land on the other side of the delete. Nothing is lost by
     // skipping: the row is being deleted with the namespace, and the
     // token it describes belongs to a device that no longer exists.
-    if (destroyed) return;
-    await writeOauth(key, row);
+    if (destroyed || !unsealed() || requireSeal().epoch() !== generation) return;
+    await writeOauth(row);
   })().catch(() => {});
 }
 
@@ -1343,10 +1428,10 @@ function onTokenRefreshed(token: string, refreshToken?: string): void {
  * grant: a bearer must not outlive the consent it came from.
  */
 async function forgetOauth(): Promise<DeviceStatus> {
-  if (!dek) {
+  if (!unsealed()) {
     throw new SealError("no-rung", "the device is sealed; open it before disconnecting an account");
   }
-  const row = await readOauth(dek);
+  const row = await readOauth();
   if (row) {
     const revokeUrl = row.tokenUrl
       ? new URL("/revoke", row.tokenUrl).toString()
@@ -1359,7 +1444,7 @@ async function forgetOauth(): Promise<DeviceStatus> {
       });
     } catch { /* best-effort: see the doc comment */ }
   }
-  await sealedDelete(ns, OAUTH_KEY);
+  await requireSeal().sealed.delete(OAUTH_KEY);
   clearGrant();
   return await status();
 }
@@ -1381,10 +1466,10 @@ async function bindStore(binding: StoreBinding): Promise<DeviceStatus> {
   // Sealed means no DEK to seal the binding under and no engine to
   // re-point; the file's idiom for "open it first" is a `SealError
   // "no-rung"`, and clients already branch on that code.
-  if (!dek || !engine) {
+  if (!unsealed() || !engine) {
     throw new SealError("no-rung", "the device is sealed; open it before binding storage");
   }
-  const stored = await settleBinding(binding, dek);
+  const stored = await settleBinding(binding);
   // A THROW FROM HERE LEAVES THE BINDING SEALED AND THE GRANT ARMED
   // while the live instance still has no addressing — self-consistent
   // rather than half-open (the seams refuse or the engine does, and
@@ -1444,8 +1529,8 @@ function storeConfigOf(b: StoreBinding): StoreConfig {
  * but not the disk would come back unbound at the next unseal, which is
  * the confusing direction.
  */
-async function settleBinding(binding: StoreBinding, key: CryptoKey): Promise<StoreBinding> {
-  if (binding?.kind === "gdrive") return await settleGdrive(binding, key);
+async function settleBinding(binding: StoreBinding): Promise<StoreBinding> {
+  if (binding?.kind === "gdrive") return await settleGdrive(binding);
   if (binding?.kind !== "s3") {
     // The two arms this host binds are S3 and Google Drive. DROPBOX is
     // still parked for the worker and the reason is unchanged
@@ -1501,7 +1586,7 @@ async function settleBinding(binding: StoreBinding, key: CryptoKey): Promise<Sto
     bucket: binding.bucket,
     accessKey: binding.accessKey,
   };
-  await sealedPut(ns, key, STORE_BINDING_KEY, new TextEncoder().encode(JSON.stringify(stored)));
+  await requireSeal().sealed.put(STORE_BINDING_KEY, new TextEncoder().encode(JSON.stringify(stored)));
   await applyBinding(stored);
   return stored;
 }
@@ -1532,7 +1617,6 @@ async function settleBinding(binding: StoreBinding, key: CryptoKey): Promise<Sto
  */
 async function settleGdrive(
   binding: Extract<StoreBinding, { kind: "gdrive" }>,
-  key: CryptoKey,
 ): Promise<StoreBinding> {
   if (binding.root.trim() === "" || binding.clientId.trim() === "") {
     throw new StoreError("bad-destination", "a Drive binding needs a root folder and a client id");
@@ -1544,7 +1628,7 @@ async function settleGdrive(
       `the Drive API base is not a usable origin: ${binding.apiBase}`,
     );
   }
-  const row = await readOauth(key);
+  const row = await readOauth();
   if (!row) {
     throw new StoreError(
       "no-credential",
@@ -1580,7 +1664,7 @@ async function settleGdrive(
     clientId: binding.clientId,
     space: binding.space,
   };
-  await sealedPut(ns, key, STORE_BINDING_KEY, new TextEncoder().encode(JSON.stringify(stored)));
+  await requireSeal().sealed.put(STORE_BINDING_KEY, new TextEncoder().encode(JSON.stringify(stored)));
   await applyBinding(stored);
   return stored;
 }
@@ -1606,10 +1690,10 @@ async function settleGdrive(
  * ceremony a user asks for by name.
  */
 async function unbindStore(): Promise<DeviceStatus> {
-  if (!dek) {
+  if (!unsealed()) {
     throw new SealError("no-rung", "the device is sealed; open it before unbinding storage");
   }
-  await sealedDelete(ns, STORE_BINDING_KEY);
+  await requireSeal().sealed.delete(STORE_BINDING_KEY);
   clearGrant();
   return await status();
 }
@@ -1628,6 +1712,31 @@ async function fetchArtifacts(spec: AttachSpec["artifacts"]) {
     }),
   ]);
   return { envelope, bytes: new Uint8Array(bytes) };
+}
+
+/**
+ * THE SEAL COMPONENT'S ARTIFACTS, FETCHED BESIDE THE ENGINE'S.
+ *
+ * Same directory, by convention and by construction: both are copied
+ * into the served tree by the same build recipe, so the seal's plan and
+ * wasm are the engine's URLs with the filename swapped. Deriving them
+ * rather than adding two more fields to `AttachSpec` keeps the wire
+ * unchanged and makes it impossible for a client to point the seal and
+ * the engine at different builds.
+ */
+async function fetchSealArtifacts(spec: AttachSpec["artifacts"]) {
+  const beside = (name: string) => new URL(name, new URL(spec.wasmUrl, self.location.href));
+  const [envelope, bytes] = await Promise.all([
+    fetch(beside("device-seal.plan.json")).then((r) => {
+      if (!r.ok) throw new Error(`device-seal plan: HTTP ${r.status}`);
+      return r.text();
+    }),
+    fetch(beside("device-seal.component.wasm")).then((r) => {
+      if (!r.ok) throw new Error(`device-seal wasm: HTTP ${r.status}`);
+      return r.arrayBuffer();
+    }),
+  ]);
+  return sealArtifacts(envelope, new Uint8Array(bytes));
 }
 
 // --- the device identity (platform posture) ---------------------------------
@@ -1653,7 +1762,7 @@ async function fetchArtifacts(spec: AttachSpec["artifacts"]) {
  * The device's key pair, loaded ONCE per worker global.
  *
  * `loadOrMintIdentity` is already race-free and validate-on-load
- * (identity-keys.ts), so the caching here is about not paying an
+ * (the component's add-if-absent slot), so the caching here is about not paying an
  * IndexedDB round trip on every `deviceKeyPair()` call — the engine asks
  * at least once per instantiation and the answer cannot change while
  * this global lives.
@@ -1663,24 +1772,23 @@ async function fetchArtifacts(spec: AttachSpec["artifacts"]) {
  * which for a device host means "this device never opens again until you
  * close every tab".
  */
-let identityPair: Promise<CryptoKeyPair> | undefined;
+let identityPair: Promise<IdentityPair> | undefined;
 
 /**
  * The device's TRANSPORT key pair, cached on the same terms and for the
  * same reasons as the signing one above — and a genuinely separate pair
- * (identity-keys.ts's `DEVICE_ENDPOINT_KEY`, engine.wit's
+ * (the `device-endpoint` slot, engine.wit's
  * `endpoint-key-pair`): iroh's endpoint id is this key's public half,
  * and no key crosses between keyhive's signatures and iroh's handshake.
  */
-let endpointPair: Promise<CryptoKeyPair> | undefined;
+let endpointPair: Promise<IdentityPair> | undefined;
 
 /** Where the fresh-init agent id is recorded, in the unsealed `meta`
  * store beside the lease and the boot counter. */
 const AGENT_KEY = "agent";
 
-function devicePair(): Promise<CryptoKeyPair> {
-  identityPair ??= loadOrMintIdentity(ns, DEVICE_IDENTITY_KEY)
-    .then((r) => r.pair)
+function devicePair(): Promise<IdentityPair> {
+  identityPair ??= requireSeal().identity.loadOrMint("device-signing")
     .catch((e) => {
       identityPair = undefined;
       throw e;
@@ -1688,9 +1796,8 @@ function devicePair(): Promise<CryptoKeyPair> {
   return identityPair;
 }
 
-function endpointKey(): Promise<CryptoKeyPair> {
-  endpointPair ??= loadOrMintIdentity(ns, DEVICE_ENDPOINT_KEY)
-    .then((r) => r.pair)
+function endpointKey(): Promise<IdentityPair> {
+  endpointPair ??= requireSeal().identity.loadOrMint("device-endpoint")
     .catch((e) => {
       endpointPair = undefined;
       throw e;
@@ -1701,41 +1808,28 @@ function endpointKey(): Promise<CryptoKeyPair> {
 /**
  * Build the `device-identity` fragment for ONE engine instance.
  *
- * FRESH PER INSTANCE, and that is not incidental: the port's resource
- * classes carry per-instance registry identity (engine.ts's module
- * header, the polymorph-iroh host-deltic finding), so a `SigningKey`
- * wrapper minted for one instance must not be handed to another. What is
- * cached across instances is the `CryptoKeyPair` — plain platform
- * handles, which belong to no registry — and the wrappers are minted at
- * the moment the engine asks.
+ * THE PAIR ARRIVES AS THE PORT'S OWN WRAPPERS AND IS PASSED STRAIGHT
+ * THROUGH — no `fromCryptoKey` here any more, and that deletion is the
+ * point of the seam rather than a shortcut (world.wit:310-317). The seal
+ * component and the engine are served by the SAME host webcrypto module
+ * (seal-component.ts and engine.ts spell one specifier), so what
+ * `identity.load-or-mint` hands back is already a `SigningKey` of the
+ * class the engine's own imports serve. Laundering it back through a
+ * `CryptoKey` and re-minting would be a conversion between a class and
+ * itself.
  *
- * `fromCryptoKey` is the merged webcrypto#392 injection seam: it
- * launders the key, checks the type, algorithm and usages, and mints a
- * wrapper under the port's private token. The non-extractability rides
- * along untouched — the port never sees material either.
+ * The non-extractability rides along untouched: the private half was
+ * minted `extractable: false` inside the component and nothing on this
+ * path can read material either way.
  */
 function deviceIdentityFragment(): DeviceIdentityFragment {
   return {
-    deviceKeyPair: async () => {
-      const pair = await devicePair();
-      return [
-        SigningKey.fromCryptoKey(pair.privateKey),
-        VerifyingKey.fromCryptoKey(pair.publicKey),
-      ];
-    },
+    deviceKeyPair: async () => await devicePair(),
     // THE ENDPOINT ID SURVIVES THE RELOAD, which is the point: this
     // device's iroh address is derived from a key that lives in the
     // device namespace, so a peer that recorded the id can still dial it
-    // after both sides have been closed and reopened. Fresh wrappers per
-    // instance for the registry-identity reason in this function's
-    // header; the underlying `CryptoKeyPair` is the cached one.
-    endpointKeyPair: async () => {
-      const pair = await endpointKey();
-      return [
-        SigningKey.fromCryptoKey(pair.privateKey),
-        VerifyingKey.fromCryptoKey(pair.publicKey),
-      ];
-    },
+    // after both sides have been closed and reopened.
+    endpointKeyPair: async () => await endpointKey(),
   };
 }
 
@@ -1766,7 +1860,7 @@ async function bringUpEngine(restore?: RestorePlan): Promise<void> {
   if (engine) return;
   requireJspi();
   if (!attached) throw new Error("device-store: the host was never attached (no engine artifacts)");
-  if (!dek) throw new SealError("no-rung", "the device is sealed");
+  if (!unsealed()) throw new SealError("no-rung", "the device is sealed");
 
   const dir = await ns.directory();
   // THE BINDING IS READ AND APPLIED BEFORE THE ENGINE EXISTS, which is
@@ -1781,7 +1875,7 @@ async function bringUpEngine(restore?: RestorePlan): Promise<void> {
   // is right above us and will put the device back to sealed rather than
   // leave it half open, and a binding that has been altered underneath
   // the DEK is a finding worth surfacing at the ceremony that touched it.
-  const binding = await readBinding(dek);
+  const binding = await readBinding();
   if (binding) await applyBinding(binding);
   // The cast is the one engine.ts, sealed-fs.ts and the spike all
   // document: the DOM's `FileSystemDirectoryHandle` does not
@@ -1789,7 +1883,7 @@ async function bringUpEngine(restore?: RestorePlan): Promise<void> {
   // parameter form, `Uint8Array<ArrayBufferLike>` vs `ArrayBuffer`)
   // although the runtime shapes match exactly.
   // deno-lint-ignore no-explicit-any
-  const sealed = sealedDirectory(dir as any, dek);
+  const sealed = sealedDirectory(dir as any, requireSeal().sealed);
   const artifacts = await fetchArtifacts(attached.artifacts);
   const e = await newEngine(
     attached.label ?? `device-${DEVICE_ID.slice(0, 8)}`,
@@ -1992,20 +2086,20 @@ async function restorePrepare(opts: UnsealOptions = {}): Promise<DeviceStatus> {
     );
   }
   await refuseUnlessFresh();
-  if (!dek) {
+  if (!unsealed()) {
     const record = await getDevice(DEVICE_ID);
     if (!record) {
       throw new SealError("no-rung", `device-store: no device ${DEVICE_ID} in the index`);
     }
-    const rungs = await sealState(ns);
+    const rungs = await requireSeal().state();
     // A namespace with rungs has been sealed before, which means a DEK
     // was minted for it — and `refuseUnlessFresh` has already established
     // that no ENGINE state rests under it. Climbing rather than minting
     // a second one is `unseal`'s rule and its reason (a second DEK
     // silently orphans everything sealed under the first).
-    dek = (!rungs.passphrase && !rungs.untilReseal && !rungs.prf)
-      ? await firstSeal(record.tier, opts)
-      : await climbRung(record.unsealPolicy, rungs, opts);
+    await ((!rungs.passphrase && !rungs.untilReseal && !rungs.prf)
+      ? firstSeal(record.tier, opts)
+      : climbRung(record.unsealPolicy, rungs, opts));
   }
   return await status();
 }
@@ -2055,16 +2149,17 @@ async function restoreCeremony(spec: RestoreSpec): Promise<DeviceStatus> {
     );
   }
   await refuseUnlessFresh();
-  if (!dek) await restorePrepare(spec.unseal ?? {});
-  const key = dek;
-  if (!key) throw new SealError("no-rung", "the device is sealed; there is nothing to restore into");
+  if (!unsealed()) await restorePrepare(spec.unseal ?? {});
+  if (!unsealed()) {
+    throw new SealError("no-rung", "the device is sealed; there is nothing to restore into");
+  }
   const kit = spec.kit;
   try {
     // 1. THE DESTINATION, on `bindStore`'s terms and before anything is
     //    fetched. A missing escrow or a mismatched access key is a
     //    refusal HERE rather than a provider 403 in the middle of a
     //    ceremony that has already minted half a device.
-    const binding = await settleBinding(spec.binding, key);
+    const binding = await settleBinding(spec.binding);
     // 2-3. The engine, and the guest's restore inside it.
     try {
       await bringUpEngine({ binding, kit, deviceName: spec.deviceName });
@@ -2075,7 +2170,7 @@ async function restoreCeremony(spec: RestoreSpec): Promise<DeviceStatus> {
       // stays sealed in the namespace (the user entered it correctly and
       // a retry should not re-ask), but the grant goes: armed seams with
       // no engine are authority with nothing to authorize.
-      dek = null;
+      await requireSeal().forget();
       engine = null;
       resumed = null;
       clearGrant();
@@ -2561,13 +2656,15 @@ function hexOf(bytes: Uint8Array): string {
  *   * a client bucket op is in flight — defer, see `clientBucketOps`.
  */
 async function syncMayRun(): Promise<Engine | null> {
-  if (destroyed || dek === null || engine === null) return null;
+  if (destroyed || !unsealed() || engine === null) return null;
   if (clientBucketOps > 0) return null;
   const live = engine;
-  const key = dek;
+  // The generation this cycle belongs to — see `onTokenRefreshed` for
+  // why a bool cannot stand in for the old `dek` identity comparison.
+  const generation = requireSeal().epoch();
   let binding: StoreBinding | undefined;
   try {
-    binding = await readBinding(key);
+    binding = await readBinding();
   } catch {
     // A binding that will not open is `unseal`'s and `status()`'s
     // finding to report, not a background timer's to raise: those two
@@ -2578,7 +2675,9 @@ async function syncMayRun(): Promise<Engine | null> {
   if (!binding) return null;
   // The awaits above are suspension points; re-check that the device did
   // not seal underneath them.
-  if (destroyed || dek !== key || engine !== live) return null;
+  if (destroyed || !unsealed() || requireSeal().epoch() !== generation || engine !== live) {
+    return null;
+  }
   return live;
 }
 
@@ -2658,7 +2757,7 @@ async function pullUsDoc(
   let succeeded = 0;
   let failure: unknown | null = null;
   for (const sib of siblings) {
-    if (engine !== live || dek === null || destroyed) break;
+    if (engine !== live || !unsealed() || destroyed) break;
     attempted++;
     try {
       await live.driver.bucketPull(US_DOC, sib.agentId, undefined);
@@ -2751,7 +2850,7 @@ async function flushCycle(): Promise<void> {
     failure ??= e;
   }
   for (const part of parts) {
-    if (engine !== live || dek === null || destroyed) break;
+    if (engine !== live || !unsealed() || destroyed) break;
     try {
       await live.driver.bucketFlush(part.id);
     } catch (e) {
@@ -2824,7 +2923,7 @@ async function pullCycle(): Promise<void> {
   const parts = await syncScope(live);
   for (const part of parts ?? []) {
     for (const sib of siblings) {
-      if (engine !== live || dek === null || destroyed) break;
+      if (engine !== live || !unsealed() || destroyed) break;
       attempted++;
       try {
         // `pickup` is the LINK tier's standing capability and this is an
@@ -2855,7 +2954,7 @@ async function pullCycle(): Promise<void> {
  * already armed sooner.
  */
 function armFlush(delay: number, fromMutation: boolean): void {
-  if (dek === null || destroyed) return;
+  if (!unsealed() || destroyed) return;
   if (!fromMutation && flushTimer !== undefined) return;
   const now = Date.now();
   let due = now + delay;
@@ -2882,7 +2981,7 @@ function armFlush(delay: number, fromMutation: boolean): void {
 }
 
 function armPull(delay: number): void {
-  if (dek === null || destroyed) return;
+  if (!unsealed() || destroyed) return;
   if (pullTimer !== undefined) clearTimeout(pullTimer);
   pullTimer = setTimeout(() => {
     pullTimer = undefined;
@@ -2908,7 +3007,7 @@ function scheduleFlush(): void {
  * already-open device re-arm one timer, they do not start two loops.
  */
 function startSyncSchedule(): void {
-  if (dek === null || destroyed) return;
+  if (!unsealed() || destroyed) return;
   armPull(0);
 }
 
@@ -2932,7 +3031,7 @@ function startSyncSchedule(): void {
  * time — so 45 s later is both safe and sufficient.
  */
 function rearmSyncSchedule(): void {
-  if (dek === null || destroyed) return;
+  if (!unsealed() || destroyed) return;
   armPull(PULL_INTERVAL_MS);
 }
 
@@ -2993,7 +3092,7 @@ function syncFlushNow(): Promise<void> {
 /** `status()`'s sync half. Null while sealed or unbound, with the
  * cannot-know/has-no-opinion split rpc.ts documents. */
 function syncStatusOf(binding: StoreBinding | null): SyncStatus | null {
-  if (dek === null || binding === null) return null;
+  if (!unsealed() || binding === null) return null;
   return {
     lastFlush,
     lastPull,
@@ -3031,16 +3130,16 @@ async function status(): Promise<DeviceStatus> {
         `there is nothing to report on, and nothing here will recreate it`,
     );
   }
-  const rungs = await sealState(ns);
+  const rungs = await sealRungs();
   const policy = record?.unsealPolicy ?? "every-session";
   // Read once, reported below: `null` while sealed is UNREADABLE, not
   // absent (see the field's own note).
-  const gdriveRow = dek === null ? undefined : await readOauth(dek);
+  const gdriveRow = !unsealed() ? undefined : await readOauth();
   // Read once and used TWICE below — by `storage` and by `sync`, whose
   // null arms are the same two facts (sealed, or nothing bound). Two
   // reads could straddle a bind and report a destination beside a
   // "nothing is bound" sync record.
-  const binding = dek === null ? null : ((await readBinding(dek)) ?? null);
+  const binding = !unsealed() ? null : ((await readBinding()) ?? null);
   return {
     deviceId: DEVICE_ID,
     tier: record?.tier ?? "t0",
@@ -3052,7 +3151,7 @@ async function status(): Promise<DeviceStatus> {
     // engine the same question from the other side.
     agentId: (await ns.get<string>("meta", AGENT_KEY)) ?? null,
     policy,
-    sealed: dek === null,
+    sealed: !unsealed(),
     rungs,
     // What the picker needs in order to decide whether to render a
     // passphrase field: `every-session` always, and any other policy
@@ -3061,7 +3160,7 @@ async function status(): Promise<DeviceStatus> {
     // `unseal()` needs is that ceremony, not a passphrase. The picker
     // learns which to offer from `policy`; `rungs` tells it what else it
     // may offer beside it.
-    needsPassphrase: dek === null &&
+    needsPassphrase: !unsealed() &&
       (policy === "every-session" || (!rungs.untilReseal && !rungs.prf)),
     resumed,
     lastCheckpoint,
@@ -3155,6 +3254,14 @@ async function callHost(method: string, args: unknown[]): Promise<unknown> {
       // is a worse outcome than ignoring a redundant argument. They are
       // the same bytes in every real deployment.
       attached ??= spec;
+      // THE SEAL IS INSTANTIATED ONCE PER WORKER, HERE, because this is
+      // where the artifacts arrive — and BEFORE `takeLock()`, so a
+      // device whose seal cannot be built never starts a lease. Second
+      // and later attaches reuse the instance for `attached ??=`'s
+      // reason: re-pointing a live host at different bytes is worse than
+      // ignoring a redundant argument, and re-instantiating would drop a
+      // parked DEK on the floor and silently re-seal an open device.
+      seal ??= await openSeal(ns, await fetchSealArtifacts(spec.artifacts));
       await takeLock();
       return await status();
     }
@@ -3297,7 +3404,12 @@ async function callHost(method: string, args: unknown[]): Promise<unknown> {
       // until it settles. The identity promise goes too; its handles
       // live in the `identity` store, which is one of the things being
       // deleted.
-      dek = null;
+      // THE WHOLE COMPONENT GOES, not just the parked DEK: it closed
+      // over a namespace that is about to stop existing, so keeping the
+      // instance would keep a live handle onto deleted storage. Dropping
+      // it is what dropping the DEK handle used to be, one level up.
+      await seal?.forget();
+      seal = null;
       engine = null;
       resumed = null;
       lastCheckpoint = null;

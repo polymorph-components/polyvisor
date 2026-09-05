@@ -28,7 +28,7 @@
 
 import type { Driver, Tasks } from "../engine.ts";
 import type { Posture, Tier, UnsealPolicy } from "./index.ts";
-import type { PrfEnrollment } from "./seal.ts";
+import type { PrfEnrollment } from "./seal-records.ts";
 
 // --- how a rejection crosses -----------------------------------------------
 //
@@ -70,7 +70,7 @@ import type { PrfEnrollment } from "./seal.ts";
 // where the form crosses: a `WireFailure` lives for one `postMessage`
 // between two realms of ONE page load, running one bundle of one engine
 // version. Nothing here reaches IndexedDB, OPFS or the checkpoint —
-// sealed-fs.ts and seal.ts never see it. If a future change is tempted
+// sealed-fs.ts and the seal never see it. If a future change is tempted
 // to log one, cache one, or put one in a checkpoint: that is the line.
 
 /**
@@ -227,7 +227,7 @@ export function hostErrorOf(e: unknown, code?: string): HostError {
 //     there) — it is not a value squeezed through a hole.
 //   * BOTH ARE NON-EXTRACTABLE, so neither is a bearer secret in the way
 //     a passphrase string is: the receiver can ask the platform to
-//     unwrap with it and can do nothing else with it, and seal.ts
+//     unwrap with it and can do nothing else with it, and the seal
 //     validates that property on arrival rather than trusting it
 //     (`requirePrfKek`).
 //   * THE CEREMONY HAS NOWHERE ELSE TO RUN. `navigator.credentials` is
@@ -403,7 +403,7 @@ export interface UnsealOptions {
   /** The `every-session` rung's input, and the first-seal ceremony's.
    * Never persisted, never logged, never echoed back in `status()`. */
   passphrase?: string;
-  /** FIRST SEAL ONLY: also arm the `until-reseal` rung (seal.ts's
+  /** FIRST SEAL ONLY: also arm the `until-reseal` rung (the seal's
    * `enableUntilReseal`). Ignored on a device that already has rungs —
    * arming after the fact is a separate ceremony the UI owns. */
   untilReseal?: boolean;
@@ -415,7 +415,8 @@ export interface UnsealOptions {
    * It is one of the two CryptoKeys that cross this surface by design
    * (see the serialization-discipline note above); the ceremony cannot
    * run in the worker, because `navigator.credentials` is window-only.
-   * seal.ts validates the handle on arrival rather than trusting it.
+   * The seal component validates the handle on arrival rather than
+   * trusting it.
    * Never persisted by the worker, never logged, never echoed back in
    * `status()`.
    */
@@ -809,13 +810,13 @@ export interface DeviceStatus {
   /** True until an unseal succeeds, true again after `reseal()`. The
    * headline fact. */
   sealed: boolean;
-  /** Which rungs this device HAS (seal.ts's `sealState`) — the picker's
+  /** Which rungs this device HAS (the seal's `state`) — the picker's
    * question, answerable without opening anything. `userPassphrase` is
    * the one a reseal ceremony branches on: a passphrase rung EXISTS on
    * every sealed device, but only a `user` one is a door anybody can
    * walk through. `prf` needs no such companion bit — a passkey rung
    * only exists because a person enrolled a credential they hold, so it
-   * is always walkable (seal.ts's `PrfWrap`). */
+   * is always walkable (seal-records.ts's `PrfWrap`). */
   rungs: { passphrase: boolean; userPassphrase: boolean; untilReseal: boolean; prf: boolean };
   /** True when the next `unseal()` cannot succeed without one.
    *

@@ -1,0 +1,28 @@
+# The device seal component (wit/world.wit).
+
+# Build the component, validate it, and translate it to a polyengine plan.
+build:
+    cargo build --target wasm32-wasip2 --release
+    mkdir -p build
+    cp target/wasm32-wasip2/release/device_seal.wasm build/device-seal.component.wasm
+    wasm-tools validate --features component-model,cm-async build/device-seal.component.wasm
+    deno run --allow-read --allow-write --config ../../demo/deno.json \
+        ../tools/translate.ts build/device-seal.component.wasm build/device-seal.plan.json
+
+# The pure rules — the ladder's record validation and the PMSEALv1
+# layout — natively, with no platform in sight.
+test:
+    cargo test
+
+check:
+    cargo clippy --target wasm32-wasip2 --release -- -D warnings
+    cargo clippy --all-targets -- -D warnings
+
+# The contract. Read-only here: a defect in it is reported, not edited around.
+wit:
+    wasm-tools component wit wit/
+
+# What the artifact ACTUALLY imports — the authority on the component's
+# reach (world.wit:336-338), unused interfaces having been stripped.
+imports: build
+    wasm-tools component wit build/device-seal.component.wasm | rg '^\s*import'

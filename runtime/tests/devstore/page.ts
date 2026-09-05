@@ -57,14 +57,11 @@ import {
   clearAnchor,
   connectDevice,
   createDevice,
-  createSealedDek,
   type DeviceConnection,
-  DEVICE_IDENTITY_KEY,
   deviceLockIsHeld,
   type DeviceLock,
   type DeviceNamespace,
   destroyNamespace,
-  enableUntilReseal,
   ensureDevice,
   getAnchor,
   getDevice,
@@ -73,32 +70,22 @@ import {
   LEASE_STALE_MS,
   leaseIsStale,
   listDevices,
-  loadIdentity,
-  loadOrMintIdentity,
   namespaceExists,
   newDeviceId,
   nsDbName,
   type Posture,
   openNamespace,
-  persistIdentity,
   promoteDevice,
   readLease,
-  rekeyPassphrase,
   removeDevice,
-  reseal,
-  sealedGet,
   sealedPreopens,
-  sealedPut,
   SealError,
-  sealState,
   setAnchor,
   startLease,
   sweepT0,
   touchDevice,
   touchLease,
   type UnsealPolicy,
-  unsealFromPlatform,
-  unsealWithPassphrase,
 } from "../../device-store/mod.ts";
 // THE PRF RUNG'S WINDOW HALF (PERSISTENCE.md, "The PRF rung: passkey
 // unseal"). `passkey.ts` is imported ONLY here, never by worker.ts —
@@ -106,14 +93,69 @@ import {
 // governing note repeats the module's own: this is the split that
 // keeps the WebAuthn ceremony on the page.
 import { assertPasskey, enrollPasskey, prfCapability } from "../../device-store/passkey.ts";
-import { getPrfEnrollment } from "../../device-store/seal.ts";
+import { getPrfEnrollment } from "../../device-store/seal-records.ts";
+// THE SEAL AS A COMPONENT. Every row that used to call seal.ts's
+// ceremonies directly now opens one over its own namespace — which is
+// what the worker does, so these rows measure the same code path the
+// host does rather than a page-only shortcut. The page already carries
+// the whole engine graph (see this file's header), so `instantiate`, the
+// wasi batteries and the webcrypto port are all in hand.
+import {
+  type DeviceSeal,
+  openSeal,
+  sealArtifacts,
+} from "../../device-store/seal-component.ts";
+// The port's own resource classes, for `pairOf` below — the SAME module
+// the seal component's imports come from, which is what makes a pair it
+// minted readable here at all.
+import type { SigningKey, VerifyingKey } from "@polymorph/webcrypto-polyengine";
 
 // --- obviously-synthetic test values ---------------------------------------
 
 const PASS = "correct-horse-battery-staple-TEST";
 const PASS_WRONG = "definitely-not-the-passphrase-TEST";
 const PASS_NEW = "the-second-passphrase-TEST";
-const IDENTITY_ID = "device-signing";
+/** The two `identity-slot` cases the component serves — the same two
+ * strings the store was keyed by before the port (identity-keys.ts's
+ * `DEVICE_IDENTITY_KEY`/`DEVICE_ENDPOINT_KEY`), which is why the slot
+ * needs no translation table. */
+const IDENTITY_SLOT = "device-signing" as const;
+const ENDPOINT_SLOT = "device-endpoint" as const;
+
+// --- the on-disk compatibility fixture --------------------------------------
+//
+// THE PROOF THAT THE FORMAT SURVIVED THE PORT. A device sealed by the
+// OLD seal.ts (captured once, into fixtures/legacy-seal-v1.json) must
+// open through the COMPONENT. These four constants name what was
+// captured and what it must open back to; the `legacy-unseal` row loads
+// the fixture into a fresh namespace and asserts exactly that.
+//
+// The passphrase is `PASS` above — an obviously-synthetic labelled test
+// value, and the fixture's header field says so. Everything else the row
+// needs travels IN the fixture (the key it rests under, and the two
+// plaintexts), so nothing about the capture is restated here where it
+// could drift.
+
+/**
+ * The fixture as it crosses from the driver (which reads the JSON off
+ * disk) to this page. Byte fields are base64; the file's own header
+ * names what each one is.
+ */
+export interface LegacyFixture {
+  passphraseWrap: {
+    v: 1;
+    kdf: "PBKDF2-SHA-256";
+    iterations: number;
+    salt: string;
+    wrapped: string;
+    origin: "user" | "generated";
+  };
+  sealedKey: string;
+  sealedValue: { v: 1; iv: string; ct: string };
+  sealedFile: string;
+  kvPlaintext: string;
+  filePlaintext: string;
+}
 
 // --- small helpers ----------------------------------------------------------
 
@@ -153,6 +195,30 @@ function caught(
   };
 }
 
+/**
+ * Run `body` with `console.warn` captured, and hand back what it said.
+ *
+ * A SILENT DISCARD IS THE FAULT, not just a wrong return value: when the
+ * load path throws away a planted identity entry, the user's account
+ * depends on someone being able to see WHY they became a new device
+ * (identity-keys.ts's rule, carried into seal-component.ts's `warnOnce`).
+ * So the warning is asserted, not assumed.
+ */
+async function capturingWarnings<T>(
+  body: () => Promise<T>,
+): Promise<{ value: T; warnings: string[] }> {
+  const warnings: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map((a) => String(a)).join(" "));
+  };
+  try {
+    return { value: await body(), warnings };
+  } finally {
+    console.warn = original;
+  }
+}
+
 async function refuses(body: () => Promise<unknown>): Promise<
   { refused: boolean; error: ReturnType<typeof caught> | null }
 > {
@@ -184,6 +250,13 @@ const hexOf = (b: ArrayBuffer | Uint8Array): string =>
   Array.from(b instanceof Uint8Array ? b : new Uint8Array(b), (x) => x.toString(16).padStart(2, "0"))
     .join("");
 
+/** Byte fields travel to and from the JSON fixture as base64 — the one
+ * place bytes are written down, and they are the labelled synthetic
+ * fixture's. */
+const b64 = (b: Uint8Array): string => btoa(Array.from(b, (x) => String.fromCharCode(x)).join(""));
+const unb64 = (s: string): Uint8Array =>
+  Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
 // --- the wasi descriptor surface (the spike's Q2 pattern) -------------------
 
 interface Descriptor03Like {
@@ -208,9 +281,9 @@ interface Descriptor03Like {
  * spike's reason: the DOM handle types do not structurally satisfy the
  * published interfaces though the runtime shapes match exactly.
  */
-async function mountSealed(ns: DeviceNamespace, dek: CryptoKey): Promise<Descriptor03Like> {
+async function mountSealed(ns: DeviceNamespace, seal: DeviceSeal): Promise<Descriptor03Like> {
   const dir = await ns.directory();
-  const preopens = sealedPreopens(dek, {
+  const preopens = sealedPreopens(seal.sealed, {
     "/": dir as unknown as Parameters<typeof sealedPreopens>[1][string],
   });
   const fragment = filesystemWeb(
@@ -273,6 +346,36 @@ async function guestRead(root: Descriptor03Like, path: string): Promise<string> 
     at += p.length;
   }
   return dec.decode(out);
+}
+
+// --- the seal component, page-side -----------------------------------------
+
+/**
+ * THE SEAL ARTIFACTS, fetched from the served tree ONCE and shared by
+ * every row that opens one.
+ *
+ * The bytes are cached, the INSTANCE is not: each `sealFor` call
+ * instantiates a fresh component over its own namespace, which is what
+ * the worker does per device and what the boundary means — a component
+ * can spell one device's records and cannot name another.
+ */
+let sealSource: Promise<ReturnType<typeof sealArtifacts>> | undefined;
+function sealArtifactsOnce() {
+  sealSource ??= (async () => {
+    const [envelope, bytes] = await Promise.all([
+      fetch(new URL("./device-seal.plan.json", location.href)).then((r) => r.text()),
+      fetch(new URL("./device-seal.component.wasm", location.href)).then((r) =>
+        r.arrayBuffer()
+      ),
+    ]);
+    return sealArtifacts(envelope, new Uint8Array(bytes));
+  })();
+  return sealSource;
+}
+
+/** Open a seal over one device's namespace — the page's `openSeal`. */
+async function sealFor(ns: DeviceNamespace): Promise<DeviceSeal> {
+  return await openSeal(ns, await sealArtifactsOnce());
 }
 
 /** Read a device's file straight out of OPFS, with no wrapper anywhere
@@ -351,38 +454,119 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
   passphrase: async () => {
     const d = await createDevice({ petname: "sealed" });
     const ns = openNamespace(d.id);
-    const dek = await createSealedDek(ns, PASS);
-    const state = await sealState(ns);
+    const seal = await sealFor(ns);
+    await seal.createSealedDek(PASS);
+    const state = await seal.state();
 
-    // The DEK a caller may hold is not a bearer secret.
-    const dekExtractable = dek.extractable;
+    // NO DEK CROSSES AT ALL — the successor to the old row's
+    // "the handle you may hold is not a bearer secret". The component
+    // parks it; what the page can observe is only that it IS parked.
+    const parkedNotHanded = seal.unsealed();
 
-    // Round-trip through the sealed KV to prove the unsealed handle is
+    // Round-trip through the sealed KV to prove a re-opened seal spends
     // the SAME key, not merely a key.
-    await sealedPut(ns, dek, "probe", enc.encode("sealed-kv-payload-TEST"));
-    const reopened = await unsealWithPassphrase(ns, PASS);
-    const readBack = dec.decode((await sealedGet(ns, reopened, "probe"))!);
+    await seal.sealed.put("probe", enc.encode("sealed-kv-payload-TEST"));
+    const reopened = await sealFor(ns);
+    await reopened.unsealWithPassphrase(PASS);
+    const readBack = dec.decode((await reopened.sealed.get("probe"))!);
 
-    const wrong = await refuses(() => unsealWithPassphrase(ns, PASS_WRONG));
+    const wrong = await refuses(() => sealFor(ns).then((x) => x.unsealWithPassphrase(PASS_WRONG)));
 
     const saltBefore = await saltOf(ns);
-    await rekeyPassphrase(ns, PASS, PASS_NEW);
+    await seal.rekeyPassphrase(PASS, PASS_NEW);
     const saltAfter = await saltOf(ns);
-    const oldRefused = await refuses(() => unsealWithPassphrase(ns, PASS));
-    const withNew = await unsealWithPassphrase(ns, PASS_NEW);
-    const stillReadable = dec.decode((await sealedGet(ns, withNew, "probe"))!);
+    const oldRefused = await refuses(() =>
+      sealFor(ns).then((x) => x.unsealWithPassphrase(PASS))
+    );
+    const withNew = await sealFor(ns);
+    await withNew.unsealWithPassphrase(PASS_NEW);
+    const stillReadable = dec.decode((await withNew.sealed.get("probe"))!);
 
-    const secondMint = await refuses(() => createSealedDek(ns, PASS));
+    const secondMint = await refuses(() => seal.createSealedDek(PASS));
+
+    // A SEALED COMPONENT SPENDS NOTHING: `forget()` drops the parked DEK
+    // and the sealed surface refuses `no-rung`, which is what dropping
+    // the old `CryptoKey` handle bought implicitly.
+    await seal.forget();
+    const afterForget = await refuses(() => seal.sealed.get("probe"));
 
     return {
       state,
-      dekExtractable,
+      parkedNotHanded,
       readBack,
       wrong,
       saltRotated: saltBefore !== saltAfter && saltBefore.length === 32,
       oldRefused,
       stillReadable,
       secondMint,
+      forgotten: !seal.unsealed(),
+      afterForget,
+      cleanup: await cleanup([d.id]),
+    };
+  },
+
+  /**
+   * THE ON-DISK FORMAT SURVIVED THE PORT — the fixture row.
+   *
+   * A device sealed by the PRE-COMPONENT seal.ts was captured once, in a
+   * real browser, into fixtures/legacy-seal-v1.json (the file's own
+   * header says what each field is). This row loads those records
+   * VERBATIM into a fresh namespace and opens the device through the
+   * COMPONENT: the passphrase wrap must yield the DEK, the sealed KV
+   * record and the sealed FILE must both come back as the plaintexts the
+   * capture named, and a wrong passphrase must still refuse
+   * `wrong-passphrase`.
+   *
+   * IT FAILS IF EITHER SIDE DRIFTS, which is the point: a change to the
+   * record shapes (the host's codec) or to the ladder and the PMSEALv1
+   * framing (the component's) breaks it, and no reload row would.
+   */
+  "legacy-unseal": async (arg: { fixture: LegacyFixture }) => {
+    const f = arg.fixture;
+    const d = await createDevice({ petname: "legacy" });
+    const ns = openNamespace(d.id);
+
+    // The records, byte for byte as seal.ts wrote them.
+    await ns.put("seal", "wrap:passphrase", {
+      v: f.passphraseWrap.v,
+      kdf: f.passphraseWrap.kdf,
+      iterations: f.passphraseWrap.iterations,
+      salt: unb64(f.passphraseWrap.salt),
+      wrapped: unb64(f.passphraseWrap.wrapped),
+      origin: f.passphraseWrap.origin,
+    });
+    await ns.put("sealed", f.sealedKey, {
+      v: f.sealedValue.v,
+      iv: unb64(f.sealedValue.iv),
+      ct: unb64(f.sealedValue.ct),
+    });
+
+    const seal = await sealFor(ns);
+    // The rungs the fixture's records describe, read through the
+    // component before anything is opened.
+    const state = await seal.state();
+
+    await seal.unsealWithPassphrase(PASS);
+    const opened = seal.unsealed();
+
+    const kv = await seal.sealed.get(f.sealedKey);
+    const fileBytes = await seal.sealed.openFile(unb64(f.sealedFile));
+
+    // A WRONG PASSPHRASE STILL REFUSES, and with the same typed code the
+    // pre-port ladder used — the bit that says the refusal survived the
+    // port too, not just the success.
+    const wrong = await refuses(() =>
+      sealFor(ns).then((x) => x.unsealWithPassphrase(PASS_WRONG))
+    );
+
+    return {
+      state,
+      opened,
+      kv: kv ? dec.decode(kv) : null,
+      kvMatches: kv !== undefined && dec.decode(kv) === f.kvPlaintext,
+      file: dec.decode(fileBytes),
+      fileMatches: dec.decode(fileBytes) === f.filePlaintext,
+      wrong,
       cleanup: await cleanup([d.id]),
     };
   },
@@ -391,18 +575,19 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
   kv: async () => {
     const d = await createDevice({ petname: "kv" });
     const ns = openNamespace(d.id);
-    const dek = await createSealedDek(ns, PASS);
+    const seal = await sealFor(ns);
+    await seal.createSealedDek(PASS);
     const payload = "the-sealed-value-TEST";
-    await sealedPut(ns, dek, "blob", enc.encode(payload));
-    const round = dec.decode((await sealedGet(ns, dek, "blob"))!);
-    const absent = await sealedGet(ns, dek, "never-written");
+    await seal.sealed.put("blob", enc.encode(payload));
+    const round = dec.decode((await seal.sealed.get("blob"))!);
+    const absent = await seal.sealed.get("never-written");
 
     // FLIP ONE CIPHERTEXT BYTE. GCM's tag is what turns this into a
     // refusal instead of plausible garbage.
     const rec = await ns.get<{ v: 1; iv: Uint8Array; ct: Uint8Array }>("sealed", "blob");
     rec!.ct[0] ^= 0x01;
     await ns.put("sealed", "blob", rec);
-    const tampered = await refuses(() => sealedGet(ns, dek, "blob"));
+    const tampered = await refuses(() => seal.sealed.get("blob"));
 
     return {
       round,
@@ -412,80 +597,130 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
     };
   },
 
-  /** The identity library: mint, persist, and the two refusals.
-   * Returns the device id so the driver can reload and load it back. */
+  /**
+   * THE IDENTITY SLOTS: mint, load-or-mint's idempotence, and the race.
+   *
+   * The library moved into the component (world.wit's `identity`), so
+   * these are asked through a seal rather than of a loose module — and
+   * the store is keyed by SLOT now (`device-signing`, `device-endpoint`)
+   * rather than by an arbitrary string, which is what the WIT enum
+   * means. Returns the device id so the driver can reload and load back.
+   */
   "identity-mint": async () => {
     const d = await createDevice({ petname: "identity" });
     setAnchor(d.id);
     const ns = openNamespace(d.id);
-    const { pair, minted } = await loadOrMintIdentity(ns, IDENTITY_ID);
-    const again = await loadOrMintIdentity(ns, IDENTITY_ID);
+    const seal = await sealFor(ns);
 
-    // The race, exactly as two restored tabs run it.
-    const raceNs = openNamespace(d.id);
+    const before = await seal.identity.load(IDENTITY_SLOT);
+    const pair = await seal.identity.loadOrMint(IDENTITY_SLOT);
+    const again = await seal.identity.loadOrMint(IDENTITY_SLOT);
+
+    // THE RACE, exactly as two restored tabs run it — two components
+    // over one namespace, which is closer to the real thing than two
+    // calls on one instance: each has its own handle table, and the
+    // add-if-absent slot is the only thing making them agree.
+    const [ra, rb] = await Promise.all([sealFor(ns), sealFor(ns)]);
     const [x, y] = await Promise.all([
-      loadOrMintIdentity(raceNs, "raced"),
-      loadOrMintIdentity(raceNs, "raced"),
+      ra.identity.loadOrMint(ENDPOINT_SLOT),
+      rb.identity.loadOrMint(ENDPOINT_SLOT),
     ]);
     // ONE key, not two: a signature made under one caller's handle
     // verifies under the other caller's public half. (Comparing handles
-    // by identity would not prove it — two loads of one stored entry
-    // are two JS objects.)
-    const raceSame = await verify(y.pair, await sign(x.pair, "cross-verify-TEST"), "cross-verify-TEST");
-    const raceMintedCount = [x.minted, y.minted].filter(Boolean).length;
+    // by identity would not prove it — two loads of one stored entry are
+    // two JS objects.)
+    const raceSame = await verify(
+      pairOf(y),
+      await sign(pairOf(x), "cross-verify-TEST"),
+      "cross-verify-TEST",
+    );
 
-    // An EXTRACTABLE key is refused at the door.
-    const loose = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]) as CryptoKeyPair;
-    const extractableRefused = await refuses(() => persistIdentity(ns, "loose", loose));
+    // THE TWO SLOTS ARE GENUINELY DIFFERENT KEYS (engine.wit's ruling:
+    // no cross-protocol reuse between keyhive's signatures and iroh's
+    // handshake).
+    const slotsDiffer = hexOf(await rawPublic(pairOf(pair))) !==
+      hexOf(await rawPublic(pairOf(x)));
 
     return {
       id: d.id,
-      minted,
-      secondCallMinted: again.minted,
-      extractable: pair.privateKey.extractable,
-      publicKey: hexOf(await rawPublic(pair)),
-      signed: await verify(pair, await sign(pair, "identity-probe-TEST"), "identity-probe-TEST"),
+      mintedOnFirstAsk: before === undefined,
+      publicKey: hexOf(await rawPublic(pairOf(pair))),
+      // Load-or-mint is idempotent: the second ask returns the STORED
+      // pair, not a fresh mint.
+      secondAskSameKey: hexOf(await rawPublic(pairOf(pair))) ===
+        hexOf(await rawPublic(pairOf(again))),
+      extractable: pairOf(pair).privateKey.extractable,
+      signed: await verify(
+        pairOf(pair),
+        await sign(pairOf(pair), "identity-probe-TEST"),
+        "identity-probe-TEST",
+      ),
       raceSame,
-      raceMintedCount,
-      extractableRefused,
+      slotsDiffer,
     };
   },
 
   /** After a REAL reload: the handle comes back and still signs, and a
-   * planted junk entry is discarded rather than handed out. */
+   * planted junk entry reads as absent rather than being handed out. */
   "identity-after": async (arg: { id: string }) => {
     const ns = openNamespace(arg.id);
-    const loaded = await loadIdentity(ns, IDENTITY_ID);
+    const seal = await sealFor(ns);
+    const loaded = await seal.identity.load(IDENTITY_SLOT);
     const signed = loaded
-      ? await verify(loaded, await sign(loaded, "identity-probe-TEST"), "identity-probe-TEST")
+      ? await verify(
+        pairOf(loaded),
+        await sign(pairOf(loaded), "identity-probe-TEST"),
+        "identity-probe-TEST",
+      )
       : false;
 
     // PLANTED JUNK: anything on this origin can write to IndexedDB, so
     // the load path treats an entry as untrusted input. Two plants — a
     // value that is not a key pair at all, and an EXTRACTABLE pair,
-    // which is the one that would matter.
-    await ns.put("identity", "junk", { privateKey: "not a key", publicKey: 42 });
-    const junk = await loadIdentity(ns, "junk");
-    const junkDiscarded = (await ns.get("identity", "junk")) === undefined;
+    // which is the one that would matter. VALIDATE-ON-LOAD IS THE
+    // HOST'S, and `usableIdentity` IN FULL rather than `fromCryptoKey`
+    // alone, which never looks at `extractable` (world.wit:136-153): a
+    // stored value that is not a usable key of the right kind reads as
+    // `none`, and the host says so on the console.
+    await ns.put("identity", ENDPOINT_SLOT, { privateKey: "not a key", publicKey: 42 });
+    const junkSeal = await sealFor(ns);
+    const junk = await junkSeal.identity.load(ENDPOINT_SLOT);
 
+    // THE PLANT GOES IN THROUGH `ns.put`, BYPASSING THE CODEC — which is
+    // the point: an attacker with origin access writes the store
+    // directly, so the entry never passed the check that would have
+    // refused it on the way in. It must still not be adopted on the way
+    // out, and the discard must be VISIBLE.
     const loose = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]) as CryptoKeyPair;
-    await ns.put("identity", "planted", loose);
-    const planted = await loadIdentity(ns, "planted");
-    const plantedDiscarded = (await ns.get("identity", "planted")) === undefined;
+    await ns.put("identity", ENDPOINT_SLOT, loose);
+    const plantedSeal = await sealFor(ns);
+    const plantedLoad = await capturingWarnings(() => plantedSeal.identity.load(ENDPOINT_SLOT));
+    const planted = plantedLoad.value;
+    const plantedWarned = plantedLoad.warnings.some((w) => w.includes(ENDPOINT_SLOT));
 
-    // And after a discard, load-or-mint gives a REAL key rather than
-    // looping against the plant.
-    const after = await loadOrMintIdentity(ns, "planted");
+    // And after a plant, load-or-mint gives a REAL key rather than
+    // looping against it — the add-if-absent slot replaces an unusable
+    // entry in the same transaction.
+    const after = await plantedSeal.identity.loadOrMint(ENDPOINT_SLOT);
+    const remintedNonExtractable = pairOf(after).privateKey.extractable === false;
+    const plantedReplaced = hexOf(await rawPublic(pairOf(after))) !==
+      hexOf(await rawPublic(loose));
+
+    // The slot can be forgotten, and then it is genuinely gone.
+    await plantedSeal.identity.delete(ENDPOINT_SLOT);
+    const afterDelete = await (await sealFor(ns)).identity.load(ENDPOINT_SLOT);
 
     return {
-      loadedAfterReload: loaded !== null,
-      publicKey: loaded ? hexOf(await rawPublic(loaded)) : "",
+      loadedAfterReload: loaded !== undefined,
+      publicKey: loaded ? hexOf(await rawPublic(pairOf(loaded))) : "",
       signed,
-      junkRejected: junk === null,
-      junkDiscarded,
-      plantedRejected: planted === null,
-      plantedDiscarded,
-      remintedNonExtractable: after.minted && after.pair.privateKey.extractable === false,
+      junkRejected: junk === undefined,
+      plantedRejected: planted === undefined,
+      plantedWarned,
+      plantedWarning: plantedLoad.warnings.find((w) => w.includes(ENDPOINT_SLOT))?.slice(0, 160) ?? "",
+      remintedNonExtractable,
+      plantedReplaced,
+      deleted: afterDelete === undefined,
       cleanup: await cleanup([arg.id]),
     };
   },
@@ -494,36 +729,37 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
   "platform-arm": async () => {
     const d = await createDevice({ petname: "convenient" });
     const ns = openNamespace(d.id);
-    const dek = await createSealedDek(ns, PASS);
-    await sealedPut(ns, dek, "note", enc.encode("survives-the-reload-TEST"));
-    await enableUntilReseal(ns, PASS);
-    return { id: d.id, state: await sealState(ns) };
+    const seal = await sealFor(ns);
+    await seal.createSealedDek(PASS);
+    await seal.sealed.put("note", enc.encode("survives-the-reload-TEST"));
+    await seal.enableUntilReseal(PASS);
+    return { id: d.id, state: await seal.state() };
   },
 
   /** After a REAL reload: auto-unseal with NO passphrase. Then reseal,
    * and prove the passphrase is required again. */
   "platform-after": async (arg: { id: string }) => {
     const ns = openNamespace(arg.id);
-    const auto = await unsealFromPlatform(ns);
-    const read = auto ? dec.decode((await sealedGet(ns, auto, "note"))!) : "";
-    const autoExtractable = auto?.extractable ?? null;
+    const seal = await sealFor(ns);
+    const auto = await seal.unsealFromPlatform();
+    const read = auto ? dec.decode((await seal.sealed.get("note"))!) : "";
 
-    await reseal(ns);
-    const afterReseal = await unsealFromPlatform(ns);
-    const state = await sealState(ns);
+    await seal.reseal();
+    await seal.forget();
+    const afterSeal = await sealFor(ns);
+    const afterReseal = await afterSeal.unsealFromPlatform();
+    const state = await afterSeal.state();
     // The handle went too, not just the wrap.
     const handleGone = (await ns.get("seal", "kek:platform")) === undefined;
     // The passphrase rung is untouched — it is the only thing that can
     // open the device after a reseal.
-    const stillOpens = dec.decode(
-      (await sealedGet(ns, await unsealWithPassphrase(ns, PASS), "note"))!,
-    );
+    await afterSeal.unsealWithPassphrase(PASS);
+    const stillOpens = dec.decode((await afterSeal.sealed.get("note"))!);
 
     return {
-      autoUnsealed: auto !== null,
-      autoExtractable,
+      autoUnsealed: auto,
       read,
-      afterResealIsNull: afterReseal === null,
+      afterResealIsNull: afterReseal === false,
       state,
       handleGone,
       stillOpens,
@@ -535,8 +771,9 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
   "fs-write": async (arg: { marker: string }) => {
     const d = await createDevice({ petname: "filesystem" });
     const ns = openNamespace(d.id);
-    const dek = await createSealedDek(ns, PASS);
-    const root = await mountSealed(ns, dek);
+    const seal = await sealFor(ns);
+    await seal.createSealedDek(PASS);
+    const root = await mountSealed(ns, seal);
     const text = `checkpoint plaintext ${arg.marker} end`;
     await guestWrite(root, "checkpoint.bin", text);
     // Read it back through a FRESH descriptor before the reload, so a
@@ -550,17 +787,22 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
    * and look at what actually rests on disk. */
   "fs-after": async (arg: { id: string; marker: string; wrote: string }) => {
     const ns = openNamespace(arg.id);
-    const dek = await unsealWithPassphrase(ns, PASS);
-    const root = await mountSealed(ns, dek);
+    const seal = await sealFor(ns);
+    await seal.unsealWithPassphrase(PASS);
+    const root = await mountSealed(ns, seal);
     const readBack = await guestRead(root, "checkpoint.bin");
 
     // A DIFFERENT DEK is the "someone else's device key" case, and it
-    // must fail the way a filesystem fails, not by trapping.
-    const other = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
-      "encrypt",
-      "decrypt",
-    ]) as CryptoKey;
-    const otherRoot = await mountSealed(ns, other);
+    // must fail the way a filesystem fails, not by trapping. ANOTHER
+    // DEVICE'S SEAL is how that is spelled now: a second namespace with
+    // its own minted DEK, asked to open this device's file. (A loose
+    // AES-GCM key cannot stand in any more — no key crosses the
+    // boundary, which is the point of the port.)
+    const otherDevice = await createDevice({ petname: "another-device" });
+    const otherNs = openNamespace(otherDevice.id);
+    const otherSeal = await sealFor(otherNs);
+    await otherSeal.createSealedDek(PASS_NEW);
+    const otherRoot = await mountSealed(ns, otherSeal);
     const wrongKey = await refuses(() => guestRead(otherRoot, "checkpoint.bin"));
 
     // THE BYTES ON DISK. The marker is a string the guest wrote; if it
@@ -583,7 +825,7 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
       plaintextOnDisk: rawText.includes("checkpoint plaintext"),
       magic,
       second,
-      cleanup: await cleanup([arg.id]),
+      cleanup: await cleanup([arg.id, otherDevice.id]),
     };
   },
 
@@ -1160,7 +1402,7 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
   /**
    * PLANT A RIVAL IDENTITY in the device's namespace — a DIFFERENT but
    * perfectly valid non-extractable Ed25519 pair, exactly the shape
-   * `loadOrMintIdentity` would hand back.
+   * `identity.load-or-mint` would hand back.
    *
    * This is the wrong-device / corrupt-namespace case made reproducible.
    * The engine records the agent id in the checkpoint manifest, so the
@@ -1172,20 +1414,23 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
    */
   "hc-plant-identity": async (arg: { id: string }) => {
     const ns = openNamespace(arg.id);
-    const before = await loadIdentity(ns, DEVICE_IDENTITY_KEY);
+    const before = await ns.get<CryptoKeyPair>("identity", IDENTITY_SLOT);
     const rival = await crypto.subtle.generateKey("Ed25519", false, [
       "sign",
       "verify",
     ]) as CryptoKeyPair;
-    await persistIdentity(ns, DEVICE_IDENTITY_KEY, rival);
-    const after = await loadIdentity(ns, DEVICE_IDENTITY_KEY);
+    // Written straight into the slot: the plant IS the corrupt-namespace
+    // case, so it goes in the way an attacker's would rather than through
+    // a ceremony that would refuse it.
+    await ns.put("identity", IDENTITY_SLOT, rival);
+    const after = await ns.get<CryptoKeyPair>("identity", IDENTITY_SLOT);
     return {
-      hadOne: before !== null,
-      planted: after !== null,
+      hadOne: before !== undefined,
+      planted: after !== undefined,
       // The rival is a real one: non-extractable, like every key this
       // store will accept.
       rivalExtractable: rival.privateKey.extractable,
-      different: before !== null && after !== null &&
+      different: before !== undefined && after !== undefined &&
         (await rawPublic(before)).byteLength > 0 &&
         hexOf(await rawPublic(before)) !== hexOf(await rawPublic(after)),
     };
@@ -1200,7 +1445,7 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
    */
   "hc-identity-at-rest": async (arg: { id: string }) => {
     const ns = openNamespace(arg.id);
-    const stored = await ns.get<CryptoKeyPair>("identity", DEVICE_IDENTITY_KEY);
+    const stored = await ns.get<CryptoKeyPair>("identity", IDENTITY_SLOT);
     if (!stored) return { present: false };
     let exportRefused = false;
     try {
@@ -1685,13 +1930,15 @@ const ops: Record<string, (arg: never) => Promise<unknown>> = {
    * PLANT A PLATFORM WRAP beside a passkey device's PRF wrap — the
    * adversarial arm of the asked-to-be-asked ruling. Promotion to
    * `passkey` deletes the platform wrap; this puts one BACK (through
-   * seal.ts's own `enableUntilReseal`, which is exactly how a stale one
+   * the seal's own `enableUntilReseal`, which is exactly how a stale one
    * could exist), so the gate can assert that a `passkey`-policy unseal
    * still refuses to walk it silently (worker.ts's `climbRung`: the
    * passkey arm never falls to the platform wrap).
    */
   "pk-plant-platform": async (arg: { id: string; passphrase: string }) => {
-    await enableUntilReseal(openNamespace(arg.id), arg.passphrase);
+    const ns = openNamespace(arg.id);
+    const seal = await sealFor(ns);
+    await seal.enableUntilReseal(arg.passphrase);
     return { planted: true };
   },
 
@@ -2613,6 +2860,15 @@ async function saltOf(ns: DeviceNamespace): Promise<string> {
   const rec = await ns.get<{ salt: Uint8Array }>("seal", "wrap:passphrase");
   return hexOf(rec!.salt);
 }
+
+/** A component-minted pair as the plain platform handles the signing
+ * helpers below take. `toCryptoKey()` is the port's own extraction seam
+ * (webcrypto#391); it launders the handle and preserves
+ * non-extractability, so this reads the pair without reading material. */
+const pairOf = (pair: [SigningKey, VerifyingKey]): CryptoKeyPair => ({
+  privateKey: pair[0].toCryptoKey(),
+  publicKey: pair[1].toCryptoKey(),
+});
 
 const sign = async (pair: CryptoKeyPair, msg: string) =>
   new Uint8Array(await crypto.subtle.sign("Ed25519", pair.privateKey, enc.encode(msg) as BufferSource));

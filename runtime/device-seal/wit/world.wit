@@ -1,0 +1,400 @@
+/// THE DEVICE SEAL AS A COMPONENT.
+///
+/// This world is the per-device sealing layer of runtime/device-store —
+/// `seal.ts` (the DEK and the KEK ladder), `sealed-fs.ts`'s per-file
+/// sealing, and `identity-keys.ts` (the device's signing handles) — moved
+/// out of TypeScript and behind a component boundary. The governing design
+/// record is runtime/PERSISTENCE.md ("Sealing", "The PRF rung"); its
+/// vocabulary is this file's vocabulary, and where this file and seal.ts
+/// disagree on a rule, PERSISTENCE.md decides.
+///
+/// WHAT THE BOUNDARY BUYS, stated plainly so it can be checked:
+///
+/// - THE UNSEALED DEK EXISTS NOWHERE IN JAVASCRIPT. Today the worker holds
+///   a `CryptoKey` in a variable and hands it to two modules; the grep in
+///   demo/scripts/check-invariants.sh (d) is what stands between that
+///   variable and `exportKey`. Here the DEK is a resource inside this
+///   component. The worker holds a component and asks it to seal and open
+///   bytes; it has no handle to export.
+/// - THE COMPONENT'S REACH IS ITS IMPORTS. It can spell five record kinds
+///   and four key slots of ONE device's namespace, and nothing else: not
+///   another device's database, not the index, not `localStorage`. The
+///   engine composite already has this property; the seal did not.
+/// - THE LADDER'S RULES ARE NATIVELY TESTABLE. "absent origin means
+///   generated", "a PRF rung is always reachable", "reseal keeps the PRF
+///   wrap", the PMSEALv1 header — today these are asserted only by a
+///   49-row browser matrix. Here they are `cargo test`.
+///
+/// WHAT IT DOES NOT CHANGE: the WebCrypto operations are the platform's,
+/// reached through `polymorph:webcrypto`. PBKDF2 costs what it costs;
+/// `extractable: false` is still the platform's own flag; a persisted
+/// handle is still a structured-cloned `CryptoKey` in IndexedDB. The
+/// component decides WHICH operations happen and WHO holds the results;
+/// the platform still performs them.
+///
+/// ON-DISK FORMAT: UNCHANGED, and this is a requirement, not a convenience.
+/// Every record below mirrors a structured-clone shape seal.ts already
+/// writes (field for field, absent-means-default rules preserved), and
+/// the `namespace` import is TYPED PER RECORD so the host's codec is a
+/// field mapping with no decisions in it. A device sealed by seal.ts
+/// yesterday unseals through this component today; the matrix's reload
+/// rows and a captured fixture gate it.
+package polyvisor:device-seal@0.1.0;
+
+/// Shared vocabulary. Functionless — no host implementation.
+interface types {
+    /// Why the sealing layer refused, as a closed set (seal.ts
+    /// `SealError.code`). The unseal ceremony branches on these.
+    enum seal-code {
+        /// The passphrase did not open the wrap. Indistinguishable by
+        /// construction from "wrong wrap record".
+        wrong-passphrase,
+        /// The passkey-derived KEK did not open the PRF wrap — a wrong
+        /// credential, a wrong PRF input, or a record copied in from
+        /// another device (the HKDF `info` binds the device id).
+        wrong-passkey,
+        /// The device has no rung of the kind asked for.
+        no-rung,
+        /// A second mint was refused: this device already has a DEK, and
+        /// a second one would silently orphan every byte under the first.
+        already-sealed,
+        /// Stored bytes that did not authenticate — GCM's tag, AES-KW's
+        /// integrity check, or a record that failed shape validation.
+        /// "Nothing stored" and "stored and altered" are different facts.
+        tampered,
+        /// A request the layer refuses on principle: an empty
+        /// passphrase, a KEK handle with the wrong shape, a platform
+        /// operation that declined.
+        unsupported,
+    }
+
+    /// A refusal from the sealing layer (seal.ts `SealError`): the code a
+    /// caller branches on, and THE SENTENCE THE VISOR SHOWS. The sentence
+    /// is the component's — seal.ts had eleven distinct ones ("an empty
+    /// passphrase cannot seal a device", "this device has no platform
+    /// rung to re-key from", …) and the sheets render them, so the
+    /// component that knows which refusal it is states it, in framework
+    /// voice. Never a key, never user-typed text.
+    record seal-error {
+        code: seal-code,
+        message: string,
+    }
+
+    /// WHETHER ANYBODY KNOWS A PASSPHRASE (seal.ts `PassphraseWrap.origin`).
+    /// `user` — a person chose it. `generated` — minted from random bytes
+    /// and dropped on the floor, which is how a T0 device is sealed with
+    /// no ceremony. The reseal-upgrade guard consults this bit before
+    /// deleting the platform wrap.
+    enum passphrase-origin { user, generated }
+
+    /// Which rungs this device HAS — the picker's question, asked without
+    /// opening anything (seal.ts `SealState`).
+    record seal-state {
+        /// A passphrase rung EXISTS. Says nothing about reachability.
+        passphrase: bool,
+        /// A passphrase rung exists AND a person chose it.
+        user-passphrase: bool,
+        /// Auto-unseals from the platform key until reseal.
+        until-reseal: bool,
+        /// A passkey rung exists. Always reachable by the authenticator's
+        /// holder — a PRF rung has no `origin` because it cannot be a
+        /// door with no key.
+        prf: bool,
+    }
+
+    /// What the PAGE hands the worker beside the KEK at enrollment, and
+    /// reads back to run an unseal assertion: the ceremony half of the
+    /// PRF wrap, minus the wrapped bytes (seal.ts `PrfEnrollment`).
+    record prf-enrollment {
+        credential-id: list<u8>,
+        transports: list<string>,
+        rp-id: string,
+        /// The 32 bytes handed to the PRF extension as `eval.first`.
+        prf-input: list<u8>,
+        /// HKDF's salt, 32 bytes.
+        hkdf-salt: list<u8>,
+    }
+
+    /// Which persisted signing identity (identity-keys.ts's two ids).
+    enum identity-slot {
+        /// `device-signing`: the device's keyhive signing identity.
+        device-signing,
+        /// `device-endpoint`: the iroh endpoint key pair.
+        device-endpoint,
+    }
+}
+
+/// THE DEVICE'S NAMESPACE, as the component may see it: one device's
+/// `seal`, `sealed` and `identity` stores, typed per record kind.
+///
+/// The host implements this over `DeviceNamespace` (namespace.ts) for ONE
+/// device. There is no `device-id` parameter anywhere in this interface:
+/// which device is decided at instantiation, by which namespace the host
+/// closed over, and the component cannot name another.
+///
+/// RECORD SHAPES ARE seal.ts's, FIELD FOR FIELD. The host's job per
+/// function is a structured-clone object ↔ record mapping and nothing
+/// else — no defaults applied, no validation, no decisions. An absent
+/// optional field crosses as `none`; the component owns the rule for what
+/// `none` means (e.g. `origin: none` reads as `generated`).
+///
+/// KEY HANDLES cross as `polymorph:webcrypto` resources, bridged by the
+/// #391 persistence seam: the host calls `toCryptoKey()` on the resource it
+/// receives and structured-clones the `CryptoKey` into IndexedDB
+/// (non-extractability preserved); on read it calls `fromCryptoKey`.
+///
+/// VALIDATE-ON-LOAD IS THE HOST'S, and `fromCryptoKey` is NOT all of it.
+/// `fromCryptoKey` refuses the wrong type, algorithm and usages; it does
+/// not look at `extractable`. The host's usability predicate for an
+/// identity entry is identity-keys.ts `usableIdentity`, in full: both
+/// halves are `CryptoKey`s of the right type and algorithm, the private
+/// half has `extractable === false` and `sign`, the public half `verify`.
+/// It lives on the host because `put-identity`'s add-if-absent
+/// transaction has to apply it to the entry it finds — a transaction
+/// cannot call back into the component — and a stored entry that fails
+/// it is DISCARDED there and replaced by the caller's pair, with a
+/// console warning (identity-keys.ts `loadOrMintIdentity`: "the
+/// planted-junk case ends with a real key rather than a loop"). The
+/// component still checks `extractable()` on every pair it receives and
+/// refuses one that is extractable, so a host that gets the predicate
+/// wrong fails loudly rather than adopting a readable key.
+///
+/// A stored value that is not a usable key of the right kind reads as
+/// `none`, and the host says so on the console.
+interface namespace {
+    use types.{passphrase-origin, identity-slot};
+    use polymorph:webcrypto/key-wrap@0.1.0.{kw-key};
+    use polymorph:webcrypto/signature@0.1.0.{signing-key, verifying-key};
+
+    /// `seal` store, key `wrap:passphrase` (seal.ts `PassphraseWrap`).
+    record passphrase-wrap {
+        /// PBKDF2-SHA-256 iteration count, RECORDED so a later floor
+        /// does not orphan existing devices.
+        iterations: u32,
+        /// 16 bytes, fresh per wrap.
+        salt: list<u8>,
+        /// The DEK, AES-KW-wrapped under the derived KEK.
+        wrapped: list<u8>,
+        /// Absent in records seal.ts wrote before the bit existed.
+        origin: option<passphrase-origin>,
+    }
+
+    /// `seal` store, key `wrap:platform` (seal.ts `PlatformWrap`). The
+    /// wrapping key is the handle at `platform-kek`.
+    record platform-wrap {
+        wrapped: list<u8>,
+    }
+
+    /// `seal` store, key `wrap:prf` (seal.ts `PrfWrap`). `kdf` is fixed
+    /// at `prf-hkdf-sha-256` by this version; the host refuses to map a
+    /// record with another tag (reads as `none`).
+    record prf-wrap {
+        credential-id: list<u8>,
+        transports: list<string>,
+        rp-id: string,
+        prf-input: list<u8>,
+        hkdf-salt: list<u8>,
+        wrapped: list<u8>,
+    }
+
+    /// `sealed` store, any key (seal.ts `SealedValue`): AES-GCM under the
+    /// DEK with the key string as additional data.
+    record sealed-value {
+        /// 12 bytes.
+        iv: list<u8>,
+        ct: list<u8>,
+    }
+
+    get-passphrase-wrap: async func() -> option<passphrase-wrap>;
+    put-passphrase-wrap: async func(rec: passphrase-wrap);
+    get-platform-wrap: async func() -> option<platform-wrap>;
+    put-platform-wrap: async func(rec: platform-wrap);
+    delete-platform-wrap: async func();
+    get-prf-wrap: async func() -> option<prf-wrap>;
+    put-prf-wrap: async func(rec: prf-wrap);
+
+    /// `seal` store, key `kek:platform`: the non-extractable AES-KW
+    /// platform key, as a handle. `put` stores `toCryptoKey()`.
+    get-platform-kek: async func() -> option<kw-key>;
+    put-platform-kek: async func(key: borrow<kw-key>);
+    delete-platform-kek: async func();
+
+    get-sealed: async func(key: string) -> option<sealed-value>;
+    put-sealed: async func(key: string, rec: sealed-value);
+    delete-sealed: async func(key: string);
+
+    /// `identity` store, keyed by slot. RACE-FREE FIRST MINT
+    /// (identity-keys.ts): `put-identity` is ADD-IF-ABSENT and returns
+    /// what is stored afterwards — the caller's pair if it won, the
+    /// earlier winner's if it lost. Two workers racing to mint agree on
+    /// one identity. An entry found in the transaction that fails the
+    /// usability predicate above counts as ABSENT: it is deleted and the
+    /// caller's pair is stored.
+    get-identity: async func(slot: identity-slot) -> option<tuple<signing-key, verifying-key>>;
+    put-identity: async func(slot: identity-slot, signing: borrow<signing-key>, verifying: borrow<verifying-key>) -> tuple<signing-key, verifying-key>;
+    delete-identity: async func(slot: identity-slot);
+}
+
+/// THE KEK LADDER AND THE DEK — seal.ts's export surface, with one change
+/// of shape: NO FUNCTION RETURNS A DEK. Where seal.ts handed back a
+/// non-extractable `CryptoKey` for the worker to hold, this interface
+/// parks it inside the component (`unsealed()` says whether one is
+/// parked) and the `sealed` interface spends it. Dropping the component
+/// re-seals the device, exactly as dropping the handle did.
+///
+/// Each function's rules are seal.ts's, cited by name. Two are worth
+/// restating because they are the ones a port gets wrong:
+///
+/// - THE DEK IS BORN EXTRACTABLE AND PARKED NON-EXTRACTABLE. `wrapKey`
+///   needs an extractable key, so the mint and every re-wrap unwrap the
+///   DEK extractable for the length of the ceremony and then re-unwrap
+///   it `extractable: false` for holding (seal.ts `wrappableDek`). The
+///   parked handle is never the wrappable one.
+/// - THE SINGLE WRITE LANDS AFTER EVERY FALLIBLE STEP. A ceremony that
+///   fails part-way leaves the namespace exactly as it was.
+interface seal {
+    use types.{seal-error, seal-state, passphrase-origin, prf-enrollment};
+    use polymorph:webcrypto/key-wrap@0.1.0.{kw-key};
+
+    state: async func() -> seal-state;
+    /// Whether a DEK is parked in this component.
+    ///
+    /// ON polyengine HOSTS EVERY EXPORT IS PROMISE-SHAPED, this one
+    /// included (embedder-api.md, "Exports are uniformly Promise-shaped");
+    /// a host reading it as a synchronous boolean gets a truthy Promise
+    /// and an always-unsealed device. A host with synchronous call sites
+    /// mirrors the parked bit itself from the five paths that change it
+    /// (the four `unseal-*`/`create-sealed-dek` successes and `forget`).
+    unsealed: func() -> bool;
+    /// Drop the parked DEK. The device is sealed as far as this
+    /// component is concerned; the namespace is untouched.
+    forget: func();
+
+    /// Mint the DEK and seal it under a passphrase — the `every-session`
+    /// rung (seal.ts `createSealedDek`). Refuses `already-sealed` rather
+    /// than replacing; refuses an empty passphrase as `unsupported`.
+    /// Parks the DEK on success.
+    create-sealed-dek: async func(passphrase: string, origin: passphrase-origin) -> result<_, seal-error>;
+    /// THE LOGIN (seal.ts `unsealWithPassphrase`). Parks the DEK.
+    unseal-with-passphrase: async func(passphrase: string) -> result<_, seal-error>;
+    /// Re-wrap under a new passphrase; the salt rotates, the DEK does not
+    /// (seal.ts `rekeyPassphrase`). Marks the rung `user`.
+    rekey-passphrase: async func(old: string, new: string) -> result<_, seal-error>;
+    /// Arm `until-reseal`: mint a non-extractable platform AES-KW key,
+    /// wrap the DEK under it, store both (seal.ts `enableUntilReseal`).
+    /// ADDITIVE — the passphrase rung stays.
+    enable-until-reseal: async func(passphrase: string) -> result<_, seal-error>;
+    /// Give a platform-rung device a passphrase it did not have (seal.ts
+    /// `rekeyFromPlatform`): authorised by the platform wrap.
+    rekey-from-platform: async func(new: string) -> result<_, seal-error>;
+    /// Open from the platform wrap. `ok(false)` when the device has no
+    /// platform rung — the normal case, not an error (seal.ts
+    /// `unsealFromPlatform` returning null). Parks the DEK on `ok(true)`.
+    unseal-from-platform: async func() -> result<bool, seal-error>;
+
+    /// The PRF rung's ceremony half, for the page's assertion (seal.ts
+    /// `getPrfEnrollment`).
+    get-prf-enrollment: async func() -> result<option<prf-enrollment>, seal-error>;
+    /// Enrol a passkey rung (seal.ts `enablePrf`). `kek` is the KEK the
+    /// PAGE derived from the PRF output — the derivation stays on the
+    /// page by PERSISTENCE.md's ruling, since `navigator.credentials` is
+    /// window-only; it enters here as a non-extractable AES-KW handle.
+    /// Authorised by the platform wrap when one exists, else by
+    /// `passphrase`. Writes nothing until the wrap is in hand. Refuses a
+    /// `kek` that is extractable or lacks wrap+unwrap as `unsupported`.
+    enable-prf: async func(kek: kw-key, enrollment: prf-enrollment, passphrase: option<string>) -> result<_, seal-error>;
+    /// Open with the page-derived KEK (seal.ts `unsealWithPrf`). Parks
+    /// the DEK. A malformed record is `tampered`; the right record and
+    /// the wrong key is `wrong-passkey`.
+    unseal-with-prf: async func(kek: kw-key) -> result<_, seal-error>;
+
+    /// Delete the platform wrap and its key (seal.ts `reseal`). The PRF
+    /// wrap and the passphrase wrap SURVIVE — an assertion per unseal is
+    /// the PRF rung's whole point.
+    reseal: async func();
+}
+
+/// SPENDING THE PARKED DEK. Every function refuses with `no-rung` when
+/// nothing is parked — the component is sealed.
+interface sealed {
+    use types.{seal-error};
+
+    /// The sealed key/value surface (seal.ts `sealedPut`/`sealedGet`/
+    /// `sealedDelete`): AES-GCM, fresh 12-byte IV per write, the key
+    /// string as additional data. A present value that does not open is
+    /// `tampered`, never `none`.
+    put: async func(key: string, bytes: list<u8>) -> result<_, seal-error>;
+    get: async func(key: string) -> result<option<list<u8>>, seal-error>;
+    delete: async func(key: string) -> result<_, seal-error>;
+
+    /// Per-file sealing for the OPFS proxy (sealed-fs.ts): whole-file
+    /// AES-GCM. Layout: `PMSEALv1` magic (8 bytes) ‖ IV (12, fresh per
+    /// write) ‖ ciphertext ‖ tag. The additional data is THE MAGIC ONLY
+    /// (sealed-fs.ts:127-131) — not the header; the IV is authenticated
+    /// by GCM's own use of it. Byte-compatible with files sealed-fs.ts
+    /// has already written, which is the requirement. The host's
+    /// directory proxy calls these on every read and write and does
+    /// nothing else cryptographic. Sealing an EMPTY plaintext still costs
+    /// a full header and tag (sealed-fs.ts:139-147 has no empty case);
+    /// only a zero-length file — one created and never written — opens
+    /// as empty without a header (sealed-fs.ts's read side).
+    seal-file: async func(plaintext: list<u8>) -> result<list<u8>, seal-error>;
+    /// A file that is present but does not open — bad magic, short
+    /// header, GCM failure — is `tampered`.
+    open-file: async func(sealed: list<u8>) -> result<list<u8>, seal-error>;
+}
+
+/// THE DEVICE'S SIGNING HANDLES (identity-keys.ts), posture `platform`:
+/// non-extractable Ed25519, minted by the platform, persisted as handles
+/// through the namespace's add-if-absent slot, never passphrase-derived.
+///
+/// The worker receives the pair as `polymorph:webcrypto` resources and
+/// builds the engine's `device-identity` fragment from them directly —
+/// the SAME host module serves both components, which is what makes the
+/// handoff a no-op (worker.ts's `fromCryptoKey` note).
+interface identity {
+    use types.{seal-error, identity-slot};
+    use polymorph:webcrypto/signature@0.1.0.{signing-key, verifying-key};
+
+    /// Load the slot's pair, or mint one and store it add-if-absent
+    /// (identity-keys.ts `loadOrMintIdentity`). What comes back is what
+    /// is STORED, which under a race may be another minter's pair. A
+    /// pair whose signing half reports `extractable()` is refused as
+    /// `unsupported` whichever door it came through — see `namespace`.
+    load-or-mint: async func(slot: identity-slot) -> result<tuple<signing-key, verifying-key>, seal-error>;
+    /// The slot's pair if one is stored and usable; `none` otherwise
+    /// (identity-keys.ts `loadIdentity`).
+    load: async func(slot: identity-slot) -> result<option<tuple<signing-key, verifying-key>>, seal-error>;
+    delete: async func(slot: identity-slot) -> result<_, seal-error>;
+}
+
+world device-seal {
+    /// Salts, IVs, the generated passphrase: the platform's CSPRNG, never
+    /// an in-guest generator. `@polyengine/wasi` serves it.
+    import wasi:random/random@0.2.0;
+
+    /// The platform's WebCrypto, by primitive. Only what the ladder
+    /// calls: PBKDF2 and HKDF (derive-input minting), AES-KW (the KEKs),
+    /// AES-GCM (the DEK), Ed25519 (identity). Unused interfaces are
+    /// dropped from the artifact by the linker; `wasm-tools component
+    /// wit` on the build is the authority for what is actually imported.
+    import polymorph:webcrypto/derivation@0.1.0;
+    import polymorph:webcrypto/pbkdf2@0.1.0;
+    import polymorph:webcrypto/pbkdf2-sha2@0.1.0;
+    import polymorph:webcrypto/hkdf@0.1.0;
+    import polymorph:webcrypto/hkdf-sha2@0.1.0;
+    import polymorph:webcrypto/wrapping@0.1.0;
+    import polymorph:webcrypto/key-wrap@0.1.0;
+    import polymorph:webcrypto/aes-kw@0.1.0;
+    import polymorph:webcrypto/aead@0.1.0;
+    import polymorph:webcrypto/aes-gcm@0.1.0;
+    import polymorph:webcrypto/signature@0.1.0;
+    import polymorph:webcrypto/ed25519-sign@0.1.0;
+    import polymorph:webcrypto/ed25519-verify@0.1.0;
+
+    import namespace;
+
+    export seal;
+    export sealed;
+    export identity;
+}

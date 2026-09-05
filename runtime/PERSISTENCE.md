@@ -149,6 +149,20 @@ engine, and same-browser multi-device is just two workers.
 
 ## Sealing
 
+**Where the seal lives (2026-09-05): in a component.** The DEK, the KEK
+ladder, the PMSEALv1 file format and the signing-handle mint/validate
+described below are implemented in `runtime/device-seal/` — a wasm
+component (`polyvisor:device-seal@0.1.0`, contract `wit/world.wit`)
+reaching WebCrypto through `polymorph:webcrypto`, instantiated by the
+worker beside the engine. Nothing in this section's RULES changed; what
+changed is who holds the results: the unsealed DEK is a resource inside
+the component and no JavaScript variable, the component's reach is the
+one device namespace its `namespace` import closed over, and the wrap
+records are byte-identical (`tests/devstore/fixtures/legacy-seal-v1.json`
+is a pre-component device the matrix opens every run). The PRF
+derivation stays on the page as ruled below; the derived KEK enters the
+component as a non-extractable `kw-key`.
+
 Two protected classes, deliberately split:
 
 **Bulk state** — keyhive archive, checkpoint blobs, us-doc working

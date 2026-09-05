@@ -1,0 +1,36 @@
+# The device seal as a component (runtime/device-seal/wit/world.wit).
+#
+# STANDALONE PACKAGE, deliberately: no parent directory in this repo
+# carries a Cargo.toml, and this crate pins a webcrypto guest revision of
+# its own, so an empty `[workspace]` table makes it its own workspace root
+# rather than something a future parent manifest could silently absorb.
+[workspace]
+
+[package]
+name = "device-seal"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+# `cdylib` is the component; `rlib` so `cargo test` can link the pure
+# modules natively (the bindings-touching ones are cfg'd out there).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# polymorph:webcrypto guest bindings. This crate binds the whole
+# `polymorph:webcrypto` import surface once; `src/lib.rs`'s `generate!`
+# remaps every one of those interfaces onto it (see the comment there).
+polymorph-webcrypto-guest = { git = "https://github.com/polymorph-components/polymorph-webcrypto", rev = "0cde56168117277f7157b1285e48a980d8c37a10" }
+
+# Must match polymorph-webcrypto-guest's wit-bindgen minor so the two
+# `generate!` expansions share one async runtime (engine/guest/Cargo.toml
+# records why). `async-spawn` is the feature the async export shape needs.
+wit-bindgen = { version = "0.59", features = ["async", "async-spawn"] }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

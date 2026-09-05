@@ -46,34 +46,30 @@ export {
 
 export { deviceLockName, INDEX_DB, INDEX_STORE, nsDbName, nsDirName } from "./names.ts";
 
+// THE SEAL IS A COMPONENT (runtime/device-seal/). What the ladder used
+// to export as loose functions is now `openSeal(ns, artifacts)`, whose
+// `DeviceSeal` carries the ceremonies, the sealed KV/file surface and the
+// device's signing handles. What stayed in TypeScript is the RECORD
+// SHAPES and the one reader that needs no key.
+//
+// `openSeal` itself is exported from seal-component.ts and NOT re-exported
+// here, for the reason worker.ts is not: it imports the polyengine
+// embedder and the webcrypto port by bare specifier, and only the
+// embedder can map those (runtime/README.md's resolution model). A
+// consumer that reads the index to render a picker still needs no pins.
 export {
-  createSealedDek,
-  enableUntilReseal,
-  rekeyFromPlatform,
-  rekeyPassphrase,
-  reseal,
+  getPrfEnrollment,
+  type PassphraseWrap,
+  type PlatformWrap,
+  type PrfEnrollment,
+  type PrfWrap,
   SealError,
-  sealedDelete,
-  sealedGet,
-  sealedPut,
+  type SealedValue,
   type SealState,
-  sealState,
-  unsealFromPlatform,
-  unsealWithPassphrase,
-} from "./seal.ts";
+} from "./seal-records.ts";
 
 export {
-  deleteIdentity,
-  DEVICE_ENDPOINT_KEY,
-  DEVICE_IDENTITY_KEY,
-  IdentityKeyError,
-  loadIdentity,
-  loadOrMintIdentity,
-  persistIdentity,
-  usableIdentity,
-} from "./identity-keys.ts";
-
-export {
+  type FileSealer,
   type OpfsDirectoryHandle,
   type OpfsFileHandle,
   sealedDirectory,

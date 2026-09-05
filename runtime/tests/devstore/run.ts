@@ -669,23 +669,56 @@ async function main() {
     // --- 3: the passphrase rung -------------------------------------------
     await guard(async () => {
       const r = await probe(page, "passphrase");
-      const ok = r.state.passphrase && r.dekExtractable === false &&
+      const ok = r.state.passphrase && r.parkedNotHanded &&
         r.readBack === "sealed-kv-payload-TEST" &&
         r.wrong.refused && r.wrong.error.code === "wrong-passphrase" &&
         r.saltRotated && r.oldRefused.refused &&
         r.stillReadable === "sealed-kv-payload-TEST" &&
         r.secondMint.refused && r.secondMint.error.code === "already-sealed" &&
+        r.forgotten && r.afterForget.refused && r.afterForget.error.code === "no-rung" &&
         r.cleanup === "ok";
       record(
         "3  seal",
         "every-session rung: unseal, refuse the wrong passphrase, rotate the salt on re-key",
         ok,
-        `the handed-out DEK is extractable=${r.dekExtractable}; unseal round-trips a sealed ` +
+        `NO DEK IS HANDED OUT AT ALL — it is parked in the component (${r.parkedNotHanded}); ` +
+          `unseal round-trips a sealed ` +
           `value (${j(r.readBack)}); wrong passphrase → ${r.wrong.error.name} ` +
           `code=${j(r.wrong.error.code)} and nothing was written; re-key rotates the 16-byte ` +
           `salt: ${r.saltRotated}, old passphrase then refused: ${r.oldRefused.refused}, and the ` +
           `SAME data still opens (${j(r.stillReadable)}) — the DEK did not rotate, by design; ` +
-          `a second mint is refused (${j(r.secondMint.error.code)})`,
+          `a second mint is refused (${j(r.secondMint.error.code)}); forget() re-seals ` +
+          `(${r.forgotten}) and the sealed surface then refuses ` +
+          `${j(r.afterForget.error.code)}`,
+      );
+    });
+
+    // --- 3b: the on-disk compatibility fixture -----------------------------
+    //
+    // THE PROOF THAT THE PORT MOVED NO BYTES. Every other row above seals
+    // and opens with the SAME build, so all of them would still pass if
+    // the format had changed in a self-consistent way. This one replays a
+    // device sealed by the pre-component seal.ts, captured once and
+    // committed, and is the only row that can fail for that reason.
+    await guard(async () => {
+      const fixture = JSON.parse(
+        await Deno.readTextFile(`${here}fixtures/legacy-seal-v1.json`),
+      );
+      const r = await probe(page, "legacy-unseal", { fixture });
+      const ok = r.state.passphrase && r.state.userPassphrase && r.opened &&
+        r.kvMatches && r.fileMatches &&
+        r.wrong.refused && r.wrong.error.code === "wrong-passphrase" &&
+        r.cleanup === "ok";
+      record(
+        "3b legacy",
+        "a device sealed by the PRE-COMPONENT seal.ts opens through the component",
+        ok,
+        `the captured wrap/sealed/file records were loaded verbatim into a fresh namespace; ` +
+          `state=${j(r.state)}; the passphrase opened it (${r.opened}); the sealed KV value ` +
+          `came back (${j(r.kv)}, matches: ${r.kvMatches}) and so did the PMSEALv1 file ` +
+          `(${j(r.file)}, matches: ${r.fileMatches}); a wrong passphrase still refuses ` +
+          `${j(r.wrong.error.code)}. This row fails if EITHER side drifts — the host's record ` +
+          `codec or the component's ladder and framing.`,
       );
     });
 
@@ -707,19 +740,18 @@ async function main() {
     // --- 5: identity keys, across a REAL reload ---------------------------
     await guard(async () => {
       const mint = await probe(page, "identity-mint");
-      const mintOk = mint.minted && mint.secondCallMinted === false &&
-        mint.extractable === false && mint.raceSame && mint.raceMintedCount === 1 &&
-        mint.extractableRefused.refused &&
-        mint.extractableRefused.error.code === "extractable" && mint.signed;
+      const mintOk = mint.mintedOnFirstAsk && mint.secondAskSameKey &&
+        mint.extractable === false && mint.raceSame && mint.slotsDiffer && mint.signed;
       record(
         "5  identity",
-        "non-extractable mint, race-free first mint, extractable key refused",
+        "non-extractable mint through the component, race-free first mint, two distinct slots",
         mintOk,
-        `minted=${mint.minted} (second call minted=${mint.secondCallMinted}); private half ` +
-          `extractable=${mint.extractable}; it signs and verifies: ${mint.signed}; two ` +
-          `concurrent loadOrMint → one minter (${mint.raceMintedCount}) and one key ` +
-          `(cross-verified: ${mint.raceSame}); persisting an EXTRACTABLE key is refused: ` +
-          `${mint.extractableRefused.error.name} code=${j(mint.extractableRefused.error.code)}`,
+        `the slot was empty and load-or-mint filled it (${mint.mintedOnFirstAsk}); the second ` +
+          `ask returns the STORED pair rather than a fresh mint (${mint.secondAskSameKey}); ` +
+          `private half extractable=${mint.extractable}; it signs and verifies: ${mint.signed}; ` +
+          `two CONCURRENT components over one namespace agree on one key ` +
+          `(cross-verified: ${mint.raceSame}) — the add-if-absent slot is what makes them; ` +
+          `the signing and endpoint slots are genuinely different keys (${mint.slotsDiffer})`,
       );
 
       await page.reload({ waitUntil: "load" });
@@ -727,19 +759,24 @@ async function main() {
       const after = await probe(page, "identity-after", { id: mint.id });
       const sameKey = after.publicKey === mint.publicKey && after.publicKey !== "";
       const ok = after.loadedAfterReload && sameKey && after.signed &&
-        after.junkRejected && after.junkDiscarded &&
-        after.plantedRejected && after.plantedDiscarded &&
-        after.remintedNonExtractable && after.cleanup === "ok";
+        after.junkRejected && after.plantedRejected && after.plantedWarned &&
+        after.remintedNonExtractable && after.plantedReplaced &&
+        after.deleted && after.cleanup === "ok";
       record(
         "5b identity",
-        "the handle survives a REAL reload and still signs; planted entries are discarded",
+        "the handle survives a REAL reload and still signs; planted entries read as absent",
         ok,
         `after navigation the stored pair loads (${after.loadedAfterReload}), is the SAME ` +
           `identity (public halves equal: ${sameKey}) and signs: ${after.signed}; a non-key ` +
-          `entry is rejected AND deleted (${after.junkRejected}/${after.junkDiscarded}); a ` +
-          `planted EXTRACTABLE pair likewise (${after.plantedRejected}/${after.plantedDiscarded}); ` +
-          `load-or-mint then produces a real non-extractable key rather than looping: ` +
-          `${after.remintedNonExtractable}`,
+          `entry reads as absent (${after.junkRejected}) and so does a planted EXTRACTABLE ` +
+          `pair written STRAIGHT INTO THE STORE, past the codec (${after.plantedRejected}) — ` +
+          `validate-on-load is the host's, and usableIdentity IN FULL rather than ` +
+          `fromCryptoKey alone, which never looks at extractable (world.wit:136-153); the ` +
+          `discard is VISIBLE rather than silent (${after.plantedWarned}: ` +
+          `${j(after.plantedWarning)}); load-or-mint then produces a real non-extractable key ` +
+          `rather than looping against the plant ` +
+          `(${after.remintedNonExtractable}, replaced: ${after.plantedReplaced}); ` +
+          `deleting the slot leaves it empty (${after.deleted})`,
       );
     });
 
@@ -749,7 +786,7 @@ async function main() {
       await page.reload({ waitUntil: "load" });
       await ready(page);
       const r = await probe(page, "platform-after", { id: arm.id });
-      const ok = arm.state.untilReseal && r.autoUnsealed && r.autoExtractable === false &&
+      const ok = arm.state.untilReseal && r.autoUnsealed &&
         r.read === "survives-the-reload-TEST" && r.afterResealIsNull &&
         r.state.untilReseal === false && r.state.passphrase && r.handleGone &&
         r.stillOpens === "survives-the-reload-TEST" && r.cleanup === "ok";
@@ -758,8 +795,8 @@ async function main() {
         "auto-unseal after a REAL reload with NO passphrase; reseal puts the passphrase back",
         ok,
         `armed: ${j(arm.state)}; after navigation the DEK comes back from the non-extractable ` +
-          `platform key with no passphrase (${r.autoUnsealed}, extractable=${r.autoExtractable}) ` +
-          `and opens the sealed value (${j(r.read)}); after reseal(): auto-unseal is null ` +
+          `platform key with no passphrase (${r.autoUnsealed}) ` +
+          `and opens the sealed value (${j(r.read)}); after reseal(): auto-unseal answers false ` +
           `(${r.afterResealIsNull}), the key HANDLE is gone too (${r.handleGone}), state=${j(r.state)}, ` +
           `and the passphrase still opens the same data (${j(r.stillOpens)}). ` +
           `The honest sentence stands: this rung is login convenience, not protection ` +
@@ -783,8 +820,8 @@ async function main() {
         ok,
         `write+read through wasi:filesystem/preopens@0.3 → openAt → writeViaStream/readViaStream ` +
           `(the spike's Q2 pattern) round-trips before the reload: ${w.ok}; after navigation, ` +
-          `re-mounting with the DEK recovered from the passphrase reads the guest's plaintext ` +
-          `back: ${r.ok}; a DIFFERENT DEK fails cleanly as a filesystem error ` +
+          `re-opening the seal with the passphrase reads the guest's plaintext ` +
+          `back: ${r.ok}; ANOTHER DEVICE'S SEAL fails cleanly as a filesystem error ` +
           `(the 0.3 completion future settles err: ${r.wrongKey.error.name} ` +
           `kind=${j(r.wrongKey.error.code)}), not a trap; the RAW ` +
           `OPFS file is ${r.rawLength} bytes beginning ${j(r.magic)}, and contains neither the ` +

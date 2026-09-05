@@ -38,6 +38,13 @@ check:
 artifacts:
     cd ../demo && just translate
 
+# The device seal component's artifacts, on the demo-delegation pattern
+# `artifacts` above uses and for the same reason: the matrix must measure
+# the SAME bytes the component's own gate built, so the build is
+# delegated to that directory rather than reproduced here.
+seal-artifacts:
+    cd device-seal && just build
+
 # Bundle the probe page AND the device host for the browser, and
 # assemble serve/.
 #
@@ -59,7 +66,7 @@ artifacts:
 # pairing-engine.ts takes `hex`/`unhex` from engine.ts as VALUES, not
 # types, so the whole import record comes with them. The page still
 # instantiates nothing; it just carries the graph.
-build: check artifacts
+build: check artifacts seal-artifacts
     mkdir -p {{DEVSTORE}}/serve
     cd {{DEVSTORE}} && deno bundle --config deno.json --platform browser \
         --external node-datachannel --external "node-datachannel/polyfill" --external werift \
@@ -78,6 +85,12 @@ build: check artifacts
     cp {{DEVSTORE}}/probe.html {{DEVSTORE}}/serve/
     cp ../demo/build/engine.plan.json {{DEVSTORE}}/serve/engine.plan.json
     cp ../engine/target/composed.wasm {{DEVSTORE}}/serve/engine.component.wasm
+    # THE SEAL COMPONENT, BESIDE THE ENGINE'S BYTES — which is not
+    # incidental: worker.ts derives these two URLs from the engine's
+    # `wasmUrl` (its `fetchSealArtifacts`), so "same directory" is the
+    # wire contract rather than a convenience of this recipe.
+    cp device-seal/build/device-seal.component.wasm {{DEVSTORE}}/serve/device-seal.component.wasm
+    cp device-seal/build/device-seal.plan.json {{DEVSTORE}}/serve/device-seal.plan.json
 
 # The browser Playwright needs. PROBE-THEN-INSTALL (demo/justfile's
 # `e2e-deps`, verbatim reasoning): a launch that already works is left
