@@ -37,21 +37,37 @@ wit_bindgen::generate!({
         "polymorph:dioxus/events@0.6.0": polyengine_dioxus::bindings::polymorph::dioxus::events,
         "polymorph:dioxus/mutations@0.6.0": polyengine_dioxus::bindings::polymorph::dioxus::mutations,
         "polymorph:dioxus/dom@0.6.0": polyengine_dioxus::bindings::polymorph::dioxus::dom,
-        // REUSED BUT NOW INERT, and worth keeping for the day it is not.
+        // ADDED BY THE fdc0d52 BUMP, and mapped for the same reason the three
+        // above are: the base world gained `import head` and `import history`,
+        // and `driver::run` now provides `WitDocument` and `WitHistory` as root
+        // context UNCONDITIONALLY (polyengine-dioxus/src/driver.rs:258-269), so
+        // both imports are live in every component built against the crate —
+        // this one included, which asks for neither.
+        //
+        // Generating a second copy would make nominally different types from
+        // the ones `polyengine_dioxus::{document, history}` call through, which
+        // is the same trap the `events`/`dom` mappings exist to avoid.
+        "polymorph:dioxus/head@0.6.0": polyengine_dioxus::bindings::polymorph::dioxus::head,
+        "polymorph:dioxus/history@0.6.0": polyengine_dioxus::bindings::polymorph::dioxus::history,
+        // REUSED BUT INERT, and worth keeping for the day it is not.
         //
         // The base world declares `import eval` unconditionally, so a mapping
         // has to name something; this points at the renderer's module rather
-        // than generating a second copy of the interface, whose `Evaluation`
-        // resource would be a nominally different type from the one
-        // `polyengine_dioxus::document` holds.
+        // than generating a second copy of the interface, whose types would be
+        // nominally different from the ones `polyengine_dioxus::document`
+        // holds.
         //
-        // NOTHING CALLS IT. The renderer's `eval` Cargo feature is OFF
-        // (`Cargo.toml`, which carries the argument), so `WitDocument` is never
-        // installed and `document::eval` answers `Unsupported`. Verified rather
-        // than assumed: `wasm-tools component wit` on the built artifact shows
-        // no `polymorph:dioxus/eval` import at all, which is the property that
-        // actually matters — an unused mapping is bookkeeping, an unused
-        // IMPORT would still be a capability the host had to grant.
+        // NOTHING CALLS IT. `WitDocument` IS installed now (see above — that
+        // changed at fdc0d52, and it is why `head` had to be mapped), but the
+        // renderer's `eval` Cargo feature is still OFF (`Cargo.toml`, which
+        // carries the argument), so `Document::eval` delegates to dioxus's
+        // `NoOpDocument` and answers `Unsupported`, the crate names the `eval`
+        // interface nowhere, and no import is emitted
+        // (polyengine-dioxus/src/document.rs:92-99). Verified rather than
+        // assumed: the `e2e/imports` gate runs `wasm-tools component wit` on
+        // the built artifact and asserts `head` and `history` are imported and
+        // `eval` is not — an unused mapping is bookkeeping, an unused IMPORT
+        // would still be a capability the host had to grant.
         "polymorph:dioxus/eval@0.6.0": polyengine_dioxus::bindings::polymorph::dioxus::eval,
     },
     generate_all,

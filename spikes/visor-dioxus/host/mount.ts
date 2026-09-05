@@ -12,13 +12,15 @@
 // ("Module wiring and instantiation", "Value mapping") — cited as
 // `contract:<section>`.
 //
-// WHY THIS IS NOT A CALL TO `mountApp`. `mountApp`'s `MountOptions` is
-// `{ source, root, onError }`: there is no seam for additional imports, and
-// its `Mounted` return exposes the applier/dispatcher but not
-// `instance.exports`. Our world adds three imports and one export, so
-// neither end fits. Everything mechanical is still the sibling's code —
-// `DomApplier`, `DispatchGate`, `EventDispatcher`, `applyOperations`,
-// `createDomImports` are all imported, not reimplemented — but the ~40
+// WHY THIS IS NOT A CALL TO `mountApp`. `mountApp`'s `MountOptions` grew at
+// fdc0d52 (`eval`, `history`, `intercept` joined `source`/`root`/`hydrate`/
+// `onError`), but not in the direction this file needs: there is still no seam
+// for ADDITIONAL imports, and its `Mounted` return still exposes the applier/
+// dispatcher/history but not `instance.exports`. Our world adds five imports
+// and five exports, so neither end fits. Everything mechanical is still the
+// sibling's code — `DomApplier`, `DispatchGate`, `EventDispatcher`,
+// `applyOperations`, `createDomImports`, `createHeadImports`,
+// `createHistoryImports` are all imported, not reimplemented — but the ~40
 // lines of instantiate/read-loop wiring are duplicated here. Two upstream
 // additions would delete this duplication: an `imports?: Record<string,
 // unknown>` field on `MountOptions` merged into the import record, and
@@ -33,9 +35,12 @@ import { ComponentException } from "@deltic/protocol";
 import { DomApplier } from "@polyengine/dioxus-host/applier.ts";
 import { DispatchGate } from "@polyengine/dioxus-host/dispatch.ts";
 import { createDomImports } from "@polyengine/dioxus-host/host.ts";
-import { createEvalImports } from "@polyengine/dioxus-host/eval.ts";
+import { createHeadImports } from "@polyengine/dioxus-host/head.ts";
+import { createHistoryImports, memoryHistory } from "@polyengine/dioxus-host/history.ts";
 import {
   EventDispatcher,
+  HostDataTransfer,
+  HostFile,
   serializePayload,
 } from "@polyengine/dioxus-host/events.ts";
 import type { NativeEventLike } from "@polyengine/dioxus-host/events.ts";
@@ -486,16 +491,59 @@ export async function mountVisor(opts: MountVisorOptions): Promise<MountedVisor>
   // (contract:"Module wiring and instantiation").
   const instance = await instantiate(opts.source, {
     ...wasi(),
-    "polymorph:dioxus/events@0.6.0": { DomEvent },
+    // `DomEvent` is host-implemented HERE (see the class at the foot of this
+    // file); `File`/`DataTransfer` are the sibling's, imported rather than
+    // restated because — unlike `DomEvent` — they ARE exported from the host
+    // package.
+    //
+    // The two resource classes arrived with the fdc0d52 bump (event payloads
+    // gained file and drag-transfer handles). This spike renders no file input
+    // and no drag source, but the CLASSES are not optional: the guest's
+    // generated bindings import the resource TYPES `events.file` and
+    // `events.data-transfer` whether or not a payload ever carries one, so a
+    // missing key is a failed instantiation, not a dormant capability. That is
+    // exactly how the bump surfaced here — "the component imports the resource
+    // type 'data-transfer'; provide the implementing class as 'DataTransfer'".
+    //
+    // Keys are the resource name PascalCased (contract:"Resources").
+    "polymorph:dioxus/events@0.6.0": { DomEvent, File: HostFile, DataTransfer: HostDataTransfer },
     "polymorph:dioxus/dom@0.6.0": createDomImports(applier, gate),
-    // THE HOST HALF OF THE TWO-SIDED EVAL OPT-IN (the renderer's wit/world.wit,
-    // `interface eval`; `MountOptions.eval` is `mountApp`'s spelling of the
-    // same choice). Unconditional here, and that is the policy statement: this
-    // host mounts exactly one component, the visor, which is in the trusted
-    // computing base. An app host must never supply this key — a component
-    // that imports `eval` against a host that did not opt in fails to
-    // instantiate, which is the loud, safe direction.
-    "polymorph:dioxus/eval@0.6.0": createEvalImports(gate),
+    // NOT ASKED FOR, AND SUPPLIED ANYWAY. The renderer provides `WitDocument`
+    // and `WitHistory` as root context unconditionally
+    // (polyengine-dioxus/src/driver.rs:258-269), so every component built
+    // against the crate imports `head` and `history` whether it renders a
+    // `document::Title` or runs a router or not — this one does neither. A
+    // missing key here is not a dormant capability, it is a failed
+    // instantiation, so both must be present.
+    //
+    // `allowScript: false` — host.ts computes this as `!!opts.eval`, and this
+    // mount grants no eval (see the eval note below), so the renderer's WIT
+    // says the answer already: "The default host refuses `script` unless the
+    // mount also granted `eval` — a script tag is eval by another name."
+    // Refusing is silent by design (`create-element` returns `false` and the
+    // guest has nothing to do with it), which is the correct shape here: the
+    // visor renders into a page it SHARES with the consumer, so the sibling's
+    // default head policy is exactly the policy wanted.
+    "polymorph:dioxus/head@0.6.0": createHeadImports(document, gate, { allowScript: false }),
+    // MEMORY HISTORY AT "/", because THE VISOR DOES NOT ROUTE. It has no
+    // router, no routes, and no link that navigates; `history` is imported
+    // only because the renderer installs the provider for everyone. Memory
+    // history is therefore the honest answer — a stack of one entry nothing
+    // ever pushes to.
+    //
+    // Deliberately NOT `fragmentHistory`: that encodes routes into the URL
+    // fragment, which would have the visor's shell claim the page's fragment.
+    // The fragment belongs to the apps the visor hosts, not to the visor.
+    "polymorph:dioxus/history@0.6.0": createHistoryImports(memoryHistory()),
+    // NO `polymorph:dioxus/eval@0.6.0` KEY, deliberately, and it is a
+    // two-sided opt-in so this end matters. The renderer's `eval` Cargo
+    // feature is off (Cargo.toml carries the argument — the capability had one
+    // suspected customer, the pairing QR, and the port measured that it did
+    // not need it), so the component emits no `eval` import and a key here
+    // would be an import record entry nothing claims. Re-enabling is the
+    // feature, the `with:` mapping in src/component.rs, and this key; a
+    // component built with only one side fails to instantiate, which is the
+    // loud, safe direction.
     "polymorph:visor-spike/store@0.1.0": createStoreImports(storeLog),
     "polymorph:visor-spike/chrome@0.1.0": createChromeImports(sheets),
     "polymorph:visor-spike/embedder@0.1.0": createEmbedderImports(embedderLog, sheets, embedderTest),
