@@ -17,6 +17,6 @@
     ]
   },
   "tasks": {
-    "check": "deno check host/mount.ts web/entry.ts web/build.ts e2e/server.ts e2e/tests/spike.spec.ts"
+    "check": "deno check host/mount.ts web/entry.ts web/build.ts e2e/server.ts e2e/tests/spike.spec.ts e2e/tests/sheets.spec.ts"
   }
 }

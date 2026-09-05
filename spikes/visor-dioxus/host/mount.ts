@@ -28,6 +28,7 @@ import { instantiate } from "@deltic/runtime/embedder";
 import { wasi } from "@polyengine/wasi";
 import type { InstantiateSource } from "@deltic/runtime/embedder";
 import type { Stream } from "@deltic/protocol";
+import { ComponentException } from "@deltic/protocol";
 
 import { DomApplier } from "@polyengine/dioxus-host/applier.ts";
 import { DispatchGate } from "@polyengine/dioxus-host/dispatch.ts";
@@ -46,7 +47,7 @@ import { ForeignSlotHost } from "./sheets.ts";
 
 /** WIT `store.slot` — an enum lifts as the bare kebab-case case name
  * (contract:"Value mapping"). */
-export type Slot = "hue" | "word" | "identity" | "events" | "legacy-hue";
+export type Slot = "hue" | "word" | "identity" | "events" | "marks" | "legacy-hue";
 
 /** The slot -> storage-key mapping lives HERE, not in the guest. That is the
  * whole point of naming slots rather than keys: a component that cannot
@@ -57,6 +58,7 @@ const KEYS: Record<Slot, string> = {
   word: "pm-spike-word",
   identity: "pm-spike-identity",
   events: "pm-spike-events",
+  marks: "pm-spike-marks",
   "legacy-hue": "pm-spike-visor-hue",
 };
 
@@ -101,6 +103,13 @@ export function createChromeImports(_sheets: ForeignSlotHost) {
     viewportHeight(): number {
       return globalThis.innerHeight;
     },
+    /** `chrome.reload` — the erase ceremony's last step (wit/world.wit's
+     * `chrome.reload` doc). Real `location.reload()`: the e2e observes it
+     * happened by waiting for the page's own reload/navigation, exactly as
+     * a user would see it happen. */
+    reload(): void {
+      location.reload();
+    },
   };
 }
 
@@ -113,7 +122,29 @@ export interface EmbedderLog {
   calls: Array<{ fn: string; at: number; arg?: unknown }>;
 }
 
-export function createEmbedderImports(log: EmbedderLog, sheets: ForeignSlotHost) {
+/** The consumer-side knobs the e2e needs to reach past `embedder`'s
+ * notification/query split (wit/world.wit's `embedder` doc): `can-open` and
+ * `nested-place-active` are QUERIES the consumer answers, and `on-reset` is
+ * the one FALLIBLE one — the refusal path is the one the erase ceremony's
+ * whole design is about, so the harness must be able to force it on demand
+ * rather than only ever exercise the ok arm.
+ *
+ * `onResetFail`: `false` = ok; a `string` or `true` = fail (a `string`
+ * becomes the `ComponentException`'s payload, `true` uses a fixed one —
+ * `sheets.ts`'s own ceremony never renders the payload either way, see
+ * `src/sheets/reset.rs`'s CONTRACT note, so the exact string is not
+ * load-bearing for the guest, only for the host-side calls-log assertion). */
+export interface EmbedderTestControls {
+  canOpen: boolean;
+  nestedPlaceActive: boolean;
+  onResetFail: boolean | string;
+}
+
+export function createEmbedderImports(
+  log: EmbedderLog,
+  sheets: ForeignSlotHost,
+  testControls: EmbedderTestControls,
+) {
   const note = (fn: string) => (arg?: unknown) => {
     log.calls.push({ fn, at: Date.now(), arg });
   };
@@ -139,6 +170,48 @@ export function createEmbedderImports(log: EmbedderLog, sheets: ForeignSlotHost)
     tenantUnmount(tenant: string): void {
       note("tenant-unmount")(tenant);
       sheets.unmount(tenant);
+    },
+
+    // -- the ceremonies' consumer half (`VisorSheetsConfig`) --------------
+
+    canOpen(): boolean {
+      note("can-open")();
+      return testControls.canOpen;
+    },
+    beforeOpen: note("before-open"),
+    onNamed(provenance: string, petname: string, icon: string): void {
+      note("on-named")({ provenance, petname, icon });
+    },
+    onForgotten: note("on-forgotten"),
+    onIdentityCommitted(rec: WitIdentity, hue: number): void {
+      note("on-identity-committed")({ rec, hue });
+    },
+    nestedPlaceActive(): boolean {
+      note("nested-place-active")();
+      return testControls.nestedPlaceActive;
+    },
+    nestedPlaceFreeze: note("nested-place-freeze"),
+    nestedPlaceThaw: note("nested-place-thaw"),
+    onAction: note("on-action"),
+
+    /** `on-reset` — async and fallible (wit/world.wit's `embedder.on-reset`
+     * doc). ONE FLAG the e2e can flip (`testControls.onResetFail`) to make
+     * it fail on demand: the refusal path is the one the ceremony's design
+     * is actually about (nothing forgotten on `err`), so an untested
+     * failure arm would be the whole risk left unexercised.
+     *
+     * `result<_, string>` as a HOST IMPORT lowers as: return (here,
+     * resolve) `undefined` for `ok`, `throw`/reject a branded
+     * `ComponentException(payload)` for `err`
+     * (contract:"Value mapping", the `result<T,E>` function-result row,
+     * and the "Host import with `result<T, E>`" bullet). */
+    async onReset(): Promise<void> {
+      note("on-reset")();
+      if (testControls.onResetFail !== false) {
+        throw new ComponentException(
+          typeof testControls.onResetFail === "string" ? testControls.onResetFail : "consumer refused",
+        );
+      }
     },
   };
 }
@@ -202,6 +275,82 @@ export interface Control {
   erase(): void;
 }
 
+// -- `polymorph:visor-spike/types`, `sheets`, `marks` ------------------------
+
+/** `types.surface`, camelCased, for `sheets.request-naming`'s argument and
+ * `control`'s context variant's payload. `meta`/`firstSeen` are sheet-only
+ * (wit/world.wit's own note) but live on the one shared shape rather than a
+ * second one, since the WIT's `surface` record is itself the one shape. */
+export interface WitSurface {
+  name: string;
+  nickname: string;
+  icon: string;
+  isNew: boolean;
+  petname?: string;
+  nomination?: string;
+  meta?: { label: string; value: string; foreign: boolean };
+  firstSeen?: bigint;
+}
+
+/** `sheets.action`, camelCased. */
+export interface SheetAction {
+  label: string;
+  hint?: string;
+  key: string;
+}
+
+/** `polymorph:visor-spike/sheets`, in full. */
+export interface Sheets {
+  configure(resetConsequences: string[], extraActions: SheetAction[]): void;
+  requestNaming(target: WitSurface): void;
+  requestSettings(): void;
+  requestReset(): void;
+  requestEvents(): void;
+  closeNaming(restoreContext: boolean): void;
+  closeSettings(restoreContext: boolean, commit: boolean): void;
+  closeReset(restoreContext: boolean): void;
+  closeEvents(restoreContext: boolean): void;
+  namingOpen(): boolean;
+  settingsOpen(): boolean;
+  resetOpen(): boolean;
+  eventsOpen(): boolean;
+}
+
+export interface PetMark {
+  icon: string;
+  firstSeen: bigint;
+  petname?: string;
+}
+export interface MarkEntry {
+  provenance: string;
+  mark: PetMark;
+}
+export interface Marked {
+  mark: PetMark;
+  isNew: boolean;
+}
+export interface Offer {
+  glyph: string;
+  nominated: boolean;
+}
+export interface Clash {
+  key: string;
+  petname: string;
+}
+
+/** `polymorph:visor-spike/marks`, in full — the trust table, exported
+ * because it is consumer-facing as well as ceremony-facing. */
+export interface Marks {
+  listAll(): MarkEntry[];
+  mark(provenance: string): Marked;
+  setPetname(provenance: string, petname: string, icon: string): void;
+  forget(provenance: string): void;
+  eraseAll(): void;
+  freeIcons(provenance: string): string[];
+  iconOffers(provenance: string, nomination?: string): Offer[];
+  collision(provenance: string, petname: string): Clash | undefined;
+}
+
 export interface MountVisorOptions {
   source: InstantiateSource;
   root: Element;
@@ -210,8 +359,13 @@ export interface MountVisorOptions {
 
 export interface MountedVisor {
   control: Control;
+  sheets_api: Sheets;
+  marks: Marks;
   store: StoreLog;
   embedder: EmbedderLog;
+  /** The e2e's own knobs onto `embedder`'s query/fallible half — see
+   * `EmbedderTestControls`. */
+  embedderTest: EmbedderTestControls;
   /** Raw export record, for the e2e's naming assertion. */
   // deno-lint-ignore no-explicit-any
   exports: Record<string, any>;
@@ -220,10 +374,12 @@ export interface MountedVisor {
   dispose(): void;
 }
 
-/** The interface id the `control` export is keyed by: the fully-qualified
- * WIT id verbatim, version included (contract:"Module wiring and
- * instantiation", the interface-key row of its table). */
+/** The interface ids the exports are keyed by: the fully-qualified WIT id
+ * verbatim, version included (contract:"Module wiring and instantiation",
+ * the interface-key row of its table). */
 export const CONTROL_ID = "polymorph:visor-spike/control@0.1.0";
+export const SHEETS_ID = "polymorph:visor-spike/sheets@0.1.0";
+export const MARKS_ID = "polymorph:visor-spike/marks@0.1.0";
 
 /** The three demo tenants, mirroring demo/host/demo.ts's shapes
  * (credentialTenant / pickerTenant / the settings tenant): "credentials" is
@@ -240,6 +396,11 @@ export async function mountVisor(opts: MountVisorOptions): Promise<MountedVisor>
   const onError = opts.onError ?? (() => {});
   const storeLog: StoreLog = { calls: [] };
   const embedderLog: EmbedderLog = { calls: [] };
+  const embedderTest: EmbedderTestControls = {
+    canOpen: true,
+    nestedPlaceActive: false,
+    onResetFail: false,
+  };
   let disposed = false;
   let control: Control | undefined;
   const sheets = new ForeignSlotHost({
@@ -270,7 +431,7 @@ export async function mountVisor(opts: MountVisorOptions): Promise<MountedVisor>
     "polymorph:dioxus/dom@0.5.0": createDomImports(applier, gate),
     "polymorph:visor-spike/store@0.1.0": createStoreImports(storeLog),
     "polymorph:visor-spike/chrome@0.1.0": createChromeImports(sheets),
-    "polymorph:visor-spike/embedder@0.1.0": createEmbedderImports(embedderLog, sheets),
+    "polymorph:visor-spike/embedder@0.1.0": createEmbedderImports(embedderLog, sheets, embedderTest),
   });
 
   // deno-lint-ignore no-explicit-any
@@ -301,6 +462,18 @@ export async function mountVisor(opts: MountVisorOptions): Promise<MountedVisor>
       `no ${CONTROL_ID} on instance.exports; got: ${Object.keys(exports).join(", ")}`,
     );
   }
+  const sheetsApi = exports[SHEETS_ID] as Sheets | undefined;
+  if (!sheetsApi) {
+    throw new Error(
+      `no ${SHEETS_ID} on instance.exports; got: ${Object.keys(exports).join(", ")}`,
+    );
+  }
+  const marks = exports[MARKS_ID] as Marks | undefined;
+  if (!marks) {
+    throw new Error(
+      `no ${MARKS_ID} on instance.exports; got: ${Object.keys(exports).join(", ")}`,
+    );
+  }
 
   // Register the three demo tenants now the export is live. Registration
   // order is precedence order (wit/world.wit:250-251), so this order is
@@ -309,8 +482,11 @@ export async function mountVisor(opts: MountVisorOptions): Promise<MountedVisor>
 
   return {
     control,
+    sheets_api: sheetsApi,
+    marks,
     store: storeLog,
     embedder: embedderLog,
+    embedderTest,
     exports,
     sheets,
     dispose() {

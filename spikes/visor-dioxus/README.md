@@ -1,32 +1,45 @@
-# spikes/visor-dioxus — the visor's strip and drawer host as a component
+# spikes/visor-dioxus — the visor as a component
 
 **The question.** The visor is the framework's trusted UI: the pinned strip,
-the drawer, the pixels an app cannot reproduce. Today it is TypeScript running
-as the page's own script (`visor/ui/`). Could it instead be a wasm component
-rendering through `polymorph:dioxus`, the same mutation surface apps use?
+the drawer, the ceremonies, the pixels an app cannot reproduce. Today it is
+TypeScript running as the page's own script (`visor/ui/`). Could it instead be
+a wasm component rendering through `polymorph:dioxus`, the same mutation
+surface apps use?
 
-**The answer: yes, it works — and it costs about eight times the download, in
-the one place the project has decided download size means audit surface.**
-Everything below is measured, not estimated. Nothing here is adopted; this
-directory is a spike and the decision is open.
+**The answer: yes, it works. The download cost is large but it is a FLOOR, not
+a slope — and the second round is what showed that.** Everything below is
+measured, not estimated. Nothing here is adopted; this directory is a spike and
+the decision is open.
 
-Scope: `visor/ui/visor.ts:1211-2786` — the strip and the drawer host, 1,576
-lines. Sheets, pairing and entry stay in TypeScript and arrive in the drawer as
-foreign DOM, which is what makes the seam question real rather than academic.
+Ported so far, in two rounds:
+
+- **round one** — `visor/ui/visor.ts:1211-2786`, the strip and the drawer host
+  (1,576 lines). Sheets arrived in the drawer as foreign DOM, which is what
+  made the seam question real rather than academic.
+- **round two** — `visor/ui/sheets.ts` in full (1,866 lines): the naming
+  ceremony, the settings sheet, the erase ceremony, the event list, and the
+  trust table. These are now guest-rendered and no longer cross the seam.
+
+Still TypeScript, deliberately: `pairing.ts`, `entry.ts`, and a consumer's own
+sheets (the demo's credential sheet and storage picker). **Keeping one foreign
+tenant is a feature of the spike, not an omission** — the mixed case, guest
+sheets and a consumer's foreign DOM in one drawer, is what the real system
+looks like and is the thing most likely to break.
 
 ## What was built
 
-A Rust/Dioxus component (`src/`, 4,228 lines) rendering the whole of the
+A Rust/Dioxus component (`src/`, 7,319 lines) rendering the whole of the
 visor's territory — `#visor-zone`, `#visor-drawer`, `#visor-strip`,
-`#visor-dim` — against **the unmodified `visor/ui/visor.css`**. The stylesheet
-is served, not copied (`e2e/server.ts`), so there is exactly one file the
-component is measured against.
+`#visor-dim`, and now the four ceremonies — against **the unmodified
+`visor/ui/visor.css`**. The stylesheet is served, not copied
+(`e2e/server.ts`), so there is exactly one file the component is measured
+against.
 
 `wit/world.wit` extends the base `polymorph:dioxus/app` world with three
-imports (`store`, `chrome`, `embedder`) and one export (`control`). 13
-Playwright gates in real Chromium, ported from `demo/e2e/scenarios/`; 46 native
-`cargo test`s covering the tenancy machine, the word roll, the event record and
-the voice types.
+imports (`store`, `chrome`, `embedder`) and three exports (`control`, `marks`,
+`sheets`). **24 Playwright gates** in real Chromium ported from
+`demo/e2e/scenarios/`, and **62 native `cargo test`s** covering the tenancy
+machine, the trust table, the word roll, the event record and the voice types.
 
 ## The costs
 
@@ -34,20 +47,33 @@ the voice types.
 
 | | raw | gzipped |
 | --- | --- | --- |
-| this component (strip + drawer host only) | 963,908 | **281,415** |
-| `visor/ui/visor.ts` — the same scope, today | 46,082 | **13,843** |
-| all of `visor/ui/` — strip, drawer, sheets, pairing, entry, QR codegen | 137,947 | **36,141** |
+| empty dioxus component (renders one div) | 435,281 | **144,247** |
+| + strip and drawer host (round one) | 963,908 | **281,415** |
+| + all four ceremonies and the trust table (round two) | 1,220,168 | **334,200** |
+| `visor.ts` + `sheets.ts` — the same scope, today | 76,960 | **20,329** |
+| all of `visor/ui/` — incl. pairing, entry, QR codegen | 137,947 | **36,141** |
 
-**~20x the ported scope; ~8x the entire current visor including everything
-this spike did not port.** The floor is not our code: an empty dioxus
-component that renders one div measured 435 KB raw / 144 KB gzipped, and the
-sibling's own `counter` example is 383 KB. The build already runs `lto = fat`,
-`opt-level = "s"`, `panic = "abort"`, `strip`; `wasm-tools strip` recovers
-0.5%. The clock cost 1.2% of it.
+**THE SHAPE OF THE COST IS THE ROUND-TWO RESULT.** Round one read as a 20x
+multiplier. It is not a multiplier — it is a floor plus a small slope:
+
+- the floor is **144 KB gzipped** before a line of visor code exists, and it
+  is not our code (the sibling's `counter` example is 383 KB raw)
+- the strip and drawer host cost **+137 KB** on top of it
+- **1,866 further lines of TypeScript — the whole of `sheets.ts` — cost
+  +53 KB**, against the ~6 KB gzipped those lines occupy today
+
+So the marginal price of moving more of the visor in is real but modest, and
+the headline ratio improves the more you port: ~20x for the strip alone, ~16x
+for strip-plus-sheets. Anyone deciding this should decide about the **floor**,
+because that is where the money is; arguing about the slope is arguing about
+the small half.
+
+The build already runs `lto = fat`, `opt-level = "s"`, `panic = "abort"`,
+`strip`; `wasm-tools strip` recovers 0.5%. The clock cost 1.2%.
 
 This matters more here than in an app because the visor is the signed,
-third-party-monitored release artifact (#3). The trade is ~1,600 lines of
-reviewable TypeScript for a ~950 KB binary plus a Rust dependency tree
+third-party-monitored release artifact (#3). The trade is ~3,400 lines of
+reviewable TypeScript for a ~1.2 MB binary plus a Rust dependency tree
 (dioxus-core, dioxus-html, wit-bindgen, wasi-libc).
 
 ### Expressiveness lost at the boundary
@@ -65,6 +91,19 @@ implementation — each is the boundary charging rent:
 | `DrawerHost.note`/`setNote` (:820-826) | absent entirely — they take `HTMLElement`. |
 | `committedHue`/`applyHue`/`speakWord` while unclaimed (:2713-2746) | TS **throws**. WIT has no error channel and a trap kills the instance, so these no-op — strictly weaker than the guard they replace. |
 | `embedder.request-naming` | round-trips lossily: `AppVoice` has no text accessor, so the nickname cannot be echoed back. That is the enforcement working, but the embedder must re-derive. |
+
+Round two added two more, both from the ceremonies:
+
+| `sheets.ts` | what the data-only interface cost |
+| --- | --- |
+| `DrawerTenantSpec.suspendable` as a predicate (:621-635) | still a `bool`, so the settings sheet suspends under *every* displacer, not only the settings→reset/events steps |
+| `SurfaceMeta.value` rendering unplated when `foreign: false` (:795-801) | the TypeScript branches; here `value` is an `AppVoice` with no text accessor, so the plain branch is **unrepresentable** and the value is always plated. Over-plating is the "ugly but not dangerous" direction, so it stands — but it is the enforcement being *too* strong, and the honest fix is a two-voice enum rather than widening the door |
+| `toLocaleDateString()` (:780) | no locale or date formatter on the world; renders ISO `YYYY-MM-DD` |
+
+And one it did **not** cost, because I extended the contract instead:
+`location.reload()` (:1618-1637) had no expression, which left the erase
+ceremony wiping storage while the running instance went on saying the name it
+had just forgotten. `chrome.reload` now exists and the ceremony ends with it.
 
 ## The wins
 
@@ -138,6 +177,52 @@ nameable downstream). The strip learns its own id by stashing `handle-event`'s
 `target` in a thread-local for the duration of the synchronous dispatch
 (`component.rs`'s `EVENT_TARGET`, ~6 lines). Worth fixing upstream.
 
+### The ceremonies deleted the seam for themselves — and kept it for others
+
+The four visor ceremonies no longer emit `embedder.tenant-build` /
+`tenant-unmount`: they render themselves, so for them the foreign-DOM
+machinery is simply gone. A consumer's own sheets still use it. That mixed
+case — guest-rendered ceremonies and a consumer's foreign sheet in one drawer
+— is what the real system looks like, and it holds (`spike.spec.ts`'s slot
+gates pass unchanged alongside the new ones).
+
+The visible consequence: the host side barely grew. `host/mount.ts` went from
+~341 to ~396 lines of real wiring while 1,866 lines of TypeScript ceremony
+moved into Rust, because nothing about those ceremonies crosses the boundary
+any more.
+
+### A failure mode with no TypeScript analogue
+
+Round two produced two defects that looked unrelated — the settings sheet
+hanging forever on first render, and the erase ceremony's arming delay never
+firing — and they were one mistake: **render bodies reading state through the
+WRITE door.**
+
+`with_visor` takes `signal.write()`, which marks the signal dirty
+unconditionally (that is what lets a `control` call arriving on a bare export
+task repaint the strip). `read_visor` takes `signal.read()`, which subscribes
+the calling component. Reading through the writer therefore does one of two
+things:
+
+- a component that **writes but never subscribes** renders once and never
+  learns anything again — the erase control stayed dead after the machine had
+  armed it (`embedder.tenant-armed` was observed firing on time)
+- a component that **subscribes and writes** dirties itself every pass —
+  dirty, render, dirty — so the guest never returned from the export and the
+  host awaited it forever
+
+The arming one is the one to dwell on: **a security control went dead on
+exactly the path this port proposes to ship**, while the same control worked
+on the foreign-sheet path. It failed closed, which is the right direction, and
+it was invisible to all 60 native tests because the fault was downstream of
+every effect a test without a renderer can observe. Only the browser gate
+caught it. Measured after the fix, guest-rendered path: 706.0 / 710.5 /
+708.5 ms against `ARM_MS = 700`.
+
+Worth weighing honestly against the type-system wins above: the boundary buys
+real static guarantees about *voice*, and introduces a new class of
+runtime-only reactivity bug that TypeScript's direct DOM writes cannot have.
+
 ## Corrections made during the spike
 
 Recorded because both were nearly shipped as findings:
@@ -166,13 +251,24 @@ site where the function used to be.
 
 ## Does the TypeScript shrink?
 
-Partly, and less than the raw diff suggests. 1,576 lines of `visor.ts` become
-~341 lines of host wiring (`host/mount.ts`) — the rest of `host/` is test
-fixture standing in for sheets that stay TypeScript either way. So roughly a
-78% reduction **of the ported scope**, against 4,228 lines of Rust. Total
-source goes up substantially; what moves is where the logic lives and what
-tests it — the tenancy machine is now 46 native `cargo test`s instead of
-browser-only assertions, which is a genuine gain in gate density.
+Yes, and round two sharpened the answer. **3,442 lines of TypeScript**
+(`visor.ts`'s strip and drawer host, plus all of `sheets.ts`) become **~396
+lines of host wiring** in `host/mount.ts`; the remaining 261 lines of `host/`
+are fixture tenants standing in for a consumer's own sheets, which stay
+TypeScript either way.
+
+The telling number is the DELTA: round two moved 1,866 lines of ceremony into
+Rust and grew the host by ~55 lines — because a guest-rendered ceremony has
+almost no boundary. Against that, 7,319 lines of Rust. Total source goes up
+substantially; what moves is where the logic lives and what tests it.
+
+Gate density is the clearest gain: **62 native `cargo test`s** now hold the
+tenancy machine, the trust table, the word roll and the voice types with no
+browser at all. The clearest loss sits right beside it — `src/sheets/` is
+wasm32-gated, so tests written inside it do **not** run under host
+`cargo test`, and the reactivity defects above were invisible to every native
+test by construction. Whatever is true of the ceremonies is held by the
+browser gates or not at all.
 
 ## Assertions that could not be ported
 
@@ -188,13 +284,18 @@ Costs of the approach, listed rather than hidden:
   height-budget and internal-scroll half is ported and passes.
 - `drawer-announcements`' word-never-drawn probe — needs `claim()` plus a
   seeded word; flagged as a genuine gap rather than folded in.
+- `petname-ceremony`'s full nomination path was initially untestable through
+  `sheets.request-naming` because `types.surface` had no `nomination` field —
+  a contract omission, since fixed; the mechanism is now exercised end to end
+  (offered first, `data-nominated`, and silently dropped when another record
+  wears the glyph).
 
 ## Running it
 
 ```
 just build   # cargo → wasm32-wasip2 → validate → translate to a plan.json
-just e2e     # 13 Playwright gates in real Chromium
-cargo test   # 46 native tests, no browser
+just e2e     # 24 Playwright gates in real Chromium
+cargo test   # 62 native tests, no browser
 ```
 
 Two environment notes. The crate depends on the sibling renderer by relative
@@ -205,3 +306,20 @@ seam for extra imports and does not expose `instance.exports`, so `host/`
 duplicates ~40 lines of instantiation; two small upstream additions to
 polyengine-dioxus (`imports?` on `MountOptions`, `exports` on `Mounted`) would
 delete that duplication and are worth doing regardless of what happens here.
+
+## What opt-in document eval would change
+
+polyengine is growing opt-in document eval, which the visor — being trusted —
+will be able to use and apps will not. It lands squarely on `chrome`, the
+interface invented here only because this world cannot otherwise reach the
+page: `viewport-height` and `reload` are both candidates to collapse into it,
+and the `measure-sheet` deleted this round would become answerable directly
+rather than needing the host to push heights in-band.
+
+**`store` should not migrate onto it.** The slot enum is the sharpest trust
+result in this port precisely because it is *not* a general capability: a
+component that cannot spell a key cannot read the origin's other storage,
+which is a promise the TypeScript visor has no way to make. Reaching
+localStorage through document eval hands it straight back. "The visor may
+eval" and "the visor should eval for everything it can" are different claims,
+and only the first is implied.

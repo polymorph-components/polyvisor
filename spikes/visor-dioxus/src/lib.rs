@@ -17,8 +17,14 @@
 //!   suspend/resume, the height budget. Pure, and tested natively.
 //! - `component` (wasm32 only) — the WIT bindings, the `control` export, and
 //!   the `Visor` that ties the pure halves to the signal the renderer watches.
+//! - [`marks`] — the trust table: the pet icon, the first-sight timestamp and
+//!   the user's own word for one component. Pure, and tested natively.
+//! - `sheets` (wasm32 only) — the visor's OWN four ceremonies, rendered by the
+//!   guest now rather than mounted as foreign DOM. Read its header before
+//!   adding one: it states the pattern all four follow.
 //! - `app` (wasm32 only) — the Dioxus tree: the whole of the visor's pixels,
-//!   including the `.visor-slide` LEAF the host appends foreign sheets into.
+//!   including the `.visor-slide` a visor ceremony grows inside and a
+//!   consumer's foreign sheet is appended into.
 //!
 //! The wasm32 gate is the same one `polyengine_dioxus` uses and for the same
 //! reason: those two modules name the generated bindings, and the pure ones do
@@ -55,6 +61,7 @@
 //! no clock underneath them. Only the durations need a browser.
 
 pub mod drawer;
+pub mod marks;
 pub mod state;
 pub mod voice;
 
@@ -72,3 +79,5 @@ pub(crate) mod words;
 pub mod app;
 #[cfg(target_arch = "wasm32")]
 mod component;
+#[cfg(target_arch = "wasm32")]
+pub mod sheets;
