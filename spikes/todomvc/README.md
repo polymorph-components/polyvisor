@@ -9,10 +9,14 @@ under the shape rules of [#15], running on [deltic].
 https://polymorph-components.github.io/polymorph-apps/spike-todomvc/
 
 **Scope.** Validates the wasm→DOM plumbing only: the WIT surface, the
-validated op protocol, and the event-record path. The worker/frame split,
-permission linker, and asset pipeline are deliberately left as seams.
-Quarantined, delete-at-will, wired into no CI. The built demo is committed
-at `docs/spike-todomvc/` (the repo's Pages root).
+validated op protocol, and the event-record path. The permission linker and
+asset pipeline are deliberately left as seams; the worker/frame split is no
+longer one (both surfaces mount into a real sandboxed frame). Quarantined
+and delete-at-will, but no longer gate-less: see [Gates](#gates), two
+Playwright suites, one of which is currently RED for a
+[pre-existing reason](#known-broken-the-surface-guests-do-not-instantiate-pre-existing).
+The built demo is committed at `docs/spike-todomvc/` (the repo's Pages
+root).
 
 [#16]: https://github.com/polymorph-components/polyvisor/issues/16
 [#15]: https://github.com/polymorph-components/polyvisor/issues/15
@@ -74,7 +78,9 @@ are applied; within a boundary, application is atomic w.r.t. paint.
 | `channel` | the queued protocol over a real `MessageChannel` (postMessage clones; events round-trip) | faithful stand-in for the worker/frame split, one realm |
 
 The demo takes `?backend=` (default `frame`, as of the visor extraction's
-Phase C).
+Phase C). **These four are the `polyvisor:surface` guests' backends only**
+— the dioxus guest is a different world with one transport; see
+[Two surfaces, four guests](#two-surfaces-four-guests).
 
 **The equivalence harness** ([harness.html](https://polymorph-components.github.io/polymorph-apps/spike-todomvc/harness.html))
 makes "semantically equivalent" a checked property: the same guests run the
@@ -83,7 +89,14 @@ plus real DOM clicks) with full-DOM serialization compared stepwise
 (attributes, input value/checked props, focus marker), and 8 probe cases
 from a violation guest (`lab/`) compared as trap vectors, including the
 flush-on-trap rule (a visible legal mutation before the violating call must
-land on every backend). Status: **PASS**, 3 backends.
+land on every backend).
+
+Status: **RED** since 2026-08-21 — and only observably so since it acquired
+a gate (`e2e/tests/harness.spec.ts`). The three surface guests do not
+instantiate at all; the cause is a WIT package rename that predates this
+wave and is unrelated to it. See
+[Known-broken](#known-broken-the-surface-guests-do-not-instantiate-pre-existing).
+Before that commit it passed, 3 backends.
 
 `frame` is deliberately EXCLUDED from the harness (and from `bench.ts`'s
 churn sweep): both compare backends by reading the DOM directly, and a
@@ -112,59 +125,230 @@ is a VDOM-op-rate problem, not a UI-rate problem, so the contract-level
 accel option stays shelved and the bridge position is "delete scaffolding
 when native bindings arrive".
 
-## Three guests, one world
+## Two surfaces, four guests
+
+The spike no longer has "one world". It has **two app surfaces, split by
+what the app is written in** — and demonstrating both in one page is now
+the point of the `?guest=` toggle:
+
+| surface | for | guests here |
+|---|---|---|
+| **`polyvisor:surface`** (`wit/todomvc.wit`) — the WebIDL-mirror surface, [#15]'s bet | hand-written, Preact, componentize-js apps | `guest/`, `guest-preact/`, `lab/` |
+| **`polymorph:dioxus`** ([polyengine-dioxus], the sibling renderer) | dioxus apps, and the visor itself | `guest-dioxus/` |
+
+They are different worlds, not two configurations of one. The surface is a
+curated DOM API an app calls; `polymorph:dioxus` is a batched mutation
+channel a VDOM renders through. Neither subsumes the other and both are
+kept.
 
 | guest | tech | size (raw / gz) | notes |
 |---|---|---|---|
-| `guest/` | hand-written Rust | 37 KB / 14 KB | baseline; naive rebuild |
-| `guest-dioxus/` | dioxus 0.7 rsx (VDOM) | 352 KB / 130 KB | `?guest=dioxus`; JS boundary severed at build |
-| `guest-preact/` | **unmodified Preact 10.27** in StarlingMonkey (componentize-js) | 12.7 MB / 4.1 MB | `?guest=preact`; JS-as-userland proof |
+| `guest/` | hand-written Rust | 36 KB / 13 KB | baseline; naive rebuild |
+| `guest-dioxus/` | dioxus 0.7 rsx on **polyengine-dioxus** | 644 KB / 219 KB | `?guest=dioxus`; wasm32-wasip2, mounted in a sandboxed frame |
+| `guest-preact/` | **unmodified Preact 10.27** in StarlingMonkey (componentize-js) | 12.4 MB / 4.0 MB | `?guest=preact`; JS-as-userland proof |
+| `lab/` | hand-written Rust | 28 KB / 10 KB | violation probes for the harness |
 
-### The dioxus guest
+[polyengine-dioxus]: https://github.com/lannbot/polyengine-dioxus
 
-`guest-dioxus/` implements the same WIT world with the app written in
-[dioxus](https://dioxuslabs.com) 0.7 `rsx!` — a real framework's VDOM
-diffing running in-guest, its patch stream applied through the surface
-(demo: [`?guest=dioxus`](https://polymorph-components.github.io/polymorph-apps/spike-todomvc/?guest=dioxus)).
-The framework-support research and decision (2026-08-16):
+### The dioxus guest: re-targeted onto polyengine-dioxus
 
-- **Dioxus chosen.** `dioxus-core` is renderer-agnostic in practice, not
-  just in theory: `WriteMutations` is a public seam (Blitz/dioxus-native
-  ship on it), the crate graph is wasm-bindgen-free, and the VirtualDom
-  drives synchronously (`handle_event` → `process_events` →
-  `render_immediate`) — a perfect fit for a reactor guest. The glue is
-  ~450 lines: a `WriteMutations` impl over surface imports (stack machine
-  with guest-side shadow children for template paths, cribbed from
-  dioxus-native-dom), an `HtmlEventConverter` mapping surface event
-  records to dioxus event data, and listener tokens = dioxus `ElementId`s.
-- **Leptos rejected for now.** tachys 0.2 (leptos 0.8) hardcodes
-  `pub type Rndr = dom::Dom` — the 0.7-era generic renderer was
-  monomorphized away for compile times, and the alternate renderers are
-  commented out in the source. Supporting it means forking its view
-  layer. Its standalone `reactive_graph` remains attractive for a future
-  hand-rolled fine-grained renderer.
-- **One dependency lie needed severing**: dioxus-core's mandatory
-  `subsecond` (hot-patch runtime) links js-sys/wasm-bindgen on *all*
-  wasm32 targets — "wasm32 implies browser" strikes again — which poisons
-  componentization. Solved generically at composition time:
-  [`../no-js-bindgen`](../no-js-bindgen)'s `wbg-sever` replaces every
-  JS-boundary import with a trapping body and strips the describe
-  machinery (4 imports severed, 1930 describe exports stripped here).
-  A bespoke source-level subsecond stub predated it and was deleted once
-  severing proved sufficient.
+`guest-dioxus/` used to implement the *surface* world with a hand-rolled
+`renderer.rs` (a `WriteMutations` impl over the surface imports, ~285
+lines) and `events.rs` (an `HtmlEventConverter`, ~249 lines). **Those were
+the prototype of polyengine-dioxus**, which is the generalised, maintained,
+independently-tested version of exactly that idea. Both files are now
+**deleted in its favour**, along with `app.rs`: the app body is taken over
+from the sibling's own `examples/todomvc`, because one TodoMVC in dioxus is
+enough and a second copy that drifts is worse than a shared ancestor.
+
+What the guest is now: `polyengine_dioxus::launch!(app)`, built for
+**wasm32-wasip2** — which emits a component directly, so this guest needs
+no `wasm-tools component new` and, notably, **no `wbg-sever`**: on that
+target wasm-bindgen compiles to off-target stubs and emits no imports at
+all, so the JS-boundary lie the old pipeline had to sever generically
+([`../no-js-bindgen`](../no-js-bindgen), still used by nothing here) does
+not arise. The artifact imports `dom`, `events`, `head`, `history` and
+`mutations`, and **not `eval`** — apps never get eval, and the justfile
+asserts its absence rather than assuming it.
+
+**The filter is a route now.** Upstream's TodoMVC keeps All/Active/
+Completed as in-guest state; this guest drives it from
+`polymorph:dioxus/history`, encoded by the host into the URL fragment
+(`fragmentHistory` — the WIT names this exact case, "a host that does not
+own the path, such as polyvisor's apps"). Deliberately **no
+dioxus-router**: three filter states reachable by three literal routes do
+not need a routing table when `history()` is already root context. Both
+directions are wired and they are genuinely different paths — a click is a
+guest-initiated `push` (which deliberately does *not* echo back on
+`changes`), the back button is a host-initiated move that arrives on the
+`changes` stream.
+
+#### The three documented gaps: two closed, and honestly
+
+The old prototype had three recorded gaps. The re-target does **not** close
+all three "for free", and the difference matters:
+
+- **Only six event families converted** — **CLOSED, outright.** The sibling
+  converts the whole dioxus-html vocabulary (13 payload families plus the
+  ResizeObserver/IntersectionObserver-backed `resize` and `visible`).
+- **`bubbles` was always told `false`** — **CLOSED, outright.** The renderer
+  sends dioxus-core's real `event_bubbles` verdict and does synthetic
+  bubbling guest-side.
+- **No `onmounted`/focus bridging** — **closed in the renderer, reopened by
+  the frame.** The renderer implements `mounted` and the whole `MountedData`
+  backing (`interface dom`), so a *same-realm* mount auto-focuses correctly.
+  Across the sandboxed frame those imports are synchronous and cannot cross
+  postMessage (see below), so the edit field still does not auto-focus on
+  the default backend. Same visible symptom as before, entirely different
+  cause: it was missing plumbing, it is now a structural property of the
+  trust boundary.
+- **`preventDefault`/`stopPropagation`** — same shape: real in the renderer,
+  no-ops across the frame.
+
+#### What the prototype taught, and is still true
+
+The 2026-08-16 framework-support investigation produced findings that
+outlived the code it produced. Kept because they are about the *surface* and
+the *choice*, not about the deleted renderer:
+
 - **Surface additions the framework forced** (the exact prerequisite list
   predicted): `create-text-node` (mixed content like the
   `<strong>{n}</strong> items left` counter), and `before`/`after`
   (ChildNode mirrors) for positional insertion — all structural, all
-  validator-checked, two new probe cases pin text-node restrictions.
-- **Sizes**: dioxus component 366 KB raw / **130 KB gz** vs 37 KB / 14 KB
-  hand-written — the framework tax, paid once per app.
-- **Known gaps** (documented, not hidden): no `onmounted`/focus bridging
-  (the edit field doesn't auto-focus in the dioxus guest — needs a
-  mounted-data story over the surface), `preventDefault`/
-  `stopPropagation` from handlers don't cross the record boundary
-  (bubbling is delegated to the real DOM; dioxus is told `bubbles=false`),
-  and only the six surface event families convert.
+  validator-checked, two probe cases pin text-node restrictions. These are
+  in `wit/todomvc.wit` today and the hand-written and Preact guests use
+  them.
+- **Leptos rejected, and the reason has not changed.** tachys 0.2 (leptos
+  0.8) hardcodes `pub type Rndr = dom::Dom` — the 0.7-era generic renderer
+  was monomorphized away for compile times, and the alternate renderers are
+  commented out in the source. Supporting it means forking its view layer.
+  Its standalone `reactive_graph` remains attractive for a future
+  hand-rolled fine-grained renderer.
+- **`wbg-sever` is no longer in this guest's path**, and the reason is worth
+  recording because it looks like the problem went away on its own. It did
+  not: dioxus-core's mandatory `subsecond` still links js-sys/wasm-bindgen
+  on *all* wasm32 targets ("wasm32 implies browser"). What changed is the
+  target — on `wasm32-wasip2` wasm-bindgen compiles to off-target stubs and
+  emits no imports to sever. [`../no-js-bindgen`](../no-js-bindgen) remains
+  the generic answer for anything still built for
+  `wasm32-unknown-unknown`.
+
+### The frame transport (`host/dioxus-frame.ts` + `host/frame-dioxus.ts`)
+
+The page's default backend is `frame`, and the dioxus guest keeps it. That
+is not decoration: the visor's strip carries the user's personal anchor
+colour, and non-disclosure of it is **structural** — a document on an opaque
+origin has nothing to read, as opposed to nothing it is *allowed* to read
+(`visor/frame/frame-backend.ts` explains at length). A re-target that
+mounted the app same-realm would have silently traded that away.
+
+The sibling's `mountApp` applies into the document it runs in, so the two
+halves are split here:
+
+- **the shell** runs the wasm instance, owns the import table, and reads the
+  mutation stream — and never touches the app's DOM;
+- **the frame** owns the app's document: `DomApplier`, `applyOperations`,
+  `EventDispatcher`, `serializePayload`, all of them the sibling's code
+  rather than a reimplementation.
+
+Op batches cross as-is (lifted `operation` values are plain data, `Uint8Array`
+paths and `bigint`s included, so `structuredClone` carries them); events are
+serialized frame-side and posted back with the ids `handle-event` wants. The
+handshake, the height reporting and the teardown-with-completion mirror
+`frame-backend.ts`'s discipline exactly. It stays **in the spike**: it is the
+first consumer of this shape, and it moves upstream if a second appears.
+
+**The honest degradations**, each marked at its site in the source:
+
+1. **`dom-event.prevent-default` / `stop-propagation` are no-ops.** The
+   frame's native listener returned before the shell saw the event. The WIT
+   already covers the shape ("calling either method after the originating
+   dispatch has completed is a harmless no-op").
+2. **The `dom` queries cannot cross.** `get-client-rect`, `set-focus` and the
+   rest are synchronous imports; postMessage is not. They answer the
+   interface's own documented miss values (`none` / `false`), which is a real
+   specified state and not an error.
+3. **`eval` is not granted** — a rule, not a degradation. No import supplied,
+   none imported.
+4. **A fourth, found by building it rather than predicted:** an event payload
+   carrying a *resource* — `form-data.files`, `drag-data.transfer` — cannot
+   cross either, because the serializer builds live `HostFile`/
+   `HostDataTransfer` instances and `structuredClone` flattens a class
+   instance into a method-less object. TodoMVC never produces one (its inputs
+   are text and checkbox, so `files` is always `[]`), so it costs this app
+   nothing today.
+
+One consequence of (1) needed a frame-side fix rather than just a note: an
+un-prevented in-page anchor click navigates the *frame's* fragment, and a
+same-document navigation in a subframe still appends to the browsing
+context group's **joint session history** — so the shell's back button
+stepped through fragment entries of a frame whose URL nobody reads. Found
+by the e2e suite, whose second `history.back()` moved nothing. The frame
+now refuses in-page anchor defaults on the guest's behalf: a framed app's
+own fragment is unobservable by construction, so navigating it can only be
+noise.
+
+`?backend=` does not apply to this guest and is **not faked**. `direct` has
+a real analogue (the sibling's own `mountApp`); `queued` and `channel` are
+surface-specific — two application strategies for the surface's op protocol
+— and `polymorph:dioxus` has one op protocol whose transport is decided by
+where the applier lives. The page note says so rather than offering a
+switch that ignores three of its four values.
+
+## Gates
+
+The spike had **no automated gate** before this wave — which is why the
+break recorded under "Known-broken" below went unnoticed for three weeks.
+It now has two, in `e2e/` (Playwright, real Chromium):
+
+```sh
+cd e2e && npm install && npx playwright install chromium   # first run
+just e2e                                                    # build + both gates
+```
+
+- **`tests/harness.spec.ts`** wraps the existing differential harness
+  (`web/harness.html`): the same guests over the three same-realm surface
+  backends, 15 scripted steps compared stepwise plus 8 trap-vector probes,
+  asserted PASS. This is the gate that would prove the runtime bump did not
+  disturb the surface guests. **Currently RED**, for the pre-existing reason
+  below.
+- **`tests/dioxus-frame.spec.ts`** drives the re-targeted dioxus guest on
+  the default frame backend through real interaction — add, toggle, edit via
+  dblclick+Enter, cancel via Escape, destroy, and the three hash routes in
+  both directions — and asserts the two properties a re-target could silently
+  lose: that the app frame **cannot resolve the shell's `--visor-bg`** (it is
+  opaque-origin), and that the artifact **does not import `eval`**. **Green**,
+  4/4.
+
+## Known-broken: the surface guests do not instantiate (pre-existing)
+
+`guest/`, `guest-preact/` and `lab/` have been unable to instantiate since
+**2026-08-21**, commit `4ec8d2f` ("Split the WIT contracts:
+polyvisor:surface, polyvisor:panel…", #74). That commit moved
+`visor/surface/surface.ts` onto import keys `polyvisor:surface/{dom,events,
+shell}@0.1.0`, but `wit/todomvc.wit` here still declares
+`package polymorph:todomvc-spike@0.0.1`, so the components ask for keys the
+host does not register:
+
+```
+PlanError: host import 'polymorph:todomvc-spike/dom@0.0.1/element' not provided
+  (no key 'polymorph:todomvc-spike/dom@0.0.1' in imports;
+   registered: polyvisor:surface/dom@0.1.0, …)
+```
+
+This is **not** the runtime bump: the identical failure reproduces on the
+old `jsr:@deltic/runtime@0.1.0-pre.gc4043e6` with old-format envelopes.
+Nothing caught it because the spike had no gate; the new harness gate found
+it on its first honest run.
+
+The fix is mechanical but not one line: the interface bodies of
+`wit/todomvc.wit` and the repo-root `wit/surface/surface.wit` are
+byte-identical, so it is a package rename — which then cascades into every
+surface guest's source (`crate::polymorph::todomvc_spike::*` in `guest/` and
+`lab/`, and the `"polymorph:todomvc-spike/…"` import specifiers in
+`guest-preact/`). It is left for its own change rather than folded into the
+dioxus re-target.
+
 
 ### The preact guest (JS as userland)
 
@@ -316,26 +500,52 @@ page is exactly what its binary imports.
 
 ## Build
 
-Requires Rust (`wasm32-unknown-unknown`), `wasm-tools`, and Deno.
+Requires Rust (`wasm32-unknown-unknown` **and** `wasm32-wasip2`),
+`wasm-tools`, Deno, and — for the dioxus guest — a
+[polyengine-dioxus][polyengine-dioxus] checkout as a sibling of this repo's
+root (`../../../polyengine-dioxus`; inside a git worktree a symlink next to
+the worktree restores that invariant, as `spikes/visor-dioxus` documents).
 
 ```sh
 just build    # → ../../docs/spike-todomvc (the Pages root)
 just serve    # build + serve docs/ on :8931
+just e2e      # build + both Playwright gates
+just size     # the dioxus component, raw and gzipped
 ```
 
-Pipeline: `cargo build` (todomvc + lab guests) → `wasm-tools component new`
-+ `validate` → build-time translate (envelopes) → `deno bundle` the host
-(one bundle, three pages: demo / harness / bench) → assemble the demo dir.
+**Two pipelines**, because there are two surfaces:
+
+- surface guests (`guest/`, `lab/`, `guest-preact/`): `cargo build` for
+  `wasm32-unknown-unknown` → `wasm-tools component new` + `validate`;
+- the dioxus guest: `cargo build` for `wasm32-wasip2`, which **emits a
+  component directly** — no `wasm-tools component new`, no `wbg-sever` —
+  then `validate --features component-model,cm-async` (the mutation channel
+  is a `stream`, so `cm-async` is required) and an assertion that the
+  artifact does not import `eval`.
+
+Both then get build-time translation into envelopes (the blessed deploy
+artifact; nothing ships a translator), and `deno bundle` produces the host
+bundle plus **two** frame entries — the surface's and the dioxus guest's.
 
 ## Pins
 
 | what | version |
 |---|---|
-| deltic (`@deltic/runtime`, `@deltic/translator`) | `0.1.0-pre.gc4043e6` (JSR) |
-| wit-bindgen (Rust crate) | `=0.60.0` |
-| dioxus (`dioxus`, `dioxus-core`, `dioxus-html`) | `=0.7.10` (JS boundary severed at build, see `../no-js-bindgen`) |
+| deltic runtime + translator | the sibling's pinned `.deps/polyengine` checkout (`polyengine-dioxus/justfile`'s `POLYENGINE_REV`), reached through `deno.json` — **not** JSR any more |
+| polyengine-dioxus | the sibling checkout, by path (`polymorph:dioxus@0.6.0`) |
+| wit-bindgen (Rust crate) | `=0.60.0`, features `async-spawn`, `inter-task-wakeup` |
+| dioxus (`dioxus`, `dioxus-history`) | `=0.7.10` — mirrored EXACTLY from the sibling; `dioxus-core` is shared state with the renderer and a skew compiles two incompatible copies |
 | preact / htm / componentize-js / jco | `10.27.2` / `3.1.1` / `0.18.4` / `1.29.0` (npm, `guest-preact/package.json`) |
-| Rust | 1.96.0, `wasm32-unknown-unknown` |
+| Playwright | `1.62.1` (`e2e/package.json`) |
+| Rust | 1.96.0, `wasm32-unknown-unknown` + `wasm32-wasip2` |
+
+**Why the runtime moved.** The spike pinned
+`jsr:@deltic/runtime@0.1.0-pre.gc4043e6`, which predates
+component-model-async; the dioxus guest's mutation stream needs `cm-async`,
+so `deno.json` now maps `@deltic/*` onto the sibling's `.deps/polyengine`
+checkout exactly as `spikes/visor-dioxus/deno.json` does, and the build uses
+its translate tool. (The spike's own `tools/translate.ts` is deleted — it
+wrapped the JSR translator and had no remaining caller.)
 
 `web/todomvc-app.css` is vendored from
 [todomvc-app-css](https://github.com/tastejs/todomvc-app-css) 2.4.3 (MIT,

@@ -1,6 +1,15 @@
 [toolchain]
-# What the spike was built and verified with; the guest is a pure reactor
-# (no WASI), so plain wasm32-unknown-unknown + `wasm-tools component new`.
+# What the spike was built and verified with.
+#
+# TWO TARGETS, because the spike now has two kinds of guest. The three
+# surface guests (`guest/`, `lab/`, and the dioxus guest as it used to be)
+# are pure reactors with no WASI, so they build for
+# wasm32-unknown-unknown and are componentized afterwards by
+# `wasm-tools component new`. The re-targeted dioxus guest builds on
+# polyengine-dioxus, whose pipeline is wasm32-wasip2 — rustc runs the
+# module→component step itself there, so that guest needs no
+# `wasm-tools component new` and no JS-boundary severing (see the sibling's
+# justfile `example` recipe, and this spike's README on the re-target).
 channel = "1.96.0"
 components = ["rustfmt", "clippy"]
-targets = ["wasm32-unknown-unknown"]
+targets = ["wasm32-unknown-unknown", "wasm32-wasip2"]
