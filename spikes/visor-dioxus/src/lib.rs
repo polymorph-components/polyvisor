@@ -81,3 +81,9 @@ pub mod app;
 mod component;
 #[cfg(target_arch = "wasm32")]
 pub mod sheets;
+/// Device enrollment (`visor/ui/pairing.ts`): the join flow's code and QR, the
+/// comparison screens, and the add flow's heavy ceremony.
+pub mod pairing;
+/// The entry ceremonies (`visor/ui/entry.ts`): the device picker and the
+/// first-run fork — the only sheets that open before the visor is claimed.
+pub mod entry;

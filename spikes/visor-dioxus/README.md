@@ -11,7 +11,7 @@ a slope — and the second round is what showed that.** Everything below is
 measured, not estimated. Nothing here is adopted; this directory is a spike and
 the decision is open.
 
-Ported so far, in two rounds:
+Ported so far, in three rounds — **`visor/ui/` is now ported in full**:
 
 - **round one** — `visor/ui/visor.ts:1211-2786`, the strip and the drawer host
   (1,576 lines). Sheets arrived in the drawer as foreign DOM, which is what
@@ -20,26 +20,33 @@ Ported so far, in two rounds:
   ceremony, the settings sheet, the erase ceremony, the event list, and the
   trust table. These are now guest-rendered and no longer cross the seam.
 
-Still TypeScript, deliberately: `pairing.ts`, `entry.ts`, and a consumer's own
-sheets (the demo's credential sheet and storage picker). **Keeping one foreign
-tenant is a feature of the spike, not an omission** — the mixed case, guest
-sheets and a consumer's foreign DOM in one drawer, is what the real system
-looks like and is the thing most likely to break.
+- **round three** — `visor/ui/pairing.ts` and `entry.ts` (1,574 lines, plus the
+  997-line vendored QR generator, which became a dependency rather than a hand
+  port): device enrollment, and the two entry ceremonies that decide how a
+  browser becomes a device with an account.
+
+Still TypeScript, deliberately: a consumer's own sheets (the demo's credential
+sheet and storage picker). **Keeping one foreign tenant is a feature of the
+spike, not an omission** — the mixed case, guest sheets and a consumer's
+foreign DOM in one drawer, is what the real system looks like and is the thing
+most likely to break.
 
 ## What was built
 
-A Rust/Dioxus component (`src/`, 7,319 lines) rendering the whole of the
+A Rust/Dioxus component (`src/`, 11,378 lines) rendering the whole of the
 visor's territory — `#visor-zone`, `#visor-drawer`, `#visor-strip`,
 `#visor-dim`, and now the four ceremonies — against **the unmodified
 `visor/ui/visor.css`**. The stylesheet is served, not copied
 (`e2e/server.ts`), so there is exactly one file the component is measured
 against.
 
-`wit/world.wit` extends the base `polymorph:dioxus/app` world with three
-imports (`store`, `chrome`, `embedder`) and three exports (`control`, `marks`,
-`sheets`). **24 Playwright gates** in real Chromium ported from
-`demo/e2e/scenarios/`, and **62 native `cargo test`s** covering the tenancy
-machine, the trust table, the word roll, the event record and the voice types.
+`wit/world.wit` extends the base `polymorph:dioxus/app` world (now `@0.6.0`)
+with five imports (`store`, `chrome`, `embedder`, `pairing-driver`,
+`entry-host`) and five exports (`control`, `marks`, `sheets`, `pairing`,
+`entry`). **35 Playwright gates** in real Chromium ported from
+`demo/e2e/scenarios/`, and **100 native `cargo test`s** covering the tenancy
+machine, the trust table, the word roll, the event record, the voice types, the
+two enrollment state machines and the QR matrix.
 
 ## The costs
 
@@ -50,31 +57,53 @@ machine, the trust table, the word roll, the event record and the voice types.
 | empty dioxus component (renders one div) | 435,281 | **144,247** |
 | + strip and drawer host (round one) | 963,908 | **281,415** |
 | + all four ceremonies and the trust table (round two) | 1,220,168 | **334,200** |
-| `visor.ts` + `sheets.ts` — the same scope, today | 76,960 | **20,329** |
-| all of `visor/ui/` — incl. pairing, entry, QR codegen | 137,947 | **36,141** |
+| + pairing and the entry ceremonies (round three) | 1,637,011 | **414,211** |
+| **all of `visor/ui/` — the same scope, today** | 137,947 | **36,141** |
 
-**THE SHAPE OF THE COST IS THE ROUND-TWO RESULT.** Round one read as a 20x
-multiplier. It is not a multiplier — it is a floor plus a small slope:
+**THE SHAPE OF THE COST IS THE RESULT.** Round one read as a 20x multiplier.
+It is not a multiplier — it is a floor plus a small slope:
 
 - the floor is **144 KB gzipped** before a line of visor code exists, and it
   is not our code (the sibling's `counter` example is 383 KB raw)
 - the strip and drawer host cost **+137 KB** on top of it
 - **1,866 further lines of TypeScript — the whole of `sheets.ts` — cost
   +53 KB**, against the ~6 KB gzipped those lines occupy today
+- pairing and entry cost **+80 KB**, of which 16 KB is the `qrcode` crate
 
-So the marginal price of moving more of the visor in is real but modest, and
-the headline ratio improves the more you port: ~20x for the strip alone, ~16x
-for strip-plus-sheets. Anyone deciding this should decide about the **floor**,
-because that is where the money is; arguing about the slope is arguing about
-the small half.
+The ratio therefore improves monotonically as more moves in: **~20x** for the
+strip alone, **~16x** with the sheets, **~11.5x** for the whole of `visor/ui/`.
+Anyone deciding this should decide about the **floor**, because that is where
+the money is; arguing about the slope is arguing about the small half.
+
+### The capability that turned out not to be needed
+
+`document::eval` was turned on in round three and turned back off in the same
+round. The reasoning is worth keeping because it is the only place this spike
+reversed itself on evidence.
+
+It was enabled on the belief that `pairing.ts:133-144`'s 2D canvas — building
+the join code's QR and reading it back as a PNG data URL — was the one thing in
+all of `visor/ui/` that a DOM-mutation surface could not express. That belief
+was wrong. A 79-character join code is a 37-module symbol, which reduces to
+**362 row-wise runs**: one `<path>`, **two DOM nodes**, **26.5 ms** from
+`request-join()` to painted, 0.05 ms to re-layout — and it decodes back to the
+same code under a real scanner (`jsQR`, against the rasterised SVG).
+
+Retiring it bought back **~37 KB gzipped**, about 70% of what the entire
+1,866-line `sheets.ts` port cost, for a capability that reaches the page's own
+realm (`globalThis`, `document`). In a trusted computing base that is a good
+trade, and re-enabling it is one feature flag on the day something demonstrates
+a need. The finding generalises: **eval is an escape hatch, and the visor —
+having now been ported in full — does not currently need it.**
 
 The build already runs `lto = fat`, `opt-level = "s"`, `panic = "abort"`,
 `strip`; `wasm-tools strip` recovers 0.5%. The clock cost 1.2%.
 
 This matters more here than in an app because the visor is the signed,
-third-party-monitored release artifact (#3). The trade is ~3,400 lines of
-reviewable TypeScript for a ~1.2 MB binary plus a Rust dependency tree
-(dioxus-core, dioxus-html, wit-bindgen, wasi-libc).
+third-party-monitored release artifact (#3). The trade is the whole of
+`visor/ui/` — ~6,100 lines of reviewable TypeScript — for a ~1.6 MB binary plus
+a Rust dependency tree (dioxus-core, dioxus-html, wit-bindgen, wasi-libc,
+qrcode).
 
 ### Expressiveness lost at the boundary
 
@@ -262,7 +291,7 @@ Rust and grew the host by ~55 lines — because a guest-rendered ceremony has
 almost no boundary. Against that, 7,319 lines of Rust. Total source goes up
 substantially; what moves is where the logic lives and what tests it.
 
-Gate density is the clearest gain: **62 native `cargo test`s** now hold the
+Gate density is the clearest gain: **100 native `cargo test`s** now hold the
 tenancy machine, the trust table, the word roll and the voice types with no
 browser at all. The clearest loss sits right beside it — `src/sheets/` is
 wasm32-gated, so tests written inside it do **not** run under host
@@ -294,8 +323,8 @@ Costs of the approach, listed rather than hidden:
 
 ```
 just build   # cargo → wasm32-wasip2 → validate → translate to a plan.json
-just e2e     # 24 Playwright gates in real Chromium
-cargo test   # 62 native tests, no browser
+just e2e     # 35 Playwright gates in real Chromium
+cargo test   # 100 native tests, no browser
 ```
 
 Two environment notes. The crate depends on the sibling renderer by relative
@@ -307,19 +336,25 @@ duplicates ~40 lines of instantiation; two small upstream additions to
 polyengine-dioxus (`imports?` on `MountOptions`, `exports` on `Mounted`) would
 delete that duplication and are worth doing regardless of what happens here.
 
-## What opt-in document eval would change
+## What is still TypeScript, and what the contract refuses to carry
 
-polyengine is growing opt-in document eval, which the visor — being trusted —
-will be able to use and apps will not. It lands squarely on `chrome`, the
-interface invented here only because this world cannot otherwise reach the
-page: `viewport-height` and `reload` are both candidates to collapse into it,
-and the `measure-sheet` deleted this round would become answerable directly
-rather than needing the host to push heights in-band.
+A consumer's own sheets — the demo's credential sheet and storage picker —
+stay TypeScript and arrive through the foreign-DOM seam. That is deliberate:
+the mixed case is what the real system looks like.
 
-**`store` should not migrate onto it.** The slot enum is the sharpest trust
-result in this port precisely because it is *not* a general capability: a
-component that cannot spell a key cannot read the origin's other storage,
-which is a promise the TypeScript visor has no way to make. Reaching
-localStorage through document eval hands it straight back. "The visor may
-eval" and "the visor should eval for everything it can" are different claims,
-and only the first is implied.
+`pairing-driver` was first transcribed whole from `visor/ui/pairing-driver.ts`
+— nineteen functions — and the port calls ten. The other nine are called by
+consumer surfaces that are not in `visor/ui/` and are not ported here, so they
+were **deleted from the contract** rather than kept for completeness. An import
+is a capability the host must grant and a promise the guest may call; a
+contract wider than its caller is a standing invitation to widen the caller.
+`us-devices-list` was kept despite having no Rust caller, because the
+TypeScript visor does call it — its absence is a gap in the port, not evidence
+the visor does not need it.
+
+Two things the contract gained this round because the port demonstrated the
+need: `types.context` grew `pairing-join`/`pairing-add` (without them the strip
+read "visor settings" while a comparison screen was up — safe, since the
+cluster stayed untappable, but not true), and `store.slot` grew `account` for
+the user-system boot cache, which the pairing wave correctly refused to
+overload onto `marks`.

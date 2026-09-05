@@ -112,6 +112,7 @@ pub fn App() -> Element {
         signal
     });
 
+
     // Read once, and clone out everything the rsx below needs: the handlers are
     // `move` closures that outlive this borrow, and they reach the live state
     // through `with_visor` at click time rather than capturing a snapshot of it

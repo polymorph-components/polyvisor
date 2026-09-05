@@ -76,6 +76,12 @@ pub enum Context {
     Events,
     DevicePicker,
     FirstRun,
+    /// THE PAIRING CEREMONIES (`types.context`, wit/world.wit:184-196). Bare
+    /// kinds, like `Settings` and `Reset`: no component stands behind either,
+    /// so there is no surface to carry and the strip's honest answer is the
+    /// name of the ceremony.
+    PairingJoin,
+    PairingAdd,
 }
 
 impl Context {
@@ -92,6 +98,8 @@ impl Context {
             Context::Events => "events",
             Context::DevicePicker => "device-picker",
             Context::FirstRun => "first-run",
+            Context::PairingJoin => "pairing-join",
+            Context::PairingAdd => "pairing-add",
         }
     }
 
@@ -139,6 +147,17 @@ impl Context {
             Context::DevicePicker => "choose a device",
             Context::FirstRun => "no account on this device yet",
             Context::Settings => "visor settings",
+            // THE CEREMONY'S OWN WORDS, and SHORTER THAN ITS HEADING on
+            // purpose: this line sits on the strip beside the identity
+            // cluster, and the sheet above it already says the long form.
+            //
+            // THE TWO MUST NOT BE CONFUSABLE. They are the only pair in this
+            // table that look alike and mean OPPOSITE things — one takes
+            // access, the other gives it — so each names its DIRECTION in the
+            // first two words rather than sharing a "pairing" noun that would
+            // make a glanced line ambiguous.
+            Context::PairingJoin => "join this device",
+            Context::PairingAdd => "add a device",
             Context::None | Context::Panel(_) => return None,
         })
     }
@@ -163,6 +182,19 @@ impl Context {
                     | Context::Reset
                     | Context::DevicePicker
                     | Context::FirstRun
+                    // A CEREMONY HOLDING A SHORT AUTHENTICATION STRING must
+                    // not be displaceable by a stray tap on the anchor it
+                    // hangs from — the erase ceremony's argument exactly, and
+                    // for a higher stake: a comparison interrupted mid-glance
+                    // is a comparison the user may finish from memory.
+                    //
+                    // Both are already untappable through `top_surface()`
+                    // being `None`, as `Reset` and the two entry kinds are.
+                    // Listed anyway, and for the reason those are: the
+                    // predicate should say what it refuses, not leave it as a
+                    // consequence of a field being empty.
+                    | Context::PairingJoin
+                    | Context::PairingAdd
             )
     }
 
@@ -421,7 +453,7 @@ pub fn visor_bg(hue: u16) -> String {
 
 /// The string value of a top-level `"key"` in `raw`, with JSON escapes
 /// resolved. `None` when absent or not a string.
-fn json_string(raw: &str, key: &str) -> Option<String> {
+pub(crate) fn json_string(raw: &str, key: &str) -> Option<String> {
     let rest = after_key(raw, key)?;
     let mut chars = rest.char_indices();
     if chars.next()?.1 != '"' {
@@ -454,7 +486,7 @@ fn json_string(raw: &str, key: &str) -> Option<String> {
 
 /// The numeric value of a top-level `"key"`. `None` when absent or not a
 /// number.
-fn json_number(raw: &str, key: &str) -> Option<f64> {
+pub(crate) fn json_number(raw: &str, key: &str) -> Option<f64> {
     let rest = after_key(raw, key)?;
     let end = rest
         .find(|c: char| !matches!(c, '0'..='9' | '-' | '+' | '.' | 'e' | 'E'))
@@ -521,7 +553,7 @@ fn after_key<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
 
 /// A JSON string literal. Escapes the two characters that would break the
 /// document plus the C0 range, which is what a hand-edited record could carry.
-fn json_escape(s: &str) -> String {
+pub(crate) fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

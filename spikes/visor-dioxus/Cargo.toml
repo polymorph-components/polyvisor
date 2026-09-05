@@ -14,6 +14,44 @@ crate-type = ["cdylib", "rlib"]
 # ~/.paseo/worktrees/<id>/<name>, six levels down). See the spike report: a
 # symlink next to the worktree restores the invariant; there is no
 # cargo-native way to express "the sibling of my repo root".
+#
+# NO `eval` FEATURE, AND NO `dioxus/document` EITHER. The reason is a
+# measurement, not a policy — and the measurement went the other way from the
+# expectation that turned it on.
+#
+# It was enabled on the belief that `visor/ui/pairing.ts:133-144`'s 2D canvas
+# was the one thing in the whole of visor/ui/ that a DOM-mutation surface could
+# not express. Ported, it turned out a 79-char join code is a 37-module symbol
+# reducing to 362 row-wise runs — one `<path>`, two DOM nodes, 26.5ms from
+# `request-join()` to painted, and it decodes back to the same code under a
+# real scanner. So the capability's one suspected customer did not need it.
+#
+# Retiring it bought back ~37 KB gzipped — about 70% of what the entire
+# 1,866-line sheets.ts port cost — for a capability that reaches the page's own
+# realm. That is a good trade in a trusted computing base, and re-enabling it
+# is one feature flag on the day something demonstrates a need.
+#
+# It was turned on for ONE customer: `visor/ui/pairing.ts:133-144` builds the
+# pairing QR on a 2D canvas and returns a `toDataURL` PNG, which looked like the
+# one thing in all of visor/ui/ that a DOM-mutation surface could not express.
+# The pairing wave ported it, measured it, and found otherwise — a QR is a grid
+# of axis-aligned rectangles, which is what a vector format is for. It is now a
+# single SVG `<path>`: two nodes, one attribute, no host round trip. See
+# `src/pairing/pure/qr.rs`'s header.
+#
+# So the capability had one customer and the customer did not need it. Dropping
+# it is not merely a size win: the visor is the trusted computing base, and
+# `eval` reaches the page's own realm — `globalThis`, `document`, and through
+# them every other thing on the origin, including the localStorage that
+# `interface store`'s slot enum exists to keep out of this component's reach
+# (wit/world.wit:64-75 says exactly this about what must never migrate onto
+# eval). A capability that wide is carried for a demonstrated need, not a
+# suspected one.
+#
+# WHAT TURNING IT BACK ON WOULD TAKE: this feature, plus the `with:` mapping in
+# `src/component.rs`'s `generate!`, plus `MountOptions.eval` on the host. It is
+# a two-sided opt-in and a component built with only one side fails to
+# instantiate, which is the loud, safe direction.
 polyengine-dioxus = { path = "../../../polyengine-dioxus" }
 
 # Pins mirrored EXACTLY from the sibling's Cargo.toml. dioxus-core is shared
@@ -27,6 +65,25 @@ dioxus = { version = "=0.7.10", default-features = false, features = [
   "signals",
   "hooks",
 ] }
+
+# THE QR ENCODER, for the join flow's code (`visor/ui/pairing.ts:130-145`).
+#
+# A REVIEWED DEPENDENCY RATHER THAN A HAND-PORT. The TypeScript vendors
+# `visor/ui/vendor/qrcodegen.ts` — 997 lines of Nayuki's reference encoder
+# copied into the tree — because adding an npm dependency for one image was
+# judged the worse trade there. That trade inverts here: this crate is trusted
+# UI, so everything in it is in the TCB, and 997 lines of hand-copied
+# Reed-Solomon that no one on this project will ever re-review is a worse thing
+# to have in a TCB than a crates.io package with a version, a checksum and
+# other people reading it. Nothing secret is encoded either way — a pairing
+# code is a public offer whose whole security rests on the SAS comparison the
+# two humans make, not on the code's confidentiality — so an encoder bug is a
+# QR that fails to scan, not a leak.
+#
+# `default-features = false` drops `image`, `svg` and `pic`: only the matrix is
+# wanted here (`QrCode::width`/`to_vec`), because the rasterisation is the
+# renderer's job. See `src/pairing/qr.rs`.
+qrcode = { version = "0.14.1", default-features = false }
 
 # THE CLOCK. `wasm32-wasip2` has no JavaScript host to call `setTimeout` on,
 # and `dioxus-sdk-time`'s stock wasm backend reaches `setTimeout` through
