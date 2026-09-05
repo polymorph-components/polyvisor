@@ -1,0 +1,17 @@
+/// Vendored from wasi-random 0.2.0 (the `random` interface only): the
+/// world imports it so the webcrypto-componentize library can serve
+/// `crypto.getRandomValues` from the host's entropy.
+package wasi:random@0.2.0;
+
+/// WASI Random is a random data API.
+///
+/// It is intended to be portable at least between Unix-family platforms and
+/// Windows.
+interface random {
+    /// Return `len` cryptographically-secure random or pseudo-random bytes.
+    get-random-bytes: func(len: u64) -> list<u8>;
+
+    /// Return a cryptographically-secure random or pseudo-random `u64`
+    /// value.
+    get-random-u64: func() -> u64;
+}

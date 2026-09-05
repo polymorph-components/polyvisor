@@ -18,13 +18,15 @@ import { INDEX_DB, INDEX_STORE, nsDbName, nsDirName } from "./names.ts";
 /** The stores every namespace database has.
  *
  * - `seal` — the KEK ladder's persisted state: passphrase wrap, the
- *   non-extractable platform key handle and its wrap (seal.ts).
+ *   non-extractable platform key handle and its wrap (the record
+ *   shapes are seal-records.ts; the ladder is the seal component).
  * - `sealed` — the sealed key/value surface (`sealedPut`/`sealedGet`).
  * - `meta` — unsealed per-device bookkeeping the sweep needs: the lease.
  *   NOTHING PERSONAL: this store rests in the clear exactly like the
  *   index, so it carries timestamps and nothing else.
  * - `identity` — the device's signing identity as NON-EXTRACTABLE
- *   CryptoKey handles (identity-keys.ts). Unsealed by construction and
+ *   CryptoKey handles (the seal component's `identity` interface,
+ *   through seal-component.ts). Unsealed by construction and
  *   deliberately so: the handles are unreadable because the platform
  *   says so, not because a DEK hides them (PERSISTENCE.md, "Device
  *   signing identity").

@@ -69,6 +69,7 @@ jobs:
             examples/todomvc/guest
             providers/s3/panel
             providers/dropbox/panel
+            runtime/device-seal
           # No registry pruning: the sibling workspace sits outside the
           # repo, and its deps must survive the post-job save.
           cache-all-crates: true

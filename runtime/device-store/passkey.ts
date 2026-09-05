@@ -7,7 +7,7 @@
 // happen on the PAGE. This module runs them, derives the AES-KW key
 // encryption key from the assertion's PRF output, and hands the worker a
 // NON-EXTRACTABLE handle across the port — never the output, never the
-// DEK. seal.ts validates that handle on arrival (`requirePrfKek`) rather
+// DEK. The seal component validates that handle on arrival rather
 // than trusting where it came from.
 //
 // THE TRUST SENTENCE, said here because this is where it applies: the
@@ -28,13 +28,13 @@
 // THIS MODULE MUST NEVER BE IMPORTED BY worker.ts. Every symbol here
 // touches `window`/`navigator`, so an import would be a module that
 // cannot evaluate in the host's global — and the split above is the
-// reason it is a separate file rather than a branch inside seal.ts.
+// reason it is a separate file rather than a branch inside the seal.
 //
 // IT IMPORTS NO PACKAGE — DOM globals and sibling modules only, which is
 // runtime/README.md's resolution model for the device-store core, kept.
 
 import { openNamespace } from "./namespace.ts";
-import { getPrfEnrollment, type PrfEnrollment, SealError } from "./seal.ts";
+import { getPrfEnrollment, type PrfEnrollment, SealError } from "./seal-records.ts";
 
 /**
  * Can this browser do the PRF extension at all — asked BEFORE offering
@@ -254,7 +254,7 @@ export async function assertPasskey(deviceId: string): Promise<CryptoKey> {
  * that crosses to the worker, and both properties are what make that
  * crossing narrow: the receiver can ask the platform to unwrap with it
  * and can do nothing else, and it cannot be read back as bytes by
- * either side. seal.ts re-checks both on arrival.
+ * either side. The seal component re-checks both on arrival.
  *
  * THE DEVICE ID IS BOUND INTO `info`, and that is the record's ruling
  * rather than decoration: a wrap record copied from one namespace into
@@ -289,7 +289,7 @@ async function deriveKek(
     },
     material,
     // `length` is REQUIRED for a derived AES key even though AES-KW-256
-    // is implied by the usages — seal.ts's `kekFromPassphrase` records
+    // is implied by the usages — the ladder's own derivation records
     // the same Chromium refusal.
     { name: "AES-KW", length: 256 },
     false,

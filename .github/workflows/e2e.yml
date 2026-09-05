@@ -62,6 +62,7 @@ jobs:
             examples/todomvc/guest
             providers/s3/panel
             providers/dropbox/panel
+            runtime/device-seal
           cache-all-crates: true
           cache-bin: false
           # The SAME entry the Pages build job saves — the expression must

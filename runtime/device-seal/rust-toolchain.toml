@@ -1,0 +1,5 @@
+[toolchain]
+# Matches engine/rust-toolchain.toml (the repo-wide pin).
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-wasip2"]

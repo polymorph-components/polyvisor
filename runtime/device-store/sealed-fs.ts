@@ -66,8 +66,11 @@
 export class SealedFsError extends Error {
   /** Consumed by the provider's `mapError` (fs_provider.ts). */
   readonly fsCode = "io";
-  constructor(message: string) {
-    super(message);
+  /** `cause` carries the sealer's own refusal — the component's
+   * `seal-error`, lowered — so a debugger can still see WHICH refusal it
+   * was without that becoming part of the filesystem's contract. */
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
     this.name = "SealedFsError";
   }
 }
@@ -115,58 +118,31 @@ export interface OpfsDirectoryHandle {
   move?(parent: OpfsDirectoryHandle, name: string): Promise<void>;
 }
 
-// --- the on-disk shape ------------------------------------------------------
+// --- the sealing seam -------------------------------------------------------
 
-/** `PMSEALv1` — 8 ASCII bytes. Present so that a file which is NOT
- * sealed is diagnosed as such instead of decrypted into noise, and
- * AUTHENTICATED as AAD so the version cannot be downgraded by an editor
- * of the raw bytes. */
-const MAGIC = new TextEncoder().encode("PMSEALv1");
-const IV_BYTES = 12;
-const HEADER = MAGIC.length + IV_BYTES;
-/** magic + iv + GCM tag: what an empty file costs once sealed. */
-const OVERHEAD = HEADER + 16;
-
-const gcm = (iv: Uint8Array): AesGcmParams => ({
-  name: "AES-GCM",
-  iv: iv as BufferSource,
-  additionalData: MAGIC as BufferSource,
-});
-
-/** Seal a whole plaintext buffer. FRESH IV PER WRITE — every commit of
- * a file generates one, so re-sealing the same file after a one-byte
- * change never reuses an IV under the DEK. */
-async function sealBytes(dek: CryptoKey, plain: Uint8Array): Promise<Uint8Array> {
-  const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
-  const ct = new Uint8Array(await crypto.subtle.encrypt(gcm(iv), dek, plain as BufferSource));
-  const out = new Uint8Array(HEADER + ct.length);
-  out.set(MAGIC, 0);
-  out.set(iv, MAGIC.length);
-  out.set(ct, HEADER);
-  return out;
+/**
+ * WHAT SEALS AND OPENS A FILE'S BYTES — the device seal component's
+ * `sealed` interface (world.wit:296-307), handed in rather than
+ * performed here.
+ *
+ * THE FORMAT MOVED AND THIS MODULE NO LONGER KNOWS IT. PMSEALv1's magic,
+ * its 12-byte IV, the additional data and the empty-file rule all live in
+ * the component (runtime/device-seal/src/file_format.rs, which cites the
+ * lines of this file they were ported from). What is left here is the
+ * PROXY: buffering, the plaintext view, growth and truncation, handle
+ * identity — everything that is about OPFS rather than about
+ * cryptography.
+ *
+ * The proxy passes bytes through UNCHANGED in both directions and adds no
+ * special case of its own, which is the same thing the deleted code did:
+ * `sealBytes` had no empty-plaintext branch (an empty file the guest
+ * actually wrote costs a full header and tag), and the zero-length read
+ * was `openBytes`'s rule, not the proxy's. Both are the component's now.
+ */
+export interface FileSealer {
+  sealFile(plaintext: Uint8Array): Promise<Uint8Array>;
+  openFile(sealed: Uint8Array): Promise<Uint8Array>;
 }
-
-async function openBytes(dek: CryptoKey, raw: Uint8Array, what: string): Promise<Uint8Array> {
-  // A ZERO-LENGTH file is an empty file, not a broken one: the
-  // provider's `openAt` creates the OPFS entry before anything is ever
-  // written to it (filesystem_web.ts's create path), so a legitimately
-  // empty file has no header at all.
-  if (raw.length === 0) return new Uint8Array(0);
-  if (raw.length < OVERHEAD || !eq(raw.subarray(0, MAGIC.length), MAGIC)) {
-    throw new SealedFsError(`${what}: not a sealed file`);
-  }
-  const iv = raw.subarray(MAGIC.length, HEADER);
-  try {
-    return new Uint8Array(await crypto.subtle.decrypt(gcm(iv), dek, raw.subarray(HEADER) as BufferSource));
-  } catch {
-    // Wrong DEK and altered bytes are the same event to GCM, and are
-    // reported as one: neither tells the caller anything about the
-    // other.
-    throw new SealedFsError(`${what}: did not open under this device key (wrong key or altered bytes)`);
-  }
-}
-
-const eq = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
 
 // --- the plaintext view -----------------------------------------------------
 
@@ -194,11 +170,40 @@ function plainFile(bytes: Uint8Array, lastModified: number): OpfsFileLike {
   };
 }
 
-function sealedFile(inner: OpfsFileHandle, dek: CryptoKey): OpfsFileHandle {
+/**
+ * RE-TAG THE SEALER'S REFUSAL AS A FILESYSTEM ERROR.
+ *
+ * The component refuses a file that does not open with a `seal-error`,
+ * which the adapter lowers to a `SealError` — and a `SealError` carries
+ * no `fsCode`, so the polyengine provider's `mapError` would not
+ * recognize it and the host would explode where a filesystem should
+ * merely report an error. `SealedFsError` is what makes the guest see an
+ * I/O error instead, which is the whole reason that class has an
+ * `fsCode` at all; the wrapping keeps that contract across the move.
+ *
+ * A wrong DEK and altered bytes are the same event to GCM and were
+ * always reported as one, so nothing is lost by flattening the
+ * component's refusal into this sentence.
+ */
+async function asFsError<T>(what: string, body: () => Promise<T>): Promise<T> {
+  try {
+    return await body();
+  } catch (e) {
+    throw new SealedFsError(
+      `${what}: did not open under this device key (wrong key or altered bytes)`,
+      { cause: e },
+    );
+  }
+}
+
+function sealedFile(inner: OpfsFileHandle, sealer: FileSealer): OpfsFileHandle {
   const read = async (): Promise<{ bytes: Uint8Array; lastModified: number }> => {
     const f = await inner.getFile();
     const raw = new Uint8Array(await f.arrayBuffer());
-    return { bytes: await openBytes(dek, raw, inner.name), lastModified: f.lastModified };
+    return {
+      bytes: await asFsError(inner.name, () => sealer.openFile(raw)),
+      lastModified: f.lastModified,
+    };
   };
 
   const handle: OpfsFileHandle = {
@@ -243,7 +248,7 @@ function sealedFile(inner: OpfsFileHandle, dek: CryptoKey): OpfsFileHandle {
           // underlying writable is opened WITHOUT keepExistingData, so
           // the previous ciphertext (a different length in general) can
           // never leave a tail behind the new one.
-          const raw = await sealBytes(dek, buffer);
+          const raw = await asFsError(inner.name, () => sealer.sealFile(buffer));
           const w = await inner.createWritable({ keepExistingData: false });
           try {
             await w.write({ type: "write", position: 0, data: raw });
@@ -272,24 +277,24 @@ function unwrap(h: OpfsFileHandle | OpfsDirectoryHandle): OpfsFileHandle | OpfsD
 }
 
 /**
- * Wrap an OPFS directory so every file under it rests sealed under
- * `dek` while readers and writers see plaintext. Sub-directories are
+ * Wrap an OPFS directory so every file under it rests sealed by
+ * `sealer` while readers and writers see plaintext. Sub-directories are
  * wrapped on the way out, so the whole subtree is covered.
  *
  * Hand the result to `filesystemWeb({ preopens: { "/": here }, writable:
  * true })`. Nothing above needs to know it is there.
  */
-export function sealedDirectory(inner: OpfsDirectoryHandle, dek: CryptoKey): OpfsDirectoryHandle {
+export function sealedDirectory(inner: OpfsDirectoryHandle, sealer: FileSealer): OpfsDirectoryHandle {
   const dir: OpfsDirectoryHandle = {
     kind: "directory",
     name: inner.name,
     getDirectoryHandle: async (name, opts) =>
-      sealedDirectory(await inner.getDirectoryHandle(name, opts), dek),
-    getFileHandle: async (name, opts) => sealedFile(await inner.getFileHandle(name, opts), dek),
+      sealedDirectory(await inner.getDirectoryHandle(name, opts), sealer),
+    getFileHandle: async (name, opts) => sealedFile(await inner.getFileHandle(name, opts), sealer),
     removeEntry: (name, opts) => inner.removeEntry(name, opts),
     entries: async function* () {
       for await (const [name, h] of inner.entries()) {
-        yield [name, h.kind === "directory" ? sealedDirectory(h, dek) : sealedFile(h, dek)] as [
+        yield [name, h.kind === "directory" ? sealedDirectory(h, sealer) : sealedFile(h, sealer)] as [
           string,
           OpfsDirectoryHandle | OpfsFileHandle,
         ];
@@ -311,7 +316,7 @@ export function sealedDirectory(inner: OpfsDirectoryHandle, dek: CryptoKey): Opf
  * ```ts
  * const ns = openNamespace(id);
  * const fragment = filesystemWeb({
- *   preopens: sealedPreopens(dek, { "/": await ns.directory() }),
+ *   preopens: sealedPreopens(seal.sealed, { "/": await ns.directory() }),
  *   writable: true,
  * });
  * ```
@@ -324,10 +329,10 @@ export function sealedDirectory(inner: OpfsDirectoryHandle, dek: CryptoKey): Opf
  * workaround.
  */
 export function sealedPreopens(
-  dek: CryptoKey,
+  sealer: FileSealer,
   preopens: Record<string, OpfsDirectoryHandle>,
 ): Record<string, OpfsDirectoryHandle> {
   return Object.fromEntries(
-    Object.entries(preopens).map(([guestName, handle]) => [guestName, sealedDirectory(handle, dek)]),
+    Object.entries(preopens).map(([guestName, handle]) => [guestName, sealedDirectory(handle, sealer)]),
   );
 }

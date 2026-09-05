@@ -22,6 +22,13 @@ translate: engine
     deno run --allow-read --allow-write --config deno.json ../runtime/tools/translate.ts \
         ../engine/target/composed.wasm build/engine.plan.json
 
+# THE DEVICE SEAL COMPONENT (runtime/device-seal/): the worker host fetches
+# its plan and wasm BESIDE the engine's (worker.ts `fetchSealArtifacts`),
+# so every recipe that ships the engine ships this too. Its own justfile
+# builds, validates and translates it.
+seal:
+    cd ../runtime/device-seal && just build
+
 # Local infra: iroh relay (ws on 3340) + MinIO (9000) with CORS open.
 infra:
     #!/usr/bin/env bash
@@ -137,7 +144,7 @@ check:
     bash scripts/check-invariants.sh
 
 # Assemble the servable demo directory.
-site: translate app panels check
+site: translate seal app panels check
     mkdir -p serve
     deno check host/demo.ts host/solo.ts host/solo-worker.ts ../visor/frame/frame.ts ../visor/frame/frame-backend.ts
     deno bundle --platform browser --minify --external node-datachannel --external "node-datachannel/polyfill" --external werift -o serve/demo.js host/demo.ts
@@ -181,6 +188,7 @@ site: translate app panels check
     cp build/panel-dropbox.component.wasm build/panel-dropbox.plan.json serve/
     cp ../engine/target/composed.wasm serve/engine.component.wasm
     cp build/engine.plan.json serve/engine.plan.json
+    cp ../runtime/device-seal/build/device-seal.component.wasm ../runtime/device-seal/build/device-seal.plan.json serve/
     sed "s/__BUILD__/$(git rev-parse --short HEAD)-$(date +%s)/g" web/index.html > serve/index.html
     sed "s/__BUILD__/$(git rev-parse --short HEAD)-$(date +%s)/g" web/solo.html > serve/solo.html
     # THE OAUTH CALLBACK PAGE (DRIVE.md §3): the registered Drive
@@ -198,7 +206,7 @@ serve: site
 # todomvc spike: docs/ is served by GitHub Pages, the build is
 # committed). The page still needs LOCAL infra (relay + MinIO) or
 # ?relay=&s3= overrides — Pages hosts the artifact, not the network.
-pages: translate app panels check
+pages: translate seal app panels check
     mkdir -p ../docs/demo
     deno check host/demo.ts host/solo.ts host/solo-worker.ts ../visor/frame/frame.ts ../visor/frame/frame-backend.ts
     deno bundle --platform browser --minify --external node-datachannel --external "node-datachannel/polyfill" --external werift -o ../docs/demo/demo.js host/demo.ts
@@ -216,6 +224,7 @@ pages: translate app panels check
     cp build/panel-dropbox.component.wasm build/panel-dropbox.plan.json ../docs/demo/
     cp ../engine/target/composed.wasm ../docs/demo/engine.component.wasm
     cp build/engine.plan.json ../docs/demo/
+    cp ../runtime/device-seal/build/device-seal.component.wasm ../runtime/device-seal/build/device-seal.plan.json ../docs/demo/
     sed "s/__BUILD__/$(git rev-parse --short HEAD)-$(date +%s)/g" web/index.html > ../docs/demo/index.html
     sed "s/__BUILD__/$(git rev-parse --short HEAD)-$(date +%s)/g" web/solo.html > ../docs/demo/solo.html
     # THE OAUTH CALLBACK PAGE (DRIVE.md §3) — see `site` above; same
