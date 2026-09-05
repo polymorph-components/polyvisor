@@ -7,7 +7,7 @@ import type { Backend, BackendKind } from "../../../visor/surface/backend.ts";
 import { createDirectBackend } from "../../../visor/surface/backend-direct.ts";
 import { createQueuedBackend } from "../../../visor/surface/backend-queued.ts";
 import { createChannelBackend } from "../../../visor/surface/backend-channel.ts";
-import { createFrameBackend } from "../../../visor/frame/frame-backend.ts";
+import { mountApp } from "../../../visor/frame/mount.ts";
 import { createApplier } from "../../../visor/surface/applier.ts";
 import type { UiEvent } from "../../../visor/surface/events.ts";
 import { createRunner, type Runner } from "../../../visor/surface/runner.ts";
@@ -58,10 +58,10 @@ export async function instantiateWorld(
 // --- backends ------------------------------------------------------------------
 
 /** The three backends `createBackend` builds synchronously, in-realm.
- * "frame" is deliberately excluded from this type: its construction is
- * async (a handshake with the sandboxed frame's own document — see
- * createFrameBackend), so every caller branches on it separately rather
- * than folding it into this switch (see `resolveBackend` below). */
+ * "frame" is deliberately excluded from this type: it is not a backend
+ * this file builds at all any more — it is the app-mount seam
+ * (visor/frame/mount.ts), which stands up the frame, the surface and the
+ * runner together. Both callers branch on it before reaching here. */
 export type SameRealmBackendKind = Exclude<BackendKind, "frame">;
 
 export function createBackend(
@@ -83,30 +83,6 @@ export function createBackend(
   }
 }
 
-/** The frame surface's teardown, handed back to the caller so `kind ===
- * "frame"` can be torn down on demand (see TodoApp.teardown). undefined
- * for the three same-realm kinds, which need none: retiring one of those
- * is pausing the runner forever and dropping the DOM node, both of which
- * the caller can do without help from here. */
-type Teardown = (() => Promise<void>) | undefined;
-
-/** Resolve one backend for `kind`, awaiting the frame handshake when
- * `kind === "frame"` and constructing synchronously otherwise (a small
- * internal async step either way — `createBackend`'s own signature and
- * the three same-realm cases inside it are unchanged). */
-async function resolveBackend(
-  kind: BackendKind,
-  container: HTMLElement,
-  dispatch: (ev: UiEvent) => void,
-): Promise<{ backend: Backend; teardown: Teardown }> {
-  if (kind === "frame") {
-    const frameBackend = createFrameBackend(container, dispatch);
-    const backend = await frameBackend.backend;
-    return { backend, teardown: () => frameBackend.destroy() };
-  }
-  return { backend: createBackend(kind, container, dispatch), teardown: undefined };
-}
-
 // --- the TodoMVC app ------------------------------------------------------------
 
 export interface TodoExports {
@@ -116,7 +92,13 @@ export interface TodoExports {
 }
 
 export interface TodoApp {
-  runner: Runner;
+  /** The serialized guest-call chain — present for the three same-realm
+   * kinds only. `kind === "frame"` goes through the app-mount seam
+   * (visor/frame/mount.ts), which owns its runner and exposes what a
+   * caller may do with it (`exports`, suspension, teardown) rather than
+   * the chain itself. The two harness consumers of `settle`/`generation`
+   * (harness.ts, bench.ts) sweep the same-realm kinds only. */
+  runner?: Runner;
   exports: TodoExports;
   /** Inject a synthetic event record (harness use). */
   sendEvent(ev: UiEvent): Promise<void>;
@@ -141,10 +123,40 @@ export async function startTodoApp(
   onEventError: (e: unknown) => void,
   artifact = "todomvc",
 ): Promise<TodoApp> {
+  // THE FRAME KIND IS NOT A BACKEND CHOICE ANY MORE, it is the app-mount
+  // seam: the frame, the surface and the runner all live behind
+  // `mountApp` (visor/frame/mount.ts), which is what the visor's own
+  // pages use. The three same-realm kinds below stay exactly as they
+  // were — they are the differential harness's instrument, not a
+  // product placement.
+  if (kind === "frame") {
+    const { envelope, bytes } = await loadArtifacts(artifact);
+    const mounted = await mountApp<TodoExports>({
+      container,
+      artifact: { envelope, bytes },
+      imports: {},
+      // The seam holds a route VALUE, not the caller's getter, so the
+      // route travels with the call that announces it. Every route
+      // change in this spike already comes through `sendRoute`.
+      route: route(),
+      onEventError,
+    });
+    await mounted.exports.run();
+    return {
+      exports: mounted.exports,
+      sendEvent: (ev) => mounted.exports.onEvent(ev),
+      sendRoute: (r) => {
+        mounted.setRoute(r);
+        return mounted.exports.onRoute(r);
+      },
+      teardown: () => mounted.destroy(),
+    };
+  }
+
   // DOM-originated events land on the same serialized chain as everything
   // else; the exports binding below closes the loop.
   let dispatch: (ev: UiEvent) => void = () => {};
-  const { backend, teardown } = await resolveBackend(kind, container, (ev) => dispatch(ev));
+  const backend = createBackend(kind, container, (ev) => dispatch(ev));
   const surface = createSurface(backend, route);
   const exports = (await instantiateWorld(
     artifact,
@@ -160,7 +172,6 @@ export async function startTodoApp(
     exports,
     sendEvent: (ev) => runner.call(() => exports.onEvent(ev)),
     sendRoute: (r) => runner.call(() => exports.onRoute(r)),
-    teardown,
   };
 }
 
@@ -172,7 +183,8 @@ export interface LabExports {
 }
 
 export interface LabApp {
-  runner: Runner;
+  /** Same-realm kinds only — see TodoApp.runner. */
+  runner?: Runner;
   exports: LabExports;
 }
 
@@ -180,7 +192,16 @@ export async function startLab(
   kind: BackendKind,
   container: HTMLElement,
 ): Promise<LabApp> {
-  const { backend } = await resolveBackend(kind, container, () => {});
+  if (kind === "frame") {
+    const { envelope, bytes } = await loadArtifacts("lab");
+    const mounted = await mountApp<LabExports>({
+      container,
+      artifact: { envelope, bytes },
+      imports: {},
+    });
+    return { exports: mounted.exports };
+  }
+  const backend = createBackend(kind, container, () => {});
   const surface = createSurface(backend, () => "");
   const exports = (await instantiateWorld(
     "lab",

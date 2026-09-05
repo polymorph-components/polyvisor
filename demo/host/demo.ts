@@ -10,11 +10,8 @@
 // `polyvisor:tasks` import is wired DIRECTLY to the engine
 // instance's export — the framework-links-apps-to-services topology.
 
-import { artifactsFromEnvelope, instantiate } from "@polyengine/runtime/embedder";
 import { ComponentException } from "@polyengine/protocol";
-import { createRunner, type Runner } from "../../visor/surface/runner.ts";
-import { createFrameBackend } from "../../visor/frame/frame-backend.ts";
-import { createSurface } from "../../visor/surface/surface.ts";
+import { mountApp as mountVisorApp, type Mounted } from "../../visor/frame/mount.ts";
 // The visor's system UI: the strip, the identity cluster, the context
 // cluster and the drawer host. The demo is a CONSUMER of it — it supplies
 // storage keys, the surface the strip falls back to, and the CONTENT of
@@ -862,8 +859,10 @@ interface Pane {
   name: string;
   engine: Engine;
   id: Uint8Array;
-  runner?: Runner;
-  app?: AppExports;
+  /** The app surface, once mounted (visor/frame/mount.ts). Carries the
+   * exports, input suspension and teardown; the visor never holds the
+   * runner behind them. */
+  mounted?: Mounted<AppExports>;
   /** Polls dropped because the previous one was still in flight. */
   pollSkips?: number;
   status: (line: string, sticky?: boolean) => void;
@@ -899,42 +898,34 @@ async function newPane(
  * partition is bound: the app renders the service's answers). */
 async function mountApp(pane: Pane, appArtifacts: EngineArtifacts) {
   const container = document.getElementById(`${pane.name}-app`)!;
-  let dispatch: (ev: UiEvent) => void = () => {};
   // A REAL sandboxed frame per app surface (#16), not the `direct`
   // backend: the app's nodes never enter the visor's document, so the visor's
   // personal strip colour is unreachable by construction rather than by
-  // allowlist. See frame-backend.ts.
-  const frameBackend = createFrameBackend(
-    container as HTMLElement,
-    (ev) => dispatch(ev),
-  );
-  const backend = await frameBackend.backend;
-  const surface = createSurface(backend, () => "");
-  const imports = {
-    ...surface.imports,
-    // The framework seam: the app's data-service import IS the engine
-    // instance's export object (same embedder, same value conventions,
-    // same exception brand).
-    "polyvisor:tasks/tasks@0.1.0": pane.engine.tasks,
-  };
-  const instance = await instantiate(
-    artifactsFromEnvelope(appArtifacts.envelope, appArtifacts.bytes),
-    imports,
-  );
-  const app = instance.exports as unknown as AppExports;
-  const runner = createRunner(surface);
-  dispatch = (ev) => {
-    runner.call(() => app.onEvent(ev)).catch((e) => pane.status(`event: ${e}`));
-  };
-  await runner.call(() => app.run());
-  pane.app = app;
-  pane.runner = runner;
+  // allowlist. The frame, the surface and the serialized guest-call
+  // chain are all behind `mountApp` now (visor/frame/mount.ts).
+  const mounted = await mountVisorApp<AppExports>({
+    container: container as HTMLElement,
+    artifact: appArtifacts,
+    imports: {
+      // The framework seam: the app's data-service import IS the engine
+      // instance's export object (same embedder, same value conventions,
+      // same exception brand). The cast is TypeScript's interface quirk,
+      // not a widening: an INTERFACE never gets an implicit index
+      // signature, so a perfectly good `Tasks` will not match
+      // `Record<string, unknown>` without one.
+      "polyvisor:tasks/tasks@0.1.0": pane.engine.tasks as unknown as Record<string, unknown>,
+    },
+    onEventError: (e) => pane.status(`event: ${e}`),
+  });
+  await mounted.exports.run();
+  pane.mounted = mounted;
   // Remote changes surface as revision bumps; poll on a UI cadence —
-  // but SKIP a tick whose predecessor is still running. `runner.call`
-  // is an unbounded promise chain, so a poll that outlives its 400 ms
-  // period (routine while the engine is busy syncing) would otherwise
-  // append forever: the queue grows, latency grows with it, and the
-  // page ends up wedged with every tick's closure still retained.
+  // but SKIP a tick whose predecessor is still running. Every export
+  // call rides an unbounded promise chain, so a poll that outlives its
+  // 400 ms period (routine while the engine is busy syncing) would
+  // otherwise append forever: the queue grows, latency grows with it,
+  // and the page ends up wedged with every tick's closure still
+  // retained.
   let polling = false;
   pane.pollSkips = 0;
   setInterval(() => {
@@ -943,7 +934,7 @@ async function mountApp(pane: Pane, appArtifacts: EngineArtifacts) {
       return;
     }
     polling = true;
-    runner.call(() => app.poll())
+    mounted.exports.poll()
       .catch(() => {})
       .finally(() => {
         polling = false;
@@ -1121,9 +1112,7 @@ async function boot() {
   // renderer has to remember to.
   let appNickname = APP_ARTIFACT;
   try {
-    const declared = alice.app && alice.runner
-      ? await alice.runner.call(() => alice.app!.nickname())
-      : "";
+    const declared = alice.mounted ? await alice.mounted.exports.nickname() : "";
     const clamped = (declared ?? "").trim().slice(0, 40);
     if (clamped !== "") appNickname = clamped;
   } catch (e) {
@@ -1136,9 +1125,7 @@ async function boot() {
   const appNomination = await readMarkNomination(
     "app",
     async () =>
-      alice.app && alice.runner
-        ? await alice.runner.call(() => alice.app!.markNomination())
-        : undefined,
+      alice.mounted ? await alice.mounted.exports.markNomination() : undefined,
   );
   appSurface = {
     name: APP_ARTIFACT,
@@ -1872,11 +1859,11 @@ async function boot() {
     // always had (the anchor never changes colour per surface).
     context: (s) => ({ ...s.surface, kind: "credentials" }),
     beforeShow: () => {
-      for (const p of panes) p.runner?.pause();
+      for (const p of panes) p.mounted?.suspend();
     },
     // Input delivery resumes for every pane; the panel is already gone.
     afterCollapse: () => {
-      for (const p of panes) p.runner?.resume();
+      for (const p of panes) p.mounted?.resume();
     },
     // Held secrets die with the sheet: the visor keeps nothing after the
     // interaction it collected them for is over.
@@ -2314,14 +2301,14 @@ async function boot() {
   let activePanel:
     | {
       provider: "s3" | "dropbox";
+      /** Already serialized through the mount's runner: every call is a
+       * promise, and the visor never sees the chain behind it. */
       panel: PanelExports;
-      runner: Runner;
       /** The surface mark the visor showed for this panel; the drawer
        * repeats it so "who asked" survives the panel's teardown. */
       surface: SurfaceIdentity;
     }
     | null = null;
-  let panelDispatch: (ev: UiEvent) => void = () => {};
   /** The live panel surface's sandboxed frame, if any (see
    * frame-backend.ts). Teardown must destroy it explicitly: clearing the
    * region would orphan the port and the window listener. */
@@ -2354,7 +2341,6 @@ async function boot() {
   let teardownInFlight: Promise<void> | null = null;
   const teardownPanel = (): Promise<void> => {
     panelGeneration++;
-    panelDispatch = () => {};
     // Close the port and drop the frame BEFORE clearing the region, so
     // the frame's window listener and MessagePort go with it rather than
     // being left holding a detached document.
@@ -2457,10 +2443,59 @@ async function boot() {
     // Same sandboxed-frame treatment as the app panes: the panel handles
     // provider credentials, so the argument for keeping it out of
     // the visor's document is if anything stronger here.
-    const frameBackend = createFrameBackend(region, (ev) => panelDispatch(ev), "dark");
-    panelFrame = frameBackend;
+    //
+    // THE ABORT IS THIS MOUNT'S CANCELLATION CHANNEL, and it is what
+    // `panelFrame` now holds: a mount is async, so a teardown can land
+    // while it is still in flight, and it must be able to stop the mount
+    // rather than leave it holding an iframe the teardown has already
+    // detached from the region (which would never complete its handshake
+    // — and `teardownPanel`'s completion signal, awaited by the NEXT
+    // mount, would never settle).
+    const cancel = new AbortController();
+    /** This mount's surface once it exists, so teardown can destroy it
+     * SYNCHRONOUSLY (as it did when it held the frame backend directly)
+     * rather than a microtask later. */
+    let settled: Mounted<PanelExports> | null = null;
+    const pending = mountVisorApp<PanelExports>({
+      container: region,
+      artifact: art,
+      signal: cancel.signal,
+      // The capability profiles, side by side (#21): the S3 panel is PURE —
+      // surface only, no egress. The Dropbox panel additionally holds
+      // exactly ONE host-scoped fetch. It used to hold the OAuth broker
+      // too; sign-in moved into the visor's drawer (where the app key is), so
+      // the grant went with it rather than lingering unused.
+      imports: provider === "s3" ? {} : { ...dropboxFetchImports },
+      theme: "dark",
+      onEventError: (e) => console.warn(`[panel] event: ${err(e)}`),
+      // The binding is LIVE (#22 rule 2): the panel's configuration can
+      // move under the visor's feet with any keystroke, so the visor
+      // re-reads the destination after every pumped event rather than
+      // trusting the one it read at mount. A change drops the held
+      // values. The provider/generation guards are what keep a
+      // superseded mount from rebinding the region a newer one owns.
+      afterEvent: async () => {
+        if (settled === null) return;
+        if (panelMounted !== provider || generation !== panelGeneration) return;
+        const raw = await settled.exports.destination();
+        if (panelMounted !== provider || generation !== panelGeneration) return;
+        rebind(raw ?? "");
+      },
+    });
+    panelFrame = {
+      destroy: async () => {
+        cancel.abort();
+        // A mount that has already produced its surface is torn down
+        // right here, in this turn. One that has not gets the abort
+        // above — which destroys its frame backend and makes the mount
+        // reject — and we wait for that to complete, because "gone"
+        // must mean gone (the next mount awaits this).
+        if (settled) return await settled.destroy();
+        await pending.then((m) => m.destroy(), () => {});
+      },
+    };
     // A HANDSHAKE THAT NEVER COMPLETES BECAUSE WE WERE TORN DOWN IS
-    // CANCELLATION, NOT FAILURE. `backend` rejects when the surface is
+    // CANCELLATION, NOT FAILURE. The mount rejects when the surface is
     // destroyed before it is ready, and an unguarded `await` turns that
     // into a thrown error — which openStorage's `.catch` then writes
     // into the region as "panel failed to mount: frame backend destroyed
@@ -2468,34 +2503,19 @@ async function boot() {
     // there by now. The generation is what distinguishes the two: if we
     // have been superseded, the rejection is our own retirement arriving
     // and this mount simply stops, silently.
-    const backend = await frameBackend.backend.catch((e: unknown) => {
+    const mounted = await pending.catch((e: unknown) => {
       if (generation !== panelGeneration) return null;
       throw e;
     });
-    if (backend === null || generation !== panelGeneration) {
-      await frameBackend.destroy();
+    // GENERATION AFTER THE AWAIT: a mount that completed while a newer
+    // one took the region must not stand its surface up there, and must
+    // take its own frame down on the way out.
+    if (mounted === null || generation !== panelGeneration) {
+      await mounted?.destroy();
       return;
     }
-    const surface = createSurface(backend, () => "");
-    // The capability profiles, side by side (#21): the S3 panel is PURE —
-    // surface only, no egress. The Dropbox panel additionally holds
-    // exactly ONE host-scoped fetch. It used to hold the OAuth broker
-    // too; sign-in moved into the visor's drawer (where the app key is), so
-    // the grant went with it rather than lingering unused.
-    const imports = provider === "s3" ? { ...surface.imports } : {
-      ...surface.imports,
-      ...dropboxFetchImports,
-    };
-    const instance = await instantiate(
-      artifactsFromEnvelope(art.envelope, art.bytes),
-      imports,
-    );
-    if (generation !== panelGeneration) {
-      await frameBackend.destroy();
-      return;
-    }
-    const panel = instance.exports as unknown as PanelExports;
-    const runner = createRunner(surface);
+    const panel = mounted.exports;
+    settled = mounted;
     // WHAT THE COMPONENT CALLS ITSELF: read ONCE, here, and never again —
     // a name that could change under the visor's feet would be a name the visor
     // could not have shown the user before they acted on it. Clamped to
@@ -2507,7 +2527,7 @@ async function boot() {
     // machine string.
     let nickname = name;
     try {
-      const declared = await runner.call(() => panel.nickname());
+      const declared = await panel.nickname();
       const clamped = (declared ?? "").trim().slice(0, 40);
       if (clamped !== "") nickname = clamped;
     } catch (e) {
@@ -2518,7 +2538,7 @@ async function boot() {
     // crossing (`readMarkNomination`) — same trip, same discipline.
     const nomination = await readMarkNomination(
       "panel",
-      () => runner.call(() => panel.markNomination()),
+      () => panel.markNomination(),
     );
     if (generation !== panelGeneration) return;
     identity = { ...identity, nickname, nomination };
@@ -2526,22 +2546,7 @@ async function boot() {
     panelMounted = provider;
     // The visor keeps the handles it needs to COMMIT; the panel only ever
     // gets events and answers questions.
-    activePanel = { provider, panel, runner, surface: identity };
-    panelDispatch = (ev) => {
-      if (panelMounted !== provider) return;
-      runner.call(() => panel.onEvent(ev))
-        // The binding is LIVE (#22 rule 2): the panel's configuration can
-        // move under the visor's feet with any keystroke, so the visor re-reads
-        // the destination after every pumped event rather than trusting
-        // the one it read at mount. A change drops the held values.
-        .then(async () => {
-          if (panelMounted !== provider || generation !== panelGeneration) return;
-          const raw = await runner.call(() => panel.destination());
-          if (panelMounted !== provider || generation !== panelGeneration) return;
-          rebind(raw ?? "");
-        })
-        .catch((e) => console.warn(`[panel] event: ${err(e)}`));
-    };
+    activePanel = { provider, panel, surface: identity };
     // THIS PROVIDER'S OWN RECORD, not "the" configuration: the store is
     // plural now, so a panel is seeded from the record filed under the
     // provider it is the panel for — never from another provider's.
@@ -2549,8 +2554,8 @@ async function boot() {
     // The panel is seeded with a REDACTED copy: its own public fields
     // only. The visor's fields get the secrets (#22).
     const seedJson = stored ? JSON.stringify(redactForPanel(stored)) : "";
-    await runner.call(() => panel.seed(seedJson));
-    await runner.call(() => panel.run());
+    await panel.seed(seedJson);
+    await panel.run();
     if (generation !== panelGeneration) return;
     // The panel DECLARES its credential kinds. The visor does NOT render a
     // field here any more — entry happens later, in the visor's own drawer.
@@ -2558,9 +2563,9 @@ async function boot() {
     // was asked: an unrecognised kind is refused up front and Save is
     // disabled, so the refusal cannot be clicked past into a sheet the visor
     // could not honestly label.
-    const needs = await runner.call(() => panel.credentialNeeds());
+    const needs = await panel.credentialNeeds();
     if (generation !== panelGeneration) return;
-    const rawDest = await runner.call(() => panel.destination());
+    const rawDest = await panel.destination();
     if (generation !== panelGeneration) return;
     // note:false — this is the FIRST binding of the session, not a
     // change of one; there is nothing the user entered to invalidate.
@@ -3210,7 +3215,7 @@ async function boot() {
     ev.preventDefault();
     const active = activePanel;
     if (!active) return;
-    active.runner.call(() => active.panel.commit())
+    active.panel.commit()
       .then((out) => {
         if (out === undefined || out === "") return;
         if (activePanel !== active) return;

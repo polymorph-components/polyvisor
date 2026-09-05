@@ -58,13 +58,7 @@
 // in-page embedder, deliberately, so the two pages remain two different
 // arguments.
 
-import {
-  artifactsFromEnvelope,
-  instantiate,
-} from "@polyengine/runtime/embedder";
-import { createRunner, type Runner } from "../../visor/surface/runner.ts";
-import { createFrameBackend } from "../../visor/frame/frame-backend.ts";
-import { createSurface } from "../../visor/surface/surface.ts";
+import { mountApp as mountVisorApp, type Mounted } from "../../visor/frame/mount.ts";
 import {
   initVisor,
   type SurfaceIdentity,
@@ -1613,40 +1607,32 @@ async function startApp(
 
   // --- the app -------------------------------------------------------------
 
-  let appRunner: Runner | null = null;
+  let appSurfaceMount: Mounted<AppExports> | null = null;
   let appMounted = false;
 
   /** Instantiate the app guest over THIS device's engine, in a real
-   * sandboxed frame (#16). Structurally the same block as demo.ts's
-   * `mountApp`, and deliberately so: the frame backend, the surface, the
-   * runner and the `polyvisor:tasks` import being the engine's own
-   * export object ARE the framework's app-mount shape. What differs is
-   * that the export object is a REMOTE one — every call is a port round
-   * trip, which the app cannot tell apart because both are async. */
+   * sandboxed frame (#16) — through the same app-mount seam demo.ts
+   * uses (visor/frame/mount.ts), which is where the frame, the surface
+   * and the serialized guest-call chain now live. What differs between
+   * the two pages is only the `polyvisor:tasks` import: here the export
+   * object is a REMOTE one, every call a port round trip, which the app
+   * cannot tell apart because both are async. */
   const mountApp = async () => {
     if (appMounted) return;
     appMounted = true;
     const container = document.getElementById("solo-app")!;
-    let dispatch: (ev: UiEvent) => void = () => {};
-    const frameBackend = createFrameBackend(container, (ev) => dispatch(ev));
-    const backend = await frameBackend.backend;
-    const surface = createSurface(backend, () => "");
-    const instance = await instantiate(
-      artifactsFromEnvelope(appArt.envelope, appArt.bytes),
-      {
-        ...surface.imports,
+    const mounted = await mountVisorApp<AppExports>({
+      container,
+      artifact: appArt,
+      imports: {
         // The framework seam: the app's data-service import IS this
         // device's `tasks` export, proxied over the port.
-        "polyvisor:tasks/tasks@0.1.0": tasks,
+        "polyvisor:tasks/tasks@0.1.0": tasks as unknown as Record<string, unknown>,
       },
-    );
-    const app = instance.exports as unknown as AppExports;
-    const runner = createRunner(surface);
-    dispatch = (ev) => {
-      runner.call(() => app.onEvent(ev)).catch((e) => status(`event: ${err(e)}`));
-    };
-    await runner.call(() => app.run());
-    appRunner = runner;
+      onEventError: (e) => status(`event: ${err(e)}`),
+    });
+    await mounted.exports.run();
+    appSurfaceMount = mounted;
     // The app's row in the trust table: ONE artifact, ONE record, keyed
     // by the name the visor fetched it by.
     const { mark, isNew } = sheets.marks.mark(APP_ARTIFACT);
@@ -1668,12 +1654,12 @@ async function startApp(
     visor.renderContext();
     // Remote changes surface as revision bumps; poll on a UI cadence,
     // skipping a tick whose predecessor is still in flight (an unbounded
-    // `runner.call` chain is how demo.ts once wedged a page).
+    // chain of guest calls is how demo.ts once wedged a page).
     let polling = false;
     setInterval(() => {
       if (polling) return;
       polling = true;
-      runner.call(() => app.poll()).catch(() => {}).finally(() => {
+      mounted.exports.poll().catch(() => {}).finally(() => {
         polling = false;
       });
     }, 400);
@@ -5476,7 +5462,7 @@ async function startApp(
       if (await entry?.joinHandle.tick()) void joinerWire();
       await drainAndAdopt();
     },
-    appRunner: () => appRunner !== null,
+    appRunner: () => appSurfaceMount !== null,
     /** The storage sheet, entered the way a user enters it. */
     openStorageSheet: () => openStorage(),
     /** THE CONSUMED-KIT SENTENCE this boot announced, or "" — the one

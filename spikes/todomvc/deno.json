@@ -1,6 +1,16 @@
 {
+  "//": [
+    "@polyengine/runtime/embedder and @deltic/runtime/embedder below name",
+    "the SAME file on purpose. The visor's app-mount seam",
+    "(visor/frame/mount.ts) is shared code, imported by this spike AND by",
+    "demo/, and demo/deno.json calls the embedder @polyengine/runtime/embedder.",
+    "Both keys resolve to one URL, so the graph still holds exactly one",
+    "embedder and one exception brand — which is the property that",
+    "mattered, not the spelling."
+  ],
   "imports": {
     "@deltic/runtime/embedder": "../../../polyengine-dioxus/.deps/polyengine/runtime/src/embedder/mod.ts",
+    "@polyengine/runtime/embedder": "../../../polyengine-dioxus/.deps/polyengine/runtime/src/embedder/mod.ts",
     "@deltic/runtime/shim": "../../../polyengine-dioxus/.deps/polyengine/runtime/src/shim/mod.ts",
     "@deltic/protocol": "../../../polyengine-dioxus/.deps/polyengine/protocol/src/mod.ts",
     "@deltic/translator": "../../../polyengine-dioxus/.deps/polyengine/translator/mod.ts",

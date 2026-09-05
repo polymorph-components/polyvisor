@@ -77,10 +77,12 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function quiesce(app: TodoApp): Promise<void> {
   for (;;) {
-    const g = app.runner.generation;
-    await app.runner.settle();
+    // `runner!`: this sweep is same-realm kinds only (BACKENDS above),
+    // and only the frame kind lacks one (app.ts's TodoApp.runner).
+    const g = app.runner!.generation;
+    await app.runner!.settle();
     await sleep(0);
-    if (app.runner.generation === g) return;
+    if (app.runner!.generation === g) return;
   }
 }
 
@@ -145,12 +147,12 @@ async function runTraps(kind: BackendKind, host: HTMLElement) {
     const lab = await startLab(kind, container);
     let outcome: string;
     try {
-      await lab.runner.call(() => lab.exports.probe(id));
+      await lab.runner!.call(() => lab.exports.probe(id));
       outcome = "ok";
     } catch (e) {
       outcome = normalizeError(e);
     }
-    await lab.runner.settle();
+    await lab.runner!.settle();
     traps.push(outcome);
     if (id === 0 || id === 7) probeDom.push(snapshot(container));
     container.remove();

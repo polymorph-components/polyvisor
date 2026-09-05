@@ -32,8 +32,9 @@ async function benchBackend(kind: BackendKind, n: number): Promise<Sample> {
 
   const timed = async (f: () => Promise<void>): Promise<number> => {
     const t0 = performance.now();
-    await runner.call(f);
-    await runner.settle();
+    // `runner!`: BACKENDS above is same-realm only; see app.ts's LabApp.
+    await runner!.call(f);
+    await runner!.settle();
     return performance.now() - t0;
   };
 

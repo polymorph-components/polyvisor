@@ -32,7 +32,14 @@ Three layers, one trust story:
   allows. `frame.ts` is the code that runs there: the applier wired to
   a MessagePort, height reporting, coarse theme (never the anchor
   colour). The queued-op protocol is identical to `channel`; only the
-  realm changes.
+  realm changes. `mount.ts` is the layer's **app-mount seam**:
+  `mountApp()` stands a component up on one of these frames — frame,
+  surface, imports, the serialized guest-call chain — and hands back
+  only what a visor needs (the exports, the route, input suspension,
+  teardown). Every embedder mounts through it, so the placement change
+  #142 rules for (the wasm instance moving INSIDE the frame, surface
+  imports bound to its real DOM, everything else proxied over a port)
+  is a change of this file's internals and of nothing above it.
 
 - **`ui/`** — the system UI core. `initVisor()` renders the strip
   (two-line context, identity cluster), announcements
