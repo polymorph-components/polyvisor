@@ -27,12 +27,22 @@ bad() {
 # the visor's own voice. So it must not appear anywhere on the seam.
 echo "[1/9] petname never crosses the frame seam"
 echo "      (the visor's word for a component is never readable or influenceable by it)"
-hits=$(grep -n "petname" ../visor/frame/frame-backend.ts ../visor/frame/frame.ts ../visor/frame/frame.html 2>/dev/null)
+# WHAT "THE SEAM" IS, as a GLOB — for the reason check (b) gives at its
+# own file list. The property is about every file the visor ships into
+# or across the frame boundary, so the scan should follow the next one
+# that layer grows rather than need this list edited. It grew one
+# already: frame/mount.ts, the app-mount seam (#142), which holds the
+# mount options and is therefore exactly where a caller would hand a
+# component something it must not have.
+FRAME_SEAM="../visor/frame/*.ts ../visor/frame/*.html"
+# shellcheck disable=SC2086
+hits=$(grep -n "petname" $FRAME_SEAM 2>/dev/null)
 if [ -n "$hits" ]; then
   bad "petname appears on the frame seam:"
   printf '%s\n' "$hits" | sed 's/^/       /'
 else
-  ok "no petname reference in ../visor/frame/frame-backend.ts, ../visor/frame/frame.ts, ../visor/frame/frame.html"
+  # shellcheck disable=SC2086
+  ok "no petname reference in $(echo $FRAME_SEAM)"
 fi
 
 # --- (b) the visor never writes the word "password" ---------------------------
@@ -140,13 +150,15 @@ fi
 # cluster's id may appear anywhere on the seam.
 echo "[5/9] the user's identity never crosses the frame seam"
 echo "      (name, device and icon are visor pixels; no component may read or steer them)"
-idhits=$(grep -n "pm-demo-identity\|visor-identity" \
-  ../visor/frame/frame.ts ../visor/frame/frame-backend.ts ../visor/frame/frame.html 2>/dev/null)
+# Same seam, same glob as check (a) — one definition, both properties.
+# shellcheck disable=SC2086
+idhits=$(grep -n "pm-demo-identity\|visor-identity" $FRAME_SEAM 2>/dev/null)
 if [ -n "$idhits" ]; then
   bad "the visor identity record appears on the frame seam:"
   printf '%s\n' "$idhits" | sed 's/^/       /'
 else
-  ok "no identity reference in ../visor/frame/frame.ts, ../visor/frame/frame-backend.ts, ../visor/frame/frame.html"
+  # shellcheck disable=SC2086
+  ok "no identity reference in $(echo $FRAME_SEAM)"
 fi
 
 # --- (f) pairing code and SAS render only in visor-owned surfaces --------
