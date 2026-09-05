@@ -8,17 +8,55 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = "=0.60.0"
-# Renderer-agnostic core + markup/event vocabulary; no web renderer, no
-# wasm-bindgen anywhere in this graph.
+# THE SIBLING RENDERER, which supersedes this guest's former hand-rolled
+# `renderer.rs` (a `WriteMutations` impl over the surface) and `events.rs`
+# (an `HtmlEventConverter`). Those were the PROTOTYPE of exactly this crate;
+# both are deleted in its favour. See ../README.md, "The dioxus guest".
+#
+# Path is relative and assumes polyvisor and polyengine-dioxus are siblings
+# under ~/p/polymorph — true of the canonical checkout, and NOT true inside a
+# git worktree, where a symlink next to the worktree restores the invariant.
+# Same arrangement as ../../visor-dioxus/Cargo.toml; see its note. FOUR levels
+# and not three, because this crate sits one directory deeper than that one
+# (spikes/todomvc/guest-dioxus/ vs spikes/visor-dioxus/).
+#
+# NO `eval` FEATURE. This is an APP, and apps never get eval — wit/world.wit's
+# `eval` interface doc is normative: "polyvisor permits eval to the visor,
+# which is part of its trusted computing base, and to no app, ever." Without
+# the feature the component emits no `polymorph:dioxus/eval` import at all,
+# and the justfile asserts that absence on the artifact.
+polyengine-dioxus = { path = "../../../../polyengine-dioxus" }
+
+# Pins mirrored EXACTLY from the sibling's Cargo.toml. dioxus-core is shared
+# state between this crate and the renderer (we hand it a `fn() -> Element`);
+# a version skew would compile two incompatible dioxus-cores and fail at the
+# `launch!` call site.
+wit-bindgen = { version = "=0.60.0", features = ["async-spawn", "inter-task-wakeup"] }
 dioxus = { version = "=0.7.10", default-features = false, features = [
   "macro",
   "html",
   "signals",
   "hooks",
 ] }
-dioxus-core = "=0.7.10"
-dioxus-html = { version = "=0.7.10", default-features = false }
+
+# `history()` and the `History` trait, for the filter route (src/lib.rs).
+#
+# NAMED DIRECTLY rather than reached through `dioxus::prelude`, whose
+# re-export of both is gated behind dioxus's `document` feature — a feature
+# this guest does not want and ../../visor-dioxus/Cargo.toml argues against at
+# length. The crate is already in the graph (the renderer's `WitHistory`
+# implements this trait), so naming it costs nothing but the line.
+dioxus-history = "=0.7.10"
+
+# NO `[patch.crates-io]` FOR `dioxus-sdk-time`, unlike the sibling and unlike
+# ../../visor-dioxus/Cargo.toml. That patch exists to give the fork's `wasip3`
+# clock feature to crates that WAIT — and this guest never does: TodoMVC has no
+# timer, so `dioxus-sdk-time` is not in its graph at all. Carrying the patch
+# anyway makes cargo warn "patch ... was not used in the crate graph" on every
+# single build. The pins that DO matter are the ones above: dioxus-core is
+# shared state with the renderer.
+
+[workspace]
 
 [profile.release]
 opt-level = "s"
@@ -26,5 +64,3 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = "debuginfo"
-
-[workspace]

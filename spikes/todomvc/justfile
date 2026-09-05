@@ -1,63 +1,105 @@
 # TodoMVC surface spike: build the demo into ../../docs/spike-todomvc
 # (the repo's GitHub Pages root serves /docs).
-# Requires: Rust (wasm32-unknown-unknown), wasm-tools, Deno.
+# Requires: Rust (wasm32-unknown-unknown + wasm32-wasip2), wasm-tools, Deno.
+#
+# TWO PIPELINES, because the spike has two app surfaces (see README.md):
+#
+#   - `polyvisor:surface` guests (guest/, guest-preact/, lab/) are pure
+#     reactors with no WASI: wasm32-unknown-unknown + `wasm-tools component
+#     new`, and — for anything with dioxus in it — the JS-boundary severing
+#     in ../no-js-bindgen.
+#   - the `polymorph:dioxus` guest (guest-dioxus/) builds the sibling
+#     renderer's way: wasm32-wasip2 emits a COMPONENT directly (rustc runs
+#     the module→component step itself), so there is NO `wasm-tools component
+#     new` and NO wbg-sever for it — wasm-bindgen compiles to off-target
+#     stubs on that target and emits no imports at all. Mirrors the sibling's
+#     `example` recipe.
 
 out := "../../docs/spike-todomvc"
 severer := "../no-js-bindgen/severer"
+sibling := "../../../polyengine-dioxus"
 
 # Full pipeline: guests -> components -> envelopes -> host bundle -> demo dir.
 build: guests
+    #!/usr/bin/env bash
+    set -euo pipefail
     mkdir -p build {{out}}
     wasm-tools component new \
       guest/target/wasm32-unknown-unknown/release/todomvc_guest.wasm \
       -o build/todomvc.component.wasm
-    cargo build --release --manifest-path {{severer}}/Cargo.toml
-    {{severer}}/target/release/wbg-sever \
-      guest-dioxus/target/wasm32-unknown-unknown/release/todomvc_dioxus_guest.wasm \
-      build/todomvc-dioxus.severed.wasm
-    wasm-tools component new build/todomvc-dioxus.severed.wasm \
-      -o build/todomvc-dioxus.component.wasm
     wasm-tools component new \
       lab/target/wasm32-unknown-unknown/release/lab_guest.wasm \
       -o build/lab.component.wasm
     cp guest-preact/build/todomvc-preact.component.wasm build/
+    # The dioxus guest is ALREADY a component (wasm32-wasip2).
+    cp guest-dioxus/target/wasm32-wasip2/release/todomvc_dioxus_guest.wasm \
+      build/todomvc-dioxus.component.wasm
     wasm-tools validate --features component-model build/todomvc.component.wasm
-    wasm-tools validate --features component-model build/todomvc-dioxus.component.wasm
     wasm-tools validate --features component-model build/todomvc-preact.component.wasm
     wasm-tools validate --features component-model build/lab.component.wasm
-    deno run --allow-read --allow-write tools/translate.ts \
-      build/todomvc.component.wasm build/todomvc.plan.json
-    deno run --allow-read --allow-write tools/translate.ts \
-      build/todomvc-dioxus.component.wasm build/todomvc-dioxus.plan.json
-    deno run --allow-read --allow-write tools/translate.ts \
-      build/todomvc-preact.component.wasm build/todomvc-preact.plan.json
-    deno run --allow-read --allow-write tools/translate.ts \
-      build/lab.component.wasm build/lab.plan.json
-    deno check host/main.ts ../../visor/frame/frame.ts
+    # `cm-async` is required here and only here: the mutation channel is a
+    # `stream<operation>` and `run` is an async export.
+    wasm-tools validate --features component-model,cm-async build/todomvc-dioxus.component.wasm
+    # APPS NEVER GET EVAL (the sibling's wit/world.wit, `interface eval`:
+    # "polyvisor permits eval to the visor ... and to no app, ever"). The
+    # guest is built without the renderer's `eval` feature, so the import
+    # must be absent from the artifact — asserted, not assumed, exactly as
+    # the sibling's own `example` recipe asserts it.
+    if wasm-tools component wit build/todomvc-dioxus.component.wasm | grep -q 'polymorph:dioxus/eval@'; then \
+      echo "todomvc-dioxus imports polymorph:dioxus/eval — the eval feature leaked in" >&2; exit 1; fi
+    # Build-time translation for every artifact, with the SIBLING's translate
+    # tool (its pinned polyengine checkout is this spike's runtime now — see
+    # deno.json). The envelope is the blessed deploy artifact; nothing ships
+    # a translator.
+    for a in todomvc todomvc-dioxus todomvc-preact lab; do \
+      deno run --allow-read --allow-write --config {{sibling}}/.deps/polyengine/deno.json \
+        {{sibling}}/.deps/polyengine/tools/translate/main.ts \
+        build/$a.component.wasm -o build/$a.plan.json; \
+    done
+    just check
     deno bundle --platform browser --minify -o {{out}}/app.js host/main.ts
     # The sandboxed surface frame (#16): its own entry, its own document,
     # served from the SAME directory as the app bundle (frame-backend.ts's
     # `frame.src = "./frame.html"` is relative to whatever page loaded it).
     deno bundle --platform browser --minify -o {{out}}/frame.js ../../visor/frame/frame.ts
     cp ../../visor/frame/frame.html {{out}}/
-    cp build/todomvc.component.wasm build/todomvc.plan.json {{out}}/
-    cp build/todomvc-dioxus.component.wasm build/todomvc-dioxus.plan.json {{out}}/
-    cp build/todomvc-preact.component.wasm build/todomvc-preact.plan.json {{out}}/
-    cp build/lab.component.wasm build/lab.plan.json {{out}}/
+    # ...and the dioxus guest's own frame, same discipline, different world.
+    deno bundle --platform browser --minify -o {{out}}/frame-dioxus.js host/frame-dioxus.ts
+    cp web/frame-dioxus.html {{out}}/
+    for a in todomvc todomvc-dioxus todomvc-preact lab; do \
+      cp build/$a.component.wasm build/$a.plan.json {{out}}/; \
+    done
     cp web/index.html web/harness.html web/bench.html web/todomvc-app.css {{out}}/
     cp ../../visor/ui/visor.css {{out}}/
 
+# Typecheck every entry point, including both frame entries.
+check:
+    deno check host/main.ts host/frame-dioxus.ts ../../visor/frame/frame.ts
+
 guests:
     cd guest && cargo build --release --target wasm32-unknown-unknown
-    cd guest-dioxus && cargo build --release --target wasm32-unknown-unknown
     cd lab && cargo build --release --target wasm32-unknown-unknown
+    cd guest-dioxus && cargo build --release --target wasm32-wasip2
     cd guest-preact && npm run build
 
+# Report the dioxus component's size, raw and gzipped (README's table).
+size:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    f=build/todomvc-dioxus.component.wasm
+    printf '%s: %s bytes raw, %s bytes gzipped\n' "$f" \
+      "$(stat -c%s $f)" "$(gzip -9 -c $f | wc -c)"
+
 # Serve the built demo locally. The deno file-server, NOT python's
-# http.server: the frame backend's surface iframe is sandboxed without
-# `allow-same-origin`, so its origin is opaque and its module-script
-# fetch of frame.js is a cross-origin request — it needs the CORS
-# headers the file-server CLI sends by default (GitHub Pages sends
+# http.server: the frame backends' iframes are sandboxed without
+# `allow-same-origin`, so their origin is opaque and their module-script
+# fetch of frame.js / frame-dioxus.js is a cross-origin request — it needs
+# the CORS headers the file-server CLI sends by default (GitHub Pages sends
 # them too; python's server does not).
 serve: build
     deno run --allow-net --allow-read jsr:@std/http/file-server ../../docs --port 8931
+
+# Real-Chromium E2E (both gates). First run:
+#   cd e2e && npm install && npx playwright install chromium
+e2e: build
+    cd e2e && npx playwright test

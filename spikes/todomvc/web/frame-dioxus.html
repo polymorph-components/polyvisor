@@ -1,0 +1,54 @@
+<!doctype html>
+<!-- The sandboxed APP frame for the dioxus guest (#16's architecture).
+     Counterpart of ../../../visor/frame/frame.html, for `polymorph:dioxus`
+     instead of `polyvisor:surface`.
+
+     One document per app surface: the guest's DOM is applied HERE, in a realm
+     the shell cannot be reached from and which cannot reach the shell — the
+     iframe is created WITHOUT `allow-same-origin`, so this document runs on an
+     opaque origin. The visor's strip colour, its CSS custom properties, its
+     classes and its storage are structurally out of reach rather than merely
+     un-allowlisted. `e2e/tests/dioxus-frame.spec.ts` asserts exactly that: the
+     shell's `--visor-bg` resolves to nothing in here.
+
+     In the framework proper this skeleton is served from a dedicated sandbox
+     origin with real CSP and COOP/COEP response headers (#2/#5). A
+     <meta http-equiv="Content-Security-Policy"> is DELIBERATELY omitted, for
+     the reason frame.html gives: under an opaque origin `'self'` matches
+     nothing meaningful, so a meta policy would be vacuous or misleading. The
+     real policy belongs in headers. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>app</title>
+  <link rel="stylesheet" href="./todomvc-app.css">
+  <style>
+    /* OPAQUE background, on purpose. If the surface rectangle composited with
+       the shell's pixels (transparency, blend modes, backdrop-filter), an app
+       could read the visor's personal colour back out by sampling what shows
+       through. An opaque backdrop leaves blend-based sampling nothing to
+       read. */
+    html, body { background: #f5f5f5; }
+    body { margin: 0;
+           font: 14px 'Helvetica Neue', Helvetica, Arial, sans-serif;
+           color: #111; }
+    /* TodoMVC's <h1> is absolutely positioned ABOVE its box, so it would be
+       clipped at the frame's top edge. Reserve exactly its height. */
+    body:has(.todoapp) { padding-top: 44px; }
+    .todoapp { margin: 0; }
+    .todoapp h1 { font-size: 40px; top: -40px; }
+    .new-todo, .edit { font-size: 18px; }
+    .todo-list li { font-size: 18px; }
+  </style>
+</head>
+<!-- No inline event handlers anywhere: every listener is attached by the
+     sibling's EventDispatcher, from script. `#app` is the MOUNT ROOT — the
+     element `DomApplier` treats as ElementId 0 (wit/world.wit's `mutations`:
+     "id 0 is the mount root"). A dedicated element rather than <body> so the
+     height measurement has a stable box around it. -->
+<body>
+  <div id="app"></div>
+  <script type="module" src="./frame-dioxus.js"></script>
+</body>
+</html>

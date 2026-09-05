@@ -9,3 +9,5 @@ target/
 # the cutover, four rebuilds of an ~11 MB engine composite landed in
 # history. `just pages` still writes here for local preview.
 /docs/demo/
+# Same class: spikes/todomvc's justfile writes its built demo here.
+/docs/spike-todomvc/

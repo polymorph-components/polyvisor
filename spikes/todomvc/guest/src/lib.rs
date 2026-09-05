@@ -13,11 +13,17 @@ use std::cell::RefCell;
 wit_bindgen::generate!({
     path: "../wit",
     world: "todomvc",
+    // `generate_all`: the surface interfaces now live in a DEPENDENCY
+    // package (`polyvisor:surface@0.1.0`, symlinked at ../wit/deps), and
+    // wit-bindgen does not generate bindings for a dep unless told to —
+    // it demands either this or a `with:` mapping per interface. Bindings
+    // for all three are wanted here, so this is the one-word form.
+    generate_all,
 });
 
-use crate::polymorph::todomvc_spike::dom::{create_element, Element};
-use crate::polymorph::todomvc_spike::events::{listen, EventKind};
-use crate::polymorph::todomvc_spike::shell;
+use crate::polyvisor::surface::dom::{create_element, Element};
+use crate::polyvisor::surface::events::{listen, EventKind};
+use crate::polyvisor::surface::shell;
 
 // --- listener tokens ---------------------------------------------------------
 // Static controls get small fixed tokens; per-item listeners encode
