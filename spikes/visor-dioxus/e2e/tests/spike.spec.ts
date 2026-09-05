@@ -18,6 +18,9 @@
 
 import { expect, test } from "@playwright/test";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Page } from "@playwright/test";
 import type { Control } from "../../host/mount.ts";
 
@@ -139,6 +142,60 @@ test("serves the build under test", async ({ page, request }) => {
   expect(res.status()).toBe(200);
   const served = createHash("sha256").update(await res.body()).digest("hex");
   expect(served).toBe(stamp!.componentSha256);
+});
+
+// -- (1b) the artifact's imported capabilities ----------------------------
+
+/**
+ * THE CAPABILITY SET IS AN ARTIFACT PROPERTY, SO ASSERT IT ON THE ARTIFACT.
+ *
+ * `wit/deps/polymorph-dioxus/world.wit` and `src/component.rs`'s `with:`
+ * mappings are both source; what a host must actually grant is whatever
+ * survives into the .wasm's import section, and the two can disagree
+ * silently. They did at the fdc0d52 bump: the renderer's world gained
+ * `head` and `history` WITHOUT a package-version bump, so nothing caught
+ * the change by version — instantiation simply failed on the missing
+ * import records.
+ *
+ * Both directions matter and both are asserted:
+ *   - `head`/`history` PRESENT: the renderer provides `WitDocument` and
+ *     `WitHistory` as root context unconditionally (polyengine-dioxus/
+ *     src/driver.rs:258-269), so they are imported even though this spike
+ *     renders no `<head>` element and runs no router. `host/mount.ts` must
+ *     supply both or the mount dies.
+ *   - `eval` ABSENT: the negative is the one that carries security weight.
+ *     `eval` reaches the page's own realm, and the port measured that its
+ *     one suspected customer (the pairing QR) did not need it (Cargo.toml
+ *     carries the argument). A mapping in `component.rs` naming the
+ *     interface is bookkeeping; an IMPORT would be a capability the host
+ *     had to grant. Only this check tells the two apart.
+ *
+ * The same file the server serves — the build-identity gate above ties the
+ * served bytes to this build's stamp.
+ */
+test("imports head and history, and does not import eval", () => {
+  // `e2e/package.json` sets `"type": "module"`, so there is no `__dirname`
+  // at runtime (TypeScript's node typings offer one regardless, which is how
+  // a `__dirname` here type-checks and then fails when the test runs).
+  const here = dirname(fileURLToPath(import.meta.url));
+  const artifact = join(here, "..", "..", "build", "visor-spike.component.wasm");
+  const wit = execFileSync("wasm-tools", ["component", "wit", artifact], {
+    encoding: "utf8",
+    maxBuffer: 64 << 20,
+  });
+
+  // Top-level world imports are one `  import <id>;` line each; matching the
+  // whole line (rather than a substring) keeps an interface NAMED in a doc
+  // comment from passing for an interface IMPORTED.
+  const imports = new Set(
+    wit.split("\n")
+      .map((l) => /^\s*import\s+(\S+);\s*$/.exec(l)?.[1])
+      .filter((id): id is string => id !== undefined),
+  );
+
+  expect(imports).toContain("polymorph:dioxus/head@0.6.0");
+  expect(imports).toContain("polymorph:dioxus/history@0.6.0");
+  expect([...imports].filter((id) => id.startsWith("polymorph:dioxus/eval"))).toEqual([]);
 });
 
 // -- (2) mounts, and the extra IMPORTED interfaces ------------------------

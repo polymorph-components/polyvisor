@@ -176,6 +176,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96007ed6cbad951dfed82d83c581aabd95bc591f351f5666d454ddbe7845b324"
 
 [[package]]
+name = "dioxus-document"
+version = "0.7.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f6fadd5c6d886b48b762820abae1a08142a2159f8a1136c0466b4b4ed9f547e"
+dependencies = [
+ "dioxus-core",
+ "dioxus-core-macro",
+ "dioxus-core-types",
+ "dioxus-html",
+ "futures-channel",
+ "futures-util",
+ "generational-box",
+ "lazy-js-bundle",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "dioxus-history"
+version = "0.7.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2404b77d4441e694a5e93afb5c9a729efb26a3f6920f769cfe6cfedf5c7ac210"
+dependencies = [
+ "dioxus-core",
+ "tracing",
+]
+
+[[package]]
 name = "dioxus-hooks"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -700,7 +729,10 @@ version = "0.1.0"
 dependencies = [
  "dioxus-core",
  "dioxus-core-types",
+ "dioxus-document",
+ "dioxus-history",
  "dioxus-html",
+ "futures-util",
  "rustc-hash",
  "wit-bindgen 0.60.0",
 ]

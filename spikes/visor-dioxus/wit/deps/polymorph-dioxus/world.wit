@@ -17,8 +17,8 @@ package polymorph:dioxus@0.6.0;
 /// Typed event payloads, host-serialized at dispatch. One snapshot per
 /// event; fields not applicable to an event family are simply absent by
 /// construction (the family is chosen host-side by event name, mirroring
-/// dioxus-html's name→data-type mapping). Drag events reuse the `mouse`
-/// family (DOM drag events are MouseEvents). Some families dispatch as
+/// dioxus-html's name→data-type mapping). Drag events are `mouse` data plus
+/// a live `data-transfer` handle (`drag-data`). Some families dispatch as
 /// `empty` because there is nothing to carry: focus, cancel, clipboard,
 /// media, selection and toggle events have data types in dioxus-html that
 /// expose no accessors at all, so a handler can observe nothing beyond the
@@ -105,6 +105,65 @@ interface events {
     /// Form entries, populated for submit-shaped events on a form element
     /// (name → values, multi-valued controls preserved).
     values: list<tuple<string, list<string>>>,
+    /// The control's selected files (`<input type=file>`), empty otherwise.
+    /// Owned handles: the guest keeps them as long as its `FileData`
+    /// values live, and may read them after the dispatch has completed.
+    files: list<own<file>>,
+  }
+
+  /// One file the user handed the page — a form control's selection or a
+  /// drop. The back end of dioxus-html's `FileData` (dioxus-html-0.7.10
+  /// src/file_data.rs, `NativeFileData`). Metadata is synchronous, as the
+  /// DOM's is; contents arrive as a byte stream because reading a `File`
+  /// is asynchronous in every browser API, and dioxus's `read_bytes` /
+  /// `read_string` / `byte_stream` are all async on their side too.
+  ///
+  /// A file is only ever reachable through an event the USER caused
+  /// (choosing files, dropping them), so this carries no policy of its own;
+  /// an embedder that wants one intercepts `read` (`MountOptions.intercept`
+  /// does not yet reach resources — see host/src/intercept.ts).
+  resource file {
+    name: func() -> string;
+    /// Bytes.
+    size: func() -> u64;
+    /// Milliseconds since the Unix epoch (`File.lastModified`).
+    last-modified: func() -> u64;
+    /// The MIME type the browser reports, `none` when it reports "".
+    content-type: func() -> option<string>;
+    /// The file's contents, start to end. Each call starts a fresh read.
+    read: func() -> stream<u8>;
+  }
+
+  /// A drag operation's live `DataTransfer`: the back end of dioxus-html's
+  /// `DataTransfer` (dioxus-html-0.7.10 src/data_transfer.rs,
+  /// `NativeDataTransfer`). A RESOURCE, not a snapshot, because the setters
+  /// only mean anything against the live object during `dragstart`, and
+  /// the browser's protected mode makes `get-data` answer `none` outside
+  /// `dragstart`/`drop` — behavior dioxus-web's users already know, and
+  /// which a snapshot would have to fake. Owned by the guest; methods called
+  /// after the dispatch completed see whatever the browser still exposes.
+  resource data-transfer {
+    /// `getData(format)`; `none` for an absent format (or protected mode).
+    get-data: func(format: string) -> option<string>;
+    /// `setData`. Errs when the browser refuses (outside `dragstart`).
+    set-data: func(format: string, data: string) -> result<_, string>;
+    /// `clearData(format?)`. Errs as `set-data`.
+    clear-data: func(format: option<string>) -> result<_, string>;
+    effect-allowed: func() -> string;
+    set-effect-allowed: func(effect: string);
+    drop-effect: func() -> string;
+    set-drop-effect: func(effect: string);
+    /// `DataTransfer.files`, as owned handles (see `file`).
+    files: func() -> list<own<file>>;
+  }
+
+  /// Drag events (`dragstart`..`drop`): a `MouseEvent` plus its
+  /// `dataTransfer`. Drag events reused the `mouse` family before this
+  /// record existed; they now route here.
+  record drag-data {
+    mouse: mouse-data,
+    /// `none` when the event has no `dataTransfer` (a synthetic event).
+    transfer: option<own<data-transfer>>,
   }
 
   record scroll-data {
@@ -264,6 +323,7 @@ interface events {
     /// mouse — see family mapping in the host).
     empty,
     mouse(mouse-data),
+    drag(drag-data),
     pointer(pointer-data),
     keyboard(keyboard-data),
     wheel(wheel-data),
@@ -580,41 +640,115 @@ interface dom {
 /// - The script runs in the host's realm with whatever that realm can reach —
 ///   `document`, `window`, the mount root. That is the point, and the reason
 ///   for the opt-in.
+///
+/// One script is one call. Its channels are component-model streams and its
+/// completion a future, so every lifetime question has the CABI's answer
+/// rather than one of ours: "no more values" is the stream closing, "already
+/// completed" cannot be asked twice of a future, and an evaluation nobody
+/// awaits is a dropped reader the host's eventual write sees as `dropped`.
+/// A subtask-based design was tried first and retired: polyengine#280 loses a
+/// subtask whose settlement lands in the microtask checkpoint after its
+/// export's initial activation returns, and a `handle-event` handler awaiting
+/// an eval hits that every time; future/stream writes take a different path
+/// through the runtime and are unaffected.
 interface eval {
-  /// Why an evaluation could not deliver a value. The cases the host can
-  /// actually produce; the guest maps them onto dioxus-document's
-  /// `EvalError`.
+  /// Why an evaluation could not deliver a value.
   variant error {
     /// The script did not compile (a `SyntaxError` constructing the
-    /// function). Reported by `join` — a constructor cannot fail.
+    /// function).
     invalid-js(string),
     /// The script threw, or a value could not be represented as JSON.
     communication(string),
-    /// The script has completed and nothing more will arrive: `recv` with an
-    /// empty queue after completion, or `join` a second time.
-    finished,
+    /// The host declined to run this script (an interceptor's decision —
+    /// `MountOptions.intercept`, host/src/intercept.ts). The guest maps this
+    /// onto dioxus's `EvalError::Unsupported`, the same graceful answer
+    /// `NoOpDocument` gives, so an app degrades exactly as it would with
+    /// no eval at all.
+    denied,
   }
 
-  /// One running script. Construction starts it; the synchronous prefix
-  /// (everything before the script's first `await`) runs INSIDE the
-  /// constructor, on the calling guest's stack — so it is bracketed by the
-  /// host's dispatch gate like `dom.set-focus` is (host/src/dispatch.ts,
-  /// window 3), since that prefix can mutate the DOM and fire delegated
-  /// events. Continuations after an `await` run on their own microtasks,
-  /// outside any guest turn, and need no bracket.
+  /// Start `js`. `send` carries the guest's values (JSON) to the script's
+  /// `await dioxus.recv()`; the returned stream carries the script's
+  /// `dioxus.send(v)` values (JSON) to the guest and closes when the script
+  /// completes; the returned future is the script's completion: its return
+  /// value as JSON, or how it failed.
   ///
-  /// Dropping the handle does not stop the script (nothing could — this is
-  /// a JS promise, not a task); it only releases the host's queues.
-  resource evaluation {
-    constructor(js: string);
-    /// Queue a JSON value for the script's next `await dioxus.recv()`.
-    send: func(json: string);
-    /// The next value the script passed to `dioxus.send`, as JSON. Parks
-    /// until one is available.
-    recv: async func() -> result<string, error>;
-    /// The script's completion: its return value as JSON, or how it failed.
-    join: async func() -> result<string, error>;
-  }
+  /// Synchronous, deliberately: the script's synchronous prefix (everything
+  /// before its first `await`) runs INSIDE this call, on the calling guest's
+  /// stack — so it is bracketed by the host's dispatch gate like
+  /// `dom.set-focus` is (host/src/dispatch.ts, window 3), since that prefix
+  /// can mutate the DOM and fire delegated events. Continuations after an
+  /// `await` run on their own microtasks, outside any guest turn.
+  ///
+  /// The host MUST write the future, even for a script that never completes
+  /// before the host tears the mount down (the CABI forbids dropping an
+  /// unwritten writable future end; the guest's read would trap).
+  eval: func(js: string, send: stream<string>) -> tuple<stream<string>, future<result<string, error>>>;
+}
+/// The document's `<head>` and title: the back end of dioxus's
+/// `document::Title`, `Meta`, `Link`, `Style` and `Script` components
+/// (dioxus-document-0.7.10 src/document.rs, `Document::set_title` and
+/// `create_head_element`). Without this interface those route through
+/// `eval`, which apps do not have; with it they are plain DOM writes the host
+/// performs — and may refuse or rewrite per call (`MountOptions.intercept`).
+///
+/// Convention as in `dom`: commands return `bool`, `false` meaning the host
+/// did not do it. The guest has nothing to do with a `false` (dioxus's
+/// `Document` methods return `()`), so refusal is silent by design: the
+/// element simply is not there.
+///
+/// The default host refuses `script` unless the mount also granted `eval` —
+/// a script tag is eval by another name.
+interface head {
+  set-title: func(title: string) -> bool;
+
+  /// Append `<tag attrs...>contents</tag>` to `<head>`. `attributes` in
+  /// declaration order; `contents` is text content (a `<style>` body, an
+  /// inline `<script>`), `none` for void elements.
+  create-element: func(tag: string, attributes: list<tuple<string, string>>, contents: option<string>) -> bool;
+}
+
+/// Navigation history: the back end of dioxus's `History` trait
+/// (dioxus-history-0.7.10 src/lib.rs), which `dioxus-router` drives.
+///
+/// Routes are ABSTRACT here — `/path?query#fragment` as the router spells
+/// them. How they meet the browser's location is the host's decision
+/// (`MountOptions.history`): kept in memory, encoded into the URL fragment
+/// (the shape for a host that does not own the path, such as polyvisor's
+/// apps), or something of the embedder's own. The guest never sees the
+/// encoding, so changing it needs no guest change.
+///
+/// Hydration note: a prerendered document was rendered at ONE route (the
+/// server cannot see a fragment), so a host that hydrates must answer
+/// `current-route` with the prerendered route until the initial render is
+/// done, then deliver the real one through `changes`. Otherwise the guest's
+/// first render disagrees with the markup and hydration fails loudly.
+interface history {
+  /// The current route, `/path?query#fragment`.
+  current-route: func() -> string;
+  /// A prefix the router should prepend to links, if the app is mounted
+  /// below one (dioxus-history `current_prefix`).
+  current-prefix: func() -> option<string>;
+
+  can-go-back: func() -> bool;
+  can-go-forward: func() -> bool;
+  go-back: func();
+  go-forward: func();
+
+  /// Add / replace the current entry. `false` = refused.
+  push: func(route: string) -> bool;
+  replace: func(route: string) -> bool;
+
+  /// Navigate the whole page to a URL outside the app (dioxus-history
+  /// `external`). `false` = refused, which is what a host that runs
+  /// untrusted apps will normally answer.
+  external: func(url: string) -> bool;
+
+  /// Routes the host moved to WITHOUT the guest asking — the back button,
+  /// a visor-driven navigation — one per change. The guest reads this for
+  /// the instance's lifetime and re-renders the router on each. At most one
+  /// call per instance; a second returns a stream that closes immediately.
+  changes: func() -> stream<string>;
 }
 
 /// A Dioxus application component. The host instantiates it, calls `run`
@@ -626,6 +760,8 @@ world app {
 
   import events;
   import dom;
+  import head;
+  import history;
   /// Opt-in; see the interface doc. Present in a component's imports only
   /// when the renderer was built with its `eval` feature.
   import eval;
