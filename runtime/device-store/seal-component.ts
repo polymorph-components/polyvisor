@@ -579,12 +579,33 @@ export async function openSeal(
   ns: DeviceNamespace,
   source: InstantiateSource,
 ): Promise<DeviceSeal> {
+  // PLAIN MODE, PINNED — `jspi: false` — and the reason is a measured crash.
+  //
+  // This component never needs a suspended wasm frame: every import it
+  // calls is an `async func` (the webcrypto surface, our `namespace`), so
+  // each is lowered through the component-model async ABI and the guest
+  // parks on a callback, never on a blocked frame. polyengine's
+  // auto-detection nevertheless picks jspi mode for this plan, because
+  // wit-bindgen emits the sync-form `subtask.cancel`/`task.cancel`
+  // built-ins for the drop-a-pending-future path, and those are classified
+  // block-capable (embedder-api.md, amendment A1; jspi/bridge.ts
+  // `trampolineNeedsSuspension`). In jspi mode every export is wrapped in
+  // `WebAssembly.promising`, and under Gecko — where JSPI is still
+  // pref-gated and experimental — the first async export call then kills
+  // the content process (firefox-smoke, and a minimal probe: the same
+  // sequence passes with `jspi: false` and crashes with `true`; the
+  // engine survives only because its plan genuinely needs suspension and
+  // its exports are driven differently). Forcing plain costs nothing here
+  // and would surface loudly if it were ever wrong: a sync-lowered import
+  // that returned a Promise is refused at the call site (`NeedsJspi`),
+  // never silently degraded. The recorded Gecko hazard this joins is
+  // PERSISTENCE.md's 0.5.1 addendum on `WebAssembly.promising` exports.
   const instance = await instantiate(source, {
     ...wasi({ cli: { args: [`device-seal-${ns.id.slice(0, 8)}`] } }),
     ...webcryptoImports(),
     [I_TYPES]: {},
     [I_NAMESPACE]: namespaceImports(ns),
-  });
+  }, { jspi: false });
 
   const seal = instance.exports[I_SEAL] as SealExports;
   const sealed = instance.exports[I_SEALED] as SealedExports;
