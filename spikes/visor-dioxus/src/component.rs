@@ -17,7 +17,7 @@ use dioxus::prelude::*;
 
 use crate::drawer::{CloseReason, Deadline, DrawerState, Effect, TenantSpec};
 use crate::state::{
-    surface_from_parts, Conditions, Context, EventStore, Identity, VISOR_HUES,
+    Conditions, Context, EventStore, Identity, VISOR_HUES,
 };
 use crate::voice::{FrameworkText, MarkIcon, UserVoice, IDENTITY_MAX};
 
@@ -45,7 +45,8 @@ use exports::polymorph::visor_spike::control::{
     BackAction, Guest as ControlGuest, Identity as WitIdentity,
 };
 use polymorph::visor_spike::types::{CloseReason as WitCloseReason, Context as WitContext, Surface as WitSurface};
-use polymorph::visor_spike::{chrome, embedder, store};
+pub(crate) use polymorph::visor_spike::{embedder, store};
+use polymorph::visor_spike::chrome;
 
 /// The renderer's `dom` interface, reached through the reuse above. The strip
 /// IS a guest-rendered element, so this is the one half of the drawer's height
@@ -83,6 +84,13 @@ thread_local! {
     static EVENT_TARGET: Cell<u32> = const { Cell::new(0) };
 }
 
+/// The measured box of a guest-rendered element. The strip's own budget half
+/// and, since the visor's ceremonies became part of this tree, every sheet's
+/// natural height (`crate::sheets::SheetRoot`).
+pub(crate) fn client_rect(id: u32) -> Option<dom::Rect> {
+    dom::get_client_rect(id)
+}
+
 /// The id of the element the event now being dispatched fired on.
 pub(crate) fn dispatching_target() -> u32 {
     EVENT_TARGET.get()
@@ -94,6 +102,25 @@ pub(crate) fn dispatching_target() -> u32 {
 /// The `Signal` and the `Rc<Runtime>` are copied out before `f` runs, so the
 /// `RefCell` borrow never spans a call that might re-enter (the effect drain
 /// below does exactly that).
+///
+/// # NEVER CALL THIS FROM A RENDER BODY. Use [`read_visor`].
+///
+/// It takes a WRITE borrow, and a write MARKS THE SIGNAL DIRTY unconditionally
+/// — that is the whole point of it, and it is what lets a `control` call
+/// arriving on a bare export task repaint the strip. Inside a render body the
+/// same property is a defect, and it produced both of the two the browser
+/// found:
+///
+///   - a component that also SUBSCRIBES (any [`read_visor`] in its body) and
+///     writes here re-renders itself forever — dirty, render, dirty — and the
+///     instance never finishes a flush. That was the settings sheet's hang.
+///   - a component that only writes here never subscribes AT ALL, so it renders
+///     once and never again, and a later state change is invisible to it. That
+///     was the erase ceremony never drawing itself armed, even though the
+///     machine armed on time and `embedder.tenant-armed` fired.
+///
+/// One rule removes both: RENDER BODIES READ THROUGH [`read_visor`] AND WRITE
+/// NOTHING; handlers, deferred edges and the WIT exports write through here.
 pub(crate) fn with_visor<R>(f: impl FnOnce(&mut Visor) -> R) -> Option<R> {
     let live = LIVE.with(|l| l.borrow().as_ref().map(|v| (v.runtime.clone(), v.visor)))?;
     let _guard = RuntimeGuard::new(live.0);
@@ -102,8 +129,17 @@ pub(crate) fn with_visor<R>(f: impl FnOnce(&mut Visor) -> R) -> Option<R> {
     Some(f(&mut write))
 }
 
-/// Read-only access from outside a render (the `control` queries).
-fn read_visor<R>(f: impl FnOnce(&Visor) -> R) -> Option<R> {
+/// READ THE LIVE VISOR. The door for the `control`/`sheets`/`marks` queries,
+/// and THE ONLY DOOR A RENDER BODY MAY USE — see [`with_visor`] for what
+/// happens when a render writes instead.
+///
+/// It takes a read borrow and marks nothing dirty. Called from inside a
+/// component it also SUBSCRIBES that component to the signal, which is not
+/// incidental: it is what makes a sheet redraw when the fact it is drawn from
+/// changes — the erase ceremony's `.armed` class and its `disabled` attribute
+/// both hang off exactly that. Called from a bare WIT export task there is no
+/// scope to subscribe, so the same call is a plain read.
+pub(crate) fn read_visor<R>(f: impl FnOnce(&Visor) -> R) -> Option<R> {
     let live = LIVE.with(|l| l.borrow().as_ref().map(|v| (v.runtime.clone(), v.visor)))?;
     let _guard = RuntimeGuard::new(live.0);
     let signal = live.1;
@@ -181,6 +217,10 @@ pub struct Visor {
 
     // --- the drawer ---
     pub drawer: DrawerState,
+
+    /// THE CEREMONIES' OWN STATE: the consumer's static contributions, and
+    /// which surface each open ceremony is about. See `crate::sheets`.
+    pub sheets: crate::sheets::SheetsState,
 }
 
 /// The button's standing sentence, extended while the dot is lit. The dot
@@ -240,6 +280,7 @@ impl Visor {
             events,
             conditions: Conditions::default(),
             drawer: DrawerState::default(),
+            sheets: crate::sheets::SheetsState::default(),
         }
     }
 
@@ -251,7 +292,7 @@ impl Visor {
     /// and therefore speaks — before any identity exists. "visor: this device
     /// open" is the honest sentence there; it names the speaker without
     /// claiming a token that has not been minted (visor.ts:1845-1861).
-    fn word_prefix(&self) -> &str {
+    pub(crate) fn word_prefix(&self) -> &str {
         if self.word.is_empty() {
             "visor"
         } else {
@@ -328,7 +369,7 @@ impl Visor {
 
     /// The drawer's height budget: the viewport, minus the strip the sheet
     /// grows above, minus the band of app that always shows.
-    fn budget(&self) -> f64 {
+    pub(crate) fn budget(&self) -> f64 {
         let strip = self
             .strip_id
             .and_then(dom::get_client_rect)
@@ -348,7 +389,7 @@ impl Visor {
 /// age from, so a counter would be a lie in the data. It is the ONE thing this
 /// crate takes from `wasi` beyond the world — a clock READ, which is available;
 /// a clock WAIT, which is what every ported `setTimeout` needs, is not.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
@@ -386,14 +427,35 @@ impl From<CloseReason> for WitCloseReason {
 /// reason a superseded timer is harmless rather than a bug. There is no
 /// cancellation and none is needed.
 fn later(ms: u64, f: impl FnOnce() + 'static) {
+    spawn(async move {
+        dioxus_sdk_time::sleep(std::time::Duration::from_millis(ms)).await;
+        f();
+    });
+}
+
+/// SPAWN A TASK ON THE RENDERER'S SCHEDULER. [`later`] is this plus a sleep,
+/// and so is every async host import the guest awaits — `embedder.on-reset`
+/// being the one that exists (wit/world.wit:230-247).
+///
+/// `Runtime::spawn(ScopeId::APP, ..)` rather than the `spawn` of
+/// `dioxus::prelude`, because that one needs a current SCOPE and a `control` or
+/// `sheets` call arrives on a bare WIT export task with no scope on the stack —
+/// the same reason [`with_visor`] has to install a `RuntimeGuard` at all. The
+/// task is owned by the app scope, so it dies with the app; and it is first
+/// polled by the renderer's scheduler task (`polyengine_dioxus::driver::run`'s
+/// `spawn_local`), which is the async export a WASIp3 import must be current
+/// under. `dioxus_sdk_time::sleep`'s own doc states that constraint — "awaiting
+/// a WASIp3 import requires a `wit-bindgen` async task to be current, which is
+/// the case for code reached from a component's async exports" — and an async
+/// IMPORT generated by `wit_bindgen::generate!` needs exactly the same thing,
+/// which is why the two share this one call site rather than each finding their
+/// own way onto the pool.
+pub(crate) fn spawn(fut: impl std::future::Future<Output = ()> + 'static) {
     let Some(runtime) = LIVE.with(|l| l.borrow().as_ref().map(|v| v.runtime.clone())) else {
         return;
     };
     let _guard = RuntimeGuard::new(runtime.clone());
-    runtime.spawn(ScopeId::APP, async move {
-        dioxus_sdk_time::sleep(std::time::Duration::from_millis(ms)).await;
-        f();
-    });
+    runtime.spawn(ScopeId::APP, fut);
 }
 
 /// Schedule one of the drawer machine's deferred edges, and feed whatever it
@@ -418,18 +480,74 @@ fn schedule(deadline: Deadline, ms: u64) {
 /// Drain the drawer machine's effects: the one-way `embedder` notifications go
 /// out, the recomputed context lands on the strip, and every sentence emitted in
 /// this activation is spoken as ONE atomic write (see [`Visor::speak`]).
-fn apply_effects(effects: Vec<Effect>) {
+///
+/// THE VISOR'S OWN FOUR TENANTS ARE ROUTED DIFFERENTLY on three arms, and each
+/// difference is stated in the WIT:
+///
+///   - `Build` / `Unmount` are DROPPED. wit/world.wit:176-181: "ONLY FOR
+///     TENANTS THE HOST OWNS. The visor's own ceremonies — naming, settings,
+///     reset, events — are rendered by the guest now, so they never emit this."
+///     There is no round trip to wait for: the slide's arrival IS the build,
+///     and `crate::sheets::SheetRoot` reports its own measured height back
+///     through `mount-sheet`.
+///   - `BeforeShow` / `AfterCollapse` additionally run the nested-place
+///     bracket (sheets.ts:589-602's `freezePlace`/`thawPlace`, which were these
+///     tenants' own spec callbacks). The embedder notification is still sent:
+///     it is one-way and identifies the tenant, and withholding it would take
+///     information away from a consumer that pauses its runners on it.
+///   - `Armed` additionally records the tenant, because a guest-rendered sheet
+///     has to draw its own `.armed` class — in TypeScript the drawer host set
+///     it on foreign DOM it was holding.
+pub(crate) fn apply_effects(effects: Vec<Effect>) {
     let mut sentences = Vec::new();
     for effect in effects {
         match effect {
             Effect::Speak(s) => sentences.push(s),
-            Effect::BeforeShow(n) => embedder::tenant_before_show(&n),
+            Effect::BeforeShow(n) => {
+                if crate::sheets::is_visor_tenant(&n) {
+                    crate::sheets::freeze_place();
+                }
+                embedder::tenant_before_show(&n);
+            }
             Effect::BeforeCollapse(n, r) => embedder::tenant_before_collapse(&n, r.into()),
-            Effect::AfterCollapse(n, r) => embedder::tenant_after_collapse(&n, r.into()),
+            Effect::AfterCollapse(n, r) => {
+                if crate::sheets::is_visor_tenant(&n) {
+                    crate::sheets::thaw_place();
+                }
+                embedder::tenant_after_collapse(&n, r.into());
+            }
             Effect::AfterRestore(n, r) => embedder::tenant_after_restore(&n, r.into()),
-            Effect::Armed(n) => embedder::tenant_armed(&n),
-            Effect::Build(n) => embedder::tenant_build(&n),
-            Effect::Unmount(n) => embedder::tenant_unmount(&n),
+            Effect::Armed(n) => {
+                if crate::sheets::is_visor_tenant(&n) {
+                    with_visor(|v| v.sheets.armed = Some(n.clone()));
+                }
+                embedder::tenant_armed(&n);
+            }
+            Effect::Build(n) => {
+                if crate::sheets::is_visor_tenant(&n) {
+                    // ARMING IS PER PRESENTATION, and `Build` is emitted by
+                    // `DrawerState::present` — so this is the one edge that
+                    // fires for a fresh open, a rebuild AND a resume, which is
+                    // exactly the set `arm_elapsed`'s presentation token
+                    // invalidates. Clearing here is what makes "a resumed sheet
+                    // re-arms from zero" (drawer.rs's test of that name) true of
+                    // the VISIBLE arming too: without it a reset sheet coming
+                    // back would draw its erase button live while the delay it
+                    // is behind was really running again.
+                    with_visor(|v| {
+                        if v.sheets.armed.as_deref() == Some(n.as_str()) {
+                            v.sheets.armed = None;
+                        }
+                    });
+                } else {
+                    embedder::tenant_build(&n);
+                }
+            }
+            Effect::Unmount(n) => {
+                if !crate::sheets::is_visor_tenant(&n) {
+                    embedder::tenant_unmount(&n);
+                }
+            }
             Effect::SetContext(c) => {
                 with_visor(|v| v.set_context(c));
             }
@@ -441,10 +559,57 @@ fn apply_effects(effects: Vec<Effect>) {
     }
 }
 
+
+/// THE ANNOUNCE PATH, reachable from inside the crate as well as from
+/// `control.announce` — the visor's own ceremonies say things on the strip
+/// (`sheets.ts:963`, `:1002`), and they are framework voice by exactly the
+/// argument `control.announce` is: a flat string cannot carry class marking, so
+/// an announcement is spoken entirely in the visor's own voice and may embed
+/// user-voice words inline. `voice.rs` is why an app-influenced string cannot
+/// reach this call from inside the crate at all.
+pub(crate) fn announce_framework(text: &str) {
+    announce_for(text.to_string(), 0);
+}
+
+fn announce_for(text: String, ms: u32) {
+    let Some(token) = with_visor(|v| {
+        let text = FrameworkText::from(text);
+        // SCREEN-READER MIRROR: sighted users get the line, this is the
+        // other half (visor.ts:957-959).
+        v.speak(vec![text.as_str().to_string()]);
+        v.announcement = Some(text);
+        v.announce_token += 1;
+        v.announce_token
+    }) else {
+        return;
+    };
+    let ms = if ms == 0 { ANNOUNCE_MS } else { ms as u64 };
+    later(ms, move || {
+        with_visor(|v| {
+            // Overtaken by a newer render or announcement: that one owns the
+            // line now (visor.ts:1929-1932).
+            if v.announce_token != token {
+                return;
+            }
+            // REVERT BY RE-RENDER, never by restoring what was there.
+            v.announcement = None;
+        });
+    });
+}
+
 // --- WIT conversions ------------------------------------------------------------
 
 fn surface_in(s: &WitSurface) -> crate::state::Surface {
-    surface_from_parts(s.name.clone(), &s.nickname, &s.icon, s.is_new, s.petname.as_deref())
+    crate::state::surface_with(
+        s.name.clone(),
+        &s.nickname,
+        &s.icon,
+        s.is_new,
+        s.petname.as_deref(),
+        s.nomination.as_deref(),
+        s.meta.as_ref().map(|m| (m.label.clone(), m.value.as_str(), m.foreign)),
+        s.first_seen,
+    )
 }
 
 fn context_in(ctx: &WitContext) -> Context {
@@ -477,6 +642,14 @@ pub(crate) fn surface_out(s: &crate::state::Surface) -> WitSurface {
         icon: s.icon.map_or(String::new(), |i| i.as_str().to_string()),
         is_new: s.is_new,
         petname: s.petname.as_ref().map(|p| p.as_str().to_string()),
+        // The nomination echoes safely: it is a `MarkIcon`, i.e. one of the
+        // crate's own vetted constants, never a component-supplied string.
+        nomination: s.nomination.map(|i| i.as_str().to_string()),
+        // `meta.value` cannot echo for the same reason `nickname` cannot —
+        // it is held as `AppVoice` precisely so no bare copy exists. The
+        // embedder supplied it and can re-derive it from `name`.
+        meta: None,
+        first_seen: s.first_seen,
     }
 }
 
@@ -527,7 +700,7 @@ pub(crate) fn report_back() {
 /// `polyengine_dioxus::launch!` cannot be used: it implements the BASE world's
 /// `Guest` and invokes the renderer's own `export!`. Our world is a superset, so
 /// the export glue has to come from our own `generate!`.
-struct VisorComponent;
+pub(crate) struct VisorComponent;
 
 impl Guest for VisorComponent {
     async fn run() -> polyengine_dioxus::driver::MutationStream {
@@ -720,29 +893,7 @@ impl ControlGuest for VisorComponent {
     ///
     /// `ms = 0` uses the default dwell (wit/world.wit:222).
     fn announce(text: String, ms: u32) {
-        let Some(token) = with_visor(|v| {
-            let text = FrameworkText::from(text);
-            // SCREEN-READER MIRROR: sighted users get the line, this is the
-            // other half (visor.ts:957-959).
-            v.speak(vec![text.as_str().to_string()]);
-            v.announcement = Some(text);
-            v.announce_token += 1;
-            v.announce_token
-        }) else {
-            return;
-        };
-        let ms = if ms == 0 { ANNOUNCE_MS } else { ms as u64 };
-        later(ms, move || {
-            with_visor(|v| {
-                // Overtaken by a newer render or announcement: that one owns
-                // the line now (visor.ts:1929-1932).
-                if v.announce_token != token {
-                    return;
-                }
-                // REVERT BY RE-RENDER, never by restoring what was there.
-                v.announcement = None;
-            });
-        });
+        announce_for(text, ms);
     }
 
     /// THE VISOR POINTING AT ITS OWN CONTEXT LINES. It does NOT touch the
@@ -931,3 +1082,4 @@ impl ControlGuest for VisorComponent {
 }
 
 export!(VisorComponent);
+

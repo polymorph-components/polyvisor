@@ -34,6 +34,32 @@ pub struct Surface {
     pub is_new: bool,
     /// USER VOICE.
     pub petname: Option<UserVoice>,
+    /// WHAT THE COMPONENT ASKED TO WEAR. Held as a [`MarkIcon`], so an
+    /// unvetted glyph is unrepresentable rather than filtered: the component
+    /// chose which of the curated constants to point at, and supplied no
+    /// string. Rendered in exactly one place, the naming ceremony's picker,
+    /// and the component is never told the outcome.
+    pub nomination: Option<MarkIcon>,
+    /// One line of visor-known metadata for the App settings sheet. `value`
+    /// is APP VOICE because it may be component-influenced (a panel's
+    /// declared destination); `label` is the visor's own word.
+    pub meta: Option<SurfaceMeta>,
+    /// When the visor first assigned this record its mark, from the trust
+    /// table. Rendered as a date the user can check.
+    pub first_seen: Option<u64>,
+}
+
+/// One line of visor-known metadata about a surface (`types.surface-meta`).
+#[derive(Clone, PartialEq, Debug)]
+pub struct SurfaceMeta {
+    /// THE VISOR'S OWN WORD for what this line is. Never a component's.
+    pub label: String,
+    /// Possibly component-influenced, so it is held marked and can only be
+    /// rendered through the app-voice door.
+    pub value: AppVoice,
+    /// Whether the value is genuinely app-influenced. A visor-sourced value
+    /// still renders in the visor's voice; the flag is what says which.
+    pub foreign: bool,
 }
 
 /// The visor's context slot: what secondary surface, if any, is on screen
@@ -536,12 +562,37 @@ pub fn surface_from_parts(
     is_new: bool,
     petname: Option<&str>,
 ) -> Surface {
+    surface_with(name, nickname, icon, is_new, petname, None, None, None)
+}
+
+/// The full constructor. `surface_from_parts` is the four-field shorthand the
+/// strip's own paths use; the naming ceremony needs the rest.
+#[allow(clippy::too_many_arguments)]
+pub fn surface_with(
+    name: String,
+    nickname: &str,
+    icon: &str,
+    is_new: bool,
+    petname: Option<&str>,
+    nomination: Option<&str>,
+    meta: Option<(String, &str, bool)>,
+    first_seen: Option<u64>,
+) -> Surface {
     Surface {
         name,
         nickname: AppVoice::token(nickname),
         icon: MarkIcon::app_mark(icon),
         is_new,
         petname: petname.and_then(|p| UserVoice::new(p, NAME_MAX)),
+        // A nomination outside the curated table is DROPPED, exactly as an
+        // invalid one is: `app_mark` is the only constructor.
+        nomination: nomination.and_then(MarkIcon::app_mark),
+        meta: meta.map(|(label, value, foreign)| SurfaceMeta {
+            label,
+            value: AppVoice::token(value),
+            foreign,
+        }),
+        first_seen,
     }
 }
 

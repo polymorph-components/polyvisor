@@ -206,6 +206,17 @@ impl MarkIcon {
         APP_MARK_ICONS.iter().find(|g| **g == icon).map(|g| Self(g))
     }
 
+    /// THE WHOLE COMPONENT VOCABULARY, in the curated order.
+    ///
+    /// The trust table needs it twice — `free_icons` subtracts the used set
+    /// from it, and `icon_offers` draws from what is left — and neither can be
+    /// written against a private table. Exposed as `MarkIcon`s rather than as
+    /// `&str`s so that nothing outside this module can put a glyph into the
+    /// set: the firewall is membership, and membership stays decided here.
+    pub fn app_marks() -> impl Iterator<Item = Self> {
+        APP_MARK_ICONS.iter().copied().map(Self)
+    }
+
     /// THE VISOR'S OWN BUTTON FACE. The wide set: the ten the button shipped
     /// with, plus every pet icon not already among them (`VISOR_ICONS`,
     /// visor.ts:290-293). Unknown or absent falls back to the shield —

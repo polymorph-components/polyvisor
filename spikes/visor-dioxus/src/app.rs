@@ -37,10 +37,13 @@
 //! `polymorph:dioxus` at all, which makes the invariant structural here rather
 //! than merely observed; the two `style=` sites below are the whole of it.
 //!
-//! # `.visor-slide` IS A LEAF, AND THAT IS THE SHEET-SLOT CONTRACT
+//! # `.visor-slide` IS A LEAF FOR A FOREIGN SHEET, AND THAT IS THE SLOT CONTRACT
 //!
-//! Drawer sheets are built by TypeScript and handed over as live DOM; they are
-//! not part of this tree. The renderer's applier walks template paths by CHILD
+//! A CONSUMER'S drawer sheets are built by TypeScript and handed over as live
+//! DOM; they are not part of this tree. (The VISOR'S OWN four ceremonies are —
+//! see `crate::sheets` — and a slide is either one kind or the other for its
+//! whole life, never a mixture, which is what keeps the addressing below sound
+//! for both.) The renderer's applier walks template paths by CHILD
 //! INDEX (`polyengine-dioxus/host/src/applier.ts:194-204`, `#loadChild`), so a
 //! foreign child interleaved among guest-rendered siblings would corrupt
 //! addressing — the guest would ask for "the second child" and get the host's
@@ -178,9 +181,8 @@ pub fn App() -> Element {
                     // and only a clock can keep it.
 
                     for slide in slides.iter() {
-                        // THE LEAF. No children, ever — see this module's
-                        // header. `key` is per PRESENTATION, so a slide node is
-                        // never reused across two sheets.
+                        // `key` is per PRESENTATION, so a slide node is never
+                        // reused across two sheets.
                         div {
                             key: "{slide.key}",
                             class: slide_class(slide),
@@ -191,6 +193,17 @@ pub fn App() -> Element {
                             onmounted: move |_| {
                                 with_visor(|v| v.drawer.release_offstage());
                             },
+                            // A VISOR CEREMONY GROWS HERE; A CONSUMER'S SHEET IS
+                            // APPENDED HERE. The slide is EITHER guest-rendered
+                            // throughout or a LEAF awaiting foreign DOM, never
+                            // both — see this module's header, and
+                            // `sheets`'s for why that keeps the applier's
+                            // path-addressing sound. A slide's tenant is fixed
+                            // for its whole life, so the branch is decided once
+                            // and cannot flip under a mounted subtree.
+                            if crate::sheets::is_visor_tenant(&slide.tenant) {
+                                crate::sheets::Sheet { tenant: slide.tenant.clone() }
+                            }
                         }
                     }
                 }

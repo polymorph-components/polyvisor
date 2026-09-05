@@ -286,6 +286,14 @@ impl DrawerState {
     /// ONE occupancy test for every tenant (visor.ts:797-801): the teardown is
     /// DRAWER-scoped work, so it asks about the drawer and not about one
     /// session.
+    /// Does this tenant hold an ARMING DELAY? Asked by a guest-rendered sheet,
+    /// which has to draw its own `.armed` class and must not draw a button row
+    /// dimmed for a wait that does not exist (sheets.ts:1040-1042, 1459-1463).
+    /// A name nobody registered arms nothing, so it answers false.
+    pub fn arms(&self, name: &str) -> bool {
+        self.index(name).is_some_and(|i| self.tenants[i].spec.armed)
+    }
+
     pub fn occupied(&self) -> bool {
         self.tenants.iter().any(|t| t.open)
     }
@@ -1097,6 +1105,85 @@ mod tests {
         );
         let (tenant, presentation) = arm_deadline(&at_mount);
         assert_eq!(d.arm_elapsed(&tenant, presentation), [Effect::Armed("creds".into())]);
+    }
+
+    /// THE GUEST-RENDERED ARMING PATH, end to end — the erase ceremony's exact
+    /// tenant shape (`sheets::specs`'s RESET: exclusive, armed, dim).
+    ///
+    /// WHAT IS DIFFERENT ABOUT IT, and why it gets its own test even though the
+    /// machine cannot tell: on the FOREIGN path the host answers
+    /// `embedder.tenant-build` and calls `control.mount-sheet` back, so the
+    /// mount arrives on a fresh WIT export task. On the GUEST path there is no
+    /// round trip at all — `component::apply_effects` DROPS `Build` for a
+    /// visor tenant and `sheets::SheetRoot`'s own `onmounted` calls
+    /// `mount_sheet` directly. The token the arm is scheduled against must be
+    /// the same either way, and this pins that: nothing between `open` and
+    /// `mount_sheet` re-presents, so the deadline's token is the live one and
+    /// `arm_elapsed` accepts it.
+    ///
+    /// This test would NOT have caught the defect the browser found — that one
+    /// was a render subscription, downstream of every effect asserted here. See
+    /// the two `Build`-clears-`armed` assertions below for the part of that
+    /// story a native test CAN hold.
+    #[test]
+    fn the_guest_rendered_arming_path_schedules_and_arms_on_the_live_token() {
+        let mut d = host(vec![TenantSpec {
+            armed: true,
+            exclusive: true,
+            dim: true,
+            ..spec("reset")
+        }]);
+        let (ok, opened) = open(&mut d, "reset");
+        assert!(ok);
+        // The guest path never consumes this — `apply_effects` drops it — but
+        // the machine still emits it, and it is what clears the sheet's `armed`
+        // fact for the new presentation.
+        assert!(
+            opened.iter().any(|e| matches!(e, Effect::Build(n) if n == "reset")),
+            "every presentation asks for a build, guest-rendered or not"
+        );
+
+        // `SheetRoot`'s own self-measurement, standing in for the host's
+        // `control.mount-sheet`.
+        let at_mount = d.mount_sheet("reset", 240.0, B);
+        let (tenant, presentation) = arm_deadline(&at_mount);
+        assert_eq!(tenant, "reset");
+        assert_eq!(d.arm_elapsed(&tenant, presentation), [Effect::Armed("reset".into())]);
+    }
+
+    /// EVERY PRESENTATION RE-ASKS FOR A BUILD, and that is the whole of what
+    /// makes a guest-rendered armed sheet draw itself dead again when it comes
+    /// back: `component::apply_effects` clears `SheetsState::armed` on `Build`,
+    /// and the sheet draws both its `.armed` class and its `disabled` attribute
+    /// from that one fact. A presentation path that skipped `Build` would leave
+    /// the erase control live the instant a re-presented sheet appeared, while
+    /// the delay underneath it was really running again.
+    #[test]
+    fn every_presentation_of_an_armed_sheet_re_asks_for_its_build() {
+        let mut d = host(vec![
+            TenantSpec { armed: true, ..spec("reset") },
+            spec("other"),
+        ]);
+        let builds = |fx: &[Effect]| {
+            fx.iter().filter(|e| matches!(e, Effect::Build(n) if n == "reset")).count()
+        };
+
+        // (1) a fresh open.
+        let (_, opened) = open(&mut d, "reset");
+        assert_eq!(builds(&opened), 1, "fresh open");
+        let (t, p) = arm_deadline(&d.mount_sheet("reset", 200.0, B));
+        assert_eq!(d.arm_elapsed(&t, p), [Effect::Armed("reset".into())], "armed once");
+
+        // (2) a rebuild at a new shape re-arms from zero.
+        let rebuilt = d.rebuild("reset");
+        assert_eq!(builds(&rebuilt), 1, "rebuild");
+        assert!(
+            d.arm_elapsed(&t, p).is_empty(),
+            "the OLD token is stale after a rebuild — the guard this fix must not weaken"
+        );
+        let (t2, p2) = arm_deadline(&d.mount_sheet("reset", 260.0, B));
+        assert_ne!(p2, p, "a re-presentation is a new token");
+        assert_eq!(d.arm_elapsed(&t2, p2), [Effect::Armed("reset".into())]);
     }
 
     /// An UNARMED tenant pays no delay at all: arming defends secret entry, and

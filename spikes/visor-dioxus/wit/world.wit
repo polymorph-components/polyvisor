@@ -42,7 +42,12 @@ interface store {
     /// The anchor colour, the audible anchor word, the identity record, the
     /// event record. `legacy-hue` is the pre-rename hue key, read once at
     /// boot and cleared (`loadVisorHue`'s migration).
-    enum slot { hue, word, identity, events, legacy-hue }
+    /// `marks` is the TRUST TABLE (sheets.ts's `createSurfaceMarks`): the
+    /// per-component pet icon, first-sight timestamp and petname. It is a
+    /// slot like the rest, so the same scoping holds — the component names
+    /// the slot, the host owns the key, and two consumers on one origin do
+    /// not share a table.
+    enum slot { hue, word, identity, events, marks, legacy-hue }
 
     /// `none` = never written (distinct from written-empty).
     get: func(key: slot) -> option<string>;
@@ -53,12 +58,42 @@ interface store {
     clear-all: func();
 }
 
-/// Geometry the guest cannot obtain from the mutation surface.
+/// Page-level facts the guest cannot obtain from the mutation surface.
+///
+/// PROVISIONAL. polyengine is growing opt-in DOCUMENT EVAL, which the visor —
+/// being trusted — will be able to use and apps will not. Both functions here
+/// exist only because this world cannot otherwise reach the page, so both are
+/// candidates to collapse into that capability, and the deleted
+/// `measure-sheet` (see below) would become answerable directly rather than
+/// needing the host to push heights in-band.
+///
+/// WHAT MUST NOT MIGRATE ONTO IT: `store`. Its slot enum is the sharpest trust
+/// result in this port — the component names a slot, the host owns the key, so
+/// a component that cannot spell a key cannot read the origin's other storage.
+/// That is a promise the TypeScript visor, running as page script, has no way
+/// to make. Reaching localStorage through document eval would hand it straight
+/// back. "The visor may eval" and "the visor should eval for everything it
+/// can" are different claims, and only the first is implied.
 interface chrome {
     /// `globalThis.innerHeight` in CSS pixels — the drawer's height budget is
     /// `innerHeight - strip height - 48`, and only the strip half of that is
     /// a guest-rendered element `polymorph:dioxus/dom` can measure.
     viewport-height: func() -> f64;
+
+    /// Reload the page — `location.reload()`, which the erase ceremony ends
+    /// with (sheets.ts:1618-1637).
+    ///
+    /// WHY THE CEREMONY NEEDS IT, rather than just clearing storage. Erasing
+    /// empties the store, but the running instance still holds the identity,
+    /// the hue and the event record in memory — so without a reload the visor
+    /// goes on saying a name it has just forgotten, and the settings sheet
+    /// that resumes underneath re-renders off the stale record. A wipe the
+    /// user is told was total must not leave the screen contradicting it.
+    ///
+    /// It lives on `chrome` for the same reason `viewport-height` does: it is
+    /// a property of the page the guest is drawn into, not of the tree the
+    /// guest rendered, so the mutation surface cannot reach it.
+    reload: func();
 
     /// WHAT USED TO BE HERE, AND WHY IT IS NOT. A `measure-sheet` query, for
     /// the guest to ask the host how tall the foreign sheet DOM is — the
@@ -96,7 +131,32 @@ interface types {
         icon: string,
         is-new: bool,
         petname: option<string>,
+        /// WHAT THIS COMPONENT ASKED TO WEAR — a glyph the component itself
+        /// nominated. PRE-VALIDATED by the consumer at the seam, so nothing
+        /// downstream re-checks; and nothing downstream may assume it is
+        /// unclaimed, because the ceremony still drops it if another record
+        /// already wears it.
+        ///
+        /// It is NEVER a key, never rendered in the visor's own voice, and
+        /// appears in exactly one place: the naming ceremony's picker, first,
+        /// foreign-attributed. The component is never told the outcome.
+        ///
+        /// ADDED AFTER WAVE ONE: the first cut of this record omitted it, so
+        /// `marks.icon-offers` could take a nomination that no caller was able
+        /// to supply — the mechanism built and unreachable. A record that
+        /// cannot express its subject is the contract's bug, not the port's.
+        nomination: option<string>,
+        /// One line of visor-known metadata for the App settings sheet.
+        /// `label` is THE VISOR'S word, never a component's; `value` may be
+        /// component-influenced (a panel's declared destination), so the sheet
+        /// renders it in APP VOICE. `foreign` says which.
+        meta: option<surface-meta>,
+        /// When the visor first assigned this record its mark. Shown as a
+        /// date the user can check — "you have seen this before, since …".
+        first-seen: option<u64>,
     }
+
+    record surface-meta { label: string, value: string, foreign: bool }
 
     /// `VisorContext`. The bare kinds carry no surface because no component
     /// stands behind them.
@@ -112,6 +172,12 @@ interface types {
         device-picker,
         first-run,
     }
+
+    /// The identity record: the user's own name, their word for this device,
+    /// and the glyph on the identity circle. Shared because `embedder`'s
+    /// commit notification carries it back to a consumer that mirrors it
+    /// (the demo writes it through to the user-system partition).
+    record identity { name: string, device: string, icon: string }
 
     /// `DrawerCloseOptions`, reduced to what the drawer host itself reads.
     /// The demo's custom keys (`commit`) were consumer state riding on the
@@ -130,7 +196,7 @@ interface types {
 /// (host/src/dispatch.ts) exists because that is exactly what the component
 /// model forbids.
 interface embedder {
-    use types.{surface, close-reason};
+    use types.{surface, close-reason, identity};
 
     /// The strip's naming affordance was used ("name it", or the petname).
     request-naming: func(target: surface);
@@ -161,9 +227,195 @@ interface embedder {
     /// A sheet is wanted in the drawer: build it and hand its root to
     /// `control.mount-sheet`. The host cannot render into the guest's tree,
     /// so the guest asks and then waits for the mount.
+    ///
+    /// ONLY FOR TENANTS THE HOST OWNS. The visor's own ceremonies — naming,
+    /// settings, reset, events — are rendered by the guest now, so they
+    /// never emit this. A consumer's own sheets (the demo's credential sheet
+    /// and storage picker) still do: the seam did not go away, it stopped
+    /// being the only way a sheet can exist.
     tenant-build: func(tenant: string);
     /// The slide holding the foreign sheet is going away; drop the reference.
     tenant-unmount: func(tenant: string);
+
+    // --- the ceremonies' consumer half (`VisorSheetsConfig`) -------------
+
+    /// `canOpen` — asked before either ceremony opens; false refuses the
+    /// open outright. This is where a consumer states a precedence its own
+    /// tenants impose. Returns a value, unlike the notifications above: a
+    /// guest calling out to a host import is an ordinary synchronous call
+    /// (`store.get` already is one); what the component model forbids is the
+    /// host re-entering the guest, which is why the *notifications* are
+    /// one-way and these queries are not.
+    can-open: func() -> bool;
+    /// `beforeOpen` — run once `can-open` has agreed. The demo retires its
+    /// panel and closes a modal dialog here, because a `<dialog>` paints in
+    /// the TOP LAYER, above the pinned visor zone.
+    before-open: func();
+
+    /// `onNamed` — a petname and pet icon were committed for `provenance`.
+    /// The table is already written; this is for the consumer's in-memory
+    /// caches. `is-new` is deliberately absent: the ceremony IS the
+    /// first-sight moment completing.
+    on-named: func(provenance: string, petname: string, icon: string);
+    /// `onForgotten` — the whole record for `provenance` was deleted.
+    on-forgotten: func(provenance: string);
+    /// `onIdentityCommitted` — the identity record and anchor hue were
+    /// COMMITTED from the settings sheet (Save; never Cancel, never a live
+    /// preview). Fires AFTER the visor's own write, so a consumer that fails
+    /// cannot leave the visor's record half-committed.
+    on-identity-committed: func(rec: identity, hue: u16);
+
+    /// `nestedPlace` — while the consumer says it is showing a nested place
+    /// with a live component surface on it, a ceremony BRACKETS it: the
+    /// visor dims, and the consumer freezes the place itself. FREEZE IS NOT
+    /// RETIREMENT — the component keeps its grants and loses only the user's
+    /// input, because a ceremony is not a reason to destroy a session the
+    /// user is in the middle of.
+    nested-place-active: func() -> bool;
+    nested-place-freeze: func();
+    nested-place-thaw: func();
+
+    /// `SheetAction.onSelect` — a consumer-contributed settings row was
+    /// chosen, identified by its stable key. The consumer contributed a
+    /// LABEL and this callback, never a node: the visor draws the button in
+    /// its own chrome, so a consumer cannot paint on a sheet whose whole
+    /// claim is that no one but the visor draws there.
+    on-action: func(key: string);
+
+    /// `onReset` — THE CONSUMER'S HALF OF THE ERASE, and the one import here
+    /// that is both async and fallible.
+    ///
+    /// IT RUNS FIRST, BEFORE THE VISOR ERASES ANYTHING OF ITS OWN, and the
+    /// ordering is the whole design (sheets.ts:445-462). This is the
+    /// FALLIBLE half: on `err` the ceremony refuses with the reason line and
+    /// NOTHING has been forgotten yet — the user is looking at a visor that
+    /// still holds everything it held a second ago, which is a true sentence
+    /// the sheet can say. Doing the infallible half first would buy a state
+    /// nobody can describe.
+    ///
+    /// The exact inverse of `on-identity-committed`, deliberately: there the
+    /// visor writes first and the consumer mirrors after, because a mirror
+    /// can only be LATE, never contradictory. An erase inverts the risk — a
+    /// late erase is a record that survived a wipe — so the rule inverts.
+    ///
+    /// Async because most of what a consumer drops lives in IndexedDB.
+    on-reset: async func() -> result<_, string>;
+}
+
+/// The trust table (sheets.ts's `SurfaceMarks`), exported because it is
+/// consumer-facing as well as ceremony-facing: the demo looks petnames up
+/// per pane and renders from it.
+///
+/// EVERY FUNCTION IS STATELESS — each reads and writes the `marks` slot
+/// afresh, holding nothing between calls. That is what made two facades over
+/// one key the same table rather than two caches that can disagree, and it
+/// survives the port unchanged.
+interface marks {
+    /// A pet icon from the curated table, or "" for UNMARKED. "" is a real,
+    /// honest state, not a missing value: a record may have a first-sight
+    /// timestamp and even a petname with no icon.
+    record pet-mark { icon: string, first-seen: u64, petname: option<string> }
+    record entry { provenance: string, mark: pet-mark }
+    /// `is-new` is the first-sight moment: true exactly on the boot that
+    /// created the record.
+    record marked { mark: pet-mark, is-new: bool }
+    /// `nominated` says the component asked to wear this glyph, so the sheet
+    /// can attribute it to the component rather than to the visor. It is
+    /// offered FIRST and only if genuinely free; a nomination for a glyph
+    /// another record already wears is DROPPED SILENTLY, exactly like an
+    /// invalid one, and the component learns nothing either way.
+    record offer { glyph: string, nominated: bool }
+    /// The colliding record — its petname as the user wrote it, and its
+    /// unforgeable provenance key — so the visor can say what the clash is.
+    record clash { key: string, petname: string }
+
+    list-all: func() -> list<entry>;
+    /// The record for this provenance, CREATING one — first-sight timestamp,
+    /// and NO icon — if there is none. A fresh record is deliberately
+    /// unmarked: a mark the user did not choose is a mark they cannot
+    /// recognise, and the ceremony is where marks come from.
+    mark: func(provenance: string) -> marked;
+    /// `icon` must be a member of the curated table, or "" for unmarked;
+    /// anything else is stored as "" rather than trusted.
+    set-petname: func(provenance: string, petname: string, icon: string);
+    /// Delete the WHOLE record. Forgetting must be honest: a component whose
+    /// petname was dropped but whose mark survived would still be greeted as
+    /// familiar.
+    forget: func(provenance: string);
+    /// Drop the whole table — the marks half of the erase, which must not
+    /// have to enumerate records to be complete.
+    erase-all: func();
+    /// The pet icons no OTHER record is using; this record's own is included
+    /// (re-picking what you already wear is not a collision).
+    free-icons: func(provenance: string) -> list<string>;
+    /// The ceremony's six offers, in render order. The non-nominated ones are
+    /// drawn AT RANDOM from the free set, freshly per ceremony: a stable
+    /// global ordering would mean every user sees the same first few glyphs,
+    /// so an app's nomination would win by default-bias alone and a de-facto
+    /// brand would form out of nothing but list order. Marks are the USER's
+    /// vocabulary, not a namespace to be squatted.
+    icon-offers: func(provenance: string, nomination: option<string>) -> list<offer>;
+    /// Is this word already the user's name for a DIFFERENT component? Two
+    /// records answering to one word would defeat the point of a petname.
+    /// Compared trimmed and case-insensitively.
+    collision: func(provenance: string, petname: string) -> option<clash>;
+}
+
+/// The visor's own ceremonies, which used to be TypeScript mounted into the
+/// drawer as foreign DOM and are now rendered by the guest: the naming
+/// ceremony, the settings sheet, the erase ceremony and the event list
+/// (visor/ui/sheets.ts's `VisorSheets`).
+///
+/// The strip's own affordances reach these directly — `embedder.request-naming`
+/// and `request-settings` are no longer round trips through the consumer for
+/// these four. They stay exported because a consumer drives them too, and
+/// because the e2e suite does.
+interface sheets {
+    use types.{surface, identity};
+
+    /// One consumer-contributed action on the settings sheet — THE ONE
+    /// EXTENSION POINT on a visor-owned sheet, and deliberately narrow. The
+    /// label must be the CONSUMER'S OWN WORDS; a consumer that put a
+    /// component-influenced string here would be lending the visor's voice,
+    /// which the visor cannot check and the consumer must keep.
+    record action {
+        label: string,
+        hint: option<string>,
+        /// Stable key for `data-action`, for driving and tests. Also what
+        /// `embedder.on-action` reports back.
+        key: string,
+    }
+
+    /// The consumer's static contributions, set once at boot.
+    ///
+    /// `reset-consequences` are EXTRA LINES IN THE STATEMENT OF CONSEQUENCE
+    /// — what else this consumer is about to destroy, which only it knows
+    /// ("your saved storage provider", "the devices you paired"). Same
+    /// discipline as `action.label`, and stricter in effect: these are the
+    /// sentence the user is about to act on. An empty `extra-actions`
+    /// renders NOTHING — no heading, no container, no separator.
+    configure: func(reset-consequences: list<string>, extra-actions: list<action>);
+
+    request-naming: func(target: surface);
+    request-settings: func();
+    /// Reachable in the UI ONLY from the settings sheet's danger entry.
+    request-reset: func();
+    /// Reachable in the UI ONLY from the settings sheet's "recent events"
+    /// row — the badge that advertises it is a dot on the settings button,
+    /// so the way in is through settings, exactly as the erase ceremony's is.
+    request-events: func();
+
+    close-naming: func(restore-context: bool);
+    /// `commit` was a custom key on the old option bag; it is the settings
+    /// sheet's own Save-versus-Cancel and belongs in the signature.
+    close-settings: func(restore-context: bool, commit: bool);
+    close-reset: func(restore-context: bool);
+    close-events: func(restore-context: bool);
+
+    naming-open: func() -> bool;
+    settings-open: func() -> bool;
+    reset-open: func() -> bool;
+    events-open: func() -> bool;
 }
 
 /// The visor's API, as data.
@@ -173,7 +425,7 @@ interface embedder {
 /// `HTMLElement`. Those are the interesting deletions and each is recorded at
 /// its site.
 interface control {
-    use types.{surface, context, close-reason};
+    use types.{surface, context, close-reason, identity};
 
     /// `BackAction`, minus the `on-back` closure: the guest renders the
     /// chevron and reports the press through `embedder`. `label` is the
@@ -202,7 +454,6 @@ interface control {
     }
 
     record event-record { at: u64, text: string }
-    record identity { name: string, device: string, icon: string }
 
     // --- identity and the claim ---------------------------------------
 
@@ -283,4 +534,6 @@ world visor {
     import embedder;
 
     export control;
+    export marks;
+    export sheets;
 }
