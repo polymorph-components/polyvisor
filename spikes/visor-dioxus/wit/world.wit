@@ -677,10 +677,11 @@ interface pairing-driver {
     // caller. If a consumer surface is ported later it should state the
     // functions it needs, at that point, with a caller to justify each.
     //
-    // (`us-devices-list` stays despite having no caller in the Rust yet: the
-    // TypeScript visor DOES call it — pairing.ts renders the account's device
-    // list — so its absence from the port is a gap in the port, not evidence
-    // that the visor does not need it.)
+    // (`us-devices-list` was for a while the exception that proved the rule: it
+    // had no Rust caller, but the TypeScript visor called it, so its absence
+    // was a gap in the PORT rather than evidence the visor did not need it.
+    // The port now calls it and the exception is gone — every function here
+    // has a caller.)
 
     /// Drain remotely-caused changes, for the announced-never-silent rule.
     us-events: async func() -> result<list<us-event>, string>;

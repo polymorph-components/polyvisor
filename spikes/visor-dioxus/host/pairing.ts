@@ -118,6 +118,22 @@ export interface PairingTestControls {
   /** Reject `pair-join-start` / `pair-add-start` with this string next call. */
   joinStartError?: string;
   addStartError?: string;
+  /** Steer the NEXT `usDevicesList()` reply — the e2e's door onto the add
+   * flow's `AddPhase::Enrolled` device list (`add.rs`'s `EnrolledDevices`).
+   * `undefined` means "answer from the mock's own enrolled-device map",
+   * which is enough to cover the ceremony's own admitted device with no
+   * test steering at all; set this when a test needs a SPECIFIC roster —
+   * an unnamed row, a revoked one, more than one device — gated in one
+   * call rather than driven through several real `pairAddConfirm`s.
+   * Consumed on the next call, same discipline as `forceJoinStatus`. */
+  forceDevicesList?: UsDevice[];
+  /** Reject the NEXT `usDevicesList()` call with this string — the e2e's
+   * door onto add.rs's silent-on-failure rule (pairing.ts:715's
+   * `if (!res.ok) return;`, kept rather than "fixed" into an error line:
+   * "device added" has already been announced by the time this list is
+   * fetched, so a listing failure must not read as the enrollment having
+   * failed). Consumed on the next call. */
+  devicesListError?: string;
   /** us-events queued for the next `usEvents()` drain — the e2e's door onto
    * gate 4c (the announced-never-silent drain). */
   pendingUsEvents: UsEvent[];
@@ -276,6 +292,16 @@ export function createPairingDriverImports(
 
     async usDevicesList(): Promise<UsDevice[]> {
       note("us-devices-list")();
+      if (controls.devicesListError) {
+        const e = controls.devicesListError;
+        controls.devicesListError = undefined;
+        throw new ComponentException(e);
+      }
+      if (controls.forceDevicesList) {
+        const list = controls.forceDevicesList;
+        controls.forceDevicesList = undefined;
+        return list;
+      }
       return [...devices.values()];
     },
 
