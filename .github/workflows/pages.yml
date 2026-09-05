@@ -87,9 +87,14 @@ jobs:
           # cold cargo build every time.
           #
           # Sibling pins and tool versions live in setup.sh, the pinned
-          # compilers in rust-toolchain.toml; bumping either must rotate
-          # the key or stale target dirs get restored forever.
-          shared-key: demo-${{ hashFiles('scripts/setup.sh', '**/rust-toolchain.toml') }}
+          # compiler in engine/rust-toolchain.toml; bumping either must
+          # rotate the key or stale target dirs get restored forever.
+          # ONLY engine's toolchain file, not `**/rust-toolchain.toml`:
+          # the glob also matched every spike's, and a spike toolchain edit
+          # (#143) rotated the demo's cache for nothing — see e2e.yml's
+          # note on what that did to the suite. The spike workspaces listed
+          # above carry no toolchain file of their own.
+          shared-key: demo-${{ hashFiles('scripts/setup.sh', 'engine/rust-toolchain.toml') }}
           # Save only on main: PR jobs restore but never save, so PR
           # branches don't churn the cache entries every run depends on.
           save-if: ${{ github.ref == 'refs/heads/main' }}
