@@ -6,13 +6,17 @@
     "demo/, and demo/deno.json calls the embedder @polyengine/runtime/embedder.",
     "Both keys resolve to one URL, so the graph still holds exactly one",
     "embedder and one exception brand — which is the property that",
-    "mattered, not the spelling."
+    "mattered, not the spelling. Same for @polyengine/protocol beside",
+    "@deltic/protocol: the frame runtime carries WIT errors across its",
+    "ports as the protocol's cloneable form, and one copy of it is what",
+    "makes the rehydrated exception the real brand on both sides."
   ],
   "imports": {
     "@deltic/runtime/embedder": "../../../polyengine-dioxus/.deps/polyengine/runtime/src/embedder/mod.ts",
     "@polyengine/runtime/embedder": "../../../polyengine-dioxus/.deps/polyengine/runtime/src/embedder/mod.ts",
     "@deltic/runtime/shim": "../../../polyengine-dioxus/.deps/polyengine/runtime/src/shim/mod.ts",
     "@deltic/protocol": "../../../polyengine-dioxus/.deps/polyengine/protocol/src/mod.ts",
+    "@polyengine/protocol": "../../../polyengine-dioxus/.deps/polyengine/protocol/src/mod.ts",
     "@deltic/translator": "../../../polyengine-dioxus/.deps/polyengine/translator/mod.ts",
     "@polyengine/wasi": "../../../polyengine-dioxus/.deps/polyengine/wasi/src/mod.ts",
     "@polyengine/dioxus-host/": "../../../polyengine-dioxus/host/src/",

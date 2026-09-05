@@ -33,7 +33,10 @@ echo "      (the visor's word for a component is never readable or influenceable
 # that layer grows rather than need this list edited. It grew one
 # already: frame/mount.ts, the app-mount seam (#142), which holds the
 # mount options and is therefore exactly where a caller would hand a
-# component something it must not have.
+# component something it must not have. Since the instance moved INTO
+# the frame the seam is mount.ts + frame.ts + frame.html — frame-backend.ts
+# is gone — and checks (f) and (i1) below scan the same glob for the
+# same reason.
 FRAME_SEAM="../visor/frame/*.ts ../visor/frame/*.html"
 # shellcheck disable=SC2086
 hits=$(grep -n "petname" $FRAME_SEAM 2>/dev/null)
@@ -181,8 +184,9 @@ fi
 # a rogue definition anywhere on either side fails here.
 echo "[6/9] pairing code and SAS render only in visor-owned surfaces"
 echo "      (renderPairingCode()/renderSas() are defined and called only in ../visor/ui/pairing.ts)"
+# shellcheck disable=SC2086
 outside=$(grep -rln "renderPairingCode(\|renderSas(" \
-  ../visor/frame/frame.ts ../visor/frame/frame-backend.ts ../visor/frame/frame.html web/frame.js \
+  $FRAME_SEAM web/frame.js \
   ../examples/todomvc/guest ../providers/s3/panel ../providers/dropbox/panel \
   2>/dev/null)
 if [ -n "$outside" ]; then
@@ -390,8 +394,9 @@ fi
 #        would be believed.
 echo "[9/9] the entry ceremonies render only in the visor's drawer"
 echo "      (mountDevicePicker()/offerFirstRun() live in ../visor/ui/entry.ts; no page markup below the strip)"
+# shellcheck disable=SC2086
 outside=$(grep -rln "mountDevicePicker(\|offerFirstRun(" \
-  ../visor/frame/frame.ts ../visor/frame/frame-backend.ts ../visor/frame/frame.html web/frame.js \
+  $FRAME_SEAM web/frame.js \
   ../examples/todomvc/guest ../providers/s3/panel ../providers/dropbox/panel \
   2>/dev/null)
 if [ -n "$outside" ]; then

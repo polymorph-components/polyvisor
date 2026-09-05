@@ -18,28 +18,42 @@ Three layers, one trust story:
   suspension), and the `events` records. Everything an app's DOM ops
   and events cross, validated on both sides of every seam.
 
-- **`frame/`** — iframe isolation. `frame-backend.ts` (trusted side)
-  creates a `sandbox="allow-scripts"` iframe — no `allow-same-origin`,
+- **`frame/`** — iframe isolation, and since #142 the place the app
+  actually RUNS. `mount.ts` (visor side) is the layer's **app-mount
+  seam**: `mountApp()` creates a
+  `sandbox="allow-scripts allow-forms"` iframe — no `allow-same-origin`,
   so the app's document gets an OPAQUE ORIGIN and structurally cannot
-  read the visor's DOM, styles, or storage. It gets no `src`: the
-  backend assembles the frame's document as a `srcdoc` string from
-  `frame.html` (a template), the stylesheet, and the bundled
-  `frame.js`, all fetched in the visor's own realm — pinned by value,
-  where a real URL would be invisible to the verifying service worker
-  and unpinnable (#142). Into that document it inserts a `<meta>` CSP
-  of `default-src 'none'` with the script hash-listed; CSP policies
-  compose, so the frame is network-dead whatever the visor's own policy
-  allows. `frame.ts` is the code that runs there: the applier wired to
-  a MessagePort, height reporting, coarse theme (never the anchor
-  colour). The queued-op protocol is identical to `channel`; only the
-  realm changes. `mount.ts` is the layer's **app-mount seam**:
-  `mountApp()` stands a component up on one of these frames — frame,
-  surface, imports, the serialized guest-call chain — and hands back
-  only what a visor needs (the exports, the route, input suspension,
-  teardown). Every embedder mounts through it, so the placement change
-  #142 rules for (the wasm instance moving INSIDE the frame, surface
-  imports bound to its real DOM, everything else proxied over a port)
-  is a change of this file's internals and of nothing above it.
+  read the visor's DOM, styles, or storage. It gets no `src`: mount
+  assembles the document as a `srcdoc` string from `frame.html` (a
+  template), the stylesheet, and the bundled `frame.js`, all fetched in
+  the visor's own realm — pinned by value, where a real URL would be
+  invisible to the verifying service worker and unpinnable. Into it goes
+  a `<meta>` CSP of `default-src 'none'` (plus the script hash,
+  `'wasm-unsafe-eval'`, `blob:`/`data:` media and `form-action 'none'`);
+  CSP policies compose, so the frame is network-dead whatever the
+  visor's own policy allows.
+
+  `frame.ts` is the code that runs there, and it is now the app's
+  embedder: it instantiates the guest IN THE FRAME and binds
+  `polyvisor:surface` straight to that document's DOM through
+  `createDirectBackend` — same realm, synchronous. **The queued op
+  protocol is gone from the app path**: no op arrays, no structured
+  clone per DOM call, no second validation pass, and no `applier.ts` in
+  a mounted app's graph (both survive in `surface/` as the differential
+  harness's instrument and as the trusted-territory backend). What
+  crosses a realm now is only what must — the app's OTHER imports, one
+  MessagePort each, and the visor's calls into its exports on a control
+  port. WIT errors round-trip as errors and traps as rejections, in the
+  embedder's cloneable form.
+
+  The linker rule that keeps this cheap: **an import that crosses to the
+  visor must be async-declared in the WIT**, so the guest suspends
+  through the component model's async ABI and the frame needs no JSPI.
+
+  `mountApp()` hands a visor back only what it needs: the exports, the
+  route, input suspension (`inert` on the iframe plus the frame's own
+  runner gate and focus drop — neither is sufficient alone) and
+  teardown.
 
 - **`ui/`** — the system UI core. `initVisor()` renders the strip
   (two-line context, identity cluster), announcements

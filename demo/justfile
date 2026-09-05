@@ -139,7 +139,7 @@ check:
 # Assemble the servable demo directory.
 site: translate app panels check
     mkdir -p serve
-    deno check host/demo.ts host/solo.ts host/solo-worker.ts ../visor/frame/frame.ts ../visor/frame/frame-backend.ts
+    deno check host/demo.ts host/solo.ts host/solo-worker.ts ../visor/frame/frame.ts ../visor/frame/mount.ts
     deno bundle --platform browser --minify --external node-datachannel --external "node-datachannel/polyfill" --external werift -o serve/demo.js host/demo.ts
     # THE SOLO PAGE: the same served artifacts, a second and much smaller
     # embedder (host/solo.ts).
@@ -172,8 +172,11 @@ site: translate app panels check
     ! grep -q 'node:' serve/solo-worker.js || { echo "serve/solo-worker.js imports a node: builtin — check the --external set" >&2; exit 1; }
     ! grep -q 'node:' serve/demo.js || { echo "serve/demo.js imports a node: builtin — check the --external set" >&2; exit 1; }
     # The sandboxed surface frame (#16): its own entry, its own document.
-    # No --external flags needed — the frame imports only the applier and
-    # never touches a node backend.
+    # It now carries the polyengine embedder too — since #142 the app's
+    # component is instantiated INSIDE the frame — so this bundle is
+    # ~190 KB rather than ~3 KB. Still no --external flags: the embedder
+    # pulls in no node backend (verified with the same `node:` grep the
+    # three bundles above run).
     deno bundle --platform browser --minify -o serve/frame.js ../visor/frame/frame.ts
     cp ../visor/frame/frame.html serve/
     cp build/app.component.wasm build/app.plan.json serve/
@@ -200,7 +203,7 @@ serve: site
 # ?relay=&s3= overrides — Pages hosts the artifact, not the network.
 pages: translate app panels check
     mkdir -p ../docs/demo
-    deno check host/demo.ts host/solo.ts host/solo-worker.ts ../visor/frame/frame.ts ../visor/frame/frame-backend.ts
+    deno check host/demo.ts host/solo.ts host/solo-worker.ts ../visor/frame/frame.ts ../visor/frame/mount.ts
     deno bundle --platform browser --minify --external node-datachannel --external "node-datachannel/polyfill" --external werift -o ../docs/demo/demo.js host/demo.ts
     # THE SOLO PAGE (see `site` above for why the --external set must
     # match demo.js): same two bundles, same node: tripwire.
