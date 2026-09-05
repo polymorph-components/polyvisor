@@ -390,9 +390,17 @@ Mechanics:
   everything variable arrives by `postMessage`.
 - The app UI frame gets **zero direct network**; assets arrive via
   RPC/blob injection from the component's embedded bundle.
-- App logic runs in workers on the framework side (polyengine,
-  runtime-linked); UI ↔ shell ↔ component is a two-hop RPC path,
-  acceptable for UI latencies.
+- **The app's component runs INSIDE the frame** (ruled 2026-09-05,
+  [#142](../../issues/142), [#147](../../pull/147); spikes 2–4 measured
+  it in Chromium 143 and Firefox 144). `polyvisor:surface` binds to the
+  frame's own DOM same-realm and synchronously, so the two-hop op path
+  this bullet used to describe is gone from the app path; every OTHER
+  import is proxied to the visor over its own `MessagePort`, and the
+  visor calls the app's exports over a control port. The linker rule
+  that follows: **an import that crosses a realm must be async-declared
+  in the WIT** — the guest then suspends through the component model's
+  async ABI, so the frame needs no JSPI (the runtime SharedWorker's
+  requirement is untouched; the frame's floor is lower).
 
 Residual channels, each needing a recorded ruling (allow/block/why) in
 a **ruling table per sandbox flag and CSP directive** — the same

@@ -2310,7 +2310,7 @@ async function boot() {
     }
     | null = null;
   /** The live panel surface's sandboxed frame, if any (see
-   * frame-backend.ts). Teardown must destroy it explicitly: clearing the
+   * visor/frame/mount.ts). Teardown must destroy it explicitly: clearing the
    * region would orphan the port and the window listener. */
   let panelFrame: { destroy(): Promise<void> } | null = null;
 
@@ -2334,7 +2334,7 @@ async function boot() {
    * caused it returns. Frame teardown is the same shape and had no
    * signal at all: `destroy()` returned void, so a remount had no way to
    * ask "is the old surface actually gone?" and simply hoped. It is a
-   * promise now (frame-backend.ts's `destroy`), and this holds the
+   * promise now (the mount's `destroy`), and this holds the
    * in-flight one so `mountPanel` can await it.
    *
    * Null when no teardown is outstanding. */
@@ -2428,7 +2428,7 @@ async function boot() {
     // THE PREVIOUS SURFACE MUST BE ACTUALLY GONE before this one is
     // stood up. Teardown does not finish when `teardownPanel()` returns
     // — the old frame's window can still have messages in flight toward
-    // the visor (frame-backend.ts's `destroy`), and creating the next frame
+    // the visor (the mount's `destroy`), and creating the next frame
     // inside that window is how a stale delivery ends up attributed to
     // the new surface. Awaiting the completion is what turns "reopen
     // immediately after ESC" from a race into an ordering.

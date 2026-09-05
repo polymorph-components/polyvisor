@@ -33,12 +33,12 @@ export interface Backend {
   drain(): Promise<void>;
 }
 
-// "frame": the queued protocol carried to a real sandboxed iframe on an
-// opaque origin (visor/frame/frame-backend.ts) rather than constructed
-// in-realm by `createBackend` below — its construction is async (a
-// handshake with the frame's own document) where the other three are
-// synchronous, so it is a distinct code path in every consumer, not a
-// fourth case in the same switch.
+// "frame": NOT a backend at all any more, and kept in this union only
+// as the todomvc harness's fourth placement label. Since #142 the app's
+// instance runs INSIDE the sandboxed frame (visor/frame/mount.ts), where
+// the surface binds to the real DOM through `direct` — so there is no
+// op protocol on the app path and nothing for `createBackend` below to
+// construct. Every consumer branches on it before reaching that switch.
 export type BackendKind = "queued" | "direct" | "channel" | "frame";
 
 export function isBackendKind(s: string | null): s is BackendKind {

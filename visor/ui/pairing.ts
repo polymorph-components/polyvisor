@@ -68,8 +68,8 @@ export function paletteAngle(index: number): number {
 // Both a pairing CODE and a SAS are rendered ONLY through the two
 // functions below. The invariant script asserts that the literal
 // substrings "renderPairingCode(" and "renderSas(" appear ONLY in this
-// file (never in the frame seam — visor/frame/frame.ts,
-// frame-backend.ts, frame.html — nor in any guest-*/**, nor in any
+// file (never in the frame seam — visor/frame/frame.ts, mount.ts,
+// frame.html — nor in any guest-*/**, nor in any
 // other visor/ui/*.ts or demo host file). That is a stronger, cheaper property than trying
 // to grep the word "SAS" itself (which would also fire on comments
 // elsewhere): it pins the RENDERING CALL SITE, and a component frame
