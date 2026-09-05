@@ -43,8 +43,8 @@ against.
 `wit/world.wit` extends the base `polymorph:dioxus/app` world (now `@0.6.0`)
 with five imports (`store`, `chrome`, `embedder`, `pairing-driver`,
 `entry-host`) and five exports (`control`, `marks`, `sheets`, `pairing`,
-`entry`). **35 Playwright gates** in real Chromium ported from
-`demo/e2e/scenarios/`, and **100 native `cargo test`s** covering the tenancy
+`entry`). **37 Playwright gates** in real Chromium ported from
+`demo/e2e/scenarios/`, and **104 native `cargo test`s** covering the tenancy
 machine, the trust table, the word roll, the event record, the voice types, the
 two enrollment state machines and the QR matrix.
 
@@ -291,7 +291,7 @@ Rust and grew the host by ~55 lines — because a guest-rendered ceremony has
 almost no boundary. Against that, 7,319 lines of Rust. Total source goes up
 substantially; what moves is where the logic lives and what tests it.
 
-Gate density is the clearest gain: **100 native `cargo test`s** now hold the
+Gate density is the clearest gain: **104 native `cargo test`s** now hold the
 tenancy machine, the trust table, the word roll and the voice types with no
 browser at all. The clearest loss sits right beside it — `src/sheets/` is
 wasm32-gated, so tests written inside it do **not** run under host
@@ -323,8 +323,8 @@ Costs of the approach, listed rather than hidden:
 
 ```
 just build   # cargo → wasm32-wasip2 → validate → translate to a plan.json
-just e2e     # 35 Playwright gates in real Chromium
-cargo test   # 100 native tests, no browser
+just e2e     # 37 Playwright gates in real Chromium
+cargo test   # 104 native tests, no browser
 ```
 
 Two environment notes. The crate depends on the sibling renderer by relative
@@ -348,9 +348,11 @@ consumer surfaces that are not in `visor/ui/` and are not ported here, so they
 were **deleted from the contract** rather than kept for completeness. An import
 is a capability the host must grant and a promise the guest may call; a
 contract wider than its caller is a standing invitation to widen the caller.
-`us-devices-list` was kept despite having no Rust caller, because the
-TypeScript visor does call it — its absence is a gap in the port, not evidence
-the visor does not need it.
+`us-devices-list` was for a while the exception that proved the rule — no Rust
+caller, but the TypeScript visor called it, so the absence was a gap in the
+PORT rather than evidence the visor did not need it. The port now renders the
+account's device list on enrollment, so **every function in the interface has a
+caller**.
 
 Two things the contract gained this round because the port demonstrated the
 need: `types.context` grew `pairing-join`/`pairing-add` (without them the strip

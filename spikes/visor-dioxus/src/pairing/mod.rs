@@ -101,7 +101,7 @@ pub mod export;
 /// RUN on the host, and their tests are real `cargo test` tests rather than
 /// merely typechecked claims. Only the rendering modules above are gated.
 pub mod pure;
-pub use pure::{phase, qr, text, us};
+pub use pure::{devices, phase, qr, text, us};
 
 // --- the two tenants ---------------------------------------------------------
 

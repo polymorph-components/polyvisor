@@ -217,6 +217,74 @@ test("add: naming a device and granting reaches ENROLLED end-to-end (mock-steere
   expect(await pairingCall(page, "addOpen"), "the add sheet after the grant").toBe(false);
 });
 
+// -- 4b (cont'd). THE ACCOUNT'S DEVICE LIST ON ENROLLMENT --------------------
+//
+// `pairing-driver.us-devices-list` was declared (wit/world.wit) and
+// implemented (host/pairing.ts) with no Rust caller — the gap this dispatch
+// closes. `renderDevices`'s one call site (visor/ui/pairing.ts:859) fires
+// when the add ceremony reaches `enrolled`, so both gates below reach that
+// screen by forcing `pair-add-status` straight to `enrolled` from
+// `Connecting` — `AddPhase::advance`'s `AddStatus::Enrolled` arm is
+// unconditional (`pure/phase.rs`), which is a real, already-ported rule, not
+// a test-only shortcut.
+
+test("add: the account's device list renders on enrollment, both branches gated (a real word, and unnamed+revoked)", async ({ page }) => {
+  await pairingCall(page, "requestAdd");
+  await page.waitForSelector("#visor-drawer-inner .pair-add-sheet");
+  await addSheet(page).locator("textarea").fill("a code");
+  await addSheet(page).locator("button", { hasText: "connect" }).click();
+
+  // OBVIOUSLY SYNTHETIC device records — agent IDs and timestamps that
+  // stand for nothing except "some device", labelled as such rather than
+  // resembling real enrollment material.
+  await setPairingTest(page, {
+    forceDevicesList: [
+      { agentId: "synthetic-device-1", name: "the tablet", enrolledAt: 1n, revoked: false, endpoint: "", enrolledBy: "" },
+      { agentId: "synthetic-device-2", name: "", enrolledAt: 2n, revoked: true, endpoint: "", enrolledBy: "" },
+    ],
+    forceAddStatus: { kind: "enrolled" },
+  });
+
+  await expect(addSheet(page).locator(".cred-line", { hasText: "done." })).toBeVisible({ timeout: 5_000 });
+  const items = addSheet(page).locator(".cred-devices li");
+  await expect(items).toHaveCount(2);
+  // USER VOICE: the real device word, rendered through `.who` — not folded
+  // into a string with the framework-voice qualifier.
+  await expect(items.nth(0)).toContainText("the tablet");
+  await expect(items.nth(0).locator(".who")).toHaveText("the tablet");
+  // FRAMEWORK VOICE: the unnamed fallback and the revoked qualifier, for a
+  // record with no user word at all.
+  await expect(items.nth(1)).toContainText("(unnamed)");
+  await expect(items.nth(1)).toContainText("revoked");
+
+  await addSheet(page).locator("button", { hasText: "Close" }).click();
+  await page.waitForFunction(() => !document.querySelector("#visor-drawer-inner .pair-add-sheet"));
+});
+
+test("add: a device-list failure is silent — the enrollment success is not overwritten and the sheet stays closable", async ({ page }) => {
+  await pairingCall(page, "requestAdd");
+  await page.waitForSelector("#visor-drawer-inner .pair-add-sheet");
+  await addSheet(page).locator("textarea").fill("a code");
+  await addSheet(page).locator("button", { hasText: "connect" }).click();
+
+  await setPairingTest(page, {
+    devicesListError: "the account partition is unreachable",
+    forceAddStatus: { kind: "enrolled" },
+  });
+
+  // "device added" was already announced by `add_line(&AddPhase::Enrolled)`
+  // before the list is even fetched — a listing failure must not read as
+  // the enrollment having failed, so the success screen stands.
+  await expect(addSheet(page).locator(".cred-line", { hasText: "done." })).toBeVisible({ timeout: 5_000 });
+  // NOTHING DRAWN in place of the list — no error line, no empty list
+  // marker, just its continued absence (`EnrolledDevices`'s doc: the
+  // TypeScript `if (!res.ok) return;` kept, not "fixed" into an error).
+  await expect(addSheet(page).locator(".cred-devices")).toHaveCount(0);
+
+  await addSheet(page).locator("button", { hasText: "Close" }).click();
+  await page.waitForFunction(() => !document.querySelector("#visor-drawer-inner .pair-add-sheet"));
+});
+
 // -- 4c. THE US-EVENT DRAIN --------------------------------------------------
 
 test("us-events: several sentences from one drain arrive as ONE atomic live-region write, and ONE event record per line", async ({ page }) => {

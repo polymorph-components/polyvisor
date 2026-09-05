@@ -63,6 +63,7 @@
 
 use dioxus::prelude::*;
 
+use super::devices::{device_rows, DeviceRow};
 use super::phase::{
     add_confirm_failed, add_line, add_start_failed, AddPhase, AddStatus, Line, NEEDS_NAME,
 };
@@ -72,7 +73,7 @@ use crate::component::polymorph::visor_spike::pairing_driver as driver;
 use crate::component::spawn;
 use crate::drawer::ARM_MS;
 use crate::sheets::SheetRoot;
-use crate::voice::NAME_MAX;
+use crate::voice::{UserVoice, NAME_MAX};
 
 /// `pair-add-state` -> the local machine's alphabet.
 fn status_in(st: driver::PairAddState) -> AddStatus {
@@ -254,6 +255,7 @@ pub fn AddSheet() -> Element {
 
                 AddPhase::Enrolled => rsx! {
                     div { class: "cred-line", "done." }
+                    EnrolledDevices {}
                     div { class: "cred-row", CloseButton {} }
                 },
 
@@ -420,6 +422,97 @@ fn ConsequenceScreen(phase: Signal<AddPhase>) -> Element {
                 });
             } }
             CancelButton {}
+        }
+    }
+}
+
+/// THE ACCOUNT'S DEVICE LIST, drawn once enrollment lands.
+///
+/// `renderDevices` (`visor/ui/pairing.ts:713-722`), whose one call site
+/// (:859) is exactly here — the moment `AddPhase::Enrolled` renders — so the
+/// user sees the device they just admitted actually present in the account,
+/// not merely told "done.".
+///
+/// A COMPONENT OF ITS OWN, for the same reason [`ConsequenceScreen`] is:
+/// `use_hook` fetches ONCE PER MOUNT, and this mounts exactly when the
+/// `Enrolled` screen appears — `screen_key` forces a remount on every phase
+/// change, so re-fetching on a later poll (there is none, `Enrolled` is
+/// terminal) is not a concern in the first place.
+///
+/// SILENT ON FAILURE, on purpose and not by omission: pairing.ts's own
+/// `if (!res.ok) return;` (:715) leaves the confirmation list simply absent
+/// rather than drawing an error, and that is kept rather than "fixed" into an
+/// error line, because the reasoning still holds — `add_line(&AddPhase::Enrolled)`
+/// has already announced "device added" (pairing.ts:854) by the time this
+/// runs, so a failure to draw a confirmation LIST must not read as the
+/// enrollment itself having failed. The worst outcome of a listing failure is
+/// the list staying absent; "done." and the Close button are unaffected.
+#[component]
+fn EnrolledDevices() -> Element {
+    let mut rows = use_signal(|| None::<Vec<DeviceRow>>);
+    use_hook(move || {
+        spawn(async move {
+            let Ok(list) = driver::us_devices_list().await else {
+                // See the doc above: a listing failure is silent, not an
+                // error line drawn over a ceremony that already succeeded.
+                return;
+            };
+            rows.set(Some(device_rows(list.iter().map(|d| (d.name.as_str(), d.revoked)))));
+        });
+    });
+
+    let Some(rows) = rows.read().clone() else { return rsx! {} };
+    rsx! {
+        ul { class: "cred-devices",
+            for row in rows {
+                li {
+                    // USER VOICE / FRAMEWORK VOICE, kept apart — see
+                    // `pure::devices`'s header. `row.name` is the word the
+                    // user typed for THIS device in this very ceremony
+                    // (`pair-add-confirm`'s doc: typed by the user, never
+                    // prefilled) when it is `Some`; the unnamed fallback and
+                    // the revoked qualifier are the visor DESCRIBING the
+                    // record, so they are framework voice and never joined
+                    // into the same string as the name.
+                    match row.name {
+                        Some(name) => {
+                            // THROUGH `UserVoice`, not a bare string: this is
+                            // the word the user typed for THIS device in this
+                            // very ceremony (`pair-add-confirm`'s doc), the
+                            // same class of content the identity strip
+                            // renders as `.who`/`.who.device` (app.rs).
+                            // `pure::devices` already trimmed and clamped it,
+                            // so `UserVoice::new` only re-validates — but
+                            // going through the type is what makes a bare
+                            // string here a thing that had to be deliberately
+                            // unwrapped, not a thing that could slip in in a
+                            // later edit.
+                            let voice = UserVoice::new(&name, NAME_MAX);
+                            let shown = voice.map(|v| v.as_str().to_string()).unwrap_or_default();
+                            rsx! {
+                                span {
+                                    class: "who",
+                                    // `.who`'s weight-600 dress is scoped to
+                                    // `#visor-identity`/`.reset-sheet
+                                    // .cred-field label` (visor.css:406,
+                                    // :1036) and this row is neither —
+                                    // `visor.css` is read-only and has no
+                                    // pairing vocabulary, so the value is
+                                    // transcribed inline, the same reason
+                                    // `render.rs` dresses the code and the
+                                    // SAS inline (`ArmedGrant`'s doc, above).
+                                    style: "font-weight: 600; letter-spacing: .01em;",
+                                    "{shown}"
+                                }
+                            }
+                        }
+                        None => rsx! { "(unnamed)" },
+                    }
+                    if row.revoked {
+                        " — revoked"
+                    }
+                }
+            }
         }
     }
 }

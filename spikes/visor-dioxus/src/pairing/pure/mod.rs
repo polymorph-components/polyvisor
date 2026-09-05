@@ -40,6 +40,7 @@
 //! Left for whoever owns `lib.rs`; the restructuring here is what makes that
 //! one line all it takes.
 
+pub mod devices;
 pub mod phase;
 pub mod qr;
 pub mod text;
