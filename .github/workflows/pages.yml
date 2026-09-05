@@ -69,6 +69,9 @@ jobs:
             examples/todomvc/guest
             providers/s3/panel
             providers/dropbox/panel
+            spikes/todomvc/guest
+            spikes/todomvc/guest-dioxus
+            spikes/todomvc/lab
           # No registry pruning: the sibling workspace sits outside the
           # repo, and its deps must survive the post-job save.
           cache-all-crates: true
@@ -84,9 +87,14 @@ jobs:
           # cold cargo build every time.
           #
           # Sibling pins and tool versions live in setup.sh, the pinned
-          # compilers in rust-toolchain.toml; bumping either must rotate
-          # the key or stale target dirs get restored forever.
-          shared-key: demo-${{ hashFiles('scripts/setup.sh', '**/rust-toolchain.toml') }}
+          # compiler in engine/rust-toolchain.toml; bumping either must
+          # rotate the key or stale target dirs get restored forever.
+          # ONLY engine's toolchain file, not `**/rust-toolchain.toml`:
+          # the glob also matched every spike's, and a spike toolchain edit
+          # (#143) rotated the demo's cache for nothing — see e2e.yml's
+          # note on what that did to the suite. The spike workspaces listed
+          # above carry no toolchain file of their own.
+          shared-key: demo-${{ hashFiles('scripts/setup.sh', 'engine/rust-toolchain.toml') }}
           # Save only on main: PR jobs restore but never save, so PR
           # branches don't churn the cache entries every run depends on.
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -107,14 +115,26 @@ jobs:
         working-directory: demo
         run: just pages
 
+      - name: Build the TodoMVC spike
+        # Writes into ../../docs/spike-todomvc (spikes/todomvc/justfile's
+        # `out`) — gitignored, generated fresh here same as docs/demo.
+        working-directory: spikes/todomvc
+        run: just build
+
       - name: Assemble the site
         # docs/ is the site root: docs/index.html is the only committed
-        # build; docs/demo is the one this workflow rebuilds.
+        # build; docs/demo and docs/spike-todomvc are the two this
+        # workflow rebuilds.
         run: |
           test -f docs/demo/engine.component.wasm
           test -f docs/demo/panel-dropbox.component.wasm
           test -f docs/demo/solo.html
           test -f docs/demo/solo-worker.js
+          test -f docs/spike-todomvc/index.html
+          test -f docs/spike-todomvc/frame-dioxus.html
+          test -f docs/spike-todomvc/frame.js
+          test -f docs/spike-todomvc/todomvc-dioxus.component.wasm
+          test -f docs/spike-todomvc/todomvc-dioxus.plan.json
           test -f docs/index.html
           du -sh docs
 

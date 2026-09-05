@@ -69,7 +69,18 @@ jobs:
           # default job-id key component (and the `key` input): without
           # it this job looked up "...-e2e-..." while Pages saved
           # "...-build-...", so every E2E run was a cold cargo build.
-          shared-key: demo-${{ hashFiles('scripts/setup.sh', '**/rust-toolchain.toml') }}
+          #
+          # The key hashes ONLY the toolchain file of a cached workspace.
+          # It used to glob `**/rust-toolchain.toml`, which also matched
+          # every spikes/*/rust-toolchain.toml — none of which this job
+          # builds — so an edit to a spike's toolchain threw away the
+          # demo's cache. That is what happened at #143: every E2E run
+          # after it built the engine composite cold, and the suite went
+          # from ~20 consecutive first-attempt passes to one pass in seven
+          # attempts (browser-process crashes and store/sync timeouts, the
+          # shape of a runner under load). The spike workspaces the Pages
+          # job additionally caches carry no toolchain file of their own.
+          shared-key: demo-${{ hashFiles('scripts/setup.sh', 'engine/rust-toolchain.toml') }}
           # Never saves: the Pages workflow builds the same workspaces on
           # main and owns the entry; this job only restores it.
           save-if: false

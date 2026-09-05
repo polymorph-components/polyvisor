@@ -95,7 +95,7 @@ jobs:
           # MUST MATCH pages.yml and e2e.yml exactly — see e2e.yml's
           # comment on this key: the Pages build owns the entry and
           # everyone else restores it.
-          shared-key: demo-${{ hashFiles('scripts/setup.sh', '**/rust-toolchain.toml') }}
+          shared-key: demo-${{ hashFiles('scripts/setup.sh', 'engine/rust-toolchain.toml') }}
           save-if: false
 
       - name: Set up tools and the endpoint component
