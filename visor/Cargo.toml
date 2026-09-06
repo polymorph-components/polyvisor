@@ -6,6 +6,15 @@ license.workspace = true
 publish.workspace = true
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+# cdylib: the component artifact, as in the other two component crates. The
+# `#[cfg(test)]` units (voice, state, style) need no rlib — `cargo test`
+# compiles the lib as its own test target.
+crate-type = ["cdylib"]
 
-# M0: no dependencies yet — M1 tracks add them.
+[dependencies]
+# "hooks" on top of the workspace features: the visor's UI is signal-based
+# (m1-context.md "Rust facts").
+dioxus = { workspace = true, features = ["hooks"] }
+stream-dom-dioxus.workspace = true
+stream-dom-guest.workspace = true
+wit-bindgen.workspace = true

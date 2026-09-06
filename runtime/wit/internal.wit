@@ -157,8 +157,15 @@ interface apps {
     component: async func(session: session-id) -> result<component-artifacts, error>;
     assets: async func(session: session-id) -> result<list<asset-info>, error>;
     asset: async func(session: session-id, handle: list<u8>) -> result<list<u8>, error>;
-    /// End a session. Idempotent.
+    /// End a session. The visor's own act, so it emits no event. Idempotent.
     close: async func(session: session-id) -> result<_, error>;
+    /// The glue reports a session that died on its own — a frame torn down
+    /// by the receiver (policy violation, decode failure) or one that never
+    /// mounted. Ends the session and emits `session-ended(session, reason)`
+    /// so every visor learns of it through the one event path. `reason` is
+    /// framework voice, composed by the glue; publisher text never enters
+    /// it. Idempotent; unknown sessions are ignored.
+    abort: async func(session: session-id, reason: string);
 }
 
 /// Kernel-originated events. The runtime exports this; the worker glue
@@ -168,7 +175,9 @@ interface events {
     use types.{session-id};
 
     variant event {
-        /// A session ended other than through `apps.close`.
+        /// A session ended other than through `apps.close`. The string is
+        /// the reason, framework voice: the kernel or the glue composed it,
+        /// so the visor renders it unplated and plates only the app title.
         session-ended(tuple<session-id, string>),
     }
 
