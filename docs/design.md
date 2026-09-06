@@ -184,6 +184,42 @@ keyhive is pinned to git `main` for the CGKA transitive-authority fix
 (66a6632: relay access no longer grants CGKA membership) that the
 released 0.5.0 lacks; the pull ≠ read tier separation depends on it.
 
+## Devices
+
+A device is one kernel identity and everything it holds; a browser may
+hold many, and one SharedWorker serves one device. The glue owns only
+what has to exist before the kernel does: the device **id** (the tab's
+sessionStorage anchor, or a fresh id it mints), because the worker is
+named after it. Everything else — the index, tiers, sealing, the sweep —
+is kernel logic over `kv`, `locks` and the OPFS state root.
+
+- **The index** (`store`) is the one unsealed record: id, petname, tier,
+  how the device rests, timestamps. Never the name, hue, word or any key.
+  The visor boots unclaimed (grey, no identity) and paints the user's
+  colour only after the seal opens, so a page imitating the picker cannot
+  paint it.
+- **Tiers as a promotion.** Every device starts *ephemeral*: state is
+  checkpointed so a reload survives (the worker respawns on every
+  single-tab reload — checkpoint + rehydrate, not worker-memory luck),
+  and the namespace is garbage once its lock is free and its lease stale.
+  "Keep this device" makes it durable and asks how it rests.
+- **Two honest tiers of rest.** *Rests open*: the data key sits in the
+  namespace; protection is the profile's access control and the visor
+  says exactly that. *Passphrase*: the key is wrapped under Argon2id and
+  unsealing is the login, every session; the unwrapped key lives in
+  worker memory only. Sealing is pure Rust in the kernel (`aes-gcm`,
+  `argon2`) with the key as bytes: a non-extractable WebCrypto handle
+  persisted in IndexedDB would rest under the same profile protection,
+  so it buys nothing at this tier. Platform-held keys enter with the
+  signing identity (M3) and the passkey PRF rung (M5).
+- **Checkpoints** are AES-GCM over the kernel's serialized state, written
+  to `/<id>/` on the OPFS root through `wasi:filesystem@0.3` after every
+  mutation (state is small until the engine lands; a debounce is a later
+  optimization). Generation directories, manifest written last.
+- **Switching devices is a reload** (`shell.switch-device`): the anchor
+  changes and the page restarts against another worker. Erase destroys
+  the namespace and the index row, then switches to a fresh device.
+
 ## Visor and apps render through stream-dom
 
 Both are Dioxus producers via `stream-dom-dioxus`. The visor runs with
@@ -237,10 +273,10 @@ native tests, so browser gates are mandatory for every visor change.
   the frame policy's unit tests. (The frame-teardown integration test
   waits for a hostile fixture component — M2. The path was exercised
   anyway: the policy caught the TodoMVC example's outbound `href`.)
-- **M2** devices survive: device index, namespaces, sealing (KEK ladder
-  with webcrypto handles), checkpoint/resume on OPFS, locks, entry and
-  unseal and erase ceremonies. Reload survival with worker respawn as
-  the normal case.
+- **M2** devices survive: the index, namespaces, the two tiers of rest,
+  checkpoint/resume on OPFS, locks and the sweep, entry/keep/unseal/erase
+  in the visor, and the hostile-fixture frame-teardown scenario. Reload
+  survival with worker respawn as the normal case.
 - **M3a** sans-IO driver: the five traits, iroh transport, interop with
   a legacy peer. **M3b** keyhive policy, user-system doc, pairing,
   `tasks` over automerge.
