@@ -1,0 +1,230 @@
+/// polyvisor:internal — the private contract between this repository's own
+/// components and its own glue. Both sides of every interface here are
+/// built from the same commit, so this package changes freely; its digest
+/// is a build-consistency check, never a compatibility promise. The public
+/// half is `wit/` (polyvisor:app).
+///
+/// Realms (docs/design.md "Realms"):
+///
+///   runtime component — SharedWorker, one per device. Exports the kernel
+///                       interfaces; imports the platform interfaces the
+///                       worker glue implements plus WASI and polymorph
+///                       hosts.
+///   visor component   — main thread. A stream-dom producer for the trusted
+///                       pixels; imports the kernel interfaces (proxied to
+///                       the worker over a MessagePort by the glue) and the
+///                       page capabilities in `shell`.
+///   app component     — inside a sandboxed frame; targets polyvisor:app.
+///                       Its service imports reach the runtime over a port
+///                       the glue bound to its session; the kernel sees the
+///                       session id the glue supplies, never a claim the
+///                       app makes.
+///
+/// Rules every interface here obeys:
+///
+///   - Anything that crosses a realm is `async func`. The guest suspends
+///     through the component model's async ABI; the glue never wraps an
+///     import in `suspending()`, so no realm requires JSPI.
+///   - No resources cross this package's seams. Plain data only, so the
+///     same calls serialize over a MessagePort today and over process IPC
+///     under a native shell tomorrow.
+///   - Caller identity is supplied by the glue from the port a call arrived
+///     on (`session-id` parameters), never taken from the caller.
+package polyvisor:internal@0.1.0;
+
+interface types {
+    /// An installed application, as the kernel names it.
+    type app-id = string;
+    /// A running app instance. Allocated by the kernel at `launch`; never
+    /// reused within a runtime instance.
+    type session-id = u32;
+
+    enum error-code {
+        /// The named app is not installed.
+        unknown-app,
+        /// No such live session.
+        unknown-session,
+        /// The kernel is not in a state to serve this (not booted, sealed).
+        unavailable,
+        /// The request was understood and refused by policy.
+        refused,
+        /// The thing asked for does not exist.
+        not-found,
+        /// A dependency failed (network, storage, host).
+        failed,
+    }
+
+    record error {
+        code: error-code,
+        /// Framework voice, for the visor to show or log as-is.
+        message: string,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Platform: what the glue implements for the runtime component. Implemented
+// in TypeScript over browser APIs today, in Rust under a native shell later.
+// Everything else the runtime imports is WASI or a polymorph host package.
+// ---------------------------------------------------------------------------
+
+/// Small unsealed key/value store (IndexedDB in the browser). Holds only
+/// what must be readable before any device is unsealed: the device index
+/// and boot caches. Sealed state lives behind `wasi:filesystem`.
+interface kv {
+    get: async func(key: string) -> option<list<u8>>;
+    set: async func(key: string, value: list<u8>);
+    delete: async func(key: string);
+    /// Keys with the given prefix, in unspecified order.
+    keys: async func(prefix: string) -> list<string>;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel: what the runtime component exports. The visor imports the same
+// interfaces; the worker glue proxies them.
+// ---------------------------------------------------------------------------
+
+/// Runtime lifecycle. Called once by the worker glue before anything else.
+interface lifecycle {
+    use types.{error};
+
+    record boot-config {
+        /// The home origin, as an absolute URL without a trailing slash.
+        /// Release artifacts and, until installation lands, app bundles are
+        /// fetched from it.
+        home-origin: string,
+    }
+
+    boot: async func(config: boot-config) -> result<_, error>;
+}
+
+/// The device this runtime is: the identity the visor shows.
+interface device {
+    use types.{error};
+
+    record device-status {
+        /// Stable per device.
+        id: string,
+        /// User voice. "" until the user names it.
+        name: string,
+        /// The anchor colour, degrees on the hue wheel.
+        hue: u16,
+        /// The audible anchor word (framework voice; trusted pixels only).
+        word: string,
+    }
+
+    status: async func() -> result<device-status, error>;
+    set-name: async func(name: string) -> result<_, error>;
+    set-hue: async func(hue: u16) -> result<_, error>;
+    reroll-word: async func() -> result<string, error>;
+}
+
+/// Installed apps and their live sessions.
+interface apps {
+    use types.{app-id, session-id, error};
+
+    record app-info {
+        id: app-id,
+        /// App voice: the publisher's own title. Rendered plated.
+        title: string,
+    }
+
+    /// One content-addressed static asset in an app's bundle. `handle` is
+    /// what the app puts on the stream (stream-dom's asset attribute
+    /// value); the frame resolves it to bytes through `asset`.
+    record asset-info {
+        handle: list<u8>,
+        /// MIME type for the blob the frame mints.
+        media-type: string,
+    }
+
+    installed: async func() -> result<list<app-info>, error>;
+    /// Start an instance. The glue binds a port to the returned session;
+    /// the visor opens a frame for it through `shell.open-frame`.
+    launch: async func(app: app-id) -> result<session-id, error>;
+    /// The component bytes for a session's app.
+    component: async func(session: session-id) -> result<list<u8>, error>;
+    assets: async func(session: session-id) -> result<list<asset-info>, error>;
+    asset: async func(session: session-id, handle: list<u8>) -> result<list<u8>, error>;
+    /// End a session. Idempotent.
+    close: async func(session: session-id) -> result<_, error>;
+}
+
+/// Kernel-originated events. The runtime exports this; the worker glue
+/// long-polls it and fans each event out to every connected visor, whose
+/// own glue serves the same interface from a local queue.
+interface events {
+    use types.{session-id};
+
+    variant event {
+        /// A session ended other than through `apps.close`.
+        session-ended(tuple<session-id, string>),
+    }
+
+    /// Resolves with the next event; parks while there is none.
+    next: async func() -> event;
+}
+
+/// Service dispatch for app sessions: each public service interface in
+/// polyvisor:app has a mirror here with the caller's session first. The
+/// glue supplies the session from the port the call arrived on.
+interface app-services {
+    use types.{session-id};
+    use polyvisor:app/tasks@0.1.0.{snapshot};
+
+    tasks-revision: async func(session: session-id) -> result<u64, string>;
+    tasks-items: async func(session: session-id) -> result<snapshot, string>;
+    tasks-add: async func(session: session-id, title: string) -> result<string, string>;
+    tasks-set-completed: async func(session: session-id, id: string, completed: bool) -> result<_, string>;
+    tasks-set-title: async func(session: session-id, id: string, title: string) -> result<_, string>;
+    tasks-remove: async func(session: session-id, id: string) -> result<_, string>;
+}
+
+// ---------------------------------------------------------------------------
+// Shell: page capabilities the visor imports and its glue implements.
+// ---------------------------------------------------------------------------
+
+/// What the visor can do to the page it is drawn into. Geometry of its own
+/// tree comes through stream-dom `queries`; this is only what no producer
+/// can express.
+interface shell {
+    use types.{session-id, error};
+
+    /// Put a sandboxed frame for the session into the app zone: the glue
+    /// fetches the session's component bytes from the kernel, obtains the
+    /// port the worker bound to the session, and posts both into a
+    /// constant, hash-pinned srcdoc loader. At most one frame per session.
+    open-frame: async func(session: session-id) -> result<_, error>;
+    /// Tear the frame down. Idempotent.
+    close-frame: async func(session: session-id) -> result<_, error>;
+    /// `location.reload()`.
+    reload: func();
+}
+
+// ---------------------------------------------------------------------------
+// Worlds
+// ---------------------------------------------------------------------------
+
+/// The runtime component: kernel + engine, in the device's SharedWorker.
+world runtime {
+    import kv;
+    import wasi:clocks/monotonic-clock@0.3.1;
+    import wasi:clocks/system-clock@0.3.1;
+    import wasi:random/random@0.3.1;
+    import wasi:http/client@0.3.1;
+
+    export lifecycle;
+    export device;
+    export apps;
+    export events;
+    export app-services;
+}
+
+/// The visor component: the trusted pixels, on the main thread.
+world visor {
+    include polymorph:stream-dom/producer@0.1.0;
+
+    import device;
+    import apps;
+    import events;
+    import shell;
+}

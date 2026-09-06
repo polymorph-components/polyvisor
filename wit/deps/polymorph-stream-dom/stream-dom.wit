@@ -1,0 +1,101 @@
+/// polymorph:stream-dom — a framework-neutral DOM-mutation stream.
+///
+/// DRAFT. This file is the component-model half of the protocol: the
+/// functions, resources and stream that only WIT can express. Every byte
+/// on the stream is defined by proto/stream-dom.proto (length-delimited
+/// `Frame` messages) and every event payload by
+/// proto/stream-dom-events.proto (`EventPayload`). No data type is defined
+/// in both places, except `rect` / `size`, which observer payloads also
+/// carry. docs/design.md records the reasons.
+///
+/// A producer (any renderer) writes frames to a `stream<u8>`; a receiver
+/// (something owning a DOM) applies them. Transformers may sit between
+/// with the shape `func(in: stream<u8>) -> stream<u8>`. The stream is an
+/// unbuffered rendezvous channel of bytes — batches are framed by the
+/// `commit` flag on a frame, and the transport knows neither frames nor
+/// batches.
+package polymorph:stream-dom@0.1.0;
+
+interface types {
+  /// Producer-allocated node id, never reused within a stream. `0` is the
+  /// mount root.
+  type node-id = u32;
+  /// Interned string slot, defined by a prior `Intern` frame.
+  type str-ref = u32;
+  /// What a listener was registered on: a node, or one of the two
+  /// receiver-side singletons a producer may name without creating
+  /// (`Listener.target` in the proto).
+  variant event-target {
+    node(node-id),
+    window,
+    document,
+  }
+}
+
+/// Host-side reads and imperative DOM actions. All `async`: a host behind
+/// a worker or network must be allowed to park the guest; a same-thread
+/// host answers without blocking, and a guest that sync-lowers these sees
+/// a plain blocking call on every host. These are RPC, not stream data,
+/// and are the only values typed here rather than in the proto.
+///
+/// Reentrancy: `set-focus` fires `focusin`/`focusout` synchronously. The
+/// receiver must bracket such calls with a dispatch gate and drain queued
+/// event dispatches after the guest's turn unwinds.
+interface queries {
+  use types.{node-id};
+
+  record point { x: f64, y: f64 }
+  record size { width: f64, height: f64 }
+  record rect { origin: point, size: size }
+
+  get-client-rect: async func(target: node-id) -> option<rect>;
+  get-scroll-offset: async func(target: node-id) -> option<point>;
+  get-scroll-size: async func(target: node-id) -> option<size>;
+  set-focus: async func(target: node-id, focus: bool) -> bool;
+}
+
+interface events {
+  /// The live event, lent to the handler for its synchronous prefix.
+  /// Calls made after the handler first blocks are too late — the same
+  /// rule a browser applies after the first `await`.
+  resource dom-event {
+    prevent-default: func();
+    stop-propagation: func();
+  }
+}
+
+world producer {
+  use types.{node-id, str-ref, event-target};
+  use events.{dom-event};
+
+  import queries;
+
+  /// Mount. `hydrate = true` means the mount root already holds this
+  /// producer's prerendered markup: the first batch binds ids with
+  /// `BindMarker` and creates no nodes.
+  ///
+  /// The stream carries length-delimited `Frame` messages. Returning it
+  /// makes the channel's lifecycle structural: it exists iff the producer
+  /// started, once, tied to this instance. The receiver retains the
+  /// readable end for the instance's lifetime; a parked scheduler is then
+  /// a documented idle state, not a deadlock.
+  export run: async func(hydrate: bool) -> stream<u8>;
+
+  /// Dispatch one event to the listener registered on `target` under the
+  /// interned `name`. `target` and `name` are plain so the guest can route
+  /// without decoding; `payload` is an encoded `EventPayload`. `mounted`
+  /// is synthetic: the receiver fires it once per registered element after
+  /// the commit of the batch that created it, with an empty payload.
+  export handle-event: async func(
+    target: event-target,
+    name: str-ref,
+    payload: list<u8>,
+    ev: borrow<dom-event>,
+  );
+}
+
+/// A stream-to-stream transformer (coalescer, recorder, expander,
+/// multiplexer). Frames in, frames out; a frame may straddle a read.
+world transformer {
+  export transform: func(input: stream<u8>) -> stream<u8>;
+}

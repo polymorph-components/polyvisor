@@ -1,6 +1,0 @@
-[toolchain]
-# Matches the keyhive spike / polymorph-webcrypto; subduction pins 1.91,
-# so >=1.91 satisfies both.
-channel = "1.97.0"
-components = ["rustfmt", "clippy"]
-targets = ["wasm32-wasip2"]

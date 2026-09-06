@@ -1,0 +1,48 @@
+# Runs the justfile recipes; new gates belong in the justfile, not here.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Reads rust-toolchain.toml for channel/components/targets.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools,just
+      - uses: Swatinem/rust-cache@v2
+      - run: just ci
+
+  e2e:
+    needs: gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools,just
+      - uses: Swatinem/rust-cache@v2
+      # Chromium plus its shared-library deps (pattern matches
+      # polymorph-stream-dom's ci.yml).
+      - run: npx -y playwright install --with-deps chromium
+      - run: just e2e

@@ -1,0 +1,57 @@
+/// polyvisor:app — the public contract: everything code from outside this
+/// repository links against. Apps target `world app`; data services and
+/// providers target the worlds added beside it. This package is versioned
+/// deliberately and grows only additively; `runtime/wit` (polyvisor:internal)
+/// is the private half and changes freely.
+///
+/// An app's authority is its import set. The framework links each import
+/// according to the user's grants: an import the user has not granted is
+/// either unlinked (instantiation fails) or linked to a refusing stub,
+/// per interface. Nothing here is ambient.
+package polyvisor:app@0.1.0;
+
+/// The first data service: a shared task list.
+///
+/// A schema-authority contract: one live service owns a partition of task
+/// data — its schema, policy and migrations — and any number of apps
+/// project it. Apps never see documents; they see this.
+///
+/// Poll-shaped on purpose: `revision` is a cheap monotonic probe and
+/// `items` a full snapshot. A change feed is the expected additive next
+/// step once apps have an event path that wants one.
+interface tasks {
+    record todo-item {
+        /// Stable, opaque, unique within the partition.
+        id: string,
+        title: string,
+        completed: bool,
+    }
+
+    /// A consistent view of the partition.
+    record snapshot {
+        /// Advances whenever a local or synced change is applied. Equal
+        /// revisions on one replica imply an unchanged snapshot; not
+        /// comparable across replicas.
+        revision: u64,
+        /// Items in stable (id) order.
+        items: list<todo-item>,
+    }
+
+    /// Apply any newly synced changes, then report the revision.
+    revision: async func() -> result<u64, string>;
+    /// Apply any newly synced changes, then snapshot.
+    items: async func() -> result<snapshot, string>;
+    /// Create a task; returns its id.
+    add: async func(title: string) -> result<string, string>;
+    set-completed: async func(id: string, completed: bool) -> result<_, string>;
+    set-title: async func(id: string, title: string) -> result<_, string>;
+    remove: async func(id: string) -> result<_, string>;
+}
+
+/// An application. Renders through the stream-dom producer contract into
+/// a receiver the framework owns (a sandboxed frame under a vocabulary
+/// policy); everything else it can reach is an import listed here.
+world app {
+    include polymorph:stream-dom/producer@0.1.0;
+    import tasks;
+}
