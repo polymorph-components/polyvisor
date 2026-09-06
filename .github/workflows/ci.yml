@@ -42,7 +42,7 @@ jobs:
         with:
           tool: wasm-tools,just
       - uses: Swatinem/rust-cache@v2
-      # Chromium plus its shared-library deps (pattern matches
-      # polymorph-stream-dom's ci.yml).
-      - run: npx -y playwright install --with-deps chromium
+      # Chromium plus its shared-library deps, at the exact version deno.json
+      # imports — a newer CLI fetches a build the library will not find.
+      - run: npx -y playwright@1.62.1 install --with-deps chromium
       - run: just e2e

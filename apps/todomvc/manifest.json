@@ -1,0 +1,13 @@
+{
+  "id": "todomvc",
+  "title": "TodoMVC",
+  "component": "app.component.wasm",
+  "plan": "app.component.plan.json",
+  "assets": [
+    {
+      "handle": "0f827d119b7bec30534b1767e8ab8ee0f2890c98f93baa1159dcf1a46f10bc17",
+      "path": "todomvc-app.css",
+      "media_type": "text/css"
+    }
+  ]
+}

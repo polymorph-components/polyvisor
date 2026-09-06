@@ -6,6 +6,22 @@ license.workspace = true
 publish.workspace = true
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
-# M0: no dependencies yet — M1 tracks add them.
+[dependencies]
+# `hooks` on top of the workspace feature set: this crate uses `use_signal`,
+# `use_memo` and `use_future` (docs/design.md "Pins, with reasons").
+dioxus = { workspace = true, features = ["hooks"] }
+stream-dom-dioxus.workspace = true
+# Named directly (not just through stream-dom-dioxus) because this crate does
+# its own `generate!` and has to `with:`-remap the stream-dom interfaces onto
+# the guest crate's generated modules so the two agree on `EventTarget` /
+# `DomEvent`.
+stream-dom-guest.workspace = true
+wit-bindgen.workspace = true
+
+[dev-dependencies]
+# Native-only, for the manifest/asset digest agreement test. Dev-dependencies
+# do not enter the wasm32 component build.
+sha2 = "0.10"
+serde_json = "1"

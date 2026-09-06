@@ -73,7 +73,10 @@ Rules for `polyvisor:internal`:
 4. **Kernel events are a long-poll export** (`events.next`). The worker
    glue loops on it and fans out to every connected visor; each visor's
    glue serves the same interface from a local queue. No callbacks, no
-   second mechanism.
+   second mechanism. What the glue itself observes (a frame torn down by
+   the receiver) enters the same path through `apps.abort`, so the visor
+   has one source of truth for session endings; `apps.close` — the
+   visor's own act — emits nothing.
 
 Vendored dependencies live under each package's `deps/`
 (`runtime/wit/deps/polyvisor-app` is a symlink to `../../../wit`). Two
@@ -102,7 +105,8 @@ composition) and nothing else.
 
 - An opaque-origin `srcdoc` document carrying its own `<meta>` CSP
   (`default-src 'none'`; `script-src` the loader's hash plus
-  `'wasm-unsafe-eval'`; `img-src`/`font-src`/`media-src blob:`). CSP
+  `'wasm-unsafe-eval'`; `style-src`/`img-src`/`font-src`/`media-src
+  blob:` — the asset stylesheet is a `blob:`). CSP
   policies compose with the embedder's header policy, so the frame is
   network-dead regardless. `sandbox="allow-scripts allow-forms"`;
   `form-action 'none'`. The loader is a constant; everything variable
@@ -131,11 +135,14 @@ composition) and nothing else.
   below the vocabulary (ids, template arenas, mount-root inviolability)
   is the receiver's own and is fuzzed upstream.
 - **Assets.** An app bundle is a component plus content-addressed static
-  assets. The producer names an asset by handle in an attribute value;
-  the frame's `resolveAsset(handle)` fetches bytes over its session port
-  (`apps.asset`) and mints a `blob:` URL, cached per handle. The kernel
-  is the only fetcher; until installation lands (M2) it fetches bundles
-  from the home origin over `wasi:http`.
+  assets (handle = raw SHA-256 of the bytes; the manifest spells it in
+  hex). The producer names an asset by handle in an attribute value; the
+  receiver's `resolveAsset(handle)` must answer synchronously, so the
+  frame fetches every asset over its session port (`apps.asset`) before
+  the producer runs and mints one `blob:` URL per handle. Asset `href` is
+  legal only on `<link>`; an `<a href>` is a fragment. The kernel is the
+  only fetcher and re-hashes what it serves; until installation lands
+  (M2) it fetches bundles from the home origin over `wasi:http`.
 
 ## The kernel is one component
 
@@ -196,12 +203,12 @@ native tests, so browser gates are mandatory for every visor change.
 | Dependency | Pin | Reason |
 |---|---|---|
 | Rust | 1.98.1 | current stable; satisfies stream-dom (1.98), subduction (1.91), keyhive (1.90) |
-| `wit-bindgen` | `=0.60.0`, workspace-wide | must equal stream-dom's pin: `StreamReader<u8>` (a wit-bindgen runtime type) crosses the delegation from our world's `run` into `stream_dom_dioxus::driver::run`. Different wit-bindgen versions *can* coexist in one component (the `wasip3_task_set` weak-symbol ABI exists for exactly that), but not across a shared runtime type. Bumps follow stream-dom's |
+| `wit-bindgen` | `=0.60.0`, workspace-wide | must equal stream-dom's pin: `StreamReader<u8>` (a wit-bindgen runtime type) crosses the delegation from our world's `run` into `stream_dom_dioxus::driver::run`. Different wit-bindgen versions *can* coexist in one component (the `wasip3_task_set` weak-symbol ABI exists for exactly that), but not across a shared runtime type. Bumps follow stream-dom's. `generate!` never sets `async: true`: that lowers sync WIT functions (resource constructors) async, which the canonical ABI forbids and only the translator catches; WIT's own `async func` annotations are the source of truth |
+| `@polyengine/*` | git rev `80ee6cb` (raw.githubusercontent) + `pre-80ee6cb` translator asset | carries the #289 driver fix; see "polyengine is consumed at a git revision" |
 | `dioxus` | `=0.7.10` | dioxus-core state is shared with `stream-dom-dioxus`; skew breaks the build |
 | polymorph-stream-dom | git rev (see Cargo.toml / deno.json) | unpublished, moving; policy object and asset handles landed in #15 |
 | subduction | git `sansio` rev | above |
 | keyhive | git `main` rev | above |
-| `@polyengine/*` | 0.6.x, one version across the graph | brand symbols are per-version; a partial upgrade fails at `instanceof` |
 | `@polymorph/*` | 0.6.0 | the 2026-09-05 cut matching polyengine 0.6.3 |
 | polymorph:iroh WIT | provisional | being upgraded upstream in parallel; re-checked before M3a, the first milestone that exercises it |
 | `wasi:*` WIT | 0.3.1 (consolidated WASI release) | what `@polyengine/wasi` serves on the `@0.3` track |
@@ -226,8 +233,10 @@ native tests, so browser gates are mandatory for every visor change.
 - **M1** three realms, one TodoMVC: stub kernel with in-memory `tasks`;
   visor strip + settings sheet; frame loader under policy; ports.
   Gates: app renders in the opaque frame; strip geometry immobile with
-  the app mounted; a hostile stream tears the frame down and the strip
-  survives; zero network requests from the frame; `jspi: false`.
+  the app mounted; zero network requests from the frame; `jspi: false`;
+  the frame policy's unit tests. (The frame-teardown integration test
+  waits for a hostile fixture component — M2. The path was exercised
+  anyway: the policy caught the TodoMVC example's outbound `href`.)
 - **M2** devices survive: device index, namespaces, sealing (KEK ladder
   with webcrypto handles), checkpoint/resume on OPFS, locks, entry and
   unseal and erase ceremonies. Reload survival with worker respawn as
@@ -239,3 +248,23 @@ native tests, so browser gates are mandatory for every visor change.
   sync, picker, provider panel in a frame.
 - **M5** passkey PRF rung, recovery kits, Drive provider.
 - Parked: app worker (above); native shell; JS producers.
+
+## polyengine is consumed at a git revision
+
+Found in M1: an import awaited from a Dioxus event handler never resumed
+until the next event. Root cause (polyengine, fixed upstream in #289): a
+`driveAsync` loop parked on `Promise.race([...pendingHostCalls, ...])`
+holds a snapshot; an export entered through the synchronous `drive` path
+fires no driver-arrival, so a host call registered during it is
+invisible to the parked race, and the settlement pump stands down while
+the parked driver counts. A stream-dom producer is the routine victim —
+its `readDirect` session keeps a driver parked whenever one long poll
+(`events.next`) is outstanding.
+
+The fix is in polyengine `main`; polyengine publishes to JSR only on cut
+releases, and a release is a human act. So this tree consumes polyengine
+by git revision: `deno.json` maps every `@polyengine/*` specifier to
+raw.githubusercontent at one sha, and `web/translate.ts` fetches the
+matching `pre-<sha>` release's translator wasm (digest-checked against its
+SHA256SUMS, cached under `target/`). The sha is spelled in `deno.json` and
+in `web/translate.ts`; the two must agree, and a bump is its own PR. Return to a caret JSR pin when a release carrying #289 exists.

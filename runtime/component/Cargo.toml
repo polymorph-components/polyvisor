@@ -6,8 +6,10 @@ license.workspace = true
 publish.workspace = true
 
 [lib]
-# cdylib: builds to a wasm component; rlib: lets other workspace crates and
-# tests depend on it as a normal Rust lib.
-crate-type = ["cdylib", "rlib"]
+# cdylib: this crate exists only to be a wasm component. All of its logic
+# lives in `polyvisor-kernel`, which is a normal lib and tested natively.
+crate-type = ["cdylib"]
 
-# M0: no dependencies yet — M1 tracks add them.
+[dependencies]
+polyvisor-kernel = { path = "../crates/kernel" }
+wit-bindgen.workspace = true
