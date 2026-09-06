@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["runtime/component", "visor", "apps/todomvc"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# docs/design.md "Pins, with reasons": must equal stream-dom's pin —
+# StreamReader<u8> (a wit-bindgen runtime type) crosses the delegation from
+# our world's `run` into `stream_dom_dioxus::driver::run`; different
+# wit-bindgen versions cannot coexist across a shared runtime type. Bumps
+# follow stream-dom's.
+wit-bindgen = { version = "=0.60.0", features = ["async-spawn", "inter-task-wakeup"] }
+# docs/design.md "Pins, with reasons": dioxus-core state is shared with
+# stream-dom-dioxus; skew breaks the build. Feature set checked against a
+# scratch `lib` crate (see track report) — compiles with `html` included, so
+# it is kept rather than dropped to the minimal set.
+dioxus = { version = "=0.7.10", default-features = false, features = ["macro", "signals", "html"] }
+# docs/design.md "Pins, with reasons": unpublished, moving; policy object
+# and asset handles landed in #15. Full 40-char sha of origin/main at the
+# time this skeleton was cut.
+stream-dom-dioxus = { git = "https://github.com/polymorph-components/polymorph-stream-dom", rev = "197492374936b3b4ce5af55f2bac50fa6b551597" }
+stream-dom-guest = { git = "https://github.com/polymorph-components/polymorph-stream-dom", rev = "197492374936b3b4ce5af55f2bac50fa6b551597" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

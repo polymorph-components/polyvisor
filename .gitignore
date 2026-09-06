@@ -1,13 +1,9 @@
-# Cargo build output for any crate in the tree (unanchored: matches
-# nested crate target/ dirs under engine/, examples/, providers/, etc.,
-# not just a repo-root target/).
+# Unanchored: nested crates (runtime/component, visor, apps/*) each grow
+# their own target/ too.
 target/
-
-# The demo site under docs/demo/ is BUILT by CI on every push
-# (.github/workflows/pages.yml) and deployed via the GitHub Actions Pages
-# source (flipped 2026-08-18) — it is generated, not committed. Before
-# the cutover, four rebuilds of an ~11 MB engine composite landed in
-# history. `just pages` still writes here for local preview.
-/docs/demo/
-# Same class: spikes/todomvc's justfile writes its built demo here.
-/docs/spike-todomvc/
+node_modules/
+web/dist/
+.playwright/
+# Wasm build output only; *.wasm elsewhere (e.g. checked-in test fixtures)
+# is not ignored.
+web/dist/*.wasm

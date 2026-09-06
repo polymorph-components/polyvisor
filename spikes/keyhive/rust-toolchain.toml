@@ -1,5 +1,0 @@
-[toolchain]
-# Matches polymorph-webcrypto's pin; keyhive_core needs >=1.90.
-channel = "1.97.0"
-components = ["rustfmt", "clippy"]
-targets = ["wasm32-wasip2"]

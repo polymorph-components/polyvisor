@@ -1,7 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["guest", "host"]
-
-# Spike workspace: quarantined, delete-at-will, wired into no CI.
-# Pins (rust-toolchain.toml, git revs in the member manifests) are exact:
-# upstream protocol changes are migrations, not bumps.

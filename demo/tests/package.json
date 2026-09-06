@@ -1,8 +1,0 @@
-{
-  "name": "pm-demo-pairing-tests",
-  "private": true,
-  "type": "module",
-  "devDependencies": {
-    "@playwright/test": "1.62.1"
-  }
-}

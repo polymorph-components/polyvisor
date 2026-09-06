@@ -1,0 +1,28 @@
+{
+  "nodeModulesDir": "auto",
+  "imports": {
+    "@polyengine/runtime/embedder": "jsr:@polyengine/runtime@^0.6.3/embedder",
+    "@polyengine/runtime/shim": "jsr:@polyengine/runtime@^0.6.3/shim",
+    "@polyengine/runtime/plan": "jsr:@polyengine/runtime@^0.6.3/plan",
+    "@polyengine/translator": "jsr:@polyengine/translator@^0.6.3",
+    "@polyengine/protocol": "jsr:@polyengine/protocol@^0.3.1",
+    "@polyengine/wasi": "jsr:@polyengine/wasi@^0.6.3",
+    "@polyengine/wasi/filesystem-web": "jsr:@polyengine/wasi@^0.6.3/filesystem-web",
+    "@polyengine/wasi/http": "jsr:@polyengine/wasi@^0.6.3/http",
+    "@polymorph/webcrypto": "jsr:@polymorph/webcrypto@^0.6.0",
+    "@polymorph/websocket": "jsr:@polymorph/websocket@^0.6.0",
+    "@polymorph/webrtc-datachannels": "jsr:@polymorph/webrtc-datachannels@^0.6.0",
+    "@polymorph/iroh": "jsr:@polymorph/iroh@^0.6.0",
+    "@remote-dom/core": "npm:@remote-dom/core@^1.11.1",
+    "@remote-dom/core/receivers": "npm:@remote-dom/core@^1.11.1/receivers",
+    "@remote-dom/core/elements": "npm:@remote-dom/core@^1.11.1/elements",
+    "@polymorph/stream-dom-receiver/": "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/",
+    "@std/assert": "jsr:@std/assert@^1"
+  },
+  "tasks": {
+    "check": "deno check $(find web e2e -name '*.ts')",
+    "test": "deno test -A --permit-no-files web/",
+    "e2e": "deno run -A e2e/run.ts",
+    "build": "deno run -A web/build.ts"
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "version": "5",
+  "specifiers": {
+    "jsr:@polyengine/protocol@~0.3.1": "0.3.1",
+    "jsr:@polyengine/runtime@~0.6.3": "0.6.3",
+    "jsr:@polyengine/wasi@~0.6.3": "0.6.3",
+    "npm:@remote-dom/core@^1.11.1": "1.11.1"
+  },
+  "jsr": {
+    "@polyengine/protocol@0.3.1": {
+      "integrity": "3cba0ded857c5cc911fcf9c0782c7566c79af89ddc8e0ec4e48ece60c807a518"
+    },
+    "@polyengine/runtime@0.6.3": {
+      "integrity": "8f1ffc1c547793bc4cb3c1dec6a62c8cf0eb5cdb135b70e6df1fd042c6ec58f0",
+      "dependencies": [
+        "jsr:@polyengine/protocol"
+      ]
+    },
+    "@polyengine/wasi@0.6.3": {
+      "integrity": "5c738fe95101f22e469346618e79ce261dd636a5d44e89fdcdd40c33d8c92e17",
+      "dependencies": [
+        "jsr:@polyengine/protocol"
+      ]
+    }
+  },
+  "npm": {
+    "@remote-dom/core@1.11.1": {
+      "integrity": "sha512-0v29Q7F/iunb2cJm3E7r780X6jcPEFEgetSGisgRssJuoP9217yC1MKLVFNdXRmJYKX+oaugQKqaD2m8XA9dTQ==",
+      "dependencies": [
+        "@remote-dom/polyfill",
+        "htm"
+      ]
+    },
+    "@remote-dom/polyfill@1.5.1": {
+      "integrity": "sha512-eaWdIVKZpNfbqspKkRQLVxiFv/7vIw8u0FVA5oy52YANFbO/WVT0GU+PQmRt/QUSijaB36HBAqx7stjo8HGpVQ=="
+    },
+    "htm@3.1.1": {
+      "integrity": "sha512-983Vyg8NwUE7JkZ6NmOqpCZ+sh1bKv2iYTlUkzlWmA5JD2acKoxd4KVxbMmxX/85mtfdnDmTFoNKcg5DGAvxNQ=="
+    }
+  },
+  "remote": {
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/dispatch.ts": "114107ed7fbd3d535cd194ae5cb425956c6591062eb1ddd6f42f6f0ea0a0c0cf",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/driver.ts": "9f99c10ad9979035c6630d146696fe5fb5528c30377585639b450396bb94097a",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/events.ts": "9f7d431393a2ba300059cf2aa9c32698d19ea8b1115944896a2af8f5564ac9cb",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/frames.ts": "940abc92b71c797b41f892652126785281330485fbddb7a025030e17c6599a3e",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/mod.ts": "57e7e8f809f03784ca8159d7791fed609fdabf9a11569155917737b8827ec5d9",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/mount.ts": "99189376c82a21395b17705aa7bc4f1e87f8248a9dd6f6e9630dafb8ac63b7fd",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/native.ts": "26fa83f874ca63e66cb71fe100704d66490d538a1911ac140629376ffffd4128",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/policy.ts": "8daece4b13b514e0a09c821a57505837a001df9bd8d7f62a7331c607d527030e",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/proto.ts": "79c7dfd8541fc51624818f686dfe266f3e1bfb33acca8ddae819fe9fa4299d2a",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/receiver.ts": "47ce8ea37b14d6bce2c2bf83fbc7c1b3c4a092f51c5265fac62f60138edcaa7f",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/remote.ts": "7491aafd059f2382e06b0df766ec8243eba748ef9d7f4834b1938096a36ba776",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/templates.ts": "052e1d75bcaa5c9e20e3a0ad826960cd87a8c60e5a84af19163b69816c1b7e1c"
+  },
+  "workspace": {
+    "dependencies": [
+      "jsr:@polyengine/protocol@~0.3.1",
+      "jsr:@polyengine/runtime@~0.6.3",
+      "jsr:@polyengine/translator@~0.6.3",
+      "jsr:@polyengine/wasi@~0.6.3",
+      "jsr:@polymorph/iroh@0.6",
+      "jsr:@polymorph/webcrypto@0.6",
+      "jsr:@polymorph/webrtc-datachannels@0.6",
+      "jsr:@polymorph/websocket@0.6",
+      "jsr:@std/assert@1",
+      "npm:@remote-dom/core@^1.11.1"
+    ]
+  }
+}

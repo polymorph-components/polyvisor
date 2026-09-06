@@ -1,9 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["pinned", "main"]
-
-# Investigation spike: quarantined, delete-at-will, wired into no CI.
-# Two members exist ONLY so the same scenario source can be compiled
-# against two keyhive revisions in one `cargo` invocation:
-#   pinned/ -> rev efe6ccf3 (what spikes/tasks-engine ships)
-#   main/   -> branch main  (whatever upstream HEAD is at lock time)
