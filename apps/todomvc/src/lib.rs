@@ -205,6 +205,12 @@ enum FilterState {
     Completed,
 }
 
+/// The stylesheet's asset handle, `asset:` followed by `manifest.json`'s
+/// `handle` for `todomvc-app.css` — the spelling upstream's writer gives an
+/// asset-valued attribute (polymorph-stream-dom#19, `writer.rs` `asset_handle`). The
+/// `tests` module below asserts these stay in agreement.
+const STYLESHEET: &str = "asset:0f827d119b7bec30534b1767e8ab8ee0f2890c98f93baa1159dcf1a46f10bc17";
+
 pub fn app() -> Element {
     // The snapshot. Owned by the `tasks` service; this is a cached view of it.
     let items = use_signal(Vec::<TodoItem>::new);
@@ -249,17 +255,8 @@ pub fn app() -> Element {
     };
 
     rsx! {
-        // CONTRACT: the stylesheet link is deliberately absent. The app should
-        // emit `link { rel: "stylesheet", href: <asset handle> }` using
-        // `stream_dom_guest::Batch::set_attribute_asset`, but Dioxus attribute
-        // values are strings and `stream-dom-dioxus`'s writer has no
-        // convention for spelling an asset handle as one: its `set_attribute`
-        // (crates/stream-dom-dioxus/src/writer.rs:540) reduces every value
-        // through `serialize` to text and only ever calls
-        // `Batch::set_attribute` / `set_property` — the string `asset` does
-        // not appear anywhere in that file. So there is no way for this crate
-        // to reach `set_attribute_asset` today; the change belongs in
-        // `writer.rs:540`, upstream. M1's gate is functional, not pretty.
+        link { rel: "stylesheet", href: STYLESHEET }
+
         section { class: "todoapp",
             TodoHeader { items }
             section { class: "main",
@@ -485,15 +482,18 @@ fn ListFooter(
 /// handles"). Nothing else checks that at build time, so this does.
 #[cfg(test)]
 mod tests {
+    use super::STYLESHEET;
     use sha2::{Digest, Sha256};
+
+    fn manifest() -> serde_json::Value {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap()
+    }
 
     #[test]
     fn manifest_asset_handles_match_the_bytes() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let manifest: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap())
-                .unwrap();
-
+        let manifest = manifest();
         let assets = manifest["assets"].as_array().unwrap();
         assert!(!assets.is_empty(), "manifest declares no assets");
 
@@ -507,5 +507,23 @@ mod tests {
                 "manifest handle for {path} is stale"
             );
         }
+    }
+
+    /// The app's `STYLESHEET` const must name the same asset the manifest
+    /// declares for `todomvc-app.css`, in the `asset:<hex>` spelling
+    /// upstream's writer expects (polymorph-stream-dom#19).
+    #[test]
+    fn stylesheet_const_matches_the_manifest_handle() {
+        let manifest = manifest();
+        let assets = manifest["assets"].as_array().unwrap();
+        let css = assets
+            .iter()
+            .find(|a| a["path"].as_str() == Some("todomvc-app.css"))
+            .expect("manifest declares no todomvc-app.css asset");
+        let expected = format!("asset:{}", css["handle"].as_str().unwrap());
+        assert_eq!(
+            STYLESHEET, expected,
+            "STYLESHEET is stale against manifest.json"
+        );
     }
 }

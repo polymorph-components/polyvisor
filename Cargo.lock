@@ -2195,7 +2195,7 @@ dependencies = [
 [[package]]
 name = "stream-dom-dioxus"
 version = "0.1.0"
-source = "git+https://github.com/polymorph-components/polymorph-stream-dom?rev=197492374936b3b4ce5af55f2bac50fa6b551597#197492374936b3b4ce5af55f2bac50fa6b551597"
+source = "git+https://github.com/polymorph-components/polymorph-stream-dom?rev=e35dc357137a3563aa891662a626b3310a7078c4#e35dc357137a3563aa891662a626b3310a7078c4"
 dependencies = [
  "dioxus-core",
  "dioxus-core-types",
@@ -2208,7 +2208,7 @@ dependencies = [
 [[package]]
 name = "stream-dom-guest"
 version = "0.1.0"
-source = "git+https://github.com/polymorph-components/polymorph-stream-dom?rev=197492374936b3b4ce5af55f2bac50fa6b551597#197492374936b3b4ce5af55f2bac50fa6b551597"
+source = "git+https://github.com/polymorph-components/polymorph-stream-dom?rev=e35dc357137a3563aa891662a626b3310a7078c4#e35dc357137a3563aa891662a626b3310a7078c4"
 dependencies = [
  "prost",
  "rustc-hash",
@@ -2219,7 +2219,7 @@ dependencies = [
 [[package]]
 name = "stream-dom-proto"
 version = "0.1.0"
-source = "git+https://github.com/polymorph-components/polymorph-stream-dom?rev=197492374936b3b4ce5af55f2bac50fa6b551597#197492374936b3b4ce5af55f2bac50fa6b551597"
+source = "git+https://github.com/polymorph-components/polymorph-stream-dom?rev=e35dc357137a3563aa891662a626b3310a7078c4#e35dc357137a3563aa891662a626b3310a7078c4"
 dependencies = [
  "prost",
  "prost-build",
