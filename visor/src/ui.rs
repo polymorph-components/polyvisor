@@ -20,8 +20,10 @@
 
 use dioxus::prelude::*;
 
-use crate::kernel::{self, App, Entry, Event, Peer, SessionId, Status};
-use crate::state::{Action, Drawer, Gate, Rest, Tenant, Tier, boot_drawer, dial_target};
+use crate::kernel::{self, App, Entry, Event, Member, Peer, SessionId, Status};
+use crate::state::{
+    Action, Drawer, Gate, Phase, Rest, Tenant, Tier, boot_drawer, claim_code, grouped,
+};
 use crate::style::CSS;
 use crate::voice::{AppText, AppVoice, Voice, coarse_age};
 
@@ -133,6 +135,66 @@ async fn read_peers(mut peers: Signal<Vec<Peer>>, mut notice: Signal<Option<Noti
     }
 }
 
+/// The device group (internal.wit `sync.members`). Read alongside the
+/// peers, and again whenever a ceremony ends in `done` — an enrollment is
+/// precisely a change to this list, and it is the only thing on the screen
+/// that proves the pairing did anything.
+async fn read_members(mut members: Signal<Vec<Member>>, mut notice: Signal<Option<Notice>>) {
+    match kernel::members().await {
+        Ok(list) => members.set(list),
+        Err(e) => notice.set(Some(Notice::Plain(e))),
+    }
+}
+
+/// Where the ceremony stands, from the kernel.
+///
+/// `pairing.status` is the ceremony's one authority: the visor never
+/// advances the phase on its own guess about what a button did, because
+/// half the transitions belong to the *other* device. This read happens
+/// after every act, on every "Refresh", and on the press that opens
+/// Settings; the kernel's `events.pairing-changed` covers the rest.
+async fn read_pairing(
+    pairing_phase: Signal<Phase>,
+    members: Signal<Vec<Member>>,
+    notice: Signal<Option<Notice>>,
+) {
+    match kernel::pairing_status().await {
+        Ok(next) => apply_phase(next, pairing_phase, members, notice).await,
+        Err(e) => {
+            let mut notice = notice;
+            notice.set(Some(Notice::Plain(e)))
+        }
+    }
+}
+
+/// Put a phase on screen, whichever of the two paths it arrived by (a read
+/// after an act, or the kernel's push).
+///
+/// Two things hang off the transition rather than off the rendering. The
+/// equality guard is the first: `Signal::set` marks the scope dirty
+/// whether or not the value moved, and both paths deliver the same phase
+/// routinely. The `done` announcement is the second — it belongs to the
+/// *moment* the group changed, and the guard is what keeps it from being
+/// said again on every later read that still says `done`.
+async fn apply_phase(
+    next: Phase,
+    mut pairing_phase: Signal<Phase>,
+    members: Signal<Vec<Member>>,
+    mut notice: Signal<Option<Notice>>,
+) {
+    if *pairing_phase.read() == next {
+        return;
+    }
+    let paired = next == Phase::Done;
+    pairing_phase.set(next);
+    if paired {
+        // Framework voice, in the strip's context line: the ceremony is
+        // over and the drawer may well be shut by the time it lands.
+        notice.set(Some(Notice::Plain("device paired".into())));
+        read_members(members, notice).await;
+    }
+}
+
 #[component]
 pub(crate) fn Visor() -> Element {
     let mut drawer = use_signal(Drawer::default);
@@ -142,6 +204,8 @@ pub(crate) fn Visor() -> Element {
     let mut session = use_signal(|| None::<(SessionId, App)>);
     let mut notice = use_signal(|| None::<Notice>);
     let peers = use_signal(Vec::<Peer>::new);
+    let members = use_signal(Vec::<Member>::new);
+    let pairing_phase = use_signal(Phase::default);
 
     // Two orderings, both between a spawned read and a user's write. They
     // are `CopyValue` rather than `Signal` on purpose: a generation is
@@ -196,17 +260,28 @@ pub(crate) fn Visor() -> Element {
     // for (`apps.close` emits nothing), so it always has something to say.
     use_future(move || async move {
         loop {
-            let Event::SessionEnded(ended, reason) = kernel::next_event().await;
-            let current = session.read().as_ref().map(|(id, app)| (*id, app.clone()));
-            if let Some((id, app)) = current
-                && id == ended
-            {
-                let _ = kernel::close_frame(id).await;
-                session.set(None);
-                notice.set(Some(Notice::Ended {
-                    app: app.title,
-                    reason,
-                }));
+            match kernel::next_event().await {
+                Event::SessionEnded(ended, reason) => {
+                    let current = session.read().as_ref().map(|(id, app)| (*id, app.clone()));
+                    if let Some((id, app)) = current
+                        && id == ended
+                    {
+                        let _ = kernel::close_frame(id).await;
+                        session.set(None);
+                        notice.set(Some(Notice::Ended {
+                            app: app.title,
+                            reason,
+                        }));
+                    }
+                }
+                // The other device acted: a peer that confirmed, an offer
+                // that expired, an enrollment that landed. Nothing else
+                // could bring those to the screen — there is no timer here
+                // and `pairing.status` may not park (internal.wit
+                // `event-source`).
+                Event::PairingChanged(next) => {
+                    apply_phase(next, pairing_phase, members, notice).await;
+                }
             }
         }
     });
@@ -282,14 +357,25 @@ pub(crate) fn Visor() -> Element {
     // until the spawned bind completes, so first paint has none. Both are
     // read by the press that shows the tenant, exactly as "Other devices"
     // is for the index. A press that *closes* Settings reads nothing.
+    // Everything the Devices section shows is only ever as fresh as its
+    // last read, and there is no timer in this world to make it otherwise.
+    // So one refresh, used by three things: the press that opens Settings,
+    // the section's own "Refresh" button, and every pairing act (each of
+    // which is a phase change the kernel is the authority on).
+    let refresh_devices = use_callback(move |()| {
+        spawn(async move {
+            read_status(status, notice, status_gate).await;
+            read_peers(peers, notice).await;
+            read_members(members, notice).await;
+            read_pairing(pairing_phase, members, notice).await;
+        });
+    });
+
     let show_settings = use_callback(move |t: Tenant| {
         let next = drawer().reduce(Action::Toggle(t));
         set_drawer(next);
         if next == Drawer::Open(Tenant::Settings) {
-            spawn(async move {
-                read_status(status, notice, status_gate).await;
-                read_peers(peers, notice).await;
-            });
+            refresh_devices.call(());
         }
     });
 
@@ -316,10 +402,6 @@ pub(crate) fn Visor() -> Element {
             }
             read_identity(status, apps, notice, status_gate).await;
         });
-    });
-
-    let on_dialed = use_callback(move |()| {
-        spawn(async move { read_peers(peers, notice).await });
     });
 
     let live = session.read().as_ref().map(|(id, app)| (*id, app.clone()));
@@ -503,10 +585,12 @@ pub(crate) fn Visor() -> Element {
                             KeepSheet { on_kept }
                         }
 
-                        SyncSheet {
+                        DevicesSection {
                             endpoint_id: endpoint_id.clone(),
+                            members: members.read().clone(),
                             peers: peers.read().clone(),
-                            on_dialed,
+                            phase: pairing_phase.read().clone(),
+                            on_refresh: refresh_devices,
                         }
 
                         div { class: "sheet",
@@ -777,30 +861,60 @@ fn KeepSheet(on_kept: EventHandler<bool>) -> Element {
     }
 }
 
-/// Manual sync: this device's endpoint id to read off, a box to paste
-/// another one into, and the peers dialed so far.
+/// Devices: this device's group, the pairing ceremony, and the peers
+/// dialed so far.
 ///
 /// Deliberately spare — this chrome is slated for a redesign, and the
-/// milestone's claim is convergence, not a device manager. Two shapes here
-/// are decisions rather than omissions:
+/// milestone's claim is a group that pairs and converges, not a device
+/// manager. Three shapes here are decisions rather than omissions:
 ///
-/// * The endpoint id is **selectable, not copyable**. The visor's world
-///   (internal.wit `world visor`) grants no clipboard capability, and the
-///   trusted pixels are exactly the wrong place to acquire one on a whim,
-///   so the id is rendered for selection and the copy is the browser's own.
+/// * Endpoint ids and pairing codes are **selectable, not copyable**. The
+///   visor's world (internal.wit `world visor`) grants no clipboard
+///   capability, and the trusted pixels are exactly the wrong place to
+///   acquire one on a whim, so both are rendered for selection and the
+///   copy is the browser's own.
+/// * There is no box to paste a stranger's endpoint id into any more.
+///   Membership is the sync policy (internal.wit `sync`: "a non-member is
+///   refused with `refused`"), so the only dial that can succeed is a dial
+///   to a member — which is a button on that member's row.
 /// * Every peer's `state` is the kernel's framework voice, rendered as it
-///   arrived (internal.wit `sync.peer`). The visor invents no row of its
-///   own after a dial: `sync.peers` is the whole account.
+///   arrived (internal.wit `sync.peer`), and so is every pairing failure.
+///   The visor invents neither.
+///
+/// Voices: a petname is the user's own word and is rendered in the user
+/// voice; codes, the six digits, and every sentence about them are the
+/// framework's. Nothing here is ever app voice — no publisher string
+/// reaches this sheet at all.
 #[component]
-fn SyncSheet(endpoint_id: String, peers: Vec<Peer>, on_dialed: EventHandler<()>) -> Element {
+fn DevicesSection(
+    endpoint_id: String,
+    members: Vec<Member>,
+    peers: Vec<Peer>,
+    phase: Phase,
+    on_refresh: EventHandler<()>,
+) -> Element {
+    // Read once per render, so every row's age is relative to the same now.
+    let now = kernel::now_ms();
+    let empty_group = members.is_empty();
+    let mut adding = use_signal(|| false);
     let mut typed = use_signal(String::new);
     let mut error = use_signal(|| None::<String>);
-    let mine = endpoint_id.clone();
+
+    // Every act is the same shape: call the kernel, show its refusal if it
+    // refused, and re-read — because what the ceremony is doing now is the
+    // kernel's answer, never this button's assumption about it.
+    let mut acted = move |result: Result<(), String>| {
+        match result {
+            Ok(()) => error.set(None),
+            Err(e) => error.set(Some(e)),
+        }
+        on_refresh.call(());
+    };
 
     rsx! {
         div { class: "sheet",
             div { class: "sheet-head",
-                span { class: "{Voice::Framework.class()}", "Sync" }
+                span { class: "{Voice::Framework.class()}", "Devices" }
             }
             div { class: "sync-self",
                 span { class: "{Voice::Framework.class()}", "endpoint" }
@@ -811,47 +925,158 @@ fn SyncSheet(endpoint_id: String, peers: Vec<Peer>, on_dialed: EventHandler<()>)
                     // is the bind, which is spawned and lands after first
                     // paint — hence a verb, not an absence: this device
                     // will have an endpoint, it does not have one yet.
-                    // Opening Settings re-reads `device.status`, so the
-                    // next press is what replaces this.
                     span { class: "{Voice::Framework.class()} placeholder", "binding…" }
                 } else {
                     span { id: "visor-endpoint-id", class: "endpoint-id", "{endpoint_id}" }
                 }
             }
-            label {
-                span { class: "{Voice::Framework.class()}", "peer endpoint id" }
-                input {
-                    r#type: "text",
-                    value: "{typed}",
-                    oninput: move |e| typed.set(e.value()),
+
+            // The group. A device with no group yet is a group of one, so
+            // this list is never empty once the kernel answers — an empty
+            // one means it has not answered, and says so rather than
+            // implying this device belongs to nothing.
+            for member in members {
+                div { key: "{member.endpoint_id}", class: "member-row",
+                    div { class: "member-row-name",
+                        if member.petname.is_empty() {
+                            // No petname: the id is what this device is
+                            // called, and it is shown in the one shape ids
+                            // are ever shown in.
+                            span { class: "endpoint-id", "{member.endpoint_id}" }
+                        } else {
+                            span { class: "{Voice::User.class()}", "{member.petname}" }
+                        }
+                    }
+                    if member.me {
+                        span { class: "{Voice::Framework.class()}", "this device" }
+                    }
+                    span { class: "{Voice::Framework.class()}",
+                        "enrolled {coarse_age(now, member.enrolled)} ago"
+                    }
+                    if !member.me {
+                        button {
+                            onclick: move |_| {
+                                let id = member.endpoint_id.clone();
+                                async move { acted(kernel::connect(id).await) }
+                            },
+                            "Connect"
+                        }
+                    }
                 }
             }
-            button {
-                onclick: move |_| {
-                    let mine = mine.clone();
-                    async move {
-                        let Some(id) = dial_target(&typed(), &mine) else {
-                            error.set(Some("paste another device's endpoint id".into()));
-                            return;
-                        };
-                        match kernel::connect(id).await {
-                            Ok(()) => {
-                                error.set(None);
-                                typed.set(String::new());
-                                on_dialed.call(());
+            if empty_group {
+                span { class: "{Voice::Framework.class()} placeholder", "reading the group…" }
+            }
+
+            // The ceremony. One phase on screen at a time, and the two ways
+            // to start one are offered only when none is running.
+            match phase.clone() {
+                Phase::Idle | Phase::Done | Phase::Failed(_) => rsx! {
+                    if let Phase::Failed(why) = phase.clone() {
+                        div { class: "{Voice::Framework.class()} sheet-error", "{why}" }
+                        button {
+                            // Dismissing is `cancel`, not a local forget:
+                            // the kernel owns the phase, and a visor that
+                            // hid a failure it had not cleared would show
+                            // it again on the next read.
+                            //
+                            // CONTRACT: internal.wit `pairing.cancel` is
+                            // "either side, at any point"; whether it
+                            // returns a failed ceremony to `idle` is not
+                            // spelled out. If the kernel leaves it failed,
+                            // the message comes back — which is honest.
+                            onclick: move |_| async move { acted(kernel::pairing_cancel().await) },
+                            "Dismiss"
+                        }
+                    }
+                    if phase == Phase::Done {
+                        div { class: "{Voice::Framework.class()}", "device paired" }
+                    }
+                    if adding() {
+                        label {
+                            span { class: "{Voice::Framework.class()}", "the code the other device shows" }
+                            input {
+                                r#type: "text",
+                                value: "{typed}",
+                                oninput: move |e| typed.set(e.value()),
                             }
-                            Err(e) => error.set(Some(e)),
+                        }
+                        button {
+                            onclick: move |_| async move {
+                                let Some(code) = claim_code(&typed()) else {
+                                    error.set(Some("type the code the other device is showing".into()));
+                                    return;
+                                };
+                                typed.set(String::new());
+                                adding.set(false);
+                                acted(kernel::pairing_claim(code).await);
+                            },
+                            "Claim"
+                        }
+                    } else {
+                        button { onclick: move |_| adding.set(true), "Add a device" }
+                        button {
+                            onclick: move |_| async move { acted(kernel::pairing_offer().await) },
+                            "Pair this device with another"
                         }
                     }
                 },
-                "Connect"
+
+                Phase::Offering(code) => rsx! {
+                    div { class: "{Voice::Framework.class()}", "type this on the other device" }
+                    // Groups of four, monospace, selectable: 79 characters
+                    // read across from one screen to another.
+                    div { id: "visor-pairing-code", class: "pairing-code", "{grouped(&code)}" }
+                    div { class: "{Voice::Framework.class()}", "waiting for the other device…" }
+                    button {
+                        onclick: move |_| async move { acted(kernel::pairing_cancel().await) },
+                        "Cancel"
+                    }
+                },
+
+                Phase::Claiming => rsx! {
+                    div { class: "{Voice::Framework.class()}", "reaching the other device…" }
+                    button {
+                        onclick: move |_| async move { acted(kernel::pairing_cancel().await) },
+                        "Cancel"
+                    }
+                },
+
+                Phase::AwaitingConfirm(sas) => rsx! {
+                    // The whole security of the ceremony is a person
+                    // comparing these six digits with the six on the other
+                    // screen, so they are the largest thing in the drawer.
+                    div { id: "visor-pairing-sas", class: "pairing-sas", "{sas}" }
+                    div { class: "{Voice::Framework.class()}",
+                        "does the other device show the same number?"
+                    }
+                    button {
+                        onclick: move |_| async move { acted(kernel::pairing_confirm().await) },
+                        "Yes, pair"
+                    }
+                    button {
+                        onclick: move |_| async move { acted(kernel::pairing_cancel().await) },
+                        "No"
+                    }
+                },
+
+                Phase::AwaitingPeer => rsx! {
+                    div { class: "{Voice::Framework.class()}",
+                        "waiting for the other device to confirm"
+                    }
+                    button {
+                        onclick: move |_| async move { acted(kernel::pairing_cancel().await) },
+                        "Cancel"
+                    }
+                },
             }
-            // The honest sentence. Pairing — who may connect, and what they
-            // may read — is M3b (internal.wit `interface sync`), and until
-            // it exists a dial hands over everything.
-            div { class: "{Voice::Framework.class()}",
-                "a connected device is trusted with everything on this one; pairing comes later"
-            }
+
+            // Nothing on this screen refreshes on its own: the visor holds
+            // no state and its world has no timer. The kernel pushes
+            // `pairing-changed`, but a peer's state and the group are read,
+            // so this is the press that reads them.
+            button { onclick: move |_| on_refresh.call(()), "Refresh" }
+
             for peer in peers {
                 div { key: "{peer.endpoint_id}", class: "peer-row",
                     span { class: "endpoint-id", "{peer.endpoint_id}" }

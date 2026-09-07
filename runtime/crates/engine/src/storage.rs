@@ -36,12 +36,24 @@ use subduction_runtime::storage::{FetchedItems, Storage};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub apps: Vec<AppState>,
+    /// The user-system document and its tree. `#[serde(default)]` because
+    /// checkpoints written before the group existed have no such field, and
+    /// a device must still boot from one.
+    #[serde(default)]
+    pub us: Option<TreeState>,
 }
 
 /// One app's document and the tree behind it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppState {
     pub app: String,
+    #[serde(flatten)]
+    pub state: TreeState,
+}
+
+/// One document and the sedimentree items backing it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeState {
     /// `automerge::Automerge::save` bytes.
     pub doc: Vec<u8>,
     pub commits: Vec<Item>,
@@ -126,29 +138,45 @@ impl SnapshotStorage {
         }
     }
 
+    /// Drop every item of `tree`. The engine's answer to adopting another
+    /// device's user-system document: the group-of-one document this device
+    /// was carrying is discarded, and its commits must go with it — left in
+    /// place they would be absorbed back into the adopted document (a
+    /// different automerge lineage) and pushed to the group on the first
+    /// sync.
+    pub fn forget_tree(&self, tree: SedimentreeId) {
+        let _removed = self.trees.borrow_mut().remove(&tree);
+    }
+
     /// The whole store, keyed by the app ids the caller supplies alongside
     /// each tree and its saved document.
     pub fn snapshot(
         &self,
         apps: impl Iterator<Item = (String, SedimentreeId, Vec<u8>)>,
+        us: Option<(SedimentreeId, Vec<u8>)>,
     ) -> Snapshot {
-        let trees = self.trees.borrow();
         Snapshot {
             apps: apps
-                .map(|(app, tree, doc)| {
-                    let stored = trees.get(&tree);
-                    AppState {
-                        app,
-                        doc,
-                        commits: stored
-                            .map(|t| items(t.commits.values()))
-                            .unwrap_or_default(),
-                        fragments: stored
-                            .map(|t| items(t.fragments.values()))
-                            .unwrap_or_default(),
-                    }
+                .map(|(app, tree, doc)| AppState {
+                    app,
+                    state: self.tree_state(tree, doc),
                 })
                 .collect(),
+            us: us.map(|(tree, doc)| self.tree_state(tree, doc)),
+        }
+    }
+
+    fn tree_state(&self, tree: SedimentreeId, doc: Vec<u8>) -> TreeState {
+        let trees = self.trees.borrow();
+        let stored = trees.get(&tree);
+        TreeState {
+            doc,
+            commits: stored
+                .map(|t| items(t.commits.values()))
+                .unwrap_or_default(),
+            fragments: stored
+                .map(|t| items(t.fragments.values()))
+                .unwrap_or_default(),
         }
     }
 }

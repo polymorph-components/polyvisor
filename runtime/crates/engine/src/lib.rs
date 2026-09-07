@@ -19,8 +19,11 @@ use std::rc::Rc;
 
 mod clock;
 mod doc;
+mod document;
+mod policy;
 mod storage;
 mod transport;
+mod us;
 
 pub use clock::EngineClock;
 pub use doc::{TaskSnapshot, TodoItem};
@@ -28,10 +31,13 @@ pub use ed25519_dalek::VerifyingKey;
 pub use storage::Snapshot;
 pub use subduction_protocol::peer_id::PeerId;
 pub use transport::{DynTransport, EngineTransport};
+pub use us::{Member, us_tree};
 
 use clock::ClockAdapter;
 use doc::AppDoc;
+use policy::{GroupPolicy, Members};
 use storage::SnapshotStorage;
+use us::UsDoc;
 
 use ed25519_dalek::SigningKey;
 use future_form::Local;
@@ -44,7 +50,6 @@ use subduction_protocol::{
 };
 use subduction_runtime::{
     driver::{Driver, connection::Connection, handle::Handle},
-    memory::policy::AllowAll,
     transport::Transport,
 };
 
@@ -87,12 +92,9 @@ pub fn tasks_tree(app: &str) -> SedimentreeId {
     SedimentreeId::new(hasher.finalize().into())
 }
 
-/// Allow-all storage authorization.
-///
-/// M3a has no pairing: a dialed peer is trusted with everything and the visor
-/// says so (internal.wit `sync`). M3b replaces this with the keyhive pull/read
-/// gate (docs/design.md "Sync engine", `Policy` row).
-type Policy = AllowAll;
+/// Storage authorization: the device group, as the user-system document
+/// records it (see [`policy::GroupPolicy`]).
+type Policy = GroupPolicy;
 
 /// One device's sync engine.
 ///
@@ -102,12 +104,22 @@ type Policy = AllowAll;
 /// [`EngineTransport`].
 pub struct Engine<T: Transport<Local> + 'static> {
     seed: [u8; 32],
+    /// Only for the enrollment stamp this device writes for itself; the
+    /// driver has its own adapter over the same clock.
+    clock: Rc<dyn EngineClock>,
     peer: PeerId,
     handle: Handle<T>,
     storage: Rc<SnapshotStorage>,
     spawn: Spawner,
     /// One automerge document per app id, keyed by app id.
     apps: RefCell<BTreeMap<String, AppDoc>>,
+    /// The user-system document — this device's group. `None` until it is
+    /// opened, which [`Engine::open_us`] does on the first touch and on
+    /// every `connect`.
+    us: RefCell<Option<UsDoc>>,
+    /// The member keys, mirrored out of the user-system document so the
+    /// policy can read them without borrowing it.
+    members: Members,
     /// Every live authenticated connection, so a tree first touched after a
     /// peer was dialed still gets subscribed on it. Entries are removed when
     /// the driver reports the connection closed (see [`Engine::pump_events`]).
@@ -123,8 +135,15 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     ///
     /// `storage_state` restores a snapshot taken by [`Engine::snapshot`]; its
     /// seed is ignored in favour of `seed`, which is the kernel's record.
+    /// `entropy` is 32 bytes drawn fresh at every start, and it must be
+    /// fresh: it seeds the node's handshake nonces, and subduction's peers
+    /// keep a nonce cache that reads a repeat as a replay. A device whose
+    /// node entropy came from its (stable) signing seed alone therefore
+    /// produced the *same* first handshake nonce after every reboot, and the
+    /// peer it had talked to before rejected its first reconnect.
     pub fn new(
         seed: [u8; 32],
+        entropy: [u8; 32],
         clock: Rc<dyn EngineClock>,
         spawn: Spawner,
         storage_state: Option<Snapshot>,
@@ -138,38 +157,59 @@ impl<T: Transport<Local> + 'static> Engine<T> {
 
         let mut apps = BTreeMap::new();
         let mut hydrate = Vec::new();
+        let mut us: Option<UsDoc> = None;
         if let Some(state) = storage_state {
             for app in state.apps {
                 let tree = tasks_tree(&app.app);
-                storage.restore(tree, app.commits, app.fragments);
+                storage.restore(tree, app.state.commits, app.state.fragments);
                 hydrate.push(tree);
-                let mut doc = AppDoc::restore(&app.app, tree, &app.doc, seed);
+                let mut doc = AppDoc::restore(&app.app, tree, &app.state.doc, seed);
                 // The document and its tree are checkpointed together, but a
                 // crash between a commit landing in storage and the document
                 // being saved leaves the tree ahead; absorb closes that gap.
                 let _absorbed = doc.absorb(&storage);
-                apps.insert(app.app.clone(), doc);
+                let _replaced = apps.insert(app.app.clone(), doc);
+            }
+            if let Some(state) = state.us {
+                let tree = us_tree();
+                storage.restore(tree, state.commits, state.fragments);
+                hydrate.push(tree);
+                let mut doc = UsDoc::load(&state.doc, seed);
+                let _absorbed = doc.absorb(&storage);
+                us = Some(doc);
             }
         }
+        // The policy reads this on every remote storage operation, so it is
+        // populated before the driver exists rather than after: a restored
+        // device is in its group from its first turn.
+        let members: Members = Rc::new(RefCell::new(
+            us.as_ref()
+                .map(|doc| doc.members().into_iter().map(|m| m.key).collect())
+                .unwrap_or_default(),
+        ));
 
         let (driver, handle) = Driver::new(
-            // The node's entropy is its own (fingerprint seeds for set
-            // reconciliation), and must not be the signing seed: domain
-            // separation costs one hash.
-            NodeConfig::new(peer, derive(b"polyvisor:node-entropy", &seed)),
-            ClockAdapter::new(clock),
+            // The node's entropy is its own — fingerprint seeds for set
+            // reconciliation, and the handshake nonces — so it is neither
+            // the signing seed (domain separation costs one hash) nor a
+            // function of it alone (see the `entropy` parameter).
+            NodeConfig::new(peer, mix(b"polyvisor:node-entropy", &seed, &entropy)),
+            ClockAdapter::new(Rc::clone(&clock)),
             MemorySigner::from_bytes(&seed),
             Rc::clone(&storage),
-            Policy::default(),
+            Policy::new(Rc::clone(&members)),
         );
 
         let engine = Engine {
             seed,
+            clock,
             peer,
             handle,
             storage,
             spawn,
             apps: RefCell::new(apps),
+            us: RefCell::new(us),
+            members,
             conns: RefCell::new(Vec::new()),
             pending_hydration: RefCell::new((!hydrate.is_empty()).then_some(hydrate)),
         };
@@ -230,6 +270,84 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         self.mutate(app, move |doc| doc.remove(&id)).await
     }
 
+    // -- the user-system document --------------------------------------------
+
+    /// This device's group, oldest enrollment first.
+    pub async fn members(&self) -> Result<Vec<Member>, String> {
+        self.open_us().await?;
+        Ok(self.with_us(UsDoc::members))
+    }
+
+    /// Write a member into the group. The adder's half of enrollment;
+    /// idempotent on the key.
+    pub async fn add_member(
+        &self,
+        key: [u8; 32],
+        petname: String,
+        enrolled: u64,
+    ) -> Result<(), String> {
+        self.us_mutate(move |doc| doc.add_member(key, petname, enrolled))
+            .await
+    }
+
+    /// The user-system document's bytes, for the adder to put in ENROLL.
+    pub async fn us_save(&self) -> Result<Vec<u8>, String> {
+        self.open_us().await?;
+        Ok(self.with_us(UsDoc::save))
+    }
+
+    /// **Replace** this device's user-system document with the one an adder
+    /// enrolled it into.
+    ///
+    /// Not a merge. A device that has never paired is its own group of one,
+    /// and that group is not a party to anything: the adder wrote this
+    /// device's membership into *its* document, and that document is now the
+    /// whole truth. Merging instead would keep the joiner's group-of-one
+    /// entry alive as a second `members` object (see `crate::us`) and hand
+    /// the group a member nobody enrolled.
+    ///
+    /// So the local tree goes with the local document: the group-of-one's
+    /// commits are removed from the driver and from storage before the new
+    /// document takes its place. Left behind they would be absorbed straight
+    /// back in on the next turn — and pushed to the group on the first sync.
+    pub async fn adopt_us(&self, bytes: &[u8], adder: [u8; 32]) -> Result<(), String> {
+        self.hydrate().await?;
+        // Parsed and checked *before* a byte of local state is touched: a
+        // document that does not open, or that does not hold both this
+        // device and the one that sent it, leaves this device exactly as it
+        // was — its own group of one, still able to try again.
+        let adopted = UsDoc::adopt(bytes, self.seed, self.verifying_key().to_bytes(), adder)?;
+        let tree = us_tree();
+        self.handle
+            .remove_tree(tree)
+            .await
+            .map_err(|e| e.to_string())?;
+        // The durability barrier `mutate` uses: `remove_tree` only queues a
+        // command, and the deletion must have run before the new document's
+        // items can arrive — otherwise the driver's delete lands on top of
+        // them.
+        let _heads = self
+            .handle
+            .tree_heads(tree)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.storage.forget_tree(tree);
+
+        *self.us.borrow_mut() = Some(adopted);
+        self.refresh_members();
+
+        // Resubscribe: `remove_tree` took the tree out of the driver's
+        // residency, and this device now wants every commit behind the
+        // document it just adopted.
+        let conns: Vec<_> = self.conns.borrow().clone();
+        for conn in conns {
+            conn.sync_tree(tree, true)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     // -- connections ---------------------------------------------------------
 
     /// Register `transport` as a connection, wait for the handshake, and
@@ -245,6 +363,10 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         expected_peer: Option<VerifyingKey>,
     ) -> Result<PeerId, String> {
         self.hydrate().await?;
+        // Before `trees()`: the group is the one document every device of a
+        // user syncs unconditionally, so a connection subscribes to it even
+        // on a device whose apps have never been opened.
+        self.open_us().await?;
         let audience = expected_peer.map(|key| Audience::known(PeerId::from(key)));
         let (pending, read_loop) = self
             .handle
@@ -332,9 +454,15 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
         let apps = self.apps.borrow();
+        let us = self
+            .us
+            .borrow()
+            .as_ref()
+            .map(|doc| (doc.tree(), doc.save()));
         self.storage.snapshot(
             apps.iter()
                 .map(|(app, doc)| (app.clone(), doc.tree(), doc.save())),
+            us,
         )
     }
 
@@ -349,7 +477,115 @@ impl<T: Transport<Local> + 'static> Engine<T> {
 
     /// Every tree this device holds a document for.
     fn trees(&self) -> Vec<SedimentreeId> {
-        self.apps.borrow().values().map(AppDoc::tree).collect()
+        let mut trees: Vec<SedimentreeId> = self.apps.borrow().values().map(AppDoc::tree).collect();
+        if self.us.borrow().is_some() {
+            trees.push(us_tree());
+        }
+        trees
+    }
+
+    /// Make sure this device holds a user-system document, and that every
+    /// live peer is subscribed to its tree. The `open_app` shape, for the
+    /// one document that is not per-app.
+    async fn open_us(&self) -> Result<(), String> {
+        self.hydrate().await?;
+        if self.us.borrow().is_some() {
+            return Ok(());
+        }
+        let tree = us_tree();
+        {
+            let mut doc = UsDoc::empty(self.seed);
+            let _absorbed = doc.absorb(&self.storage);
+            *self.us.borrow_mut() = Some(doc);
+        }
+        self.refresh_members();
+        let conns: Vec<_> = self.conns.borrow().clone();
+        for conn in conns {
+            conn.sync_tree(tree, true)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        // A device is in its own group, and that holds from the moment the
+        // document exists rather than from whenever some other task got a
+        // turn. Every path to the document comes through here, so there is
+        // no window in which this device's own membership check — or a
+        // peer's — reads a group of nobody.
+        //
+        // The petname is empty and stays the kernel's to fill in for its own
+        // row: it changes when the user renames the device, and a value
+        // copied in here would be the one it had at first boot.
+        if self.with_us(|doc| doc.members().is_empty()) {
+            let key = self.verifying_key().to_bytes();
+            let enrolled = self.clock.now_ms();
+            let commit = {
+                let mut cell = self.us.borrow_mut();
+                let doc = cell
+                    .as_mut()
+                    .ok_or_else(|| "this device has no group document".to_string())?;
+                doc.add_member(key, String::new(), enrolled)?;
+                doc.last_local_commit()
+            };
+            self.refresh_members();
+            self.push_us_commit(commit).await?;
+        }
+        Ok(())
+    }
+
+    /// Carry a user-system change into its tree, and wait for the driver to
+    /// have persisted it (the barrier [`Engine::mutate`] documents).
+    async fn push_us_commit(
+        &self,
+        commit: Option<subduction_protocol::command::NewCommit>,
+    ) -> Result<(), String> {
+        let Some(commit) = commit else {
+            return Ok(());
+        };
+        self.handle
+            .add_commits(us_tree(), vec![commit])
+            .await
+            .map_err(|e| e.to_string())?;
+        let _heads = self
+            .handle
+            .tree_heads(us_tree())
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Read the user-system document. Empty-document defaults rather than an
+    /// error: every caller runs [`Engine::open_us`] first, and a `None` here
+    /// would mean a re-entrant call caught the cell mid-replacement.
+    fn with_us<R: Default>(&self, f: impl FnOnce(&UsDoc) -> R) -> R {
+        self.us.borrow().as_ref().map(f).unwrap_or_default()
+    }
+
+    /// Run `change` against the user-system document and carry the resulting
+    /// automerge change into its tree. [`Engine::mutate`]'s twin; the two do
+    /// not share code because the app path is keyed by app id and this one
+    /// has exactly one document.
+    async fn us_mutate<R>(
+        &self,
+        change: impl FnOnce(&mut UsDoc) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.open_us().await?;
+        let (answer, commit) = {
+            let mut cell = self.us.borrow_mut();
+            let doc = cell
+                .as_mut()
+                .ok_or_else(|| "this device has no group document".to_string())?;
+            let answer = change(doc)?;
+            (answer, doc.last_local_commit())
+        };
+        self.refresh_members();
+        self.push_us_commit(commit).await?;
+        Ok(answer)
+    }
+
+    /// Mirror the document's members into the set the policy reads.
+    fn refresh_members(&self) {
+        let keys = self.with_us(|doc| doc.members().into_iter().map(|m| m.key).collect());
+        *self.members.borrow_mut() = keys;
     }
 
     /// Hand a restored snapshot's trees to the driver, once. Idempotent: the
@@ -447,6 +683,18 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     /// Apply every stored-but-unapplied change of `tree` to its document.
     /// Returns whether anything landed.
     fn absorb(&self, tree: SedimentreeId) -> bool {
+        if tree == us_tree() {
+            let landed = {
+                let mut cell = self.us.borrow_mut();
+                cell.as_mut().is_some_and(|doc| doc.absorb(&self.storage))
+            };
+            if landed {
+                // A remote change to the group is a change to who may
+                // connect at all: the policy's set moves with it.
+                self.refresh_members();
+            }
+            return landed;
+        }
         let mut apps = self.apps.borrow_mut();
         let Some(doc) = apps.values_mut().find(|doc| doc.tree() == tree) else {
             // A tree with no local document: this device has never opened
@@ -477,10 +725,12 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     }
 }
 
-/// A domain-separated 32 bytes from the device seed.
-fn derive(domain: &[u8], seed: &[u8; 32]) -> [u8; 32] {
+/// A domain-separated 32 bytes from the device seed and this run's
+/// randomness.
+fn mix(domain: &[u8], seed: &[u8; 32], entropy: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hasher.update(seed);
+    hasher.update(entropy);
     hasher.finalize().into()
 }

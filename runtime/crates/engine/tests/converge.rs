@@ -47,6 +47,23 @@ struct Device {
     closed: Rc<Cell<u64>>,
 }
 
+/// Node entropy for one start of one device: distinct per device and
+/// distinct per start, as the kernel's `Rng` would give it.
+fn entropy(seed: u8) -> [u8; 32] {
+    use std::cell::Cell as StdCell;
+    thread_local! {
+        static STARTS: StdCell<u8> = const { StdCell::new(0) };
+    }
+    let nth = STARTS.with(|n| {
+        n.set(n.get().wrapping_add(1));
+        n.get()
+    });
+    let mut bytes = [0u8; 32];
+    bytes[0] = seed;
+    bytes[1] = nth;
+    bytes
+}
+
 fn device(pool: &LocalPool, seed: u8, snapshot: Option<Snapshot>) -> Device {
     let spawner = pool.spawner();
     let spawn: Spawner = {
@@ -59,6 +76,11 @@ fn device(pool: &LocalPool, seed: u8, snapshot: Option<Snapshot>) -> Device {
     };
     let (engine, driver) = TestEngine::new(
         [seed; 32],
+        // A device's node entropy is drawn fresh at every start, so a
+        // restart is a *different* value with the same seed — which is the
+        // whole point of the parameter (`Engine::new`). `restarts` counts
+        // the times this seed has been brought up in one test.
+        entropy(seed),
         Rc::new(TestClock(Cell::new(0))),
         Rc::clone(&spawn),
         snapshot,
@@ -124,6 +146,17 @@ async fn yield_now() {
 /// Wire two engines together, outbound from `a`, and wait for both
 /// handshakes.
 async fn wire(a: &TestEngine, b: &TestEngine) {
+    // The engine syncs within its group and nowhere else (`GroupPolicy`), so
+    // the two devices are in one first — `a` enrolling `b` exactly as an
+    // adder does at the end of pairing, and `b` adopting the document rather
+    // than merging its own group of one into it.
+    a.add_member(b.verifying_key().to_bytes(), String::new(), 0)
+        .await
+        .unwrap();
+    b.adopt_us(&a.us_save().await.unwrap(), a.verifying_key().to_bytes())
+        .await
+        .unwrap();
+
     let (ta, tb) = MemoryTransport::pair();
     let b_key = b.verifying_key();
     let inbound = RefCell::new(None);
@@ -342,5 +375,92 @@ fn a_dead_connection_leaves_the_registry() {
             1,
             "and the caller was told once, so the kernel can close the row"
         );
+    });
+}
+
+/// One device's group, keyed and ordered as the document reports it.
+async fn members(engine: &TestEngine) -> Vec<(Vec<u8>, String, u64)> {
+    engine
+        .members()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| (m.key.to_vec(), m.petname, m.enrolled))
+        .collect()
+}
+
+#[test]
+fn the_group_a_joiner_adopts_is_the_group_the_adder_has() {
+    // Adoption is a replace, and what replaces the joiner's group of one has
+    // to be the adder's group exactly — not a merge of the two, and not a
+    // document that then drifts. The third enrollment proves the joiner is
+    // on the same lineage: it arrives over the tree, with nobody adopting
+    // anything.
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 20, None);
+    let b = device(&pool, 21, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+
+    pool.run_until(async move {
+        wire(&ea, &eb).await;
+        assert_eq!(members(&ea).await, members(&eb).await);
+        assert_eq!(members(&ea).await.len(), 2);
+
+        ea.add_member([9u8; 32], "the third".into(), 77)
+            .await
+            .unwrap();
+        let seen = until(|| async {
+            let group = members(&eb).await;
+            (group.len() == 3).then_some(group)
+        })
+        .await;
+        assert_eq!(seen, members(&ea).await);
+        assert!(
+            seen.iter().any(|(_, petname, _)| petname == "the third"),
+            "the petname the adder wrote travelled with the key: {seen:?}",
+        );
+    });
+}
+
+#[test]
+fn a_group_this_device_is_not_in_is_not_adopted() {
+    // ENROLL is checked before anything local is discarded. A document that
+    // does not open, or that does not hold both this device and the one that
+    // sent it, leaves the joiner with the group of one it started with —
+    // still able to show a fresh code and try again.
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 22, None);
+    let b = device(&pool, 23, None);
+    let c = device(&pool, 24, None);
+    let (ea, eb, ec) = (
+        Rc::clone(&a.engine),
+        Rc::clone(&b.engine),
+        Rc::clone(&c.engine),
+    );
+
+    pool.run_until(async move {
+        // A's group of one, which B was never enrolled into.
+        let orphan = ea.us_save().await.unwrap();
+        let adder = ea.verifying_key().to_bytes();
+        let why = eb.adopt_us(&orphan, adder).await.unwrap_err();
+        assert!(why.contains("this one is not in"), "{why}");
+
+        let why = eb
+            .adopt_us(b"not a document at all", adder)
+            .await
+            .unwrap_err();
+        assert!(why.contains("cannot read"), "{why}");
+
+        // B enrolled itself and A into a group A knows nothing about, then
+        // claims A sent it: A is not in it, so it is not the group B just
+        // compared six digits over.
+        ec.add_member(eb.verifying_key().to_bytes(), "b".into(), 1)
+            .await
+            .unwrap();
+        let stranger = ec.us_save().await.unwrap();
+        let why = eb.adopt_us(&stranger, adder).await.unwrap_err();
+        assert!(why.contains("not in itself"), "{why}");
+
+        assert_eq!(members(&eb).await.len(), 1, "B is still its own group");
     });
 }

@@ -16,6 +16,14 @@ use std::collections::VecDeque;
 pub enum Event {
     /// A session ended other than through `apps.close`, and why.
     SessionEnded(u32, String),
+    /// The pairing ceremony moved to this phase.
+    ///
+    /// Pushed on every transition, including the ones no export of ours
+    /// caused — a peer confirming, an offer expiring, an enrollment landing.
+    /// The visor has no timer and `pairing.status` may not park, so this is
+    /// the only way a transition the OTHER device drove reaches a screen
+    /// (internal.wit `events.pairing-changed`).
+    PairingChanged(crate::pairing::Phase),
 }
 
 #[derive(Default)]

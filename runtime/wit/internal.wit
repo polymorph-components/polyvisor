@@ -59,6 +59,28 @@ interface types {
         /// Framework voice, for the visor to show or log as-is.
         message: string,
     }
+
+    /// Where a pairing ceremony stands. Declared here rather than in
+    /// `pairing` because two interfaces need it — `pairing.status` answers
+    /// it and `events.event` pushes it — and the runtime world *exports*
+    /// `pairing`, so an interface that `use`d it would need it imported and
+    /// exported at once (`wasm-tools component wit` refuses exactly that).
+    /// `types` is the package's shared vocabulary; this is now part of it.
+    variant phase {
+        idle,
+        /// Joiner: showing the code.
+        offering(string),
+        /// Adder: dialing and claiming.
+        claiming,
+        /// Both: the SAS to compare; confirm or cancel.
+        awaiting-confirm(string),
+        /// Confirmed here, waiting for the other side.
+        awaiting-peer,
+        /// Enrolled (joiner) or enrolled the peer (adder).
+        done,
+        /// Framework voice.
+        failed(string),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -175,11 +197,11 @@ interface device {
     erase: async func() -> result<_, error>;
 }
 
-/// Peer sync, the manual form: dial another device by its endpoint id.
-/// The devices then run the subduction protocol over the connection and
-/// converge every tree both hold. Pairing (who may connect, what they may
-/// read) is the next milestone; for now a dialed peer is trusted with
-/// everything, and the visor says so.
+/// Peer sync. Connections are between devices of one user's group: a peer
+/// that authenticates as a non-member is disconnected after the handshake,
+/// and the kernel dials every member it knows at boot. Membership is the
+/// user-system document (`polyvisor:us`), itself synced like any tree, so
+/// an enrollment on one device reaches every other.
 interface sync {
     use types.{error};
 
@@ -189,8 +211,46 @@ interface sync {
         state: string,
     }
 
+    record member {
+        endpoint-id: string,
+        /// User voice; the petname the device was kept under, or "".
+        petname: string,
+        /// Epoch milliseconds.
+        enrolled: u64,
+        /// This device.
+        me: bool,
+    }
+
+    /// Dial a member by endpoint id (a non-member is refused with
+    /// `refused`); the boot-time reconnect uses the same path.
     connect: async func(endpoint-id: string) -> result<_, error>;
     peers: async func() -> result<list<peer>, error>;
+    /// The device group, this device included.
+    members: async func() -> result<list<member>, error>;
+}
+
+/// Device pairing: the ceremony that enrolls a device into the group.
+///
+/// The joining device shows a code (its endpoint id and a single-claim
+/// token, 120 s); a device already in the group types or scans it and
+/// dials. A commit-then-reveal exchange of nonces yields a six-digit SAS
+/// that both devices display and both users confirm in trusted pixels;
+/// only then does the adder enroll the joiner (writes it into the
+/// user-system document and syncs). No links: pairing is started
+/// interactively on both devices. A fresh device with no group is its own
+/// group of one; joining replaces that group with the adder's.
+interface pairing {
+    use types.{error, phase};
+
+    /// Joiner: mint an offer; returns the code. Replaces any open offer.
+    offer: async func() -> result<string, error>;
+    /// Adder: claim a code shown by another device.
+    claim: async func(code: string) -> result<_, error>;
+    /// Either side, after comparing the SAS.
+    confirm: async func() -> result<_, error>;
+    /// Either side, at any point; the other side sees `failed`.
+    cancel: async func() -> result<_, error>;
+    status: async func() -> result<phase, error>;
 }
 
 /// The device index: what a boot may show before any seal opens. Every
@@ -266,13 +326,24 @@ interface apps {
 /// Kernel-originated events, as the visor consumes them: a long poll the
 /// visor's glue serves from a per-tab queue.
 interface events {
-    use types.{session-id};
+    use types.{session-id, phase};
 
     variant event {
         /// A session ended other than through `apps.close`. The string is
         /// the reason, framework voice: the kernel or the glue composed it,
         /// so the visor renders it unplated and plates only the app title.
         session-ended(tuple<session-id, string>),
+        /// The pairing ceremony moved: the kernel emits this on every phase
+        /// transition, including the ones the visor did not cause (the peer
+        /// confirming, an offer expiring, the enrollment landing).
+        ///
+        /// The visor has no timer and `pairing.status` may not park
+        /// (polyengine#292 — see `event-source`), so a ceremony that
+        /// advances because the *other* device acted has no other way to
+        /// reach the screen. `status` remains the authority and the visor
+        /// re-reads it after every act of its own; this is the push that
+        /// makes waiting cost nothing.
+        pairing-changed(phase),
     }
 
     /// Resolves with the next event; parks while there is none.
@@ -378,6 +449,7 @@ world runtime {
     export lifecycle;
     export device;
     export sync;
+    export pairing;
     export store;
     export apps;
     export event-source;
@@ -390,6 +462,7 @@ world visor {
 
     import device;
     import sync;
+    import pairing;
     import store;
     import apps;
     import events;

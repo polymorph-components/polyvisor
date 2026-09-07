@@ -7,7 +7,7 @@
 //! boundary, so no publisher string can reach a render slot unplated.
 
 use crate::component::polyvisor::internal as api;
-use crate::state::{DeviceState, Rest, Tier};
+use crate::state::{DeviceState, Phase, Rest, Tier};
 use crate::voice::AppText;
 
 pub(crate) type SessionId = u32;
@@ -122,8 +122,12 @@ pub(crate) struct Peer {
 }
 
 /// Dial another device. Returning is not converging: the contract only
-/// promises the dial was accepted, so the sync section re-reads `peers`
+/// promises the dial was accepted, so the devices section re-reads `peers`
 /// afterwards rather than inventing a row of its own.
+///
+/// Only ever called with a member's endpoint id (internal.wit `sync`: "a
+/// non-member is refused with `refused`"), which is why there is no box to
+/// paste a stranger's id into any more.
 pub(crate) async fn connect(endpoint_id: String) -> Result<(), String> {
     api::sync::connect(endpoint_id).await.map_err(message)
 }
@@ -138,6 +142,74 @@ pub(crate) async fn peers() -> Result<Vec<Peer>, String> {
             state: p.state,
         })
         .collect())
+}
+
+/// One device of this user's group (internal.wit `sync.member`).
+///
+/// `petname` is the user's own word for that device and is rendered in the
+/// user voice; the endpoint id is what stands in for it when there is
+/// none, in the monospace the ids are always shown in. `enrolled` is epoch
+/// milliseconds, shown coarsely ([`crate::voice::coarse_age`]).
+#[derive(Clone, PartialEq)]
+pub(crate) struct Member {
+    pub(crate) endpoint_id: String,
+    pub(crate) petname: String,
+    pub(crate) enrolled: u64,
+    pub(crate) me: bool,
+}
+
+/// The device group, this device included.
+pub(crate) async fn members() -> Result<Vec<Member>, String> {
+    Ok(api::sync::members()
+        .await
+        .map_err(message)?
+        .into_iter()
+        .map(|m| Member {
+            endpoint_id: m.endpoint_id,
+            petname: m.petname,
+            enrolled: m.enrolled,
+            me: m.me,
+        })
+        .collect())
+}
+
+fn phase(p: api::types::Phase) -> Phase {
+    match p {
+        api::types::Phase::Idle => Phase::Idle,
+        api::types::Phase::Offering(code) => Phase::Offering(code),
+        api::types::Phase::Claiming => Phase::Claiming,
+        api::types::Phase::AwaitingConfirm(sas) => Phase::AwaitingConfirm(sas),
+        api::types::Phase::AwaitingPeer => Phase::AwaitingPeer,
+        api::types::Phase::Done => Phase::Done,
+        api::types::Phase::Failed(why) => Phase::Failed(why),
+    }
+}
+
+/// Joiner: mint an offer. The code it answers is dropped on purpose — the
+/// ceremony's one authority is `pairing.status`, and the visor reads it
+/// back rather than keeping a second copy that could disagree with the
+/// kernel about which offer is open.
+pub(crate) async fn pairing_offer() -> Result<(), String> {
+    api::pairing::offer().await.map(|_| ()).map_err(message)
+}
+
+/// Adder: claim the code the other device is showing.
+pub(crate) async fn pairing_claim(code: String) -> Result<(), String> {
+    api::pairing::claim(code).await.map_err(message)
+}
+
+/// Either side, after comparing the six digits.
+pub(crate) async fn pairing_confirm() -> Result<(), String> {
+    api::pairing::confirm().await.map_err(message)
+}
+
+/// Either side, at any point.
+pub(crate) async fn pairing_cancel() -> Result<(), String> {
+    api::pairing::cancel().await.map_err(message)
+}
+
+pub(crate) async fn pairing_status() -> Result<Phase, String> {
+    api::pairing::status().await.map_err(message).map(phase)
 }
 
 /// The device index: every device on this origin, petname and tier only.
@@ -242,6 +314,10 @@ pub(crate) fn now_ms() -> u64 {
 
 /// The next kernel event.
 pub(crate) enum Event {
+    /// The pairing ceremony moved (internal.wit `events.pairing-changed`).
+    /// The push exists because a ceremony advances when the *other* device
+    /// acts, and this world has no timer to notice that with.
+    PairingChanged(Phase),
     /// internal.wit's `events.session-ended` settles the voice: "the reason,
     /// framework voice: the kernel or the glue composed it, so the visor
     /// renders it unplated and plates only the app title". So the reason is
@@ -254,5 +330,6 @@ pub(crate) enum Event {
 pub(crate) async fn next_event() -> Event {
     match api::events::next().await {
         api::events::Event::SessionEnded((session, reason)) => Event::SessionEnded(session, reason),
+        api::events::Event::PairingChanged(p) => Event::PairingChanged(phase(p)),
     }
 }

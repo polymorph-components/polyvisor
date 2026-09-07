@@ -16,7 +16,10 @@
 use std::cell::{Cell, RefCell};
 
 use ed25519_dalek::SigningKey;
-use polyvisor_kernel::{Accepted, Bound, Dialed, EngineTransport, LocalFuture, Net, NetHandle};
+use polyvisor_kernel::{
+    Accepted, Bound, Dialed, EngineTransport, LocalFuture, Net, NetHandle, PAIRING_ALPN,
+    SUBDUCTION_ALPN,
+};
 
 // The generated bindings live where `wit_bindgen::generate!` was invoked.
 use crate::component::polymorph::iroh::endpoint::{
@@ -29,10 +32,14 @@ use crate::component::polymorph::webcrypto::signature::SigningKeyOptions;
 use crate::component::polymorph::webcrypto::{ed25519_sign, ed25519_verify};
 use crate::z32;
 
-/// This wire's ALPN. Versioned: a future framing change is a new ALPN, and
-/// a peer that speaks only the other one is refused at the handshake rather
-/// than after a frame it cannot parse.
-const ALPN: &[u8] = b"polyvisor/subduction/0";
+/// Both wires this endpoint serves, in the kernel's spelling
+/// (`polyvisor_kernel::{SUBDUCTION_ALPN, PAIRING_ALPN}`): subduction's
+/// frames, and pairing's ceremony. The endpoint announces both, and an
+/// accepted connection carries the one it negotiated back to the kernel,
+/// whose accept loop routes on it. The strings are the kernel's because the
+/// kernel is what decides which wire a dial belongs on; this file only
+/// spells them for `polymorph:iroh`, which takes ALPNs as bytes.
+const ALPNS: [&str; 2] = [SUBDUCTION_ALPN, PAIRING_ALPN];
 
 /// Largest frame either direction, matching `subduction_iroh`'s
 /// `MAX_FRAME_SIZE` (50 MiB). A peer that announces more is not sending a
@@ -90,6 +97,15 @@ impl Net for IrohNet {
             Ok((id, Box::new(endpoint) as Box<dyn NetHandle>))
         })
     }
+
+    /// An iroh endpoint id *is* the peer's Ed25519 public key, in iroh's
+    /// z-base-32 spelling — so this is that spelling and nothing else. No
+    /// endpoint is needed for it, which is the point of the seam: a device
+    /// whose bind failed still has a group to show, and every row in it is
+    /// recorded by key.
+    fn endpoint_id(&self, key: [u8; 32]) -> String {
+        z32::encode(&key)
+    }
 }
 
 /// Bind this device's endpoint.
@@ -129,7 +145,12 @@ async fn bind(seed: &[u8; 32], relay: &str) -> Result<(String, IrohEndpoint), St
         .map_err(|e| format!("this device's identity was refused: {e:?}"))?;
 
     let options = EndpointOptions::new(&identity);
-    options.add_alpn(ALPN);
+    // Both, before the bind: `accept` delivers only connections whose
+    // negotiated ALPN was announced here (iroh.wit `endpoint.accept`), so an
+    // ALPN missing from this list is a wire that silently never answers.
+    for alpn in ALPNS {
+        options.add_alpn(alpn.as_bytes());
+    }
     options.relay_url(relay);
     // The browser profile has no UDP, so `udp-bind-addr` stays unset and the
     // relay is the dial path. WebRTC would be the upgrade off it, but this
@@ -167,8 +188,12 @@ pub struct IrohEndpoint {
 }
 
 impl NetHandle for IrohEndpoint {
-    fn connect(&self, endpoint_id: String) -> LocalFuture<'_, Result<Dialed, String>> {
-        Box::pin(async move { self.dial(&endpoint_id).await })
+    fn connect(
+        &self,
+        endpoint_id: String,
+        alpn: String,
+    ) -> LocalFuture<'_, Result<Dialed, String>> {
+        Box::pin(async move { self.dial(&endpoint_id, &alpn).await })
     }
 
     fn accept(&self) -> LocalFuture<'_, Result<Accepted, String>> {
@@ -188,7 +213,7 @@ impl IrohEndpoint {
     /// IS that key, and the engine needs it to name who it believes it is
     /// dialing (`polyvisor_kernel::Dialed`). Decoding it here is the whole
     /// reason the kernel never has to know this spelling.
-    async fn dial(&self, endpoint_id: &str) -> Result<Dialed, String> {
+    async fn dial(&self, endpoint_id: &str, alpn: &str) -> Result<Dialed, String> {
         let bytes = z32::decode(endpoint_id.trim())?;
         if bytes.len() != 32 {
             // Said here rather than left to `invalid-argument`: the caller is
@@ -206,7 +231,7 @@ impl IrohEndpoint {
         };
         let connection = self
             .endpoint
-            .connect(addr, ALPN.to_vec())
+            .connect(addr, alpn.as_bytes().to_vec())
             .await
             .map_err(|e| format!("that device did not answer: {e:?}"))?;
         let (send, recv) = connection
@@ -216,10 +241,15 @@ impl IrohEndpoint {
         Ok((key, Box::new(IrohTransport::new(connection, send, recv))))
     }
 
-    /// The next connection dialed to this device.
+    /// The next connection dialed to this device, and which wire it is on.
     ///
-    /// Its ALPN is ours by construction — `accept` delivers only connections
-    /// whose negotiated ALPN was added to the options, and we added one.
+    /// The ALPN is one of [`ALPNS`] by construction — `accept` delivers only
+    /// connections whose negotiated ALPN was announced — but *which* one is
+    /// the whole question now that the endpoint serves two, so it is read off
+    /// the connection (iroh.wit:332) and handed to the kernel, whose accept
+    /// loop routes on it. An ALPN that is not valid UTF-8 cannot be one of
+    /// ours: it is reported as the connection being unusable rather than
+    /// lossily transliterated into a wire name that might match.
     async fn answer(&self) -> Result<Accepted, String> {
         let connection = self
             .endpoint
@@ -241,9 +271,12 @@ impl IrohEndpoint {
             .try_into()
             .map_err(|_| "a peer connected with a malformed endpoint id".to_string())?;
         let peer = z32::encode(&raw);
+        let alpn = String::from_utf8(connection.alpn())
+            .map_err(|_| "a peer connected on a wire this device does not serve".to_string())?;
         Ok((
             peer,
             key,
+            alpn,
             Box::new(IrohTransport::new(connection, send, recv)),
         ))
     }

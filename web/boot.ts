@@ -17,6 +17,7 @@ const I = {
   store: "polyvisor:internal/store@0.1.0",
   apps: "polyvisor:internal/apps@0.1.0",
   sync: "polyvisor:internal/sync@0.1.0",
+  pairing: "polyvisor:internal/pairing@0.1.0",
   events: "polyvisor:internal/events@0.1.0",
   shell: "polyvisor:internal/shell@0.1.0",
 } as const;
@@ -184,6 +185,7 @@ const kernel = proxyInterfaces(control, [
   I.store,
   I.apps,
   I.sync,
+  I.pairing,
   I.events,
 ]);
 const apps = kernel[I.apps] as {

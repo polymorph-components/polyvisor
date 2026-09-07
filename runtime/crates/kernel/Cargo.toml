@@ -10,6 +10,8 @@ publish.workspace = true
 # (docs/design.md "Delivery").
 [dependencies]
 aes-gcm.workspace = true
+blake3.workspace = true
+data-encoding.workspace = true
 polyvisor-engine = { path = "../engine" }
 futures.workspace = true
 subduction_protocol.workspace = true

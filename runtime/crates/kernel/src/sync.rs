@@ -1,10 +1,15 @@
 //! The sync half of the kernel: bringing the engine and the endpoint up,
 //! dialing peers by endpoint id, and the peer list `sync.peers` reports.
 //!
-//! internal.wit `sync`: "Pairing (who may connect, what they may read) is the
-//! next milestone; for now a dialed peer is trusted with everything, and the
-//! visor says so." So there is no gate here — every accepted connection is
-//! handed straight to the engine, whose policy is allow-all until M3b.
+//! Who may connect is the device group, and nothing else: `sync.connect`
+//! refuses an endpoint id that is not a member's, and an accepted subduction
+//! connection is disconnected the moment the handshake names a peer outside
+//! the group (internal.wit `sync`, `pairing`). The engine's storage policy is
+//! the same rule applied one layer down.
+//!
+//! The endpoint serves two wires, so the accept loop routes by ALPN:
+//! `polyvisor/subduction/0` is sync, `polyvisor/pairing/0` is the enrollment
+//! ceremony and is answered only while this device is showing a code.
 
 use std::rc::{Rc, Weak};
 
@@ -15,7 +20,22 @@ use polyvisor_engine::{
 };
 use subduction_protocol::event::Direction;
 
-use crate::{Clock, EngineTransport, Error, ErrorCode, Kernel, NetHandle, State, SyncEngine};
+use crate::{
+    Clock, EngineTransport, Error, ErrorCode, Kernel, NetHandle, PAIRING_ALPN, SUBDUCTION_ALPN,
+    State, SyncEngine,
+};
+
+/// `polyvisor:internal/sync.member`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub endpoint_id: String,
+    /// User voice; the petname the device was kept under, or "".
+    pub petname: String,
+    /// Epoch milliseconds.
+    pub enrolled: u64,
+    /// This device.
+    pub me: bool,
+}
 
 /// `polyvisor:internal/sync.peer`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +113,11 @@ impl Kernel {
             // Taken, not cloned: the engine is the authority from here on.
             (state.seed, state.engine_state.take())
         };
+        // Fresh at every start and deliberately *not* checkpointed: it seeds
+        // the node's handshake nonces, and a peer that saw the same nonce
+        // before reads the second one as a replay. See `Engine::new`.
+        let mut entropy = [0u8; 32];
+        self.seams.rng.fill(&mut entropy);
 
         let spawner: Spawner = {
             let spawn = Rc::clone(&self.seams.spawn);
@@ -100,6 +125,7 @@ impl Kernel {
         };
         let (engine, driver) = SyncEngine::new(
             seed,
+            entropy,
             Rc::new(ClockSeam(Rc::clone(&self.seams.clock))),
             Rc::clone(&spawner),
             restored,
@@ -139,9 +165,15 @@ impl Kernel {
             .spawn(Box::pin(bind_endpoint(Rc::clone(self), seed)));
     }
 
-    /// `sync.connect`: dial a device by its endpoint id.
+    /// `sync.connect`: dial a member by its endpoint id.
+    ///
+    /// A non-member is refused before anything is dialed. That is not
+    /// belt-and-braces over the post-handshake check: dialing a stranger at
+    /// all would announce this device to it, and the group is the whole of
+    /// who this device talks to (internal.wit `sync.connect`).
     pub async fn sync_connect(&self, endpoint_id: String) -> Result<(), Error> {
         self.open()?;
+        let endpoint_id = endpoint_id.trim().to_string();
         let endpoint = match self.endpoint.borrow().clone() {
             Some(endpoint) => endpoint,
             // The bind is a spawned task, so "no endpoint" is two different
@@ -159,8 +191,17 @@ impl Kernel {
             }
         };
         let engine = self.engine()?;
+        if !self.is_member_id(&endpoint_id).await? {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "that device is not a member of this device's group",
+            ));
+        }
 
-        let (key, transport) = match endpoint.connect(endpoint_id.clone()).await {
+        let (key, transport) = match endpoint
+            .connect(endpoint_id.clone(), SUBDUCTION_ALPN.to_string())
+            .await
+        {
             Ok(dialed) => dialed,
             Err(why) => {
                 // No row: nothing was ever reached, so there is no peer to
@@ -215,6 +256,62 @@ impl Kernel {
             .collect())
     }
 
+    /// `sync.members`: the device group, this device included.
+    pub async fn sync_members(&self) -> Result<Vec<Member>, Error> {
+        self.open()?;
+        let engine = self.engine()?;
+        let me = engine.verifying_key().to_bytes();
+        let members = engine
+            .members()
+            .await
+            .map_err(|why| Error::new(ErrorCode::Failed, why))?;
+        let mine = self.state.borrow().row.petname.clone();
+        Ok(members
+            .into_iter()
+            .map(|member| {
+                let is_me = member.key == me;
+                Member {
+                    endpoint_id: self.seams.net.endpoint_id(member.key),
+                    // This device's own row is named from the index, not from
+                    // the document: the petname is what the user last kept
+                    // this device under, and it changes without the group
+                    // being rewritten. Every other row is whatever the device
+                    // that enrolled it wrote.
+                    petname: if is_me { mine.clone() } else { member.petname },
+                    enrolled: member.enrolled,
+                    me: is_me,
+                }
+            })
+            .collect())
+    }
+
+    /// Whether `endpoint_id` spells a member's key.
+    ///
+    /// Compared in the id spelling rather than by decoding it: decoding is
+    /// the endpoint component's, and the kernel deliberately never learns
+    /// z-base-32 (see [`crate::Net::endpoint_id`]).
+    async fn is_member_id(&self, endpoint_id: &str) -> Result<bool, Error> {
+        Ok(self
+            .sync_members()
+            .await?
+            .iter()
+            .any(|member| member.endpoint_id == endpoint_id))
+    }
+
+    /// Whether `key` is in the group. The post-handshake check's half: the
+    /// handshake proves a key, so this is the comparison that decides whether
+    /// a connection may live.
+    pub(crate) async fn is_member_key(&self, key: [u8; 32]) -> bool {
+        let Ok(engine) = self.engine() else {
+            return false;
+        };
+        engine
+            .members()
+            .await
+            .map(|members| members.iter().any(|member| member.key == key))
+            .unwrap_or(false)
+    }
+
     /// This device's endpoint id, or `""` while sealed or unbound.
     pub(crate) fn endpoint_id(&self) -> String {
         if self.state() == State::Sealed {
@@ -258,6 +355,14 @@ impl Kernel {
             return;
         };
         for record in self.peers.borrow_mut().iter_mut() {
+            // A row that already says why it closed keeps its reason. This
+            // one is the generic follow-on — the engine reports every
+            // connection closed, including the ones this kernel dropped on
+            // purpose — and "the peer went away" over "not a member of this
+            // device's group" would lose the only answer the user can act on.
+            if matches!(record.state, PeerState::Closed(_)) {
+                continue;
+            }
             if &record.key == peer.as_bytes() {
                 record.state = PeerState::Closed("the peer went away".to_string());
             }
@@ -287,6 +392,15 @@ async fn bind_endpoint(kernel: Rc<Kernel>, seed: [u8; 32]) {
                 .seams
                 .spawn
                 .spawn(Box::pin(accept_loop(Rc::downgrade(&kernel), handle)));
+            // The group is the address book: a device that comes up dials
+            // every other device of its user, best effort. Errors are not
+            // fatal and not announced beyond the peer row `sync_connect`
+            // already closes — a device that is not on right now is the
+            // ordinary case.
+            kernel
+                .seams
+                .spawn
+                .spawn(Box::pin(reconnect(Rc::clone(&kernel))));
         }
         Err(why) => *kernel.bind_error.borrow_mut() = Some(why),
     }
@@ -308,16 +422,42 @@ async fn accept_loop(kernel: Weak<Kernel>, endpoint: Rc<dyn NetHandle>) {
         let Some(kernel) = kernel.upgrade() else {
             return;
         };
-        let Ok((endpoint_id, key, transport)) = accepted else {
+        let Ok((endpoint_id, key, alpn, transport)) = accepted else {
             return;
         };
-        kernel.note_peer(&endpoint_id, key, PeerState::Connecting);
-        kernel.seams.spawn.spawn(Box::pin(admit(
-            Rc::clone(&kernel),
-            endpoint_id,
-            key,
-            transport,
-        )));
+        match alpn.as_str() {
+            SUBDUCTION_ALPN => {
+                kernel.note_peer(&endpoint_id, key, PeerState::Connecting);
+                kernel.seams.spawn.spawn(Box::pin(admit(
+                    Rc::clone(&kernel),
+                    endpoint_id,
+                    key,
+                    transport,
+                )));
+            }
+            // Pairing is answered only while this device is showing a code,
+            // and never becomes a peer row: a pairing connection is not a
+            // sync connection and the device on it is not (yet) a member.
+            PAIRING_ALPN => {
+                if kernel.pairing_offering() {
+                    let spawn = Rc::clone(&kernel.seams.spawn);
+                    spawn.spawn(Box::pin(async move {
+                        kernel.pairing_join(endpoint_id, key, transport).await;
+                    }));
+                } else {
+                    kernel
+                        .seams
+                        .spawn
+                        .spawn(Box::pin(async move { transport.close().await }));
+                }
+            }
+            // An ALPN this device never advertised. The endpoint should not
+            // deliver one; if something does, it is not a wire we speak.
+            _ => kernel
+                .seams
+                .spawn
+                .spawn(Box::pin(async move { transport.close().await })),
+        }
     }
 }
 
@@ -341,7 +481,18 @@ async fn admit(
         .connect(DynTransport::new(transport), Direction::Inbound, None)
         .await
     {
-        Ok(peer) if peer.as_bytes() == &key => PeerState::Connected,
+        Ok(peer) if peer.as_bytes() == &key => {
+            // The group gate, and it is here rather than before the
+            // handshake because the handshake is what *proves* the key. A
+            // device that is not one of this user's syncs nothing: it is
+            // disconnected with the reason the visor shows.
+            if kernel.is_member_key(key).await {
+                PeerState::Connected
+            } else {
+                engine.disconnect(peer).await;
+                PeerState::Closed("not a member of this device's group".to_string())
+            }
+        }
         Ok(peer) => {
             engine.disconnect(peer).await;
             PeerState::Closed("it authenticated as a different device".to_string())
@@ -349,4 +500,19 @@ async fn admit(
         Err(why) => PeerState::Closed(why),
     };
     kernel.note_peer(&endpoint_id, key, state);
+}
+
+/// Dial every member but this device, once, at bind.
+async fn reconnect(kernel: Rc<Kernel>) {
+    let Ok(members) = kernel.sync_members().await else {
+        return;
+    };
+    for member in members {
+        if member.me {
+            continue;
+        }
+        // The failure is already recorded as that peer's row state, and a
+        // device that is not on right now is the ordinary case.
+        let _dialed = kernel.sync_connect(member.endpoint_id).await;
+    }
 }
