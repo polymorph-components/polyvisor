@@ -310,8 +310,15 @@ native tests, so browser gates are mandatory for every visor change.
   component, manual dial by endpoint id, two devices converging over a
   local relay in e2e. Policy is allow-all until M3b. Wire compatibility
   with native subduction peers is a gate only when a native peer exists
-  (headless, parked). **M3b** keyhive policy, user-system doc, pairing,
-  the device group.
+  (headless, parked). **M3b** pairing (code + commit/reveal SAS + dual
+  confirm), the device group as the user-system document, sync policy =
+  group membership, reconnect at boot. **M3c** keyhive/BeeKEM: envelope
+  encryption of every tree so relays and stores hold ciphertext only;
+  the group's keyhive membership derived from the user-system document.
+  Sequenced after M3b because device↔device sync already runs inside
+  authenticated QUIC — content encryption is what untrusted *storage*
+  (M4) needs, and building the group first gives keyhive a membership
+  to key.
 - **M4** storage: per-destination egress, S3 provider component, bucket
   sync, picker, provider panel in a frame.
 - **M5** passkey PRF rung, recovery kits, Drive provider.
