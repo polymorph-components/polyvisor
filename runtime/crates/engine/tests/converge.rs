@@ -11,8 +11,8 @@ use future_form::Local;
 use futures::future::LocalBoxFuture;
 use futures::{executor::LocalPool, task::LocalSpawnExt as _};
 use polyvisor_engine::{
-    AppState, Engine, EngineClock, EngineEvent, EngineNotify, LocalFuture, Snapshot, Spawner,
-    StoreItem, TaskSnapshot, TreeState, tasks_tree,
+    AppState, Engine, EngineClock, EngineEvent, EngineNotify, ItemKind, LocalFuture, Snapshot,
+    Spawner, StoreItem, TaskSnapshot, TreeState, tasks_tree,
 };
 use subduction_protocol::event::Direction;
 use subduction_runtime::memory::transport::MemoryTransport;
@@ -1101,6 +1101,304 @@ fn parents_delivered_after_their_child_still_open() {
             titles(&seen),
             vec!["first", "second", "third"],
             "the parents delivered after their child were never opened"
+        );
+    });
+}
+
+// -- compaction ---------------------------------------------------------------
+
+/// Add tasks until automerge closes a level-1 fragment over the app tree.
+///
+/// A commit heads a level-1 fragment when its hash starts with a zero byte,
+/// so this is a geometric draw with p = 1/256 — about 256 mutations, and the
+/// bound is generous rather than tuned. It is also the only way to reach the
+/// case: the threshold is the hash's own, there is no knob, and picking
+/// titles to hit it would be testing a rigged document.
+async fn until_compacted(engine: &TestEngine) -> usize {
+    until_fragments(engine, 1).await
+}
+
+/// Add tasks until the tree holds `n` fragments — a chain of ranges, each
+/// one's boundary the previous one's head.
+async fn until_fragments(engine: &TestEngine, n: usize) -> usize {
+    for written in 1..=8192 {
+        let _id = engine
+            .tasks_add(APP, format!("task {written}"))
+            .await
+            .unwrap();
+        if engine
+            .items()
+            .iter()
+            .filter(|item| item.kind == ItemKind::Fragment)
+            .count()
+            >= n
+        {
+            return written;
+        }
+    }
+    panic!("8192 commits without {n} level-1 fragments; the depth metric moved");
+}
+
+fn kinds(engine: &TestEngine) -> (usize, usize) {
+    let items = engine.items();
+    let fragments = items
+        .iter()
+        .filter(|item| item.kind == ItemKind::Fragment)
+        .count();
+    (items.len() - fragments, fragments)
+}
+
+#[test]
+fn a_closed_range_becomes_one_fragment_and_the_commits_it_carries_go() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 20, None);
+    let ea = Rc::clone(&a.engine);
+
+    pool.run_until(async move {
+        let before = ea.entry_points().await.unwrap();
+        // A few of the commits this run will later prune, captured as the
+        // durable store would have them.
+        let _first = ea.tasks_add(APP, "first".into()).await.unwrap();
+        let early = ea.items();
+        let written = 1 + until_compacted(&ea).await;
+        let (_commits, fragments) = kinds(&ea);
+        assert_eq!(fragments, 1, "one level-1 fragment closed");
+        assert!(
+            !ea.read_not_held().is_empty(),
+            "the pruned commits are still changes this device has read",
+        );
+        // Every task is still readable — the document keeps its full history
+        // whatever the tree drops.
+        assert_eq!(ea.tasks_items(APP).await.unwrap().items.len(), written);
+
+        // The app tree is now the fragment and whatever was written after it
+        // closed; the loose commits left in `items()` belong to the group and
+        // keyhive trees, which have no fragment.
+        // The saving, stated as the inequality it is rather than as a
+        // predicted number: how many commits one fragment covers is the hash
+        // draw's business.
+        let tree = *tasks_tree(APP).as_bytes();
+        let loose = ea
+            .items()
+            .iter()
+            .filter(|item| item.tree == tree && item.kind == ItemKind::Commit)
+            .count();
+        assert!(
+            loose < written,
+            "the fragment's range left storage: {loose} loose commits from {written} mutations",
+        );
+
+        // The store deletes nothing, so those objects are still under their
+        // names and the next pull will hand them straight back. A commit this
+        // device pruned on purpose is not news, and reinstating it would undo
+        // the compaction on every pass, forever.
+        assert!(
+            !ea.ingest_items(early).await.unwrap(),
+            "commits pruned by compaction are not reinstalled from the store",
+        );
+
+        let after = ea.entry_points().await.unwrap();
+        eprintln!("PROBE2 written={written} before={before} after={after}");
+        assert!(
+            after <= before + 1,
+            "compaction adds at most the fragment's own entry point: {before} -> {after}",
+        );
+    });
+}
+
+#[test]
+fn a_compacted_tree_restores_from_its_checkpoint() {
+    // The checkpoint carries the fragment and the loose commits that survived
+    // it, and nothing else — the covered range's bytes are gone. Restoring
+    // has to read the whole list back out of the bundle.
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 21, None);
+    let ea = Rc::clone(&a.engine);
+    let (snapshot, written) = pool.run_until(async move {
+        let written = until_compacted(&ea).await;
+        (ea.snapshot().await.unwrap(), written)
+    });
+
+    let mut pool = LocalPool::new();
+    let restored = device(&pool, 21, Some(snapshot));
+    let engine = Rc::clone(&restored.engine);
+    let items = pool.run_until(async move { engine.tasks_items(APP).await.unwrap() });
+    assert_eq!(
+        items.items.len(),
+        written,
+        "the restored device reads the compacted range",
+    );
+}
+
+#[test]
+fn a_device_enrolled_after_compaction_reads_the_range_from_the_fragment() {
+    // The read-back case, at range scale. B is enrolled *after* the fragment
+    // was sealed, so it never held the epoch keys the covered commits were
+    // written under — and their envelopes are not in A's storage to send any
+    // more. What reaches B is the fragment: one envelope, sealed under the
+    // group's current epoch, carrying every change of the range.
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 22, None);
+    let b = device(&pool, 23, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+
+    pool.run_until(async move {
+        let written = until_compacted(&ea).await;
+        assert!(eb.tasks_items(APP).await.unwrap().items.is_empty());
+        wire(&ea, &eb).await;
+
+        let seen = until(|| async {
+            let items = eb.tasks_items(APP).await.unwrap();
+            (items.items.len() == written).then_some(items)
+        })
+        .await;
+        assert_eq!(seen.items.len(), written);
+        assert!(
+            eb.items()
+                .iter()
+                .any(|item| item.kind == ItemKind::Fragment),
+            "B holds the fragment itself, not the range unrolled into commits",
+        );
+    });
+}
+
+#[test]
+fn two_devices_build_the_same_fragment_from_the_same_history() {
+    // Identity is head + boundary (`design/sedimentree.md`), and both are
+    // functions of the change graph — so a second device holding the same
+    // history builds a fragment the first one's tree already has, and adding
+    // it is a no-op locally. On the store the two land under one name and the
+    // last write wins; what makes that harmless is asserted here, that they
+    // are the same fragment.
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 24, None);
+    let ea = Rc::clone(&a.engine);
+    let snapshot = pool.run_until(async move {
+        let _written = until_compacted(&ea).await;
+        ea.snapshot().await.unwrap()
+    });
+    let mine = snapshot
+        .apps
+        .iter()
+        .find(|app| app.app == APP)
+        .expect("the app was compacted")
+        .state
+        .fragments
+        .clone();
+    assert_eq!(mine.len(), 1);
+
+    // The same document, on a device whose tree has never seen the fragment:
+    // the commits it covered are gone with it, which is exactly the state a
+    // rebuild has to work from.
+    let mut naked = snapshot.clone();
+    for app in &mut naked.apps {
+        app.state.fragments.clear();
+    }
+
+    let mut pool = LocalPool::new();
+    let rebuilt = device(&pool, 24, Some(naked));
+    let engine = Rc::clone(&rebuilt.engine);
+    let items = pool.run_until(async move {
+        // Compaction runs on a mutation; one more task is the cheapest
+        // trigger, and a level-0 commit on top does not move the level-1
+        // fragment underneath it.
+        let _id = engine.tasks_add(APP, "one more".into()).await.unwrap();
+        engine.items()
+    });
+    let theirs: Vec<&StoreItem> = items
+        .iter()
+        .filter(|item| item.kind == ItemKind::Fragment)
+        .collect();
+    assert_eq!(theirs.len(), 1, "the same one fragment, rebuilt");
+    let signed =
+        subduction_crypto::signed::Signed::<sedimentree_core::fragment::Fragment>::try_decode(
+            &mine[0].signed,
+        )
+        .expect("the checkpoint's fragment decodes");
+    let original = signed
+        .try_decode_trusted_payload()
+        .expect("and its payload does");
+    let signed =
+        subduction_crypto::signed::Signed::<sedimentree_core::fragment::Fragment>::try_decode(
+            &theirs[0].signed,
+        )
+        .expect("the rebuilt fragment decodes");
+    let rebuilt = signed
+        .try_decode_trusted_payload()
+        .expect("and its payload does");
+    assert_eq!(original.head(), rebuilt.head(), "same head");
+    assert_eq!(
+        original.boundary(),
+        rebuilt.boundary(),
+        "same boundary — the two are the same fragment",
+    );
+    // The envelopes are byte-identical here, which the design did not
+    // predict: keyhive derives the content key and nonce from the group's
+    // epoch key and the payload rather than from fresh randomness, so two
+    // devices of one group seal one plaintext to one ciphertext. It is not
+    // asserted, because nothing in the contract promises it — the sealed
+    // plaintext is a `bincode` `Envelope` whose `ancestors` is a `HashMap`,
+    // and two devices with the same ancestors in a different iteration order
+    // would produce different bytes. Both cases are fine, and for the same
+    // reason: the two objects decrypt to the same range.
+}
+
+#[test]
+fn a_chain_of_fragments_is_still_one_entry_point() {
+    // Two ranges, so the second fragment's boundary is the first fragment's
+    // head — the case where naming the boundary *commit* would embed nothing
+    // (its envelope was pruned with its range and its key left the frontier
+    // when the first fragment covered it). What the second envelope names is
+    // the first *fragment*, and that is what a joiner walks down.
+    //
+    // So: the head set does not grow one entry per fragment, and a device
+    // enrolled after both were sealed reads both ranges from the single
+    // entry point it was handed.
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 25, None);
+    let b = device(&pool, 26, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+
+    pool.run_until(async move {
+        // One entry point before any compaction: a linear history is one
+        // readable branch (docs/design.md §"Read-back and partitions").
+        let _first = ea.tasks_add(APP, "first".into()).await.unwrap();
+        let before = ea.entry_points().await.unwrap();
+        let written = 1 + until_fragments(&ea, 2).await;
+        let (_commits, fragments) = kinds(&ea);
+        assert_eq!(fragments, 2, "two fragments, chained");
+        // The loop stops on the commit that closed the second fragment, so
+        // that commit is a member and its key is covered: what is left is the
+        // fragment chain's single newest entry. Naming the boundary *commit*
+        // rather than the boundary *fragment* would leave the first fragment
+        // a head too, and this reads 2.
+        let after = ea.entry_points().await.unwrap();
+        assert!(
+            after <= before,
+            "the head set does not grow one entry per fragment: {before} -> {after}",
+        );
+
+        // B is enrolled now — after both ranges were sealed, under epochs it
+        // never held.
+        assert!(eb.tasks_items(APP).await.unwrap().items.is_empty());
+        wire(&ea, &eb).await;
+        let seen = until(|| async {
+            let items = eb.tasks_items(APP).await.unwrap();
+            (items.items.len() == written).then_some(items)
+        })
+        .await;
+        assert_eq!(
+            seen.items.len(),
+            written,
+            "the joiner read both ranges, walking from the newest fragment down",
+        );
+        assert_eq!(
+            eb.items()
+                .iter()
+                .filter(|item| item.kind == ItemKind::Fragment)
+                .count(),
+            2,
+            "and holds them as fragments, not as the ranges unrolled",
         );
     });
 }

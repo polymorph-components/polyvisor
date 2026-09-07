@@ -11,6 +11,13 @@ publish.workspace = true
 [dependencies]
 automerge.workspace = true
 beekem.workspace = true
+# The fragment envelope's content reference (`crate::fragment_cref`): a
+# fragment and the commit that heads it are two different plaintexts and must
+# not share one reference in the vault, so the reference is a domain-separated
+# hash of the pair that names the fragment. BLAKE3 rather than a second use of
+# `sha2` because it is already in the workspace for the pairing transcript, and
+# a content reference is not a place to introduce a second hash's habits.
+blake3.workspace = true
 bincode.workspace = true
 ed25519-dalek.workspace = true
 future_form.workspace = true
@@ -29,3 +36,7 @@ subduction_runtime.workspace = true
 [dev-dependencies]
 futures = { workspace = true, features = ["executor"] }
 future_form.workspace = true
+# The fragment-identity test decodes a checkpoint's `Signed<Fragment>` to
+# compare head and boundary; both are already dependencies of the library.
+sedimentree_core.workspace = true
+subduction_crypto.workspace = true

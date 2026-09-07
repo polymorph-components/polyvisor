@@ -527,6 +527,20 @@ impl Vault {
         );
     }
 
+    /// A fragment this device built and stored carries `members` bodily: its
+    /// bundle *is* their changes. So their individual keys stop being entry
+    /// points, exactly as a parent's does when a child's envelope names it —
+    /// the carrier here is the fragment rather than a descendant commit.
+    ///
+    /// Only sound because the fragment's own envelope is a head (its
+    /// [`Vault::confirm`] runs first) and names the *boundary* keys, so the
+    /// walk below the fragment continues where the members' envelopes would
+    /// have taken it. Called with the members and nothing else: a commit
+    /// outside the fragment is not carried by it and must keep its key.
+    pub fn cover(&self, members: impl Iterator<Item = Cref>) {
+        self.advance(&[], members);
+    }
+
     /// Open as many of `blobs` as this device can.
     ///
     /// Two mechanisms, in order. The document's current epoch key opens

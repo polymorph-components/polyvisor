@@ -130,9 +130,16 @@ impl Document {
     /// Returns whether anything landed. The plaintext path, for the
     /// user-system document — an app document's blobs are envelopes, and the
     /// engine decrypts them before calling [`Document::apply`].
+    ///
+    /// Fragments first. Automerge buffers a change whose dependencies are
+    /// missing either way, so the order is not required for correctness; it
+    /// is cheaper, because a bundle that lands first makes every loose commit
+    /// it carries a no-op instead of a second decode.
     pub fn absorb(&mut self, storage: &SnapshotStorage) -> bool {
+        let bundles = self.unapplied_fragments(storage);
+        let fragments = self.apply_bundles(bundles);
         let items = self.unapplied(storage);
-        self.apply(items).landed
+        fragments.landed | self.apply(items).landed
     }
 
     /// The commits this document has already applied. The vault needs them to
@@ -151,6 +158,86 @@ impl Document {
             .into_iter()
             .filter(|(id, _)| !self.applied.contains(id))
             .collect()
+    }
+
+    /// The stored *fragment* blobs of this tree the document has not applied.
+    ///
+    /// A fragment is skipped once its head is applied, and that is exact
+    /// rather than approximate: the head is a member of the fragment
+    /// (automerge `change_graph.rs:1661` — `members` is the section the head
+    /// closes), so a document that has the head has been through this bundle.
+    pub fn unapplied_fragments(&self, storage: &SnapshotStorage) -> Vec<(CommitId, Vec<u8>)> {
+        storage
+            .fragment_blobs(self.tree)
+            .into_iter()
+            .filter(|(head, _)| !self.applied.contains(head))
+            .collect()
+    }
+
+    /// Apply fragment payloads: automerge *bundles*, each carrying every
+    /// change of one commit range.
+    ///
+    /// `load_incremental` takes a bundle exactly as it takes a save or a
+    /// single change (automerge `change_graph.rs:1454`,
+    /// `bundle_fragments_roundtrips_through_load_incremental`), and it
+    /// buffers what it cannot yet apply, so a bundle whose boundary has not
+    /// arrived is not an error.
+    ///
+    /// The `applied` set is re-read from the document afterwards rather than
+    /// predicted from the fragment's member list: the document is the
+    /// authority on what it holds, and a bundle names hundreds of changes
+    /// whose ids we would otherwise be copying out of an envelope nobody has
+    /// checked.
+    pub fn apply_bundles(&mut self, bundles: Vec<(CommitId, Vec<u8>)>) -> Absorbed {
+        let mut loaded = false;
+        for (head, bytes) in bundles {
+            if self.applied.contains(&head) {
+                continue;
+            }
+            if self.doc.load_incremental(&bytes).is_ok() {
+                loaded = true;
+            }
+        }
+        if !loaded {
+            return Absorbed::default();
+        }
+        let mut content = false;
+        let mut landed = false;
+        for change in self.doc.get_changes(&[]) {
+            let id = CommitId::new(change.hash().0);
+            if self.applied.insert(id) {
+                landed = true;
+                // As in `apply`: an empty change is a merge anchor and is not
+                // a reason to author another.
+                content |= !change.is_empty();
+            }
+        }
+        Absorbed { landed, content }
+    }
+
+    /// The fragments automerge would draw over this document's history at
+    /// level 1 and deeper, oldest first.
+    ///
+    /// `#[doc(hidden)]`/EXPERIMENTAL upstream, and used anyway: automerge's
+    /// fragments are co-designed with sedimentree — `ChangeHash`'s
+    /// `fragment_level` counts leading zero *bytes* (automerge
+    /// `types.rs:680`), which is `CountLeadingZeroBytes` exactly
+    /// (sedimentree_core `depth.rs`) — so this is the one decomposition whose
+    /// heads, boundaries and checkpoints line up with the tree the sync
+    /// engine already keeps. Reimplementing it over `get_changes` would be a
+    /// second implementation of the same partition, free to disagree.
+    /// Ink & Switch's own adapter does exactly this mapping
+    /// (`legacy/automerge_subduction_ingest/src/main.rs`, `ingest_automerge`).
+    pub fn fragments(&self) -> Vec<automerge::Fragment> {
+        self.doc.fragments(1..)
+    }
+
+    /// The bundle bytes for each fragment, in the order given. Separate from
+    /// [`Document::fragments`] because bundling re-encodes every member of
+    /// every fragment handed to it, and the caller drops all but the ones it
+    /// has not already stored.
+    pub fn bundle(&self, fragments: Vec<automerge::Fragment>) -> Vec<Vec<u8>> {
+        self.doc.bundle_fragments(fragments)
     }
 
     /// Whether the document has more than one head — concurrent branches that

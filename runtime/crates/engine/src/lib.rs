@@ -12,7 +12,7 @@
 //! `RefCell`.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -29,7 +29,7 @@ mod vault;
 pub use clock::EngineClock;
 pub use doc::{TaskSnapshot, TodoItem};
 pub use ed25519_dalek::VerifyingKey;
-pub use storage::{AppState, Item, Snapshot, StoreItem, TreeState};
+pub use storage::{AppState, Item, ItemKind, Snapshot, StoreItem, TreeState};
 pub use subduction_protocol::peer_id::PeerId;
 pub use transport::{DynTransport, EngineTransport};
 pub use us::{Member, us_tree};
@@ -600,6 +600,59 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         self.storage.all_items()
     }
 
+    /// Every `(tree, commit)` this device has *read* but does not hold as an
+    /// item: a change that is in the document and whose loose commit is not
+    /// in the tree, because a fragment carries it instead.
+    ///
+    /// The store deletes nothing, so a commit pruned by compaction is still
+    /// there under its name, and to a pull that only knows [`Engine::items`]
+    /// it looks exactly like a commit some other device wrote and this one
+    /// has never seen — so every pass would fetch the whole compacted range
+    /// back, and `accept` would refuse it, forever. This is the set that
+    /// closes that loop.
+    ///
+    /// Derived from the documents rather than remembered: the document *is*
+    /// the record of what this device has read, rebuilt from its own changes
+    /// on every load (`crate::document::Document`), and it answers for a
+    /// range that arrived as somebody else's fragment just as well as for one
+    /// this device compacted itself.
+    #[must_use]
+    pub fn read_not_held(&self) -> Vec<([u8; 32], [u8; 32])> {
+        let mut found = Vec::new();
+        let mut walk = |tree: SedimentreeId, applied: std::collections::BTreeSet<CommitId>| {
+            for id in applied {
+                if !self.storage.holds(tree, id) {
+                    found.push((*tree.as_bytes(), *id.as_bytes()));
+                }
+            }
+        };
+        for doc in self.apps.borrow().values() {
+            walk(doc.tree(), doc.applied_ids());
+        }
+        if let Some(doc) = self.us.borrow().as_ref() {
+            walk(us_tree(), doc.applied_ids());
+        }
+        found
+    }
+
+    /// Whether `tree`'s document has already applied `commit` — the change is
+    /// in this device's history whether or not the commit that carried it is
+    /// still an item. See [`Engine::read_not_held`].
+    fn read(&self, tree: SedimentreeId, commit: CommitId) -> bool {
+        if tree == us_tree() {
+            return self
+                .us
+                .borrow()
+                .as_ref()
+                .is_some_and(|doc| doc.applied_ids().contains(&commit));
+        }
+        self.apps
+            .borrow()
+            .values()
+            .find(|doc| doc.tree() == tree)
+            .is_some_and(|doc| doc.applied_ids().contains(&commit))
+    }
+
     /// Install items a *store* handed back — another device of this group
     /// pushed them — and apply whatever they unlock. Answers whether anything
     /// was new, which is the kernel's cue to checkpoint.
@@ -617,7 +670,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     pub async fn ingest_items(&self, items: Vec<StoreItem>) -> Result<bool, String> {
         self.hydrate().await?;
         self.open_us().await?;
-        let mut by_tree: BTreeMap<SedimentreeId, Vec<Item>> = BTreeMap::new();
+        let mut by_tree: BTreeMap<SedimentreeId, (Vec<Item>, Vec<Item>)> = BTreeMap::new();
         let mut fresh = false;
         // The member keys, read once: the store is not a peer, so nothing
         // else has checked who authored what it hands back.
@@ -625,13 +678,15 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         for item in items {
             if self.accept(&members, &item) {
                 fresh = true;
-                by_tree
-                    .entry(SedimentreeId::new(item.tree))
-                    .or_default()
-                    .push(Item {
-                        signed: item.signed,
-                        blob: item.blob,
-                    });
+                let bucket = by_tree.entry(SedimentreeId::new(item.tree)).or_default();
+                let landing = match item.kind {
+                    ItemKind::Commit => &mut bucket.0,
+                    ItemKind::Fragment => &mut bucket.1,
+                };
+                landing.push(Item {
+                    signed: item.signed,
+                    blob: item.blob,
+                });
             }
         }
         if !fresh {
@@ -648,8 +703,8 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             }
         });
         for tree in order {
-            let items = by_tree.remove(&tree).unwrap_or_default();
-            self.storage.restore(tree, items, Vec::new());
+            let (commits, fragments) = by_tree.remove(&tree).unwrap_or_default();
+            self.storage.restore(tree, commits, fragments);
             let (commits, fragments) = self.storage.metadata(tree);
             // Merged, not replaced: `Command::HydrateTree` adds each commit to
             // the resident tree (subduction_protocol/src/core_machine.rs:284),
@@ -685,34 +740,57 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     ///   before the app trees, so that pass is usually the same one);
     /// - the **tree** the object was filed under is the one the commit names
     ///   (`sedimentree_id`), so an item cannot be moved between trees;
-    /// - the **commit id** the object was named by is the commit's own head;
-    /// - the **blob** is the one the commit committed to (`BlobMeta`), so the
+    /// - the **item id** the object was named by is the item's own head;
+    /// - the **blob** is the one the item committed to (`BlobMeta`), so the
     ///   signed metadata and the bytes beside it cannot be from two different
     ///   items.
+    ///
+    /// The same five checks for a fragment, against `Signed<Fragment>` — a
+    /// fragment is a signed sedimentree item like any other, and a store that
+    /// could hand back an unverified one would be handing back a whole range
+    /// of forged history in a single object rather than one commit's worth.
     ///
     /// A failing item is skipped, not fatal: the folder is the user's own
     /// Drive and one bad object must not stop the rest from landing.
     fn accept(&self, members: &std::collections::BTreeSet<[u8; 32]>, item: &StoreItem) -> bool {
-        let Ok(signed) = subduction_crypto::signed::Signed::<
-            sedimentree_core::loose_commit::LooseCommit,
-        >::try_decode(&item.signed) else {
-            return false;
-        };
-        let Ok(verified) = signed.try_verify() else {
-            return false;
-        };
-        if !members.contains(&verified.issuer().to_bytes()) {
-            return false;
-        }
-        let payload = verified.payload();
         let tree = SedimentreeId::new(item.tree);
-        if payload.sedimentree_id() != tree
-            || payload.head() != CommitId::new(item.commit)
-            || *payload.blob_meta() != BlobMeta::new(&Blob::new(item.blob.clone()))
-        {
-            return false;
+        let id = CommitId::new(item.commit);
+        let blob = BlobMeta::new(&Blob::new(item.blob.clone()));
+        match item.kind {
+            ItemKind::Commit => {
+                let Some(payload) =
+                    verify::<sedimentree_core::loose_commit::LooseCommit>(&item.signed, members)
+                else {
+                    return false;
+                };
+                if payload.sedimentree_id() != tree
+                    || payload.head() != id
+                    || *payload.blob_meta() != blob
+                {
+                    return false;
+                }
+                // Held is not the whole of "not news": a commit whose change
+                // the document has already applied was read and then pruned
+                // (or never held loose at all, having arrived inside somebody
+                // else's fragment). Reinstating it would undo the compaction
+                // on every pass. See [`Engine::read_not_held`].
+                !self.storage.holds(tree, id) && !self.read(tree, id)
+            }
+            ItemKind::Fragment => {
+                let Some(payload) =
+                    verify::<sedimentree_core::fragment::Fragment>(&item.signed, members)
+                else {
+                    return false;
+                };
+                if payload.sedimentree_id() != tree
+                    || payload.head() != id
+                    || payload.summary().blob_meta() != blob
+                {
+                    return false;
+                }
+                !self.storage.holds_fragment(tree, id)
+            }
         }
-        !self.storage.holds(tree, payload.head())
     }
 
     // -- checkpointing -------------------------------------------------------
@@ -956,6 +1034,12 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         };
         self.refresh_members();
         self.push_us_commit(commit).await?;
+        // The group document is compacted on the same terms as an app's:
+        // `Engine::absorb` covers what arrives, this covers what is written
+        // here. A group that reaches a fragment's worth of membership edits
+        // is not a case anyone expects, and the cost of saying so is one
+        // walk of a very short change graph.
+        let _compacted = self.compact(us_tree()).await;
         Ok(answer)
     }
 
@@ -1035,8 +1119,164 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             // Encrypting may have advanced the document's CGKA epoch, and the
             // update op is what lets the other devices follow.
             self.publish_keyhive().await?;
+            // One commit in ~256 closes a level-1 fragment (its hash starts
+            // with a zero byte); the other 255 times this walks the change
+            // graph, finds every fragment already held, and stops before
+            // bundling anything. Not free — `fragments(1..)` is linear in the
+            // history — but linear in a walk automerge does over its own
+            // index, not in re-encoding the document.
+            //
+            // Not `?`: the mutation is already durable — the barrier above
+            // saw to that — so a compaction that failed must not report the
+            // user's write as failed. The roll-up waits for the next one.
+            let _compacted = self.compact(tree).await;
         }
         Ok(answer)
+    }
+
+    /// Roll every closed commit range of `tree` up into a sedimentree
+    /// fragment, and drop the loose commits the roll-up carries.
+    ///
+    /// Called after a local mutation and after an absorb that landed
+    /// (`Engine::mutate`, `Engine::absorb`), which between them cover every
+    /// way this device's history grows.
+    ///
+    /// **Who may build one.** Only a device that can read the whole range:
+    /// the fragment's payload is an automerge *bundle* of its members'
+    /// changes, and building it means having those changes in the document.
+    /// That falls out of the construction rather than being enforced — a
+    /// device that could not open an envelope never applied it, so automerge
+    /// never drew a fragment over it. A commit this device could not read is
+    /// outside the fragment's members and stays loose, and sedimentree
+    /// decides coverage by head/checkpoints/boundary
+    /// (`Fragment::supports_block`), so nothing claims to carry it.
+    ///
+    /// The keyhive-events tree is skipped: it has no automerge document —
+    /// its commits *are* the state, unordered and content-addressed (see
+    /// [`keyhive_tree`]) — so there is no change graph to fragment.
+    async fn compact(&self, tree: SedimentreeId) -> Result<(), String> {
+        if tree == keyhive_tree() {
+            return Ok(());
+        }
+        // Before anything else, and unconditionally: pruning is the last
+        // step of building a fragment and every step before it can fail
+        // (`publish_keyhive`, a storage write), which would leave a fragment
+        // durable with its range still loose beside it. Re-running it here
+        // costs one `minimize` and catches that on the next turn.
+        let _pruned = self.storage.prune(tree);
+        // The group document is plaintext by ruling (`crate::vault` module
+        // docs), so its fragments are too; an app tree's are envelopes like
+        // its commits.
+        let enveloped = tree != us_tree();
+        // A fragment whose head we already hold is one we have already built
+        // or received — identity is head plus boundary
+        // (`design/sedimentree.md`) and the tree is keyed by head, so two
+        // devices with the same causal graph produce the same one and the
+        // second is a no-op. Filtered *before* bundling: `bundle_fragments`
+        // re-encodes every member of every fragment it is handed, so bundling
+        // the whole history to throw all but the newest away would make each
+        // mutation cost the whole document.
+        let candidates: Vec<(automerge::Fragment, Vec<u8>)> = {
+            let apps = self.apps.borrow();
+            let doc: Option<&AppDoc> = enveloped
+                .then(|| apps.values().find(|doc| doc.tree() == tree))
+                .flatten();
+            if enveloped && doc.is_none() {
+                return Ok(());
+            }
+            let fragments = match doc {
+                Some(doc) => doc.fragments(),
+                None => self.with_us(UsDoc::fragments),
+            };
+            let fresh: Vec<automerge::Fragment> = fragments
+                .into_iter()
+                .filter(|f| !self.storage.holds_fragment(tree, CommitId::new(f.head.0)))
+                .collect();
+            if fresh.is_empty() {
+                return Ok(());
+            }
+            let bundles = match doc {
+                Some(doc) => doc.bundle(fresh.clone()),
+                None => self.with_us(|us| us.bundle(fresh.clone())),
+            };
+            fresh.into_iter().zip(bundles).collect()
+        };
+        for (fragment, bundle) in candidates {
+            let head = CommitId::new(fragment.head.0);
+            let boundary: BTreeSet<CommitId> = fragment
+                .boundary
+                .iter()
+                .map(|hash| CommitId::new(hash.0))
+                .collect();
+            let checkpoints: Vec<CommitId> = fragment
+                .checkpoints
+                .iter()
+                .map(|hash| CommitId::new(hash.0))
+                .collect();
+            let (blob, sealed) = if enveloped {
+                let vault = self.require_vault()?;
+                // What keeps the causal walk going below the fragment. The
+                // boundary names the commits just under it, and for each one
+                // the *carrier* is what has to be named: if we hold a
+                // fragment headed at that commit, the thing a later reader
+                // must be able to open is that fragment, under its own cref —
+                // the boundary commit's own envelope was pruned along with
+                // its range, and its content key left the frontier when it
+                // was covered, so naming the commit would embed nothing at
+                // all. `Vault::seal` embeds exactly those preds whose keys
+                // this device still holds, and `Vault::confirm` then drops
+                // them from the frontier, which is what keeps the head set
+                // at one entry point per branch instead of one per fragment.
+                let preds: Vec<[u8; 32]> = boundary
+                    .iter()
+                    .map(|id| {
+                        if self.storage.holds_fragment(tree, *id) {
+                            fragment_cref(tree, *id)
+                        } else {
+                            *id.as_bytes()
+                        }
+                    })
+                    .collect();
+                let sealed = vault
+                    .seal(fragment_cref(tree, head), &preds, bundle)
+                    .await?;
+                (Blob::new(sealed.blob.clone()), Some(sealed))
+            } else {
+                (Blob::new(bundle), None)
+            };
+            self.handle
+                .add_fragments(
+                    tree,
+                    vec![subduction_protocol::command::NewFragment {
+                        head,
+                        boundary,
+                        checkpoints,
+                        blob,
+                    }],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            // The durability barrier `mutate` documents: the fragment must be
+            // in storage before anything is dropped on the strength of it.
+            let _heads = self
+                .handle
+                .tree_heads(tree)
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Some(sealed) = sealed {
+                let vault = self.require_vault()?;
+                // `confirm` makes the fragment an entry point and drops the
+                // preds it embedded — which is where the *previous* fragment
+                // stops being one, since this envelope now carries its key.
+                vault.confirm(&sealed);
+                // And the members it carries stop being entry points too:
+                // their changes are in the bundle (`Vault::cover`).
+                vault.cover(fragment.members.iter().map(|hash| hash.0));
+                self.publish_keyhive().await?;
+            }
+            let _pruned = self.storage.prune(tree);
+        }
+        Ok(())
     }
 
     /// Replace an app commit's plaintext change with its keyhive envelope.
@@ -1116,6 +1356,22 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     /// is an async call into the vault. The `RefCell` borrows are taken and
     /// dropped around each await rather than across one.
     async fn absorb(&self, tree: SedimentreeId) -> bool {
+        let landed = self.absorb_items(tree).await;
+        if landed {
+            // The second compaction trigger. Absorbing is how a device that
+            // was behind catches up, and a batch of a few hundred commits is
+            // exactly the case fragments exist for; a device that only ever
+            // compacted its own writes would carry a peer's history loose
+            // forever. Failure is not the caller's business — nothing here
+            // is lost if the roll-up waits for the next batch.
+            let _compacted = self.compact(tree).await;
+        }
+        landed
+    }
+
+    /// [`Engine::absorb`] without the compaction step: what actually applies
+    /// the tree's stored items to its document.
+    async fn absorb_items(&self, tree: SedimentreeId) -> bool {
         if tree == us_tree() {
             let landed = {
                 let mut cell = self.us.borrow_mut();
@@ -1153,22 +1409,54 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             // stay in storage and are tried again on the next event.
             return false;
         };
-        let (wanted, known) = {
+        let (wanted, bundles, tree, known) = {
             let apps = self.apps.borrow();
             let Some(doc) = apps.get(app) else {
                 return false;
             };
             (
                 doc.unapplied(&self.storage),
+                doc.unapplied_fragments(&self.storage),
+                doc.tree(),
                 doc.applied_ids()
                     .into_iter()
                     .map(|id| *id.as_bytes())
                     .collect(),
             )
         };
-        if wanted.is_empty() {
+        if wanted.is_empty() && bundles.is_empty() {
             return false;
         }
+        // Fragments first, as `Document::absorb` does and for the same
+        // reason: a bundle that lands first turns every loose commit it
+        // carries into a no-op. Their envelopes are keyed by the fragment
+        // cref, not by the head — a fragment and its head commit are two
+        // different plaintexts and may not share one content reference — so
+        // the walk's answers are mapped back through `by_cref`.
+        let by_cref: BTreeMap<[u8; 32], CommitId> = bundles
+            .iter()
+            .map(|(head, _)| (fragment_cref(tree, *head), *head))
+            .collect();
+        let opened_bundles = if bundles.is_empty() {
+            Vec::new()
+        } else {
+            match vault
+                .open(
+                    bundles
+                        .into_iter()
+                        .map(|(head, blob)| (fragment_cref(tree, head), blob))
+                        .collect(),
+                    &known,
+                )
+                .await
+            {
+                Ok(opened) => opened
+                    .into_iter()
+                    .filter_map(|(cref, bundle)| Some((*by_cref.get(&cref)?, bundle)))
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        };
         let Ok(opened) = vault
             .open(
                 wanted
@@ -1186,12 +1474,15 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             let Some(doc) = apps.get_mut(app) else {
                 return false;
             };
-            let absorbed = doc.apply(
+            let from_fragments = doc.apply_bundles(opened_bundles);
+            let mut absorbed = doc.apply(
                 opened
                     .into_iter()
                     .map(|(id, change)| (CommitId::new(id), change))
                     .collect(),
             );
+            absorbed.landed |= from_fragments.landed;
+            absorbed.content |= from_fragments.content;
             // The partition case (`design/causal_encryption.md` §"Multiple
             // Heads"): what just landed was concurrent with what this device
             // already had, so it was sealed under an epoch some *other* member
@@ -1265,6 +1556,46 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             .ok_or_else(|| format!("no document is open for {app}"))?;
         f(doc)
     }
+}
+
+/// Where a fragment's envelope lives in the vault: `blake3("polyvisor:fragment"
+/// ‖ tree ‖ head)`.
+///
+/// Not the head itself, which is what a fragment is *named* by. A content
+/// reference indexes one plaintext in keyhive's ciphertext store, and the head
+/// commit already owns that reference for its own change; a fragment stored
+/// under it would collide with the commit whose range it closes — the walk
+/// would find one where it wanted the other, and the key it holds would open
+/// neither reliably. Domain-separated so the two can never coincide.
+fn fragment_cref(tree: SedimentreeId, head: CommitId) -> [u8; 32] {
+    *blake3::Hasher::new()
+        .update(b"polyvisor:fragment")
+        .update(tree.as_bytes())
+        .update(head.as_bytes())
+        .finalize()
+        .as_bytes()
+}
+
+/// Decode a store object's envelope, check the signature, and check the
+/// issuer is one of `members`. The half of [`Engine::accept`] that does not
+/// depend on which item kind it is.
+///
+/// `try_verify`, not the trusted-storage decode: the trusted decode reads the
+/// fields of an envelope nobody has checked, which is exactly the situation it
+/// documents itself as being wrong for.
+fn verify<T>(signed: &[u8], members: &std::collections::BTreeSet<[u8; 32]>) -> Option<T>
+where
+    T: sedimentree_core::codec::schema::Schema
+        + sedimentree_core::codec::encode::EncodeFields
+        + sedimentree_core::codec::decode::DecodeFields
+        + Clone,
+{
+    let signed = subduction_crypto::signed::Signed::<T>::try_decode(signed).ok()?;
+    let verified = signed.try_verify().ok()?;
+    if !members.contains(&verified.issuer().to_bytes()) {
+        return None;
+    }
+    Some(verified.payload().clone())
 }
 
 /// A domain-separated 32 bytes from the device seed and this run's
