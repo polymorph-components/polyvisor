@@ -18,14 +18,18 @@ import { proxyInterfaces } from "./rpc.ts";
 // `shell.open-popup`)
 //
 // The provider redirects the popup back to THIS page's URL with `code` and
-// `state` on it, so the returning load is this same bundle — in a window
-// that has an opener and nothing else to do. It hands the two parameters to
-// the opener and closes.
+// `state` on it (or with `error` and `state`, the user having declined), so
+// the returning load is this same bundle — in a window with nothing else to
+// do. It reports the outcome and gets out of the way.
 //
-// `location.origin` as the target, not `"*"`: the redirect landed on this
-// origin, so the opener is on it too, and naming it means a one-shot
-// authorization code is never posted into a window that turned out to be
-// somewhere else.
+// It reports over a BroadcastChannel, not to an opener: we open the popup
+// with `noopener` (docs/design.md "Windows and handles"), so there is no
+// opener to post to and nothing on either side holds a handle to the other.
+// A BroadcastChannel is same-origin by construction — no origin argument to
+// get wrong, and no other origin can subscribe — but it reaches EVERY tab of
+// this origin, so the message carries the ceremony's `state` and the waiting
+// side matches it against the state of the URL it opened. That is what keeps
+// one tab's ceremony from settling another's.
 //
 // Then the module PARKS. Everything below this block is the visor's boot —
 // a SharedWorker, a device, a mounted component — and none of it belongs in
@@ -35,13 +39,76 @@ import { proxyInterfaces } from "./rpc.ts";
 // rest of the module unevaluated rather than merely unused.
 // ---------------------------------------------------------------------------
 
+const CEREMONY_CHANNEL = "polyvisor.oauth";
+
 const returned = popupReturn(location.search);
-if (returned !== undefined && globalThis.opener !== null) {
-  globalThis.opener.postMessage(
-    { t: "oauth", code: returned.code, state: returned.state },
-    location.origin,
+if (returned !== undefined) {
+  const channel = new BroadcastChannel(CEREMONY_CHANNEL);
+  channel.postMessage(
+    returned.kind === "code"
+      ? { t: "oauth", state: returned.state, code: returned.code }
+      : { t: "oauth", state: returned.state, declined: true },
   );
+
+  // A window opened with `noopener` is script-closable only while its
+  // session history has one entry, and the provider's consent flow is
+  // several navigations — so `close()` works against the e2e fake's single
+  // 302 and will not work against Google. There is no way to ask which
+  // happened; the window either went away and this timer never fires, or it
+  // is still here and the framework says the one true thing left to say.
   globalThis.close();
+  setTimeout(() => {
+    const visor = document.getElementById("visor");
+    if (visor !== null) visor.textContent = "You can close this window.";
+  }, 500);
+
+  await new Promise<never>(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// The window this visor will not boot in (docs/design.md "Windows and
+// handles")
+//
+// A document that holds a WindowProxy to this window can navigate it
+// cross-origin at any moment, which is trusted pixels under someone else's
+// control. Two holders: a parent (we are framed) and an opener (someone
+// called `window.open` on us).
+//
+// The opener test is ONE-SIDED. A positive is reliable; a null is not — an
+// opener can null its popup's `opener` on the initial about:blank and then
+// navigate it here, and its handle keeps working. So this catches the naive
+// case only. COOP `same-origin` on the home origin is the general form and
+// is an optional deployment enhancement, never a requirement (GitHub Pages
+// cannot set headers, and `<meta>` does not carry COOP).
+//
+// Browsers have defaulted `target=_blank` to `noopener` since ~2020, so a
+// non-null opener today means someone opened us on purpose.
+//
+// Placed above everything: the refusing window reads no device anchor, names
+// no worker and mounts nothing personal. The returning half above ran first
+// and parked, which is what keeps a returning popup — top-level, and with no
+// opener since we open it `noopener` — from tripping this.
+// ---------------------------------------------------------------------------
+
+if (self !== top || globalThis.opener !== null) {
+  const visor = document.getElementById("visor");
+  if (visor !== null) {
+    visor.textContent =
+      "This window is not this visor's own: something else can navigate it, " +
+      "so nothing of yours is shown here.";
+    const button = document.createElement("button");
+    button.id = "visor-reopen";
+    button.textContent = "Open the visor in its own window";
+    // A user gesture, because that is what a popup blocker wants; and
+    // `noopener` so the fresh browsing context has no handle-holder at all —
+    // not the page that framed us, not this window either. The refusing
+    // window is left exactly as it is: blanking it would undo nothing a
+    // handle-holder could not redo.
+    button.addEventListener("click", () => {
+      globalThis.open(location.href, "_blank", "noopener");
+    });
+    visor.append(button);
+  }
   await new Promise<never>(() => {});
 }
 
@@ -458,60 +525,67 @@ async function main(): Promise<void> {
     // the URL, this opens it, and the two parameters that come back are all
     // that crosses.
     //
+    // `noopener`, per docs/design.md "Windows and handles": the popup must
+    // not hold a handle to these trusted pixels, and a provider's page is
+    // exactly the sort of live content that must not. The cost is that
+    // `open` returns null, so we have no handle either — no `popup.closed`
+    // to poll, no `ev.source` to check a message against. The returning load
+    // therefore reports over a same-origin BroadcastChannel, and what stands
+    // in for "the window we opened" is the `state` in the URL we just
+    // handed out: a broadcast from another tab's ceremony, or a stale one,
+    // names a different state and is ignored here.
+    //
     // Three ways this resolves, and `none` is two of them:
     //
-    //   * the popup returned to this page's URL and the returning load
-    //     posted us the pair (the block at the top of this module) — the
+    //   * the popup returned to this page's URL with a code for this
+    //     ceremony (the block at the top of this module broadcast it) — the
     //     only `some`;
-    //   * the user closed the window, which nothing notifies us of, so it
-    //     is polled: `popup.closed` every 500 ms, as internal.wit's "`none`
-    //     if the user closed it" requires something to notice;
-    //   * the browser refused to open a window at all — a popup blocker,
-    //     or a call not made from a user gesture. Indistinguishable from a
-    //     window closed at once, and `none` is the same honest answer: no
-    //     code came back.
+    //   * the user declined consent, which the provider redirects back as
+    //     `error`+`state` and the returning load broadcasts too;
+    //   * nothing came back inside the bound. That covers the user closing
+    //     the window — which nothing can notify us of, having no handle —
+    //     and a browser that refused to open one at all. Ten minutes: long
+    //     enough for a real consent screen, and a provider's code does not
+    //     outlive it anyway.
     openPopup: (url: string): Promise<[string, string] | undefined> =>
       new Promise((resolve) => {
-        const popup = globalThis.open(
-          url,
-          "polyvisor-oauth",
-          "popup,width=520,height=640",
-        );
-        if (popup === null) {
-          resolve(undefined);
-          return;
-        }
+        // Whatever the kernel put in the URL it minted. A URL with no state
+        // is not a ceremony this glue can attribute an answer to, and the
+        // empty string matches nothing a returning load can broadcast
+        // (web/oauth.ts requires a non-empty state).
+        const wanted = new URL(url, location.href).searchParams.get("state") ??
+          "";
+        const channel = new BroadcastChannel(CEREMONY_CHANNEL);
         let settled = false;
         const finish = (answer: [string, string] | undefined) => {
           if (settled) return;
           settled = true;
-          clearInterval(poll);
-          globalThis.removeEventListener("message", onMessage);
-          // The returning page closes itself; this covers the paths where
-          // it did not get that far, so a ceremony that ended one way or
-          // another never leaves a window standing.
-          try {
-            popup.close();
-          } catch {
-            // Already gone.
-          }
+          clearTimeout(bound);
+          channel.close();
           resolve(answer);
         };
-        const onMessage = (ev: MessageEvent) => {
-          // Same-origin only, and only from the window we opened: the
-          // message carries a one-shot authorization code, and any page may
-          // post to an opener.
-          if (ev.origin !== location.origin || ev.source !== popup) return;
+        channel.addEventListener("message", (ev: MessageEvent) => {
           const data = ev.data;
           if (typeof data !== "object" || data === null) return;
-          if ((data as { t?: string }).t !== "oauth") return;
-          const { code, state } = data as { code: string; state: string };
-          finish([String(code), String(state)]);
-        };
-        globalThis.addEventListener("message", onMessage);
-        const poll = setInterval(() => {
-          if (popup.closed) finish(undefined);
-        }, 500);
+          const msg = data as {
+            t?: string;
+            state?: string;
+            code?: string;
+            declined?: boolean;
+          };
+          if (msg.t !== "oauth") return;
+          // The ceremony this call opened, and no other: `state` is the only
+          // thing left that says which window a broadcast came from.
+          if (wanted === "" || msg.state !== wanted) return;
+          if (msg.declined === true) finish(undefined);
+          else if (typeof msg.code === "string") finish([msg.code, wanted]);
+        });
+        const bound = setTimeout(() => finish(undefined), 10 * 60 * 1000);
+
+        // Subscribed before the window is opened: the answer arrives on a
+        // channel, and a subscription made afterwards is one that can miss
+        // it.
+        globalThis.open(url, "_blank", "popup,noopener,width=520,height=640");
       }),
   };
 

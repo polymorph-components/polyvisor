@@ -901,8 +901,8 @@ fn KeepSheet(on_kept: EventHandler<bool>) -> Element {
 /// authority on what a binding is doing. `binding.state` is the kernel's
 /// own framework voice and is rendered unparaphrased, exactly as a peer's
 /// state is; the visor adds no sentence about a store beyond the ones it
-/// composes about its own acts (a window the user closed, a field left
-/// empty).
+/// composes about its own acts (a ceremony that did not come back, a field
+/// left empty).
 ///
 /// The client pair is typed here and goes straight through to
 /// `oauth-start`. Nothing about it is kept: the kernel seals what it needs
@@ -921,6 +921,12 @@ fn StorageSection(binding: Option<Binding>, on_refresh: EventHandler<()>) -> Ele
     let mut client_id = use_signal(String::new);
     let mut client_secret = use_signal(String::new);
     let mut error = use_signal(|| None::<String>);
+    // The ceremony is a window the user is looking at somewhere else, and
+    // this glue holds no handle to it any more (docs/design.md "Windows and
+    // handles"), so all the visor knows is that it asked and has not been
+    // answered. Read in the render body below — a signal written and never
+    // read renders once forever (docs/design.md, the visor-dioxus costs).
+    let mut waiting = use_signal(|| false);
 
     // Same shape as the Devices section's `acted`: show the kernel's
     // refusal if it refused, then re-read, because what the binding is now
@@ -944,19 +950,25 @@ fn StorageSection(binding: Option<Binding>, on_refresh: EventHandler<()>) -> Ele
                 return;
             }
         };
+        // Set only once there is a URL to open: an `oauth-start` the kernel
+        // refused never opened a window, so there is nothing to wait for.
+        waiting.set(true);
         match kernel::open_popup(url).await {
-            // `none` is a window the user closed, or one the browser
-            // refused to open (internal.wit `shell.open-popup`). Neither is
-            // a failure the kernel has to hear about: the ceremony it
-            // minted is simply not completed, and pressing Connect again
-            // mints another.
+            // `none` is a ceremony that did not come back: consent declined,
+            // the window closed, or nothing inside the glue's bound
+            // (internal.wit `shell.open-popup`). None of those is a failure
+            // the kernel has to hear about — the ceremony it minted is
+            // simply not completed, and pressing Connect again mints
+            // another.
             None => {
+                waiting.set(false);
                 error.set(Some(
-                    "the authorization window closed before it came back".into(),
+                    "the sign-in window closed without authorizing this device".into(),
                 ));
                 on_refresh.call(());
             }
             Some((code, state)) => {
+                waiting.set(false);
                 client_id.set(String::new());
                 client_secret.set(String::new());
                 acted(kernel::oauth_complete(code, state).await);
@@ -1037,7 +1049,16 @@ fn StorageSection(binding: Option<Binding>, on_refresh: EventHandler<()>) -> Ele
                         div { class: "{Voice::Framework.class()}",
                             "an installed-app client pair — the secret gates nothing without your consent, and nothing is built in"
                         }
-                        button { onclick: connect, "Connect Google Drive" }
+                        button {
+                            onclick: connect,
+                            disabled: "{waiting}",
+                            "Connect Google Drive"
+                        }
+                        if waiting() {
+                            div { class: "{Voice::Framework.class()}",
+                                "waiting for the sign-in window…"
+                            }
+                        }
                     }
                 },
             }

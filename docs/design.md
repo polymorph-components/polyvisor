@@ -219,6 +219,61 @@ only that N objects exist. Tokens rest sealed beside the device seed;
 the OAuth code is the one artifact that crosses the port, bound to a PKCE
 verifier that never left the kernel.
 
+## Windows and handles
+
+A document holding a WindowProxy to the visor's window can assign its
+`location` cross-origin — trusted pixels under someone else's control.
+Two holders exist: a parent (the visor framed in another page) and an
+opener (a page that opened us, or a provider page in a popup *we* open).
+Phishing in general is answered by the visor's identity mechanisms (grey
+until unseal, the hue painted only after); what is ruled here is
+narrower: refuse to give a controllable window trusted pixels, and stop
+handing out handles.
+
+- **The visor refuses to boot in a window something else may control**:
+  `self !== top` or `window.opener !== null`. The opener test is
+  one-sided — a positive is reliable, a null is not, because a hostile
+  opener can null its popup's `opener` on the initial `about:blank`
+  before navigating it to us and keep its own handle working. This
+  catches the naive case only, and the record says so. Browsers have
+  defaulted `target=_blank` to `noopener` since ~2020, so a non-null
+  opener today means someone opened us deliberately.
+- **On refusal**: a framework-voice notice in `#visor` — nothing
+  personal, no worker, no device anchor read — and a button that reopens
+  `location.href` with `window.open(href, "_blank", "noopener")`: a
+  fresh browsing context nobody holds a handle to, not even us. A user
+  gesture is what popup blockers want, hence a button. The refusing
+  window is left as it is; blanking it undoes nothing a handle-holder
+  could not redo.
+- **Our own OAuth popup opens with `noopener`.** `window.open` then
+  returns null, so nothing on our side holds a handle either; the
+  returning page (provider → redirect → our URL) has no opener and
+  reports over a same-origin `BroadcastChannel` instead of
+  `opener.postMessage`. The waiting side matches the message's `state`
+  against the `state` of the URL it opened, so another tab's ceremony —
+  or a stale one — is ignored; the kernel checks state again at
+  `oauth-complete`. A leaked code is inert without the PKCE verifier the
+  kernel holds.
+- **Closed-detection went with the handle; there is none.** The
+  returning page broadcasts the outcome both for a code and for a
+  declined consent (RFC 6749 §4.1.2.1 echoes `state` on the error
+  redirect too), then tries `window.close()` and, if it is still open,
+  says "You can close this window." — a `noopener` window is
+  script-closable only while its history has one entry, which a real
+  provider's multi-page consent breaks and the e2e fake's single 302
+  does not. The one silent case, a user closing the popup mid-flow, is
+  covered by a ten-minute bound on the waiting side; provider codes do
+  not outlive that.
+- **No kernel change.** The pending ceremony in the kernel is replaced
+  by the next `oauth-start`; its state is random and its code one-shot,
+  so a stale one costs nothing.
+- **COOP `same-origin` on the home origin is the general form** of all
+  of this: the browsing-context-group swap makes a null opener actually
+  mean "no handle", and it covers windows we never opened. It is an
+  OPTIONAL enhancement for hosts that can set response headers — GitHub
+  Pages cannot, and `<meta>` does not carry COOP — never a requirement.
+  Not `same-origin-allow-popups`, which keeps the very link this cuts.
+
 ## Devices
 
 A device is one kernel identity and everything it holds; a browser may
