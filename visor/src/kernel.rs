@@ -257,17 +257,17 @@ pub(crate) async fn reroll_word() -> Result<String, String> {
 }
 
 /// Which map `meta`/`set_meta` reads or replaces (internal.wit `meta-scope`).
+/// The `device` scope exists in the contract but nothing in the visor edits
+/// it yet, so it has no variant here.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum MetaScope {
     User,
-    Device,
     App(String),
 }
 
 fn meta_scope(scope: MetaScope) -> api::device::MetaScope {
     match scope {
         MetaScope::User => api::device::MetaScope::User,
-        MetaScope::Device => api::device::MetaScope::Device,
         MetaScope::App(id) => api::device::MetaScope::App(id),
     }
 }
