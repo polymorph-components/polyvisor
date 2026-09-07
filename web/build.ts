@@ -135,6 +135,14 @@ async function app(id: string): Promise<void> {
 
 const APPS = ["todomvc"];
 
+/** Test-only bundles, built by `deno task build:fixtures` (`--fixtures`) and
+ * by nothing else. `apps/hostile` exists to be refused by the frame policy,
+ * so it must never reach a home origin a user visits; the production Pages
+ * build runs the flagless task. */
+const FIXTURES = ["hostile"];
+
+const apps = Deno.args.includes("--fixtures") ? [...APPS, ...FIXTURES] : APPS;
+
 // A rebuild is a fresh tree: a stale artifact left behind by a build that
 // dropped a component is exactly the silent-blank-page failure above.
 await Deno.remove(DIST, { recursive: true }).catch(() => {});
@@ -147,10 +155,10 @@ await copy(join(ROOT, "web", "index.html"), join(DIST, "index.html"));
 
 await component("polyvisor_runtime", "runtime.component");
 await component("polyvisor_visor", "visor.component");
-for (const id of APPS) await app(id);
+for (const id of apps) await app(id);
 await Deno.writeTextFile(
   join(DIST, "apps", "index.json"),
-  JSON.stringify(APPS) + "\n",
+  JSON.stringify(apps) + "\n",
 );
 
-console.log(`build: web/dist ready (${APPS.length} app(s))`);
+console.log(`build: web/dist ready (${apps.length} app(s))`);

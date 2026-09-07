@@ -7,6 +7,7 @@
 //! boundary, so no publisher string can reach a render slot unplated.
 
 use crate::component::polyvisor::internal as api;
+use crate::state::{DeviceState, Rest, Tier};
 use crate::voice::AppText;
 
 pub(crate) type SessionId = u32;
@@ -20,14 +21,65 @@ pub(crate) struct App {
 }
 
 /// The device identity the strip and the settings tenant show.
+///
+/// `name`/`hue`/`word` are empty and zero while sealed (internal.wit
+/// `device`), which is exactly why the strip keys its dress off `state`
+/// and never off "is the name empty": an unpainted anchor must be
+/// unpaintable before the seal opens, not merely usually blank.
 pub(crate) struct Status {
+    pub(crate) id: String,
+    pub(crate) state: DeviceState,
+    pub(crate) tier: Tier,
+    pub(crate) rest: Rest,
+    pub(crate) petname: String,
     pub(crate) name: String,
     pub(crate) hue: u16,
     pub(crate) word: String,
 }
 
+impl Status {
+    /// The seal is open: personal state is readable, and the rest of the
+    /// kernel answers at all.
+    pub(crate) fn is_open(&self) -> bool {
+        self.state == DeviceState::Open
+    }
+}
+
+/// One row of the device index (`store.entry`), as the picker needs it.
+/// `created` is in the contract and not on any screen, so it is dropped
+/// here rather than carried unused.
+#[derive(Clone, PartialEq)]
+pub(crate) struct Entry {
+    pub(crate) id: String,
+    pub(crate) petname: String,
+    pub(crate) tier: Tier,
+    pub(crate) last_used: u64,
+}
+
 fn message(e: api::types::Error) -> String {
     e.message
+}
+
+fn device_state(s: api::device::State) -> DeviceState {
+    match s {
+        api::device::State::Fresh => DeviceState::Fresh,
+        api::device::State::Sealed => DeviceState::Sealed,
+        api::device::State::Open => DeviceState::Open,
+    }
+}
+
+fn tier(t: api::device::Tier) -> Tier {
+    match t {
+        api::device::Tier::Ephemeral => Tier::Ephemeral,
+        api::device::Tier::Durable => Tier::Durable,
+    }
+}
+
+fn rest(r: api::device::Rest) -> Rest {
+    match r {
+        api::device::Rest::RestsOpen => Rest::RestsOpen,
+        api::device::Rest::Passphrase => Rest::Passphrase,
+    }
 }
 
 pub(crate) async fn status() -> Result<Status, String> {
@@ -35,10 +87,47 @@ pub(crate) async fn status() -> Result<Status, String> {
         .await
         .map_err(message)
         .map(|s| Status {
+            id: s.id,
+            state: device_state(s.state),
+            tier: tier(s.tier),
+            rest: rest(s.rest),
+            petname: s.petname,
             name: s.name,
             hue: s.hue,
             word: s.word,
         })
+}
+
+/// The device index: every device on this origin, petname and tier only.
+pub(crate) async fn devices() -> Result<Vec<Entry>, String> {
+    Ok(api::store::devices()
+        .await
+        .map_err(message)?
+        .into_iter()
+        .map(|e| Entry {
+            id: e.id,
+            petname: e.petname,
+            tier: tier(e.tier),
+            last_used: e.last_used,
+        })
+        .collect())
+}
+
+/// The login. A wrong passphrase comes back as an error whose framework
+/// voice message is what the sheet shows; the device stays sealed.
+pub(crate) async fn unseal(passphrase: String) -> Result<(), String> {
+    api::device::unseal(passphrase).await.map_err(message)
+}
+
+/// Promote to durable. `None` is "rests open".
+pub(crate) async fn keep(petname: String, passphrase: Option<String>) -> Result<(), String> {
+    api::device::keep(petname, passphrase)
+        .await
+        .map_err(message)
+}
+
+pub(crate) async fn erase() -> Result<(), String> {
+    api::device::erase().await.map_err(message)
 }
 
 pub(crate) async fn set_name(name: String) -> Result<(), String> {
@@ -79,6 +168,34 @@ pub(crate) async fn open_frame(session: SessionId) -> Result<(), String> {
 
 pub(crate) async fn close_frame(session: SessionId) -> Result<(), String> {
     api::shell::close_frame(session).await.map_err(message)
+}
+
+/// Re-anchor this tab to another device, or with `None` to a fresh one.
+/// Sync in the contract, and terminal in effect: the page reloads.
+pub(crate) fn switch_device(device: Option<String>) {
+    api::shell::switch_device(device.as_deref());
+}
+
+/// `navigator.storage.persist()`. `false` only means the browser declined
+/// to exempt this origin from eviction — the device is durable either way,
+/// so the caller notes it and carries on.
+pub(crate) async fn request_persistence() -> bool {
+    api::shell::request_persistence().await
+}
+
+/// Wall-clock now, epoch milliseconds, for [`crate::voice::coarse_age`].
+///
+/// `std`'s clock, not an import of our own: the visor world declares no
+/// clock, but a wasip2 component links the WASI baselines regardless
+/// (`wasi:clocks/wall-clock` is already among this component's imports at
+/// M1) and the glue already supplies them. A clock that will not read is
+/// reported as the epoch, which makes every age "very old" rather than
+/// killing the sheet.
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The next kernel event.

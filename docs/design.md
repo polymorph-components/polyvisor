@@ -70,10 +70,14 @@ Rules for `polyvisor:internal`:
    arrived on and supplied as a `session-id` parameter; never from the
    caller. Each public service interface has an internal mirror with the
    session first (`app-services`).
-4. **Kernel events are a long-poll export** (`events.next`). The worker
-   glue loops on it and fans out to every connected visor; each visor's
-   glue serves the same interface from a local queue. No callbacks, no
-   second mechanism. What the glue itself observes (a frame torn down by
+4. **Kernel events reach the visor as a long poll** (`events.next`,
+   served by each visor's glue from a local queue). The runtime's side is
+   a non-parking `event-source.drain` the worker glue calls after every
+   export it dispatches: polyengine traps an async export parked on a
+   guest-internal waker with no host call outstanding as a deadlock
+   (polyengine#292; wasmtime stays pending), and until the engine lands
+   every event is born inside a glue-dispatched export anyway. No
+   callbacks, no second mechanism. What the glue itself observes (a frame torn down by
    the receiver) enters the same path through `apps.abort`, so the visor
    has one source of truth for session endings; `apps.close` — the
    visor's own act — emits nothing.

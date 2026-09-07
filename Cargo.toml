@@ -1,6 +1,14 @@
 [workspace]
 resolver = "3"
-members = ["runtime/component", "runtime/crates/kernel", "visor", "apps/todomvc"]
+members = [
+    "runtime/component",
+    "runtime/crates/kernel",
+    "visor",
+    "apps/todomvc",
+    # Not shipped by the production site build: `web/build.ts --fixtures`
+    # only.
+    "apps/hostile",
+]
 
 [workspace.package]
 edition = "2024"
@@ -8,6 +16,15 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+# docs/design.md "Devices": sealing is pure Rust in the kernel with the key
+# as bytes. `aes-gcm` is the checkpoint/DEK-wrap AEAD, `argon2` the Argon2id
+# KEK derivation behind a passphrase. Both with default features off: the
+# `getrandom` default would pull a second randomness source into a component
+# that already has one seam for it (`Rng` over `wasi:random`), and
+# `password-hash` (PHC strings) is unused — the kernel stores its own
+# parameter record.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 # docs/design.md "Pins, with reasons": must equal stream-dom's pin —
 # StreamReader<u8> (a wit-bindgen runtime type) crosses the delegation from
 # our world's `run` into `stream_dom_dioxus::driver::run`; different

@@ -36,11 +36,28 @@ pub(crate) const CSS: &str = r#"
 
 button { font: inherit; color: inherit; background: #3f3f46; border: 1px solid #52525b; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
 button[aria-pressed="true"] { background: #52525b; }
-input[type="text"] { font: inherit; color: inherit; background: #18181b; border: 1px solid #52525b; border-radius: 6px; padding: 6px 8px; }
+button[disabled] { opacity: 0.5; cursor: default; }
+input[type="text"], input[type="password"] { font: inherit; color: inherit; background: #18181b; border: 1px solid #52525b; border-radius: 6px; padding: 6px 8px; }
 label { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
 
 .app-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
 .app-row-title { flex: 1; min-width: 0; }
+
+/* The device ceremonies: unseal, keep, the entry picker, erase. Minimal
+   on purpose — this chrome is slated for a redesign. */
+.sheet { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; padding: 8px 0; border-top: 1px solid #3f3f46; }
+.sheet-head { margin-bottom: 4px; }
+.sheet-error { margin-top: 2px; }
+.choice { display: flex; gap: 8px; }
+.device-row { display: flex; align-items: center; gap: 8px; align-self: stretch; }
+.device-row-name { flex: 1; min-width: 0; }
+
+/* Unclaimed: before `device.status` reports `open` there is no identity to
+   show, so the strip wears zero chroma — no hue, no name, no word. The
+   circle gets its grey here and *only* here: the painted hue is an inline
+   style the open branch alone emits (docs/design.md "Devices": a page
+   imitating the picker must not be able to paint the user's colour). */
+#visor-strip.unclaimed #visor-circle { background: #52525b; }
 
 /* The three voices. polyvisor speaking. */
 .framework { color: #a1a1aa; font-style: italic; }
@@ -80,5 +97,17 @@ mod tests {
     #[test]
     fn stylesheet_pins_the_strip_height() {
         assert!(CSS.contains("height: 56px; min-height: 56px; max-height: 56px;"));
+    }
+
+    /// The unclaimed dress is a stylesheet fact, not a per-element one:
+    /// the strip carries the class and the circle's grey follows from it,
+    /// so no code path can grey the strip and still paint the circle.
+    #[test]
+    fn stylesheet_greys_the_unclaimed_anchor() {
+        assert!(CSS.contains("#visor-strip.unclaimed #visor-circle"));
+        // ...and the stylesheet itself never names a hue: the anchor colour
+        // reaches the DOM only through the inline style the open branch of
+        // `Identity` emits.
+        assert!(!CSS.contains("hsl("));
     }
 }

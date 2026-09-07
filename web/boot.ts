@@ -14,6 +14,7 @@ import { proxyInterfaces } from "./rpc.ts";
 
 const I = {
   device: "polyvisor:internal/device@0.1.0",
+  store: "polyvisor:internal/store@0.1.0",
   apps: "polyvisor:internal/apps@0.1.0",
   events: "polyvisor:internal/events@0.1.0",
   shell: "polyvisor:internal/shell@0.1.0",
@@ -52,13 +53,44 @@ function fatal(message: string): void {
 // The control port
 // ---------------------------------------------------------------------------
 
+/** The tab's device anchor (docs/design.md "Devices": "the glue owns only
+ * what has to exist before the kernel does: the device id ... because the
+ * worker is named after it"). sessionStorage, not localStorage: the anchor
+ * is per tab, so two tabs of the same profile can hold two devices and
+ * `shell.switch-device` is a reload of one of them. */
+const ANCHOR = "polyvisor.device";
+
+/** The anchored device id, minting and anchoring a fresh one if this tab has
+ * none. 16 random bytes as hex: the id is only ever an opaque name. */
+function deviceId(): string {
+  const anchored = sessionStorage.getItem(ANCHOR);
+  if (anchored !== null && anchored !== "") return anchored;
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const fresh = Array.from(bytes, (b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  sessionStorage.setItem(ANCHOR, fresh);
+  return fresh;
+}
+
+const device = deviceId();
+
 // A MODULE worker: the bundle keeps `import.meta.url` (polyengine's realm
 // identity), which is a syntax error in a classic worker.
+//
+// The NAME is what makes one SharedWorker per device: two tabs anchored to
+// the same id connect to the same worker, and a tab anchored elsewhere gets
+// its own. `type` and the URL are part of the identity too, but the name is
+// the only part that varies.
 const worker = new SharedWorker("./worker.js", {
   type: "module",
-  name: "polyvisor",
+  name: `polyvisor:${device}`,
 });
 const control = worker.port;
+
+// First message on the port, before any RPC: the worker boots its runtime
+// against the device the FIRST hello names (`lifecycle.boot-config.device`).
+// A later hello for the same id is a no-op — that is just another tab.
+control.postMessage({ t: "hello", device, homeOrigin: location.origin });
 
 /** Frame-port replies, keyed by session: `shell.open-frame` awaits one. */
 const framePortWaiters = new Map<
@@ -85,7 +117,7 @@ control.addEventListener("message", (ev: MessageEvent) => {
   }
 });
 
-const kernel = proxyInterfaces(control, [I.device, I.apps, I.events]);
+const kernel = proxyInterfaces(control, [I.device, I.store, I.apps, I.events]);
 const apps = kernel[I.apps] as {
   component(session: number): Promise<ComponentArtifacts>;
   abort(session: number, reason: string): Promise<void>;
@@ -275,6 +307,27 @@ async function main(): Promise<void> {
     // return a promise.
     reload: () => {
       location.reload();
+    },
+    // Also sync. Re-anchoring is all this does — the worker is named after
+    // the anchor, so the reload is what actually moves the tab to the other
+    // device (docs/design.md "Devices": "Switching devices is a reload").
+    // `none` drops the anchor, and the next boot mints a fresh id.
+    switchDevice: (target: string | undefined) => {
+      if (target === undefined) sessionStorage.removeItem(ANCHOR);
+      else sessionStorage.setItem(ANCHOR, target);
+      location.reload();
+    },
+    // A window capability, asked at the moment a device is kept. `false` is
+    // an honest answer, not a failure: internal.wit says the device is
+    // durable regardless, only more evictable. Browsers without the API
+    // (and insecure contexts, where `navigator.storage` is absent) answer
+    // the same way.
+    requestPersistence: async (): Promise<boolean> => {
+      try {
+        return await navigator.storage?.persist?.() ?? false;
+      } catch {
+        return false;
+      }
     },
   };
 

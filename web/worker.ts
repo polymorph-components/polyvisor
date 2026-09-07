@@ -20,6 +20,8 @@ import {
   instantiate,
 } from "@polyengine/runtime/embedder";
 import { wasi } from "@polyengine/wasi";
+import { filesystemWeb } from "@polyengine/wasi/filesystem-web";
+import type { OpfsDirectoryHandle } from "@polyengine/wasi/filesystem-web";
 import { http } from "@polyengine/wasi/http";
 
 import { serveInterfaces } from "./rpc.ts";
@@ -36,9 +38,11 @@ declare const self: {
 const I = {
   lifecycle: "polyvisor:internal/lifecycle@0.1.0",
   device: "polyvisor:internal/device@0.1.0",
+  store: "polyvisor:internal/store@0.1.0",
   apps: "polyvisor:internal/apps@0.1.0",
   events: "polyvisor:internal/events@0.1.0",
   appServices: "polyvisor:internal/app-services@0.1.0",
+  locks: "polyvisor:internal/locks@0.1.0",
   tasks: "polyvisor:app/tasks@0.1.0",
 } as const;
 
@@ -68,7 +72,53 @@ const QUEUE_LIMIT = 64;
 
 const tabs = new Set<Tab>();
 
-async function loadRuntime(): Promise<Exports> {
+// ---------------------------------------------------------------------------
+// The device this worker is
+// ---------------------------------------------------------------------------
+
+/** What the first `hello` said. The worker is NAMED after the device id, so
+ * every tab that reaches this worker is anchored to the same one; a hello
+ * naming a different id means the browser matched two different names to
+ * one worker, which is a bug, not a state to recover from. */
+interface Hello {
+  device: string;
+  homeOrigin: string;
+}
+
+let hello: Hello | undefined;
+let announce: (h: Hello) => void;
+const helloed = new Promise<Hello>((resolve) => {
+  announce = resolve;
+});
+
+/** The device's liveness signal (internal.wit `interface locks`): held for
+ * the worker's lifetime and released only when the worker dies, which is
+ * what lets the kernel's sweep tell a dead namespace from a live one.
+ *
+ * The request promise is deliberately never awaited — the callback never
+ * settles, so awaiting it would park here forever. The reference keeps the
+ * whole chain alive and says so.
+ */
+let deviceLock: Promise<unknown> | undefined;
+
+function holdDeviceLock(device: string): void {
+  deviceLock = navigator.locks.request(
+    `pm-device-${device}`,
+    () => new Promise<never>(() => {}),
+  );
+}
+
+/** Answers `locks.is-held` off the browser's own lock table. `query()` lists
+ * only locks held in THIS agent cluster's origin — which is exactly the set
+ * the sweep asks about: another device's worker on this origin. */
+const locks = {
+  isHeld: async (name: string): Promise<boolean> => {
+    const q = await navigator.locks.query();
+    return q.held?.some((l) => l.name === name) ?? false;
+  },
+};
+
+async function loadRuntime(device: string): Promise<Exports> {
   const base = self.location.href;
   const [wasmRes, planRes] = await Promise.all([
     fetch(new URL("runtime.component.wasm", base)),
@@ -82,28 +132,54 @@ async function loadRuntime(): Promise<Exports> {
   const wasm = new Uint8Array(await wasmRes.arrayBuffer());
   const plan = await planRes.text();
 
+  // The kernel's state root (internal.wit `world runtime`): the origin's
+  // OPFS at `/`, and the kernel keeps each device under `/<id>/`. The
+  // preopen is granted here and nowhere else — `device` is passed to the
+  // kernel, not baked into the grant, because a single-device preopen would
+  // give the sweep nothing to sweep.
+  //
+  // The cast is structural-typing paperwork: `filesystemWeb` takes its own
+  // handle interface (so in-memory fakes work) and the `dom` lib's
+  // `FileSystemDirectoryHandle.entries()` is typed over the `FileSystemHandle`
+  // base rather than the file/directory union.
+  const root = await navigator.storage.getDirectory();
+  const fs = filesystemWeb({
+    preopens: { "/": root as unknown as OpfsDirectoryHandle },
+    // Package-level, never per-preopen (filesystem_web.ts header). The
+    // kernel writes checkpoints, so it is on.
+    writable: true,
+  });
+
   const instance = await instantiate(
     artifactsFromEnvelope(plan, wasm),
     {
       ...wasi(),
+      // After `wasi()`: that fragment carries a filesystem of its own for
+      // the baseline imports every wasip2 component names, and this is the
+      // one that must win.
+      ...fs.imports,
       ...http().imports,
       "polyvisor:internal/kv@0.1.0": kv,
+      [I.locks]: locks,
     },
     { jspi: false },
   );
   return instance.exports as unknown as Exports;
 }
 
-/** Resolves once the runtime is booted; rejects if boot failed. */
+/** Resolves once the runtime is booted; rejects if boot failed. Parks until
+ * the first tab says which device this worker is: the id exists before the
+ * kernel does and only a tab can supply it. */
 const ready: Promise<Exports> = (async () => {
-  const exports_ = await loadRuntime();
+  const { device, homeOrigin } = await helloed;
+  const exports_ = await loadRuntime(device);
   const boot = exports_[I.lifecycle].boot as (
-    c: { homeOrigin: string },
+    c: { homeOrigin: string; device: string },
   ) => Promise<void>;
   // The home origin without a trailing slash, per `lifecycle.boot-config`.
-  // A SharedWorker's `location.origin` IS the origin that served its script,
-  // which is the home origin by construction.
-  await boot({ homeOrigin: self.location.origin });
+  // `location.origin` is spelled that way, and every tab that can reach this
+  // worker is on the home origin by construction.
+  await boot({ homeOrigin, device });
   startEventPump(exports_);
   return exports_;
 })();
@@ -171,12 +247,37 @@ self.onconnect = (ev: MessageEvent) => {
   const tab: Tab = { port, queue: [] };
   tabs.add(tab);
 
-  // Non-WIT control traffic: the frame-port request. Registered before
-  // `serveInterfaces` starts the port so no message is missed.
+  // Non-WIT control traffic: the device hello and the frame-port request.
+  // Registered before `serveInterfaces` starts the port so no message is
+  // missed — the hello is the FIRST thing a tab sends, and nothing the
+  // runtime can serve exists before it.
   port.addEventListener("message", (m: MessageEvent) => {
     const data = m.data;
     if (typeof data !== "object" || data === null) return;
-    if ((data as { t?: string }).t !== "frame-port") return;
+    const t = (data as { t?: string }).t;
+
+    if (t === "hello") {
+      const device = String((data as { device: string }).device);
+      const homeOrigin = String((data as { homeOrigin: string }).homeOrigin);
+      if (hello === undefined) {
+        hello = { device, homeOrigin };
+        holdDeviceLock(device);
+        announce(hello);
+      } else if (hello.device !== device) {
+        // One worker, one device (docs/design.md "Devices"). Two ids on one
+        // worker means the name did not separate them, and serving the tab
+        // anyway would show it another device's pixels.
+        port.postMessage({
+          t: "fatal",
+          message:
+            `this worker is device ${hello.device}, not ${device} — the ` +
+            `browser matched two SharedWorker names to one worker`,
+        });
+      }
+      return;
+    }
+
+    if (t !== "frame-port") return;
     const session = (data as { session: number }).session;
     void ready.then((exports_) => {
       const frame = mintSessionPort(exports_, session);
@@ -196,6 +297,14 @@ self.onconnect = (ev: MessageEvent) => {
       setName: async (name: string) => (await ready)[I.device].setName(name),
       setHue: async (hue: number) => (await ready)[I.device].setHue(hue),
       rerollWord: async () => (await ready)[I.device].rerollWord(),
+      keep: async (petname: string, passphrase: string | undefined) =>
+        (await ready)[I.device].keep(petname, passphrase),
+      unseal: async (passphrase: string) =>
+        (await ready)[I.device].unseal(passphrase),
+      erase: async () => (await ready)[I.device].erase(),
+    },
+    [I.store]: {
+      devices: async () => (await ready)[I.store].devices(),
     },
     [I.apps]: {
       installed: async () => (await ready)[I.apps].installed(),

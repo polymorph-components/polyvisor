@@ -1,8 +1,11 @@
-//! The task list behind `polyvisor:app/tasks`. In M1 it is in memory only,
-//! one list per app id: every session of an app sees the same partition.
+//! The task list behind `polyvisor:app/tasks`. One list per app id: every
+//! session of an app sees the same partition. Still in memory, but now part
+//! of the kernel's checkpoint, so a reload restores it.
+
+use serde::{Deserialize, Serialize};
 
 /// `polyvisor:app/tasks.todo-item`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TodoItem {
     pub id: String,
     pub title: String,
@@ -16,7 +19,7 @@ pub struct Snapshot {
     pub items: Vec<TodoItem>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskList {
     pub revision: u64,
     counter: u64,
