@@ -56,7 +56,7 @@ jobs:
         run: |
           curl -fsSL -o /tmp/iroh-relay.tar.gz \
             https://github.com/n0-computer/iroh/releases/download/v1.1.0/iroh-relay-v1.1.0-x86_64-unknown-linux-gnu.tar.gz
-          tar -xzf /tmp/iroh-relay.tar.gz -C /tmp
-          install -m 0755 /tmp/iroh-relay "$HOME/.cargo/bin/iroh-relay"
+          mkdir -p /tmp/iroh-relay && tar -xzf /tmp/iroh-relay.tar.gz -C /tmp/iroh-relay --no-same-owner --no-same-permissions
+          install -m 0755 /tmp/iroh-relay/iroh-relay "$HOME/.cargo/bin/iroh-relay"
           iroh-relay --version
       - run: just e2e
