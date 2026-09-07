@@ -1057,12 +1057,11 @@ impl Kernel {
 
     // -- events --------------------------------------------------------------
 
-    /// Everything queued since the last drain, in order (internal.wit
-    /// `event-source.drain`). Never parks: the glue drains after every export
-    /// call it dispatches, and an async export parked on a guest-internal
-    /// waker is a deadlock to polyengine (polyengine#292).
-    pub fn drain_events(&self) -> Vec<Event> {
-        self.events.drain()
+    /// The next queued event, parking while there is none (internal.wit
+    /// `events.next`). One waiter: the worker glue runs a single pump over
+    /// the runtime's export (see [`events`]).
+    pub async fn next_event(&self) -> Event {
+        self.events.next().await
     }
 
     /// The other half of [`Kernel::abort`]: an ending the visor did not ask

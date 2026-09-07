@@ -296,8 +296,7 @@ pub(crate) fn Visor() -> Element {
                 // The other device acted: a peer that confirmed, an offer
                 // that expired, an enrollment that landed. Nothing else
                 // could bring those to the screen — there is no timer here
-                // and `pairing.status` may not park (internal.wit
-                // `event-source`).
+                // and `pairing.status` may not park.
                 Event::PairingChanged(next) => {
                     apply_phase(next, pairing_phase, members, notice).await;
                 }

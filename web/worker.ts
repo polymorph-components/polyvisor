@@ -51,8 +51,10 @@ const I = {
   sync: "polyvisor:internal/sync@0.1.0",
   pairing: "polyvisor:internal/pairing@0.1.0",
   storage: "polyvisor:internal/storage@0.1.0",
+  // Both sides of one seam: the runtime EXPORTS `events` (the pump below
+  // consumes it) and each tab's visor IMPORTS it (served further down from
+  // that tab's queue). Same interface id, opposite directions.
   events: "polyvisor:internal/events@0.1.0",
-  eventSource: "polyvisor:internal/event-source@0.1.0",
   appServices: "polyvisor:internal/app-services@0.1.0",
   locks: "polyvisor:internal/locks@0.1.0",
   tasks: "polyvisor:app/tasks@0.1.0",
@@ -67,10 +69,10 @@ interface KernelEvent {
 }
 
 /** One connected tab. `queue`/`waiter` are that tab's copy of the kernel
- * event stream: the worker drains the runtime after every export call it
- * dispatches and fans each event out to every tab, whose own glue serves the
- * visor's `events.next` import from a local queue (internal.wit
- * `interface events`). */
+ * event stream: the worker pumps the runtime's parking `events.next` and
+ * fans each event out to every tab, whose own glue serves the visor's
+ * `events.next` import from a local queue (internal.wit `interface
+ * events`). */
 interface Tab {
   port: MessagePort;
   queue: KernelEvent[];
@@ -278,23 +280,12 @@ ready.catch((err: unknown) => {
 });
 
 // ---------------------------------------------------------------------------
-// Events: drain after every dispatched export call
+// Events: one long-poll pump over the runtime's export
 //
-// internal.wit `interface event-source` and design.md "Contracts" rule 4.
-// The first design was a parking `events.next` export the worker long-polled;
-// polyengine traps an async export parked on a guest-internal waker with no
-// host call outstanding as a deadlock (polyengine#292), where wasmtime would
-// stay pending. So the runtime's side is `event-source.drain`, which never
-// parks, and the glue calls it after every export activation it made.
-//
-// That misses nothing, and no longer only for now. The kernel's one event is
-// `session-ended`, and it is born inside an export activation the glue itself
-// dispatched (`apps.abort`, `apps.close`). The engine has landed and adds
-// none: a remote change reaches an app through `tasks.revision`, which the
-// app polls, and the visor re-reads `sync.peers` when Settings opens. Nothing
-// in the kernel produces an event from a host-call completion, so there is
-// nothing for a drain sited here to miss. An event with no export activation
-// behind it is what would change that, and it would change this site.
+// internal.wit `interface events` and design.md "Contracts" rule 4. The
+// runtime's `next` parks while its queue is empty, so no call has to carry
+// an event across: a phase the OTHER device drove — a peer confirming, an
+// enrollment landing — wakes this pump with nothing pressed on this device.
 // ---------------------------------------------------------------------------
 
 function fanOut(events: KernelEvent[]): void {
@@ -312,55 +303,23 @@ function fanOut(events: KernelEvent[]): void {
   }
 }
 
-/** Drain the runtime and fan out. Never throws: a drain that failed must not
- * turn into the answer of the call it followed, and it must not replace the
- * error of a call that had already failed. */
-async function drainEvents(): Promise<void> {
-  let exports_: Exports;
+/** The pump. Started once the runtime is booted, never restarted: if `next`
+ * rejects, the runtime is gone, and a runtime that is gone was already
+ * reported to every tab through `ready`'s failure path. Retrying would spin
+ * on the same rejection forever. */
+void ready.then(async (exports_) => {
+  const next = exports_[I.events].next as () => Promise<KernelEvent>;
   try {
-    exports_ = await ready;
-  } catch {
-    return; // Not booted: `ready.catch` already told every tab.
-  }
-  try {
-    const drain = exports_[I.eventSource].drain as () => Promise<KernelEvent[]>;
-    fanOut(await drain());
+    for (;;) fanOut([await next()]);
   } catch (err: unknown) {
     console.error(
-      "polyvisor: draining the kernel's events failed:",
+      "polyvisor: the kernel's event pump stopped:",
       (err as Error)?.message ?? err,
     );
   }
-}
-
-/**
- * Wrap every member of an RPC impl so the kernel is drained after the call.
- *
- * One helper rather than a `drainEvents()` at each forwarding site: a
- * forwarding site that forgets it strands events until the next call that
- * did not, which is a bug that only shows up as a stale visor. Every place
- * this worker dispatches a runtime export on behalf of a tab or a session
- * port goes through here.
- *
- * `finally`, not "on success": an export that failed may still have pushed
- * an event before failing (`apps.launch` that opened and then closed a
- * session), and the original rejection is what propagates either way.
- */
-function draining<T extends Record<string, (...args: never[]) => unknown>>(
-  impl: T,
-): T {
-  const wrapped: Record<string, unknown> = {};
-  for (const [name, fn] of Object.entries(impl)) {
-    wrapped[name] = async (...args: unknown[]) => {
-      try {
-        return await (fn as (...a: unknown[]) => unknown)(...args);
-      } finally {
-        await drainEvents();
-      }
-    };
-  }
-  return wrapped as T;
-}
+}).catch(() => {
+  // Not booted: `ready.catch` already told every tab.
+});
 
 /** Bind a fresh MessageChannel to `session` and serve the session's two
  * interfaces on it. Returns the end to transfer to the frame. */
@@ -372,7 +331,7 @@ function mintSessionPort(
   const apps = exports_[I.apps];
   const { port1, port2 } = new MessageChannel();
   serveInterfaces(port1, {
-    [I.tasks]: draining({
+    [I.tasks]: {
       revision: () => svc.tasksRevision(session),
       items: () => svc.tasksItems(session),
       add: (title: string) => svc.tasksAdd(session, title),
@@ -381,14 +340,14 @@ function mintSessionPort(
       setTitle: (id: string, title: string) =>
         svc.tasksSetTitle(session, id, title),
       remove: (id: string) => svc.tasksRemove(session, id),
-    }),
+    },
     // Only these three: a session port is not a way to enumerate or launch
     // apps.
-    [I.apps]: draining({
+    [I.apps]: {
       component: () => apps.component(session),
       assets: () => apps.assets(session),
       asset: (handle: Uint8Array) => apps.asset(session, handle),
-    }),
+    },
   });
   return port2;
 }
@@ -459,7 +418,7 @@ self.onconnect = (ev: MessageEvent) => {
   });
 
   serveInterfaces(port, {
-    [I.device]: draining({
+    [I.device]: {
       status: async () => (await ready)[I.device].status(),
       setName: async (name: string) => (await ready)[I.device].setName(name),
       setHue: async (hue: number) => (await ready)[I.device].setHue(hue),
@@ -469,37 +428,35 @@ self.onconnect = (ev: MessageEvent) => {
       unseal: async (passphrase: string) =>
         (await ready)[I.device].unseal(passphrase),
       erase: async () => (await ready)[I.device].erase(),
-    }),
-    [I.store]: draining({
+    },
+    [I.store]: {
       devices: async () => (await ready)[I.store].devices(),
-    }),
+    },
     // Control port only, like `device`: dialing another device is the
     // visor's act, and an app session has no business naming a peer.
-    [I.sync]: draining({
+    [I.sync]: {
       connect: async (endpointId: string) =>
         (await ready)[I.sync].connect(endpointId),
       peers: async () => (await ready)[I.sync].peers(),
       members: async () => (await ready)[I.sync].members(),
-    }),
+    },
     // Control port only, like `sync`: pairing is a ceremony in the trusted
     // pixels, and an app session has no business starting or confirming
-    // one. `draining` matters more here than anywhere else — the kernel
-    // pushes `pairing-changed` on transitions the *other* device caused,
-    // and this drain is what carries them to the tabs.
-    [I.pairing]: draining({
+    // one.
+    [I.pairing]: {
       offer: async () => (await ready)[I.pairing].offer(),
       claim: async (code: string) => (await ready)[I.pairing].claim(code),
       confirm: async () => (await ready)[I.pairing].confirm(),
       cancel: async () => (await ready)[I.pairing].cancel(),
       status: async () => (await ready)[I.pairing].status(),
-    }),
+    },
     // Control port only, like `pairing`: connecting a store is a ceremony
     // in the trusted pixels, and an app session has no business naming a
     // provider — still less holding the one-shot code that crosses here.
     // The tokens themselves never cross this port: `oauth-complete` hands
     // the kernel a code, and what comes back the kernel seals for itself
     // (internal.wit `storage`).
-    [I.storage]: draining({
+    [I.storage]: {
       status: async () => (await ready)[I.storage].status(),
       oauthStart: async (client: unknown) =>
         (await ready)[I.storage].oauthStart(client),
@@ -507,8 +464,8 @@ self.onconnect = (ev: MessageEvent) => {
         (await ready)[I.storage].oauthComplete(code, state),
       disconnect: async () => (await ready)[I.storage].disconnect(),
       syncNow: async () => (await ready)[I.storage].syncNow(),
-    }),
-    [I.apps]: draining({
+    },
+    [I.apps]: {
       installed: async () => (await ready)[I.apps].installed(),
       launch: async (app: string) => (await ready)[I.apps].launch(app),
       sessionApp: async (s: number) => (await ready)[I.apps].sessionApp(s),
@@ -523,9 +480,9 @@ self.onconnect = (ev: MessageEvent) => {
       // itself with a reason of its own composing.
       abort: async (s: number, reason: string) =>
         (await ready)[I.apps].abort(s, reason),
-    }),
-    // NOT `draining`: this is the tab's own local queue, not a runtime
-    // export — draining here would recurse into a call that never happened.
+    },
+    // The tab side of `events`: served from this tab's own local queue,
+    // which the pump above fills.
     [I.events]: {
       // Parks while the tab's queue is empty, exactly as the WIT says. One
       // waiter per tab: a second concurrent `next()` would silently replace

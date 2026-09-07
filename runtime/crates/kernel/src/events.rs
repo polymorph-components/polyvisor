@@ -1,15 +1,21 @@
 //! The kernel's outbound event queue.
 //!
-//! Non-parking by contract (internal.wit `event-source`): the worker glue
-//! drains after every export call it dispatches, and until the engine lands
-//! every event is born inside an export activation the glue made, so draining
-//! there misses nothing. The first design was a parking `next` — polyengine
-//! traps an async export parked on a guest-internal waker with no host call
-//! outstanding as a deadlock (polyengine#292), so there is no waker here at
-//! all, only a queue.
+//! A queue and one waker (internal.wit `interface events`): [`Events::next`]
+//! answers immediately while something is queued and parks otherwise, and
+//! [`Events::push`] wakes whoever is parked. That is what lets an event born
+//! of network activity alone — a peer confirming, an enrollment landing —
+//! reach a visor with no call made on this device.
+//!
+//! One waiter is the design, not a limitation worked around: the worker glue
+//! runs a single pump over the runtime's `events.next` export. A second
+//! `next` polled while another is parked therefore just replaces the stored
+//! waker, and the displaced future is left for its own caller to re-poll.
+//! There is deliberately no waiter list.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::future::poll_fn;
+use std::task::{Poll, Waker};
 
 /// `polyvisor:internal/events.event`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,15 +33,40 @@ pub enum Event {
 }
 
 #[derive(Default)]
-pub struct Events(RefCell<VecDeque<Event>>);
+struct Inner {
+    queue: VecDeque<Event>,
+    waker: Option<Waker>,
+}
+
+#[derive(Default)]
+pub struct Events(RefCell<Inner>);
 
 impl Events {
     pub fn push(&self, event: Event) {
-        self.0.borrow_mut().push_back(event);
+        // The waker is taken while the cell is borrowed and woken after it is
+        // released: `wake` may poll the waiting task synchronously, and that
+        // poll borrows this same cell.
+        let waker = {
+            let mut inner = self.0.borrow_mut();
+            inner.queue.push_back(event);
+            inner.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
-    /// Everything queued, in order, leaving the queue empty.
-    pub fn drain(&self) -> Vec<Event> {
-        self.0.borrow_mut().drain(..).collect()
+    /// The next event, parking while there is none.
+    pub fn next(&self) -> impl Future<Output = Event> + '_ {
+        poll_fn(|cx| {
+            let mut inner = self.0.borrow_mut();
+            match inner.queue.pop_front() {
+                Some(event) => Poll::Ready(event),
+                None => {
+                    inner.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
     }
 }

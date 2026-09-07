@@ -2128,30 +2128,85 @@ fn every_mutation_advances_the_revision_and_ids_order_the_items() {
 
 // -- events ------------------------------------------------------------------
 
-/// True while nothing is queued. Draining is the only way to ask, and it is
-/// destructive, which is the whole of the `event-source` contract.
+/// A waker that only records that it was woken.
+struct Woken(std::sync::atomic::AtomicBool);
+
+impl Woken {
+    fn was_woken(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl futures::task::ArcWake for Woken {
+    fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+        arc_self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Poll `next_event` once with a noop waker. `Pending` is how a test asks
+/// "is anything queued?" without parking the thread, and `Ready` takes the
+/// one event at the head.
+fn poll_event(kernel: &Kernel) -> Poll<Event> {
+    let mut next = std::pin::pin!(kernel.next_event());
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    next.as_mut().poll(&mut cx)
+}
+
+/// True while nothing is queued.
 fn quiet(kernel: &Kernel) -> bool {
-    kernel.drain_events().is_empty()
+    poll_event(kernel).is_pending()
+}
+
+/// Everything queued right now, in order, leaving the queue empty.
+fn queued(kernel: &Kernel) -> Vec<Event> {
+    let mut events = Vec::new();
+    while let Poll::Ready(event) = poll_event(kernel) {
+        events.push(event);
+    }
+    events
 }
 
 #[test]
-fn drain_returns_everything_queued_in_order_and_empties_the_queue() {
-    // internal.wit `event-source`: non-parking. The glue drains after every
-    // export call it dispatches, so `drain` must answer immediately and must
-    // not hand the same event over twice.
+fn next_parks_until_a_push_arrives_and_wakes_the_waiter() {
+    // internal.wit `events.next`: "Resolves with the next event; parks while
+    // there is none." The worker glue's pump is parked in exactly this way
+    // when an event is born of network activity with no call outstanding, so
+    // the push must be what wakes it.
+    let kernel = boot();
+
+    let woken = std::sync::Arc::new(Woken(std::sync::atomic::AtomicBool::new(false)));
+    let mut next = std::pin::pin!(kernel.next_event());
+    let waker = futures::task::waker(woken.clone());
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(
+        next.as_mut().poll(&mut cx).is_pending(),
+        "an empty queue parks"
+    );
+    assert!(!woken.was_woken());
+
+    kernel.push_event(Event::SessionEnded(1, "first".into()));
+    assert!(woken.was_woken(), "the push woke the parked waiter");
+    assert_eq!(
+        next.as_mut().poll(&mut cx),
+        Poll::Ready(Event::SessionEnded(1, "first".into()))
+    );
+}
+
+#[test]
+fn events_arrive_in_order_and_each_only_once() {
     let kernel = boot();
     assert!(quiet(&kernel));
 
     kernel.push_event(Event::SessionEnded(1, "first".into()));
     kernel.push_event(Event::SessionEnded(2, "second".into()));
     assert_eq!(
-        kernel.drain_events(),
+        queued(&kernel),
         vec![
             Event::SessionEnded(1, "first".into()),
             Event::SessionEnded(2, "second".into()),
         ]
     );
-    assert!(quiet(&kernel), "a drained event is gone");
+    assert!(quiet(&kernel), "a delivered event is gone");
 }
 
 #[test]
@@ -2169,7 +2224,7 @@ fn abort_ends_the_session_and_announces_it_once() {
         "the session is no longer live"
     );
     assert_eq!(
-        kernel.drain_events(),
+        queued(&kernel),
         vec![Event::SessionEnded(
             s,
             "the app's frame was closed: policy".into()
@@ -2594,8 +2649,7 @@ fn pairing_enrolls_the_joiner_and_the_two_devices_then_sync() {
     // the *other* device drove — the SAS arriving, the enrollment landing —
     // reach a screen only as events.
     for kernel in [&joiner, &adder] {
-        let phases: Vec<Phase> = kernel
-            .drain_events()
+        let phases: Vec<Phase> = queued(kernel)
             .into_iter()
             .map(|event| match event {
                 Event::PairingChanged(phase) => phase,
