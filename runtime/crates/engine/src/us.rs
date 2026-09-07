@@ -42,6 +42,11 @@ pub struct Member {
 const MEMBERS: &str = "members";
 const PETNAME: &str = "petname";
 const ENROLLED: &str = "enrolled";
+/// The keyhive group and document this group's app content is sealed to
+/// (`crate::vault`), as lowercase hex of their 32-byte ids.
+const KEYHIVE: &str = "keyhive";
+const GROUP: &str = "group";
+const DOC: &str = "doc";
 
 /// The tree every device of one user keeps its group in.
 #[must_use]
@@ -154,6 +159,37 @@ impl UsDoc {
             .collect();
         found.sort_by(|a, b| a.enrolled.cmp(&b.enrolled).then_with(|| a.key.cmp(&b.key)));
         found
+    }
+
+    /// The keyhive group and document ids this group seals its app content
+    /// to, if the document names them. A group founded before M3c has no such
+    /// entry; the founder writes one on its next boot.
+    pub fn keyhive(&self) -> Option<([u8; 32], [u8; 32])> {
+        let doc = self.core.read();
+        let (_value, keyhive) = doc.get(ROOT, KEYHIVE).ok().flatten()?;
+        let read = |field: &str| -> Option<[u8; 32]> {
+            let (value, _id) = doc.get(&keyhive, field).ok().flatten()?;
+            unhex(value.to_str()?)
+        };
+        Some((read(GROUP)?, read(DOC)?))
+    }
+
+    /// Record the keyhive group and document. Written once, by the device that
+    /// founded the group; a joiner adopts the whole document rather than
+    /// writing this.
+    pub fn set_keyhive(&mut self, group: [u8; 32], doc: [u8; 32]) -> Result<(), String> {
+        let (group, doc) = (hex(&group), hex(&doc));
+        self.core.transact(move |tx| {
+            let keyhive = match tx.get(ROOT, KEYHIVE).map_err(|e| e.to_string())? {
+                Some((_value, keyhive)) => keyhive,
+                None => tx
+                    .put_object(ROOT, KEYHIVE, ObjType::Map)
+                    .map_err(|e| e.to_string())?,
+            };
+            tx.put(&keyhive, GROUP, group).map_err(|e| e.to_string())?;
+            tx.put(&keyhive, DOC, doc).map_err(|e| e.to_string())?;
+            Ok(())
+        })
     }
 
     /// Write a member in. Idempotent on the key: re-adding a member the

@@ -10,9 +10,15 @@ publish.workspace = true
 # `LocalPool` (docs/design.md "Delivery").
 [dependencies]
 automerge.workspace = true
+beekem.workspace = true
+bincode.workspace = true
 ed25519-dalek.workspace = true
 future_form.workspace = true
 futures.workspace = true
+keyhive_core.workspace = true
+keyhive_crypto.workspace = true
+nonempty.workspace = true
+rand_chacha.workspace = true
 sedimentree_core.workspace = true
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

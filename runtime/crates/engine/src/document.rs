@@ -117,16 +117,34 @@ impl Document {
     }
 
     /// Apply every stored change of this tree the document has not seen.
-    /// Returns whether anything landed.
+    /// Returns whether anything landed. The plaintext path, for the
+    /// user-system document — an app document's blobs are envelopes, and the
+    /// engine decrypts them before calling [`Document::apply`].
+    pub fn absorb(&mut self, storage: &SnapshotStorage) -> bool {
+        let items = self.unapplied(storage);
+        self.apply(items)
+    }
+
+    /// The stored blobs of this tree the document has not applied yet, raw.
+    /// For an app document these are keyhive envelopes.
+    pub fn unapplied(&self, storage: &SnapshotStorage) -> Vec<(CommitId, Vec<u8>)> {
+        storage
+            .commit_blobs(self.tree)
+            .into_iter()
+            .filter(|(id, _)| !self.applied.contains(id))
+            .collect()
+    }
+
+    /// Apply decoded changes to the document. Returns whether anything landed.
     ///
     /// Changes may arrive before their dependencies (sync is a set
     /// reconciliation, not a topological replay); automerge queues a change
     /// whose deps are missing and applies it when they arrive, so the whole
     /// batch goes in as one call and order does not matter.
-    pub fn absorb(&mut self, storage: &SnapshotStorage) -> bool {
+    pub fn apply(&mut self, items: Vec<(CommitId, Vec<u8>)>) -> bool {
         let mut ids = Vec::new();
         let mut changes = Vec::new();
-        for (id, blob) in storage.commit_blobs(self.tree) {
+        for (id, blob) in items {
             if self.applied.contains(&id) {
                 continue;
             }

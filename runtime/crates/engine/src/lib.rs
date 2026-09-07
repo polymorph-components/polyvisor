@@ -24,25 +24,28 @@ mod policy;
 mod storage;
 mod transport;
 mod us;
+mod vault;
 
 pub use clock::EngineClock;
 pub use doc::{TaskSnapshot, TodoItem};
 pub use ed25519_dalek::VerifyingKey;
-pub use storage::Snapshot;
+pub use storage::{AppState, Snapshot, TreeState};
 pub use subduction_protocol::peer_id::PeerId;
 pub use transport::{DynTransport, EngineTransport};
 pub use us::{Member, us_tree};
+pub use vault::VaultState;
 
 use clock::ClockAdapter;
 use doc::AppDoc;
 use policy::{GroupPolicy, Members};
 use storage::SnapshotStorage;
 use us::UsDoc;
+use vault::Vault;
 
 use ed25519_dalek::SigningKey;
 use future_form::Local;
 use futures::future::LocalBoxFuture;
-use sedimentree_core::id::SedimentreeId;
+use sedimentree_core::{blob::Blob, id::SedimentreeId, loose_commit::id::CommitId};
 use sha2::{Digest as _, Sha256};
 use subduction_crypto::signer::memory::MemorySigner;
 use subduction_protocol::{
@@ -92,6 +95,21 @@ pub fn tasks_tree(app: &str) -> SedimentreeId {
     SedimentreeId::new(hasher.finalize().into())
 }
 
+/// The tree the group's keyhive operations travel in.
+///
+/// Keyhive's own membership and CGKA events have to reach the other devices
+/// before their envelopes can be opened, and the engine already has exactly
+/// one reliable multi-device channel: a sedimentree. So they get a tree of
+/// their own — one commit per static event, the commit id being the event's
+/// digest, no parents (keyhive's ingest is an unordered, content-addressed
+/// merge, not a replay). The events are keyhive-signed already and carry no
+/// content, so this tree is the one app-adjacent tree that is *not* enveloped:
+/// enveloping the key material with the key material is a circle.
+#[must_use]
+pub fn keyhive_tree() -> SedimentreeId {
+    SedimentreeId::new(Sha256::digest(b"polyvisor:keyhive-events").into())
+}
+
 /// Storage authorization: the device group, as the user-system document
 /// records it (see [`policy::GroupPolicy`]).
 type Policy = GroupPolicy;
@@ -124,6 +142,15 @@ pub struct Engine<T: Transport<Local> + 'static> {
     /// peer was dialed still gets subscribed on it. Entries are removed when
     /// the driver reports the connection closed (see [`Engine::pump_events`]).
     conns: RefCell<Vec<Connection<T>>>,
+    /// This device's keyhive (`crate::vault`). `None` until [`Engine::open_us`]
+    /// creates or restores it, on the same first touch that opens the group.
+    vault: RefCell<Option<Rc<Vault>>>,
+    /// A restored vault's bytes, until the first async call can rebuild it —
+    /// `Engine::new` is synchronous and keyhive's constructors are not.
+    pending_vault: RefCell<Option<VaultState>>,
+    /// The seed the vault's CSPRNG is built from: the device seed mixed with
+    /// this boot's entropy.
+    vault_rng_seed: [u8; 32],
     /// Restored-but-not-yet-hydrated state. `Engine::new` cannot talk to its
     /// own driver — the caller has not spawned it yet — so a restored
     /// snapshot's trees are handed to the driver on the first async call.
@@ -158,16 +185,18 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         let mut apps = BTreeMap::new();
         let mut hydrate = Vec::new();
         let mut us: Option<UsDoc> = None;
+        let mut pending_vault: Option<VaultState> = None;
         if let Some(state) = storage_state {
             for app in state.apps {
                 let tree = tasks_tree(&app.app);
                 storage.restore(tree, app.state.commits, app.state.fragments);
                 hydrate.push(tree);
-                let mut doc = AppDoc::restore(&app.app, tree, &app.state.doc, seed);
                 // The document and its tree are checkpointed together, but a
                 // crash between a commit landing in storage and the document
-                // being saved leaves the tree ahead; absorb closes that gap.
-                let _absorbed = doc.absorb(&storage);
+                // being saved leaves the tree ahead. Closing that gap is
+                // `hydrate`'s job now rather than this one: an app tree's
+                // blobs are keyhive envelopes, and opening them is async.
+                let doc = AppDoc::restore(&app.app, tree, &app.state.doc, seed);
                 let _replaced = apps.insert(app.app.clone(), doc);
             }
             if let Some(state) = state.us {
@@ -178,6 +207,12 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 let _absorbed = doc.absorb(&storage);
                 us = Some(doc);
             }
+            if let Some(state) = state.keyhive {
+                let tree = keyhive_tree();
+                storage.restore(tree, state.commits, state.fragments);
+                hydrate.push(tree);
+            }
+            pending_vault = state.vault;
         }
         // The policy reads this on every remote storage operation, so it is
         // populated before the driver exists rather than after: a restored
@@ -208,6 +243,9 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             storage,
             spawn,
             apps: RefCell::new(apps),
+            vault: RefCell::new(None),
+            pending_vault: RefCell::new(pending_vault),
+            vault_rng_seed: mix(b"polyvisor:keyhive-rng", &seed, &entropy),
             us: RefCell::new(us),
             members,
             conns: RefCell::new(Vec::new()),
@@ -288,6 +326,63 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     ) -> Result<(), String> {
         self.us_mutate(move |doc| doc.add_member(key, petname, enrolled))
             .await
+    }
+
+    // -- keyhive enrollment ---------------------------------------------------
+
+    /// This device's keyhive contact card, for the joiner's ACCEPT frame.
+    ///
+    /// A prekey, signed by this device: it is what lets the adder seal the
+    /// group's current epoch key to a device it has never met. Without it the
+    /// joiner would be a member of the group in `us` and unable to open a
+    /// single one of its documents.
+    pub async fn keyhive_card(&self) -> Result<Vec<u8>, String> {
+        self.open_us().await?;
+        self.require_vault()?.contact_card().await
+    }
+
+    /// Adder: add the joiner's keyhive identity to the device group, and
+    /// answer with the operation stream the joiner must ingest. Goes in
+    /// ENROLL, beside the user-system document.
+    /// The second element is the content keys the joiner needs to read history
+    /// authored before it existed (see `Vault::export_content_keys`).
+    pub async fn enroll_keyhive(
+        &self,
+        card: &[u8],
+        joiner_key: [u8; 32],
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.open_us().await?;
+        let vault = self.require_vault()?;
+        let events = vault.enroll(card, joiner_key).await?;
+        let keys = vault.export_content_keys()?;
+        // Also onto the wire: a third device that pairs later learns of the
+        // second one from the tree, not from a frame it never saw.
+        self.publish_keyhive().await?;
+        Ok((events, keys))
+    }
+
+    /// Joiner: ingest the adder's keyhive operations and start sealing to the
+    /// group's document.
+    ///
+    /// Runs *after* [`Engine::adopt_us`], because the group and document it
+    /// switches to are the ones the adopted user-system document names — the
+    /// adder's word on which document is the group's, carried in the same
+    /// bytes the user just confirmed six digits over.
+    pub async fn adopt_keyhive(&self, events: &[u8], content_keys: &[u8]) -> Result<(), String> {
+        self.open_us().await?;
+        let (group, doc) = self
+            .with_us(UsDoc::keyhive)
+            .ok_or_else(|| "that device sent a group with no keyhive state".to_string())?;
+        self.require_vault()?
+            .adopt(events, content_keys, group, doc)
+            .await?;
+        self.publish_keyhive().await?;
+        // Everything already in storage was unopenable a moment ago.
+        let apps: Vec<String> = self.apps.borrow().keys().cloned().collect();
+        for app in apps {
+            let _landed = self.absorb_app(&app).await;
+        }
+        Ok(())
     }
 
     /// The user-system document's bytes, for the adder to put in ENROLL.
@@ -408,7 +503,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 // out of its own storage
                 // (subduction_protocol/src/effect.rs:93).
                 AppEvent::TreeUpdated { tree, .. } | AppEvent::SyncFinished { tree, .. } => {
-                    if self.absorb(tree) {
+                    if self.absorb(tree).await {
                         notify(EngineEvent::Changed).await;
                     }
                 }
@@ -451,19 +546,30 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     ///
     /// Not the seed — the kernel holds that, in the same sealed checkpoint,
     /// and two copies of an identity is one copy too many to keep in step.
-    #[must_use]
-    pub fn snapshot(&self) -> Snapshot {
+    ///
+    /// Async, and fallible, since M3c: it now also carries this device's
+    /// keyhive, whose archive is an async read.
+    pub async fn snapshot(&self) -> Result<Snapshot, String> {
+        // The vault's own state first, and outside the `apps` borrow: reading
+        // keyhive's archive is async.
+        let vault = match self.vault() {
+            Some(vault) => Some(vault.state().await?),
+            None => self.pending_vault.borrow().clone(),
+        };
         let apps = self.apps.borrow();
         let us = self
             .us
             .borrow()
             .as_ref()
             .map(|doc| (doc.tree(), doc.save()));
-        self.storage.snapshot(
+        let keyhive = vault.is_some().then(keyhive_tree);
+        Ok(self.storage.snapshot(
             apps.iter()
                 .map(|(app, doc)| (app.clone(), doc.tree(), doc.save())),
             us,
-        )
+            keyhive,
+            vault,
+        ))
     }
 
     // -- internals -----------------------------------------------------------
@@ -480,6 +586,9 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         let mut trees: Vec<SedimentreeId> = self.apps.borrow().values().map(AppDoc::tree).collect();
         if self.us.borrow().is_some() {
             trees.push(us_tree());
+            // The group's keyhive operations: a peer that cannot ask for them
+            // cannot open a single app envelope this device writes.
+            trees.push(keyhive_tree());
         }
         trees
     }
@@ -489,6 +598,10 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     /// one document that is not per-app.
     async fn open_us(&self) -> Result<(), String> {
         self.hydrate().await?;
+        // Before the early return: a restored device has its group document
+        // already and would otherwise never build the keyhive that document
+        // names.
+        self.open_vault().await?;
         if self.us.borrow().is_some() {
             return Ok(());
         }
@@ -529,6 +642,80 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             self.refresh_members();
             self.push_us_commit(commit).await?;
         }
+        // The founder names its keyhive group and document in the one place
+        // every device of the group will read: a joiner learns which document
+        // to seal to by adopting this, not by guessing.
+        if self.with_us(UsDoc::keyhive).is_none() {
+            let vault = self.require_vault()?;
+            let (group, doc_id) = (vault.group_id(), vault.doc_id());
+            let commit = {
+                let mut cell = self.us.borrow_mut();
+                let doc = cell
+                    .as_mut()
+                    .ok_or_else(|| "this device has no group document".to_string())?;
+                doc.set_keyhive(group, doc_id)?;
+                doc.last_local_commit()
+            };
+            self.push_us_commit(commit).await?;
+        }
+        self.publish_keyhive().await?;
+        Ok(())
+    }
+
+    /// Make sure this device holds a keyhive: restored from the checkpoint if
+    /// there was one, generated otherwise.
+    async fn open_vault(&self) -> Result<(), String> {
+        if self.vault.borrow().is_some() {
+            return Ok(());
+        }
+        let restored = self.pending_vault.borrow_mut().take();
+        let vault = match restored {
+            Some(state) => Vault::restore(&state, self.seed, self.vault_rng_seed).await?,
+            None => Vault::create(self.seed, self.vault_rng_seed).await?,
+        };
+        *self.vault.borrow_mut() = Some(Rc::new(vault));
+        Ok(())
+    }
+
+    /// The vault, cloned out of its cell: every keyhive call is async, and a
+    /// `RefCell` borrow may not span an await (see `crate::document`).
+    fn vault(&self) -> Option<Rc<Vault>> {
+        self.vault.borrow().clone()
+    }
+
+    fn require_vault(&self) -> Result<Rc<Vault>, String> {
+        self.vault()
+            .ok_or_else(|| "this device has no keyhive yet".to_string())
+    }
+
+    /// Carry every keyhive operation this device has not yet published into
+    /// the keyhive-events tree. Idempotent, and cheap when there is nothing
+    /// new: the vault remembers what it has already put on the wire.
+    async fn publish_keyhive(&self) -> Result<(), String> {
+        let Some(vault) = self.vault() else {
+            return Ok(());
+        };
+        let events = vault.unpublished().await?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        let commits: Vec<subduction_protocol::command::NewCommit> = events
+            .into_iter()
+            .map(|(id, bytes)| subduction_protocol::command::NewCommit {
+                head: CommitId::new(id),
+                parents: std::collections::BTreeSet::new(),
+                blob: Blob::new(bytes),
+            })
+            .collect();
+        self.handle
+            .add_commits(keyhive_tree(), commits)
+            .await
+            .map_err(|e| e.to_string())?;
+        let _heads = self
+            .handle
+            .tree_heads(keyhive_tree())
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -595,12 +782,28 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         let Some(trees) = self.pending_hydration.borrow_mut().take() else {
             return Ok(());
         };
-        for tree in trees {
-            let (commits, fragments) = self.storage.metadata(tree);
+        for tree in &trees {
+            let (commits, fragments) = self.storage.metadata(*tree);
             self.handle
-                .hydrate_tree(tree, commits, fragments)
+                .hydrate_tree(*tree, commits, fragments)
                 .await
                 .map_err(|e| e.to_string())?;
+        }
+        // A restored device's app documents were NOT absorbed in
+        // `Engine::new`: their blobs are envelopes and opening one is async.
+        // The keyhive tree goes first — it carries the material the rest needs
+        // — and the vault has to exist before either.
+        if self.pending_vault.borrow().is_some() || self.vault.borrow().is_some() {
+            self.open_vault().await?;
+        }
+        if trees.contains(&keyhive_tree()) {
+            let _landed = self.absorb_keyhive().await;
+        }
+        for tree in trees {
+            if tree == keyhive_tree() || tree == us_tree() {
+                continue;
+            }
+            let _landed = self.absorb(tree).await;
         }
         Ok(())
     }
@@ -619,6 +822,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             Ok((answer, doc.tree(), doc.last_local_commit()))
         })?;
         if let Some(commit) = commit {
+            let commit = self.seal(commit).await?;
             self.handle
                 .add_commits(tree, vec![commit])
                 .await
@@ -635,8 +839,33 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 .tree_heads(tree)
                 .await
                 .map_err(|e| e.to_string())?;
+            // Encrypting may have advanced the document's CGKA epoch, and the
+            // update op is what lets the other devices follow.
+            self.publish_keyhive().await?;
         }
         Ok(answer)
+    }
+
+    /// Replace an app commit's plaintext change with its keyhive envelope.
+    /// This is the whole of M3c's claim: what reaches the driver — and so the
+    /// wire, the relay and storage — is ciphertext.
+    async fn seal(
+        &self,
+        commit: subduction_protocol::command::NewCommit,
+    ) -> Result<subduction_protocol::command::NewCommit, String> {
+        let vault = self.require_vault()?;
+        let preds: Vec<[u8; 32]> = commit.parents.iter().map(|id| *id.as_bytes()).collect();
+        let sealed = vault
+            .seal(
+                *commit.head.as_bytes(),
+                &preds,
+                commit.blob.as_slice().to_vec(),
+            )
+            .await?;
+        Ok(subduction_protocol::command::NewCommit {
+            blob: Blob::new(sealed),
+            ..commit
+        })
     }
 
     /// Make sure this device holds a document for `app`, and that every live
@@ -650,18 +879,22 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     /// that has never seen it pulls the other device's list.
     async fn open_app(&self, app: &str) -> Result<(), String> {
         self.hydrate().await?;
+        // The group document names the keyhive document every app tree is
+        // sealed to, so it is opened first even for a device whose caller only
+        // ever asked about tasks.
+        self.open_us().await?;
         if self.apps.borrow().contains_key(app) {
             return Ok(());
         }
         let tree = tasks_tree(app);
         {
-            let mut doc = AppDoc::empty(app, tree, self.seed);
-            // The tree may already hold items: a peer pushed them before this
-            // device ever opened the app, and the event pump had no document
-            // to put them in.
-            let _absorbed = doc.absorb(&self.storage);
+            let doc = AppDoc::empty(app, tree, self.seed);
             let _created = self.apps.borrow_mut().insert(app.to_string(), doc);
         }
+        // The tree may already hold envelopes: a peer pushed them before this
+        // device ever opened the app, and the event pump had no document to
+        // put them in.
+        let _absorbed = self.absorb(tree).await;
         // Cloned out of the cell first: `sync_tree` awaits into the driver,
         // and a borrow held across that await would collide with anything the
         // driver's own progress lets run.
@@ -682,7 +915,11 @@ impl<T: Transport<Local> + 'static> Engine<T> {
 
     /// Apply every stored-but-unapplied change of `tree` to its document.
     /// Returns whether anything landed.
-    fn absorb(&self, tree: SedimentreeId) -> bool {
+    ///
+    /// Async because an app tree's blobs are keyhive envelopes and opening one
+    /// is an async call into the vault. The `RefCell` borrows are taken and
+    /// dropped around each await rather than across one.
+    async fn absorb(&self, tree: SedimentreeId) -> bool {
         if tree == us_tree() {
             let landed = {
                 let mut cell = self.us.borrow_mut();
@@ -695,14 +932,86 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             }
             return landed;
         }
-        let mut apps = self.apps.borrow_mut();
-        let Some(doc) = apps.values_mut().find(|doc| doc.tree() == tree) else {
+        if tree == keyhive_tree() {
+            return self.absorb_keyhive().await;
+        }
+        let Some(app) = self
+            .apps
+            .borrow()
+            .iter()
+            .find(|(_, doc)| doc.tree() == tree)
+            .map(|(app, _)| app.clone())
+        else {
             // A tree with no local document: this device has never opened
-            // that app. The items stay in storage and are applied the moment
-            // it does (`AppDoc::restore` on the next boot, or `with_app`).
+            // that app. The items stay in storage and are opened the moment
+            // it does (`AppDoc::restore` on the next boot, or `open_app`).
             return false;
         };
-        doc.absorb(&self.storage)
+        self.absorb_app(&app).await
+    }
+
+    /// Open one app document's outstanding envelopes and apply what came out.
+    async fn absorb_app(&self, app: &str) -> bool {
+        let Some(vault) = self.vault() else {
+            // No keyhive yet, so nothing here can be opened. The envelopes
+            // stay in storage and are tried again on the next event.
+            return false;
+        };
+        let wanted = {
+            let apps = self.apps.borrow();
+            let Some(doc) = apps.get(app) else {
+                return false;
+            };
+            doc.unapplied(&self.storage)
+        };
+        if wanted.is_empty() {
+            return false;
+        }
+        let Ok(opened) = vault
+            .open(
+                wanted
+                    .into_iter()
+                    .map(|(id, blob)| (*id.as_bytes(), blob))
+                    .collect(),
+            )
+            .await
+        else {
+            return false;
+        };
+        let mut apps = self.apps.borrow_mut();
+        let Some(doc) = apps.get_mut(app) else {
+            return false;
+        };
+        doc.apply(
+            opened
+                .into_iter()
+                .map(|(id, change)| (CommitId::new(id), change))
+                .collect(),
+        )
+    }
+
+    /// Ingest the group's keyhive operations, then retry every app document:
+    /// what just arrived is exactly the material that turns a blob this device
+    /// could not open into one it can.
+    async fn absorb_keyhive(&self) -> bool {
+        let Some(vault) = self.vault() else {
+            return false;
+        };
+        let mut ingested = false;
+        for (id, blob) in self.storage.commit_blobs(keyhive_tree()) {
+            if vault.unseen(*id.as_bytes()) && vault.ingest(&blob).await.is_ok() {
+                ingested = true;
+            }
+        }
+        if !ingested {
+            return false;
+        }
+        let apps: Vec<String> = self.apps.borrow().keys().cloned().collect();
+        let mut landed = false;
+        for app in apps {
+            landed |= self.absorb_app(&app).await;
+        }
+        landed
     }
 
     /// The app's document. Synchronous, and the borrow never crosses an

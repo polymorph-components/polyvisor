@@ -326,16 +326,17 @@ impl Kernel {
         )
         .await?;
 
-        let (nonce_j, petname) = match frames.next().await {
+        let (nonce_j, petname, card) = match frames.next().await {
             Some(Frame::Accept {
                 nonce,
                 key,
                 petname,
+                card,
             }) => {
                 if key.as_slice() != joiner_key.as_slice() {
                     return Err("that device answered for a different key".to_string());
                 }
-                (nonce32(&nonce)?, petname)
+                (nonce32(&nonce)?, petname, card)
             }
             Some(Frame::Refused) => {
                 return Err(
@@ -392,8 +393,20 @@ impl Kernel {
         let engine = self.engine().map_err(|e| e.message)?;
         let enrolled = self.seams.clock.now_ms();
         engine.add_member(joiner_key, petname, enrolled).await?;
+        // The keyhive half of the same grant, and in this order: the group
+        // document is what names the keyhive group, so a joiner that got the
+        // operations first would have nothing to attach them to.
+        let (keyhive, read_back) = engine.enroll_keyhive(&card, joiner_key).await?;
         let us = engine.us_save().await?;
-        send_frame(transport.as_ref(), &Frame::Enroll { us }).await?;
+        send_frame(
+            transport.as_ref(),
+            &Frame::Enroll {
+                us,
+                keyhive,
+                read_back,
+            },
+        )
+        .await?;
         self.checkpoint().await.map_err(|e| e.message)?;
         Ok(())
     }
@@ -514,6 +527,7 @@ impl Kernel {
             .map_err(|_| "that code's token is malformed".to_string())?;
 
         let joiner_key = self.self_key().map_err(|e| e.message)?;
+        let card = self.engine().map_err(|e| e.message)?.keyhive_card().await?;
         let petname = self.state.borrow().row.petname.clone();
         let mut nonce_j = [0u8; 32];
         self.seams.rng.fill(&mut nonce_j);
@@ -523,6 +537,7 @@ impl Kernel {
                 nonce: nonce_j.to_vec(),
                 key: joiner_key.to_vec(),
                 petname,
+                card,
             },
         )
         .await?;
@@ -551,14 +566,19 @@ impl Kernel {
         send_frame(transport.as_ref(), &Frame::ConfirmJoin).await?;
         self.set_phase(Phase::AwaitingPeer);
 
-        let us = match frames.next().await {
-            Some(Frame::Enroll { us }) => us,
+        let (us, keyhive, read_back) = match frames.next().await {
+            Some(Frame::Enroll {
+                us,
+                keyhive,
+                read_back,
+            }) => (us, keyhive, read_back),
             Some(Frame::Cancel) => return Err(cancelled()),
             Some(_) => return Err(out_of_order()),
             None => return Err(gone()),
         };
         let engine = self.engine().map_err(|e| e.message)?;
         engine.adopt_us(&us, adder_key).await?;
+        engine.adopt_keyhive(&keyhive, &read_back).await?;
         self.checkpoint().await.map_err(|e| e.message)?;
         Ok(())
     }
@@ -677,6 +697,11 @@ enum Frame {
         nonce: Vec<u8>,
         key: Vec<u8>,
         petname: String,
+        /// The joiner's keyhive contact card (`polyvisor_engine::Engine::keyhive_card`).
+        /// Enrollment is not just a row in the group document any more: without
+        /// this the adder cannot seal the group's epoch key to the joiner, and
+        /// the joiner would arrive a member who can read nothing.
+        card: Vec<u8>,
     },
     Reveal {
         nonce: Vec<u8>,
@@ -684,6 +709,18 @@ enum Frame {
     ConfirmJoin,
     Enroll {
         us: Vec<u8>,
+        /// The group's keyhive operation stream, as the adder holds it after
+        /// adding the joiner. Public data — signed membership, prekey and CGKA
+        /// operations — and specifically *not* the adder's keyhive archive,
+        /// which would hand the joiner the adder's own prekey secrets.
+        keyhive: Vec<u8>,
+        /// The content keys the joiner needs to read what the group wrote
+        /// before it existed — the read-back foothold BeeKEM does not give a
+        /// new member (`polyvisor_engine`'s `Vault::export_content_keys`).
+        /// Secret, and it travels here rather than on the sync path because
+        /// this connection is the one the two users just compared six digits
+        /// over.
+        read_back: Vec<u8>,
     },
     Refused,
     Cancel,

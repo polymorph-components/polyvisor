@@ -17,7 +17,7 @@
 //! with the user-system document (`crate::us`).
 
 use automerge::{ObjType, ROOT, ReadDoc, ScalarValue, transaction::Transactable};
-use sedimentree_core::id::SedimentreeId;
+use sedimentree_core::{id::SedimentreeId, loose_commit::id::CommitId};
 use serde::{Deserialize, Serialize};
 use subduction_protocol::command::NewCommit;
 
@@ -206,9 +206,16 @@ impl AppDoc {
         self.core.last_local_commit()
     }
 
-    /// Apply every stored change of this tree the document has not seen.
-    pub fn absorb(&mut self, storage: &SnapshotStorage) -> bool {
-        self.core.absorb(storage)
+    /// The tree's stored envelopes this document has not opened yet, and the
+    /// ones it already has (walk entrypoints). Decryption is the engine's:
+    /// it is async, and a document may not suspend (see `crate::document`).
+    pub fn unapplied(&self, storage: &SnapshotStorage) -> Vec<(CommitId, Vec<u8>)> {
+        self.core.unapplied(storage)
+    }
+
+    /// Apply decrypted automerge changes. Returns whether anything landed.
+    pub fn apply(&mut self, items: Vec<(CommitId, Vec<u8>)>) -> bool {
+        self.core.apply(items)
     }
 
     fn put_field(&mut self, id: &str, field: &str, value: ScalarValue) -> Result<(), String> {
