@@ -28,6 +28,18 @@ jobs:
         with:
           tool: wasm-tools,just,wac-cli
       - uses: Swatinem/rust-cache@v2
+      # The endpoint component is built from polymorph-iroh's source, not
+      # taken from its jsr package (justfile `endpoint`: the interface the
+      # runtime binds is feature-gated). That is a ~20 s cargo build of a
+      # second dependency tree; the 2 MB artifact is what the composition
+      # actually needs, so cache the artifact rather than the checkout. The
+      # key is the justfile because the pinned revision lives there — a
+      # justfile edit costs one rebuild, a stale artifact is impossible
+      # (`endpoint` looks for the revision's own filename).
+      - uses: actions/cache@v4
+        with:
+          path: target/iroh_endpoint-*.wasm
+          key: iroh-endpoint-${{ runner.os }}-${{ hashFiles('justfile') }}
       # `site` composes first: the shipped runtime is the wac-plugged
       # artifact (justfile `compose`), and a dist built from the bare one
       # fails loudly in web/build.ts.

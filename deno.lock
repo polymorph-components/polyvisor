@@ -2,13 +2,9 @@
   "version": "5",
   "specifiers": {
     "jsr:@polyengine/protocol@~0.3.1": "0.3.1",
-    "jsr:@polyengine/runtime@~0.6.3": "0.6.7",
     "jsr:@polyengine/runtime@~0.6.7": "0.6.7",
-    "jsr:@polyengine/translator@~0.6.3": "0.6.7",
     "jsr:@polyengine/translator@~0.6.7": "0.6.7",
-    "jsr:@polyengine/wasi@~0.6.3": "0.6.7",
     "jsr:@polyengine/wasi@~0.6.7": "0.6.7",
-    "jsr:@polymorph/iroh@0.6": "0.6.1",
     "jsr:@polymorph/webcrypto@0.6": "0.6.1",
     "jsr:@polymorph/webrtc-datachannels@0.6": "0.6.2",
     "jsr:@polymorph/websocket@0.6": "0.6.1",
@@ -36,25 +32,13 @@
     "@polyengine/translator@0.6.7": {
       "integrity": "6797db05f37e00a5e466da7641722c9deb444051a9384ac04290e2b231944555",
       "dependencies": [
-        "jsr:@polyengine/runtime@~0.6.7"
+        "jsr:@polyengine/runtime"
       ]
     },
     "@polyengine/wasi@0.6.7": {
       "integrity": "df9c0d2bc6b2c57373941852546c3a587e33cc6be91d6124d33250c594c4e204",
       "dependencies": [
         "jsr:@polyengine/protocol"
-      ]
-    },
-    "@polymorph/iroh@0.6.1": {
-      "integrity": "5a6007af90a84ef0b9a69c5dc74ecd51faeaed3d016d274cb21877ce5bf89605",
-      "dependencies": [
-        "jsr:@polyengine/protocol",
-        "jsr:@polyengine/runtime@~0.6.3",
-        "jsr:@polyengine/translator@~0.6.3",
-        "jsr:@polyengine/wasi@~0.6.3",
-        "jsr:@polymorph/webcrypto",
-        "jsr:@polymorph/webrtc-datachannels",
-        "jsr:@polymorph/websocket"
       ]
     },
     "@polymorph/webcrypto@0.6.1": {
@@ -425,7 +409,6 @@
       "jsr:@polyengine/runtime@~0.6.7",
       "jsr:@polyengine/translator@~0.6.7",
       "jsr:@polyengine/wasi@~0.6.7",
-      "jsr:@polymorph/iroh@0.6",
       "jsr:@polymorph/webcrypto@0.6",
       "jsr:@polymorph/webrtc-datachannels@0.6",
       "jsr:@polymorph/websocket@0.6",

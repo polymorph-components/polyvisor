@@ -8,25 +8,19 @@
 // site, and an omission is invisible at runtime: it just silently permits
 // the suspending path. So the glue's own text is the gate.
 //
-// The worker is the one exception, and it is pinned just as hard in the
-// other direction. The composed iroh endpoint authenticates QUIC with
-// rustls, whose `Signer::sign` is synchronous, over an async webcrypto
-// import; with `jspi: false` the accepting side of every connection stalls
-// in `CertificateVerify`. So `worker.ts` must pass `jspi: true` — asserted
-// explicitly, so that returning it to `false` (which is the plan, once the
-// transport's signer is in-guest) is a deliberate edit of this test and not
-// something that can drift in unnoticed either way.
+// There is no exception. The worker was one through M3a, because the
+// composed iroh endpoint authenticated QUIC with rustls over an async
+// webcrypto sign import and the accepting side stalled in
+// `CertificateVerify` without JSPI; polymorph-iroh's `identity-from-seed`
+// signs in-guest and closed that hole.
 
-import { assert, assertEquals } from "@std/assert";
+import { assert } from "@std/assert";
 
-/** Realms that must never suspend a wasm frame. `boot.ts` and `frame.ts`
- * reach the embedder through `mount.ts` today and have no `instantiate(` of
- * their own; they are scanned so that a direct call added later is caught
- * by this test rather than by nothing. */
-const WITHOUT_JSPI = ["boot.ts", "frame.ts", "mount.ts"];
-
-/** The realm that must have it, until the endpoint's signer is in-guest. */
-const WITH_JSPI = "worker.ts";
+/** Every realm's embedder. `boot.ts` and `frame.ts` reach theirs through
+ * `mount.ts` today and have no `instantiate(` of their own; they are
+ * scanned so that a direct call added later is caught by this test rather
+ * than by nothing. */
+const REALMS = ["boot.ts", "frame.ts", "mount.ts", "worker.ts"];
 
 /** Index just past the `)` closing the parenthesis opened at `open`. */
 function balanced(text: string, open: number): number {
@@ -53,9 +47,9 @@ async function callSites(name: string): Promise<string[]> {
   return sites;
 }
 
-Deno.test("the visor and frame realms instantiate with jspi: false", async () => {
+Deno.test("every realm instantiates with jspi: false", async () => {
   let sites = 0;
-  for (const name of WITHOUT_JSPI) {
+  for (const name of REALMS) {
     for (const call of await callSites(name)) {
       sites++;
       assert(
@@ -64,25 +58,7 @@ Deno.test("the visor and frame realms instantiate with jspi: false", async () =>
       );
     }
   }
-  // `mount.ts` instantiates both producers (the visor and every app). A drop
-  // to zero would make this vacuous.
-  assert(sites >= 1, `expected instantiate call sites, found ${sites}`);
-});
-
-Deno.test("the worker realm instantiates with jspi: true, deliberately", async () => {
-  const sites = await callSites(WITH_JSPI);
-  // Exactly one: a second, unannotated instantiate in the worker would be a
-  // realm this test says nothing about.
-  assertEquals(
-    sites.length,
-    1,
-    `${WITH_JSPI}: expected exactly one instantiate( call site`,
-  );
-  assert(
-    /jspi:\s*true/.test(sites[0]),
-    `${WITH_JSPI}: the worker is the documented JSPI exception (design.md ` +
-      `"No JSPI") and must pass jspi: true until polymorph-iroh's TLS ` +
-      `signer is in-guest. If that landed, this test is what you edit:\n` +
-      sites[0],
-  );
+  // `mount.ts` instantiates both producers (the visor and every app) and
+  // `worker.ts` the runtime. A drop to zero would make this vacuous.
+  assert(sites >= 2, `expected instantiate call sites, found ${sites}`);
 });

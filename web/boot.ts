@@ -128,7 +128,7 @@ interface ComponentArtifacts {
   plan: string;
 }
 
-/** What the e2e scenarios read (`visor-and-frame-without-jspi`): the page's own
+/** What the e2e scenarios read (`instantiates-without-jspi`): the page's own
  * record that the worker got its runtime up, which the main thread cannot
  * see any other way. */
 const marks: { workerBooted: boolean } = {

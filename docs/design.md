@@ -104,23 +104,27 @@ checkpoint path bound `wasi:filesystem@0.2` (sync WIT) over OPFS
 
 Ruling: the runtime uses `wasi:filesystem@0.3` (async in WIT) through
 generated bindings, not `std::fs`; every glue-implemented import is
-async in WIT; the visor and frame embedders force `jspi: false`, so a
-regression there fails loudly.
+async in WIT; every embedder forces `jspi: false`, so a regression
+anywhere fails loudly.
 
-**The worker is the one exception, for now.** The composed iroh endpoint
-authenticates its QUIC connections with rustls, and rustls has no async
-signing path: `Signer::sign` is synchronous, and polymorph-iroh
-implements it as `block_on` over the async `polymorph:webcrypto` sign
-import (`core/src/crypto/sign.rs`). A sync lower of an async import is
-exactly what JSPI exists for, so the accept side of every connection
-needs it (found in M3a: with `jspi: false` the acceptor stalls in
-`CertificateVerify`). The general fact: a platform-held, non-extractable
-key as the TLS identity implies JSPI in a browser. So the worker is
-instantiated with `jspi: true`, tolerated only until the transport's
-signer is in-guest (polymorph-iroh: an identity built from a seed, which
-is the posture the kernel already holds); then the worker returns to
-`jspi: false` and the browser floor is wasm multi-memory alone. The
-visor and frame realms never needed JSPI and stay without it.
+**No realm is an exception.** The worker was one through M3a: the composed
+iroh endpoint authenticates its QUIC connections with rustls, whose
+`Signer::sign` is synchronous, and an identity built from platform key
+handles (`polymorph:iroh/identity-from-keys`) reaches its key through an
+async import — a sync lower of an async import, which is exactly what JSPI
+exists for, so the accept side of every connection needed it (with
+`jspi: false` the acceptor stalled in `CertificateVerify`). The general
+fact stands: a platform-held, non-extractable key as the TLS identity
+implies JSPI in a browser. polymorph-iroh's `identity-from-seed` (behind
+the `guest-ed25519-signing` feature) takes the other side of that: the
+identity holds its private key in the endpoint component's memory and
+signs there with ed25519-dalek. So every realm is `jspi: false` and the
+browser floor is wasm multi-memory alone. The trade, recorded: identity
+signatures run in wasm rather than in the platform's native crypto, and
+the device seed rests in the endpoint's memory for the endpoint's
+lifetime — it was already in the kernel's, and passed through guest memory
+at every bind, so this widens where it rests and not whether it is
+there.
 
 ## The app frame
 
@@ -187,7 +191,7 @@ form. Polyvisor owns five implementations:
 | `Transport` | one per connection over `polymorph:iroh` streams, relay-only: WebRTC is off in the worker because a SharedWorker has no `RTCPeerConnection` (the host backend never resolves there). Framing per `subduction_iroh` (u32 BE length prefix) so native subduction peers interoperate |
 | `Storage` | M3a: an in-memory item store serialized into the sealed checkpoint with the automerge docs. Items in their own files under the state root is the follow-up once checkpoint size matters |
 | `Policy` | group membership, read off the user-system document (`polyvisor:us`): a remote peer may read/write exactly while its key is a member. App-tree envelopes are keyhive's (M3c, `engine/src/vault.rs`) |
-| `Signer` / `NodeEffect::Sign` | M3a: `ed25519-dalek` over a seed held in the sealed checkpoint (the seed posture; the same seed, imported through `polymorph:webcrypto`, builds the iroh identity). Later: a non-extractable platform key — signing is an effect with external custody, which is exactly what that needs |
+| `Signer` / `NodeEffect::Sign` | M3a: `ed25519-dalek` over a seed held in the sealed checkpoint (the seed posture; the same seed builds the iroh identity, through `polymorph:iroh/identity-from-seed`). Later: a non-extractable platform key — signing is an effect with external custody, which is exactly what that needs |
 | `Clock` | `wasi:clocks@0.3` |
 
 Why the branch rather than the released crates: one driver loop the
@@ -378,7 +382,8 @@ the handshake.
   persisted in IndexedDB would rest under the same profile protection,
   so it buys nothing at this tier. The signing identity is a seed in the
   same sealed checkpoint (M3a); platform-held keys enter with the passkey
-  PRF rung (M5) and, for the transport, once its TLS signer is in-guest.
+  PRF rung (M5); the transport's TLS signer is in-guest instead (see
+  "No JSPI").
 - **Checkpoints** are AES-GCM over the kernel's serialized state, written
   to `/<id>/gen-<n>/` on the OPFS root through `wasi:filesystem@0.3` after
   every mutation (state is small until the engine lands; a debounce is a
@@ -420,8 +425,8 @@ native tests, so browser gates are mandatory for every visor change.
 | polymorph-stream-dom | git rev (see Cargo.toml / deno.json) | unpublished, moving; policy object and asset handles landed in #15 |
 | subduction | git `sansio` rev | above |
 | keyhive | git rev `a509a2d` | `keyhive_core` / `keyhive_crypto` / `beekem`, unreleased and moving. The sealed plaintext is keyhive's own `Envelope` and the read-back walk is keyhive's own `try_causal_decrypt`, so a rev bump is a wire-format change for every stored blob: its own PR |
-| `@polymorph/*` | 0.6.1 (iroh, webcrypto, websocket), 0.6.2 (webrtc-datachannels) | the cuts current at the polyengine 0.6.7 pin; taken within the `^0.6` range |
-| polymorph:iroh WIT | provisional | being upgraded upstream in parallel; re-checked before M3a, the first milestone that exercises it |
+| `@polymorph/*` | 0.6.1 (webcrypto, websocket), 0.6.2 (webrtc-datachannels) | the cuts current at the polyengine 0.6.7 pin; taken within the `^0.6` range |
+| polymorph-iroh | git rev `8ca991e` | the endpoint component is built from source, not taken from the jsr package: the runtime binds its identity through `identity-from-seed`, which the package gates behind the cargo feature `guest-ed25519-signing` and its published artifact excludes. `just endpoint` clones and builds the pin; the vendored `runtime/wit/deps/polymorph-iroh/iroh.wit` is that revision's |
 | `wasi:*` WIT | 0.3.1 (consolidated WASI release) | what `@polyengine/wasi` serves on the `@0.3` track |
 
 ## Delivery

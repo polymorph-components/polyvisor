@@ -20,9 +20,17 @@ use crate::net::IrohNet;
 // default bindings mode will be used"), which is exactly the contract:
 // everything in `polyvisor:internal` is `async func`, as is
 // `wasi:http/client.send`, and nothing else here is.
+// `features`: `polymorph:iroh/identity-from-seed` is
+// `@unstable(feature = guest-ed25519-signing)` (iroh.wit), and `world
+// runtime` imports it. Unstable items are invisible to the resolver unless
+// their feature is named, so without this the world fails to resolve
+// (wit-bindgen-rust-macro 0.60 lib.rs:205 — the listed features are pushed
+// into `Resolve::features`). The endpoint component is built with the
+// matching cargo feature; justfile `endpoint`.
 wit_bindgen::generate!({
     path: "../wit",
     world: "runtime",
+    features: ["guest-ed25519-signing"],
     generate_all,
 });
 
