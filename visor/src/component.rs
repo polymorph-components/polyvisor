@@ -15,9 +15,16 @@
 // wasmtime catches it. Every function in this world is `async func`
 // anyway, so following the WIT annotations is both correct today and
 // proof against a sync one arriving later.
+// `features`: not for this world, which imports nothing unstable — for the
+// package. `world runtime` in the same directory imports
+// `polymorph:iroh/identity-from-seed`, which is
+// `@unstable(feature = guest-ed25519-signing)`, and resolution is
+// package-wide: without the feature that import is an unresolvable
+// reference and the whole parse fails, whichever world is being generated.
 wit_bindgen::generate!({
     path: "../runtime/wit",
     world: "visor",
+    features: ["guest-ed25519-signing"],
     with: {
         "polymorph:stream-dom/types@0.1.0": stream_dom_guest::bindings::polymorph::stream_dom::types,
         "polymorph:stream-dom/queries@0.1.0": stream_dom_guest::bindings::polymorph::stream_dom::queries,

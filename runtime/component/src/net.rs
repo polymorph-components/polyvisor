@@ -11,11 +11,25 @@
 //!     `subduction_iroh` so native subduction peers interoperate");
 //!   * a clean end that reads as a clean end rather than as a failure.
 //!
+//! The identity comes from `polymorph:iroh/identity-from-seed`, which is the
+//! one constructor interface whose identity keeps its private key inside the
+//! endpoint component and signs there ("an identity made by
+//! `identity-from-seed` holds its private key in the component's memory
+//! instead" — iroh.wit, `interface identity`). The alternative,
+//! `identity-from-keys`, keeps the key in the platform's store and reaches
+//! it through an async import, which means rustls's `Signer::sign` — a
+//! synchronous call on the handshake path — blocks, and the worker realm
+//! has to be instantiated with JSPI to let it. The trade, recorded in
+//! docs/design.md "No JSPI": TLS signatures now run in wasm ed25519-dalek
+//! rather than in the browser's native crypto, and the seed sits in the
+//! endpoint's memory for the endpoint's lifetime. It already passed through
+//! guest memory here at every bind — this widens where it rests, not
+//! whether it is there.
+//!
 //! Nothing here is subduction-aware: frames in, frames out.
 
 use std::cell::{Cell, RefCell};
 
-use ed25519_dalek::SigningKey;
 use polyvisor_kernel::{
     Accepted, Bound, Dialed, EngineTransport, LocalFuture, Net, NetHandle, PAIRING_ALPN,
     SUBDUCTION_ALPN,
@@ -26,10 +40,8 @@ use crate::component::polymorph::iroh::endpoint::{
     Connection, Endpoint, EndpointOptions, RecvStream, SendStream,
 };
 use crate::component::polymorph::iroh::identity::Identity;
-use crate::component::polymorph::iroh::identity_from_keys;
+use crate::component::polymorph::iroh::identity_from_seed;
 use crate::component::polymorph::iroh::types::{EndpointAddr, TransportAddr};
-use crate::component::polymorph::webcrypto::signature::SigningKeyOptions;
-use crate::component::polymorph::webcrypto::{ed25519_sign, ed25519_verify};
 use crate::z32;
 
 /// Both wires this endpoint serves, in the kernel's spelling
@@ -50,30 +62,6 @@ const MAX_FRAME: usize = 50 * 1024 * 1024;
 /// How much of the stream to ask for per read. The frame reassembler cares
 /// only about throughput here, not boundaries.
 const READ_CHUNK: u32 = 64 * 1024;
-
-/// RFC 8410 §7's PKCS#8 PrivateKeyInfo for an Ed25519 seed: version 0,
-/// AlgorithmIdentifier 1.3.101.112, and the seed inside a nested OCTET
-/// STRING (`04 20` — a CurvePrivateKey of 32 bytes). Every length in it is
-/// fixed by the seed's length, so the whole envelope is this constant
-/// prefix and nothing else.
-///
-/// `polymorph:webcrypto/ed25519-sign` admits PKCS#8 and JWK and refuses a
-/// bare seed on purpose (ed25519.wit, `interface ed25519-sign`: "never as a
-/// bare seed"), so wrapping is the price of the platform's key store.
-const PKCS8_PREFIX: [u8; 16] = [
-    0x30, 0x2e, // SEQUENCE, 46 bytes
-    0x02, 0x01, 0x00, // INTEGER version 0
-    0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, // AlgorithmIdentifier: id-Ed25519
-    0x04, 0x22, // OCTET STRING, 34 bytes
-    0x04, 0x20, // CurvePrivateKey: OCTET STRING, 32 bytes
-];
-
-fn pkcs8(seed: &[u8; 32]) -> Vec<u8> {
-    let mut der = Vec::with_capacity(PKCS8_PREFIX.len() + 32);
-    der.extend_from_slice(&PKCS8_PREFIX);
-    der.extend_from_slice(seed);
-    der
-}
 
 /// The kernel's [`Net`] over `polymorph:iroh`.
 ///
@@ -114,34 +102,17 @@ impl Net for IrohNet {
 /// seed the engine signs with, so a device's endpoint id and its subduction
 /// peer id are one key.
 ///
-/// The public half is derived here, with ed25519-dalek. It has to come from
-/// somewhere: `identity-from-keys` needs both halves, and
-/// `polymorph:webcrypto` deliberately provides no derivation from a private
-/// import ("there is deliberately no way to derive a `verifying-key` from a
-/// `signing-key`" — webcrypto.wit, `interface signature`). The two halves
-/// are then checked against each other by `identity-from-keys` with a
-/// sign/verify probe, so a seed the platform's key store reads differently
-/// than ed25519-dalek does fails here at boot rather than as a handshake
-/// failure against every peer this device ever dials.
+/// The public half is never computed here: an identity from a seed derives
+/// it itself ("the expansion of the seed to the signing scalar happens
+/// here" — iroh.wit, `identity-from-seed.from-seed`), and `endpoint.id()`
+/// below is what this device is known by. A seed of any length but 32 is
+/// `error.invalid-argument`; every 32-byte value is a valid seed, so the
+/// only way this fails is a caller bug.
 ///
 /// Returns the endpoint id as `device-status.endpoint-id` spells it,
 /// alongside the handle everything else goes through.
 async fn bind(seed: &[u8; 32], relay: &str) -> Result<(String, IrohEndpoint), String> {
-    let verifying = SigningKey::from_bytes(seed).verifying_key().to_bytes();
-    let options = SigningKeyOptions::new();
-    // The sole usage, and an untouched options resource is refused
-    // (webcrypto.wit, `resource signing-key-options`). Not extractable: the
-    // seed is already in our hands, so an exportable handle would widen
-    // nothing and weaken the later move to a platform-held key.
-    options.can_sign(true);
-    let signing = ed25519_sign::import_signing_key_pkcs8(pkcs8(seed), options)
-        .await
-        .map_err(|e| format!("this device's signing key was refused: {e:?}"))?;
-    let verifying = ed25519_verify::import_verifying_key_raw(verifying.to_vec())
-        .await
-        .map_err(|e| format!("this device's public key was refused: {e:?}"))?;
-    let identity = identity_from_keys::from_keys(signing, verifying)
-        .await
+    let identity = identity_from_seed::from_seed(seed)
         .map_err(|e| format!("this device's identity was refused: {e:?}"))?;
 
     let options = EndpointOptions::new(&identity);
@@ -172,8 +143,8 @@ async fn bind(seed: &[u8; 32], relay: &str) -> Result<(String, IrohEndpoint), St
             // Held for the endpoint's life. The WIT lets one identity
             // configure any number of endpoints and says nothing about the
             // bound endpoint keeping it alive, so dropping it here would be
-            // a bet on an implementation detail of the key handle's
-            // lifetime.
+            // a bet on an implementation detail of the identity's lifetime
+            // — and this identity is what holds the signing key.
             _identity: identity,
             relay: relay.to_string(),
         },

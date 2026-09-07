@@ -220,24 +220,16 @@ async function loadRuntime(device: string): Promise<Exports> {
       "polyvisor:internal/kv@0.1.0": kv,
       [I.locks]: locks,
     },
-    // THE ONE REALM WITH JSPI (docs/design.md "No JSPI", "The worker is the
-    // one exception, for now"). Nothing polyvisor writes needs it: every
-    // glue-implemented import is `async func` and the callback ABI
-    // wit-bindgen emits never blocks a frame. The composed iroh endpoint
-    // does. It authenticates QUIC with rustls, whose `Signer::sign` is
-    // synchronous, and polymorph-iroh implements that as `block_on` over the
-    // async `polymorph:webcrypto` sign import — a sync lower of an async
-    // import, which is precisely what JSPI is for. With `jspi: false` the
-    // ACCEPTING side of every connection stalls in `CertificateVerify` and
-    // polyengine raises `NeedsJspi` (found in M3a; dialling out survives,
-    // which is why it presents as a peer stuck at "connecting").
-    //
-    // This reverts to `jspi: false` when the transport's signer is in-guest
-    // — an identity built from a seed, the posture the kernel already holds
-    // — and web/jspi_test.ts asserts `true` here explicitly, so that flip
-    // back has to be a deliberate edit of the test too. The visor and frame
-    // realms never needed it and stay without it.
-    { jspi: true },
+    // No realm needs JSPI (docs/design.md "No JSPI"). Every glue-implemented
+    // import is an `async func` whose callback ABI never blocks a frame, and
+    // the composed iroh endpoint — the one thing here that ever did need it
+    // — now signs its QUIC handshakes in-guest: the identity comes from
+    // `polymorph:iroh/identity-from-seed`, so rustls's synchronous
+    // `Signer::sign` no longer reaches an async webcrypto import. `false` is
+    // therefore an assertion, not a default: polyengine refuses loudly if a
+    // sync-typed import ever returns a Promise. web/jspi_test.ts pins it at
+    // every call site in this repository.
+    { jspi: false },
   );
   return instance.exports as unknown as Exports;
 }

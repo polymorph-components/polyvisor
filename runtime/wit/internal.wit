@@ -490,8 +490,7 @@ world runtime {
     /// `read-directory` with a Promise. So the kernel never lists a
     /// directory: every path it touches is named, from a generation
     /// pointer it keeps in `kv`. That is what keeps the kernel's filesystem
-    /// path JSPI-free (the worker itself runs with JSPI for the endpoint's
-    /// TLS signer — docs/design.md "No JSPI").
+    /// path JSPI-free — as every realm now is (docs/design.md "No JSPI").
     import wasi:filesystem/types@0.3.1;
     import wasi:filesystem/preopens@0.3.1;
     /// The transport. The endpoint component (polymorph-iroh's, composed
@@ -499,14 +498,17 @@ world runtime {
     /// sees are the endpoint's own imports (websocket, webrtc, webcrypto,
     /// a sockets stub).
     import polymorph:iroh/endpoint@0.1.0;
-    import polymorph:iroh/identity-from-keys@0.1.0;
     /// The device's signing identity rests as an Ed25519 seed inside the
-    /// sealed checkpoint (the "seed" posture); at boot the seed is imported
-    /// into the platform's key store so the iroh identity can be built
-    /// from it. A platform-held, non-extractable identity is a later
-    /// hardening.
-    import polymorph:webcrypto/ed25519-sign@0.1.0;
-    import polymorph:webcrypto/ed25519-verify@0.1.0;
+    /// sealed checkpoint (the "seed" posture), and the endpoint is built
+    /// from that seed directly: `identity-from-seed` holds the private key
+    /// in the endpoint component's own memory and signs there, rather than
+    /// behind an async crypto import. Sync signing is what lets this realm
+    /// run without JSPI; the trade is recorded in docs/design.md
+    /// "No JSPI". The interface is `@unstable(feature =
+    /// guest-ed25519-signing)`, so every tool that reads this world needs
+    /// that feature enabled (justfile `wit`, `endpoint`; the runtime
+    /// component's `generate!`).
+    import polymorph:iroh/identity-from-seed@0.1.0;
 
     export lifecycle;
     export device;

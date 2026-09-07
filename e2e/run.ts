@@ -1453,11 +1453,13 @@ const scenarios: Scenario[] = [
 
   {
     // Both realms on this side, named: the visor on the main thread and the
-    // runtime in the SharedWorker. The worker is the exception that makes
-    // the name worth spelling out — a page can see its own realm fail, but
-    // a worker that throws while instantiating does so out of sight, and
-    // `workerBooted` is the only evidence on this side that it did not.
-    name: "visor-and-frame-without-jspi",
+    // runtime in the SharedWorker. The worker is worth spelling out — a
+    // page can see its own realm fail, but a worker that throws while
+    // instantiating does so out of sight, and `workerBooted` is the only
+    // evidence on this side that it did not. The frame realm is covered by
+    // every scenario that launches an app: a frame that suspended would
+    // never mount.
+    name: "instantiates-without-jspi",
     async run(ctx, origin) {
       const page = await open(ctx, origin);
       await visorReady(page);
@@ -1472,12 +1474,14 @@ const scenarios: Scenario[] = [
         undefined,
         { timeout: 30_000 },
       );
-      // Both realms on this side instantiated, and both `instantiate` calls
-      // passed `{ jspi: false }` (web/jspi_test.ts pins that at the source
-      // level). Under that option polyengine refuses a sync-typed import
-      // that returns a Promise, so the visor having rendered its strip and
-      // the worker having answered `booted` — which needs the runtime
-      // component's exports — proves no import took a suspending path.
+      // Both realms on this side instantiated, and every `instantiate` call
+      // in the repository — visor, frame and worker alike — passes
+      // `{ jspi: false }` (web/jspi_test.ts pins that at the source level).
+      // Under that option polyengine refuses a sync-typed import that
+      // returns a Promise, so the visor having rendered its strip and the
+      // worker having answered `booted` — which needs the runtime
+      // component's exports, and its endpoint's in-guest signer — proves no
+      // import took a suspending path.
       const marks = await page.evaluate(() =>
         (globalThis as Record<string, unknown>).__polyvisor
       );
