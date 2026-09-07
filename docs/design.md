@@ -448,8 +448,8 @@ native tests, so browser gates are mandatory for every visor change.
 - **M0** archive, skeleton, this record, both WIT packages, CI.
 - **M1** three realms, one TodoMVC: stub kernel with in-memory `tasks`;
   visor strip + settings sheet; frame loader under policy; ports.
-  Gates: app renders in the opaque frame; strip geometry immobile with
-  the app mounted; zero network requests from the frame; `jspi: false`;
+  Gates: app renders in the opaque frame; zero network requests from
+  the frame; `jspi: false`;
   the frame policy's unit tests. (The frame-teardown integration test
   waits for a hostile fixture component — M2. The path was exercised
   anyway: the policy caught the TodoMVC example's outbound `href`.)

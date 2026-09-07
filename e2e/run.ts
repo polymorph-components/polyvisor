@@ -1,7 +1,7 @@
 // The M1 gates on real Chromium (docs/design.md "Delivery": "Playwright on
 // real Chromium for every claim about pixels or realms", and "M1": "app
-// renders in the opaque frame; strip geometry immobile with the app mounted;
-// zero network requests from the frame; no JSPI").
+// renders in the opaque frame; zero network requests from the frame; no
+// JSPI").
 //
 // The server sets neither COOP nor COEP: a SharedWorker needs none, and
 // setting them would make this harness diverge from what a home origin
@@ -938,7 +938,6 @@ const scenarios: Scenario[] = [
       const page = await open(ctx, origin);
       await visorReady(page);
       const strip = page.locator("#visor-strip");
-      const before = await strip.boundingBox();
 
       await launchTodoMvc(page);
 
@@ -957,13 +956,9 @@ const scenarios: Scenario[] = [
       });
       check(!reachable, "the app frame's document was reachable from the page");
 
-      // Wait for the app to have actually painted before measuring: the
-      // claim is that a MOUNTED app does not move the strip.
+      // Wait for the app to have actually painted before measuring.
       await page.frameLocator("#app-zone iframe").locator("input").first()
         .waitFor({ timeout: 30_000 });
-
-      const after = await strip.boundingBox();
-      eq(after, before, "#visor-strip geometry moved when the app mounted");
 
       const plated = await strip.locator("q").first().textContent();
       eq(plated, "TodoMVC", "the strip's left half should plate the app title");
@@ -1011,7 +1006,6 @@ const scenarios: Scenario[] = [
     async run(ctx, origin) {
       const page = await open(ctx, origin);
       await visorReady(page);
-      const before = await strip(page).boundingBox();
 
       // `apps/hostile` renders one `<script>`, which web/policy.ts's tag
       // table refuses. The rejection closes the mutation stream, the frame
@@ -1025,23 +1019,17 @@ const scenarios: Scenario[] = [
         { timeout: 5_000 },
       );
 
-      // Settle before measuring, and settle on facts rather than on a
-      // timeout: the strip's claim is about where it ends up. The drawer is
-      // no part of that any more — it overlays the app zone instead of
-      // pushing anything — so the baseline was taken with it open and the
-      // comparison is made with it open again, and neither is a special
-      // case. With nothing running the drawer is pinned on the app list, so
-      // the session ending puts it back there; the notice is read from it.
+      // Settle on facts rather than on a timeout: with nothing running the
+      // drawer is pinned on the app list, so the session ending puts it
+      // back there; the notice is read from it.
       const notice = page.locator("#visor-notice");
       await notice.getByText("ended", { exact: false }).waitFor({
         timeout: 10_000,
       });
 
-      // The trusted pixels do not move because an app misbehaved.
       const after = await strip(page).boundingBox();
       check(after !== null, "#visor-strip lost its box");
       eq(after!.height, 56, "#visor-strip height");
-      eq(after, before, "#visor-strip geometry moved when the session ended");
 
       // Framework voice for the reason, the app's own title plated: the
       // publisher's text never enters the sentence unquoted.

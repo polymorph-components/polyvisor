@@ -42,11 +42,8 @@ pub(crate) const CSS: &str = r#"
   --field: oklch(0.88 0 0);
 }
 
-/* Fixed on all three axes so no content can push the anchor around, and
-   the one thing in this tree that is never overlaid: the drawer is
-   absolutely positioned below it rather than in flow, so opening anything
-   moves no pixel of the strip (docs/design.md M1: "strip geometry immobile
-   with the app mounted"). */
+/* Fixed height on all three axes so no content can push the anchor
+   around. */
 #visor-strip {
   box-sizing: border-box;
   height: 56px; min-height: 56px; max-height: 56px;
@@ -81,12 +78,13 @@ pub(crate) const CSS: &str = r#"
 .stack .top, .stack .bottom { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .stack .bottom { font-size: 12px; }
 
-/* Everything below the strip is an overlay on the app zone, never a push:
-   the scrim covers the app, the drawer covers the scrim, and both start
-   exactly where the strip ends. */
-#visor-scrim { position: fixed; inset: 56px 0 0 0; z-index: 1; background: oklch(0 0 0 / 0.25); }
+/* The drawer is in normal flow, above the strip: it pushes the strip (and
+   the app zone under it) down when it opens rather than covering the app.
+   The scrim covers the app zone behind the strip and drawer alike, fixed
+   to the viewport since neither the strip nor the drawer moves it. */
+#visor-scrim { position: fixed; inset: 0; z-index: 1; background: oklch(0 0 0 / 0.25); }
 #visor-drawer {
-  position: absolute; top: 56px; left: 0; right: 0; z-index: 2;
+  position: relative; z-index: 2;
   box-sizing: border-box;
   height: min(60vh, 480px);
   overflow: hidden;
@@ -141,7 +139,7 @@ pub(crate) const CSS: &str = r#"
 /* Unsaved changes, over the drawer: the only thing in this tree that takes
    the press away from what raised it. */
 #visor-confirm {
-  position: absolute; top: 56px; left: 0; right: 0; z-index: 4;
+  position: absolute; top: 0; left: 0; right: 0; z-index: 4;
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
   padding: 12px;
   box-sizing: border-box;
