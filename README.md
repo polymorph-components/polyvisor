@@ -41,5 +41,6 @@ automerge document synced between devices over subduction and the iroh
 relay; pairing by code + SAS into a device group that is the sync policy;
 app content sealed as keyhive/BeeKEM envelopes; Google Drive as a dumb
 ciphertext store (OAuth split between kernel and shell; a fake Drive in
-e2e). Next: passkey unseal and recovery (M5). The settings UI is deliberately minimal
-pending a redesign.
+e2e); app history rolled up as sedimentree fragments. Passkey unseal
+(#166) and recovery kits (#167) are parked as issues. The settings UI is
+deliberately minimal pending a redesign.
