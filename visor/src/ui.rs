@@ -469,40 +469,10 @@ pub(crate) fn Visor() -> Element {
         // visor ships its own stylesheet as part of its own tree.
         style { "{CSS}" }
 
-        div { id: "visor-strip", class: "{strip_class}",
-            Identity { ident }
-            div { id: "visor-context",
-                match (&live, &*notice.read()) {
-                    (Some((_, app)), _) => rsx! {
-                        span { class: "{Voice::Framework.class()}", "showing " }
-                        AppVoice { text: app.title.clone() }
-                    },
-                    (None, Some(Notice::Ended { app, reason })) => rsx! {
-                        AppVoice { text: app.clone() }
-                        span { class: "{Voice::Framework.class()}", " ended: {reason}" }
-                    },
-                    (None, Some(Notice::Plain(message))) => rsx! {
-                        span { class: "{Voice::Framework.class()}", "{message}" }
-                    },
-                    (None, None) => rsx! {
-                        span { class: "{Voice::Framework.class()}", "nothing is running" }
-                    },
-                }
-            }
-            div { id: "visor-actions",
-                // Both tenants need a kernel that answers, so neither is
-                // offered before the seal opens; the ceremony the boot
-                // raised is what the user has to act on instead.
-                TenantButton { label: "Apps", tenant: Tenant::Apps, open: tenant == Some(Tenant::Apps), disabled: !claimed,
-                    onpress: toggle_apps }
-                TenantButton { label: "Settings", tenant: Tenant::Settings, open: tenant == Some(Tenant::Settings), disabled: !claimed,
-                    onpress: show_settings }
-                if let Some((id, _)) = live {
-                    button { onclick: move |_| async move { close_session(id).await }, "Close" }
-                }
-            }
-        }
-
+        // Drawer above strip: the strip is the line between trusted pixels
+        // and the app zone, so whatever the visor opens goes on its own side
+        // of that line and pushes the strip down rather than sitting between
+        // it and the app.
         if let Some(tenant) = tenant {
             div { id: "visor-drawer",
                 match tenant {
@@ -632,6 +602,40 @@ pub(crate) fn Visor() -> Element {
                             EraseControl {}
                         }
                     },
+                }
+            }
+        }
+
+        div { id: "visor-strip", class: "{strip_class}",
+            Identity { ident }
+            div { id: "visor-context",
+                match (&live, &*notice.read()) {
+                    (Some((_, app)), _) => rsx! {
+                        span { class: "{Voice::Framework.class()}", "showing " }
+                        AppVoice { text: app.title.clone() }
+                    },
+                    (None, Some(Notice::Ended { app, reason })) => rsx! {
+                        AppVoice { text: app.clone() }
+                        span { class: "{Voice::Framework.class()}", " ended: {reason}" }
+                    },
+                    (None, Some(Notice::Plain(message))) => rsx! {
+                        span { class: "{Voice::Framework.class()}", "{message}" }
+                    },
+                    (None, None) => rsx! {
+                        span { class: "{Voice::Framework.class()}", "nothing is running" }
+                    },
+                }
+            }
+            div { id: "visor-actions",
+                // Both tenants need a kernel that answers, so neither is
+                // offered before the seal opens; the ceremony the boot
+                // raised is what the user has to act on instead.
+                TenantButton { label: "Apps", tenant: Tenant::Apps, open: tenant == Some(Tenant::Apps), disabled: !claimed,
+                    onpress: toggle_apps }
+                TenantButton { label: "Settings", tenant: Tenant::Settings, open: tenant == Some(Tenant::Settings), disabled: !claimed,
+                    onpress: show_settings }
+                if let Some((id, _)) = live {
+                    button { onclick: move |_| async move { close_session(id).await }, "Close" }
                 }
             }
         }
