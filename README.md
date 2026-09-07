@@ -22,7 +22,7 @@ confinement.
 |---|---|
 | `wit/` | `polyvisor:app` — the public contract, versioned deliberately |
 | `runtime/wit/` | `polyvisor:internal` — the private contract between this repo's own components and glue |
-| `runtime/` | the `runtime` component (kernel + engine) |
+| `runtime/` | the `runtime` component: `crates/kernel` (devices, sealing, checkpoints, pairing, sessions), `crates/engine` (automerge over subduction's sans-IO node), `component/` (the world, the iroh transport) |
 | `visor/` | the `visor` component (trusted pixels) |
 | `apps/` | example/reference apps (`todomvc`) |
 | `web/` | glue TypeScript |
@@ -32,5 +32,13 @@ confinement.
 `docs/design.md` is the authority for rulings, contracts and milestones;
 read it before arguing with anything here.
 
-Run `just --list` for the available recipes. This is **M0**: skeleton
-only.
+Run `just --list` for the available recipes; `just e2e` runs the Playwright
+suite against a local iroh relay.
+
+**Status (M0–M3b landed):** three realms with TodoMVC; devices with two
+tiers of rest, sealed OPFS checkpoints and a swept index; `tasks` as an
+automerge document synced between devices over subduction and the iroh
+relay; pairing by code + SAS into a device group that is the sync policy.
+Next: keyhive/BeeKEM envelope encryption (M3c), storage providers (M4),
+passkey unseal and recovery (M5). The settings UI is deliberately minimal
+pending a redesign.
