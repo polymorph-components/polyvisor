@@ -202,6 +202,44 @@ keyhive is pinned to git `main` for the CGKA transitive-authority fix
 (66a6632: relay access no longer grants CGKA membership) that the
 released 0.5.0 lacks; the pull ≠ read tier separation depends on it.
 
+## Read-back and partitions
+
+App-tree envelopes are causal: keyhive's premise is that granting an
+entry point to a document at a point in history reveals the whole
+history behind it, so each envelope carries the content keys of its own
+direct causal ancestors (keyhive `design/causal_encryption.md`, §"Key
+Management"). What a device therefore keeps — and checkpoints, and hands
+to the next device it enrols — is not a key per commit but a *set of
+heads*: one ⟨pointer, key⟩ pair per readable branch, from which
+everything prior is discovered by following the ancestor keys inside
+each envelope (§"Decryption Head"). The design doc is blunt that the
+full map is "possible, but fragile and unwieldy"; the head set grows
+with live concurrency instead of with history, so a linear history of
+any length is one pair. A commit whose key a device does not hold is not
+lost, it is *under partition* — latency, in keyhive's framing — and it
+is connected "by supplying a new head for it" (§"Multiple Heads"). That
+is what the engine does on absorb: when a batch of content lands
+concurrent with what a device already had, it writes an automerge merge
+commit — an empty change whose dependencies are every current head —
+whose envelope names both branches' keys and is sealed under the group's
+current epoch. A member enrolled after the branch was written, who could
+decrypt neither it nor anything automerge buffers behind it, walks in
+from that anchor. Anchors are content-free, and a batch that is nothing
+but somebody else's anchor is not a reason to author another, which is
+what keeps two devices from anchoring each other forever. For the same
+reason the Drive pass pulls before it pushes: a device coming back
+online learns the group's current epoch and merges before it publishes,
+so writes that are concurrent with the group's go up alongside the
+anchor that names their keys. That does not close the linear case — a
+device that was merely behind produces no divergence and so no anchor,
+and its commits stay unreadable to a later-enrolled member until the
+next local mutation, whose envelope names this frontier, is written on
+top of them; latency again, not loss.
+Wire and store growth is bounded later by sedimentree fragments — a
+roll-up of a commit range into one item — which only a member that can
+open the whole range can build; that is an M-later item, not a gap in
+this one.
+
 ## Storage
 
 The store is dumb and untrusted: it holds ciphertext at unguessable

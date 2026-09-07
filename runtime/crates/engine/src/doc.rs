@@ -21,7 +21,7 @@ use sedimentree_core::{id::SedimentreeId, loose_commit::id::CommitId};
 use serde::{Deserialize, Serialize};
 use subduction_protocol::command::NewCommit;
 
-use crate::document::{Document, actor};
+use crate::document::{Absorbed, Document, actor};
 use crate::storage::SnapshotStorage;
 
 /// `polyvisor:app/tasks.todo-item`.
@@ -213,9 +213,21 @@ impl AppDoc {
         self.core.unapplied(storage)
     }
 
-    /// Apply decrypted automerge changes. Returns whether anything landed.
-    pub fn apply(&mut self, items: Vec<(CommitId, Vec<u8>)>) -> bool {
+    /// Apply decrypted automerge changes.
+    pub fn apply(&mut self, items: Vec<(CommitId, Vec<u8>)>) -> Absorbed {
         self.core.apply(items)
+    }
+
+    pub fn applied_ids(&self) -> std::collections::BTreeSet<CommitId> {
+        self.core.applied_ids()
+    }
+
+    pub fn diverged(&self) -> bool {
+        self.core.diverged()
+    }
+
+    pub fn merge_anchor(&mut self) -> Option<NewCommit> {
+        self.core.merge_anchor()
     }
 
     fn put_field(&mut self, id: &str, field: &str, value: ScalarValue) -> Result<(), String> {

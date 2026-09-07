@@ -26,6 +26,16 @@ use subduction_protocol::command::NewCommit;
 
 use crate::storage::SnapshotStorage;
 
+/// What one batch of [`Document::apply`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Absorbed {
+    /// Anything at all landed, so the kernel must checkpoint.
+    pub landed: bool,
+    /// At least one landed change carried operations, as opposed to being a
+    /// merge anchor. Only content is worth anchoring for.
+    pub content: bool,
+}
+
 /// One automerge document and the tree its changes travel in.
 pub struct Document {
     doc: Automerge,
@@ -122,7 +132,15 @@ impl Document {
     /// engine decrypts them before calling [`Document::apply`].
     pub fn absorb(&mut self, storage: &SnapshotStorage) -> bool {
         let items = self.unapplied(storage);
-        self.apply(items)
+        self.apply(items).landed
+    }
+
+    /// The commits this document has already applied. The vault needs them to
+    /// tell "an ancestor key I should keep, because that commit has not
+    /// arrived" from "an ancestor key I can drop, because I already read that
+    /// commit and its key rides in a descendant I hold".
+    pub fn applied_ids(&self) -> BTreeSet<CommitId> {
+        self.applied.clone()
     }
 
     /// The stored blobs of this tree the document has not applied yet, raw.
@@ -135,15 +153,46 @@ impl Document {
             .collect()
     }
 
-    /// Apply decoded changes to the document. Returns whether anything landed.
+    /// Whether the document has more than one head — concurrent branches that
+    /// nothing has merged yet. See [`Document::merge_anchor`].
+    pub fn diverged(&self) -> bool {
+        self.doc.get_heads().len() > 1
+    }
+
+    /// An empty change whose dependencies are every current head: automerge's
+    /// own merge commit (`Automerge::empty_commit` — "the main reason to do
+    /// this is if you want to create a merge commit").
+    ///
+    /// It carries no operations, so it changes nothing anyone reads. What it
+    /// carries is its *envelope*: sealed under the group's current epoch with
+    /// the content keys of both branches inside it
+    /// (`crate::vault::Vault::seal`), it is the "new head" that
+    /// `design/causal_encryption.md` §"Multiple Heads" says connects a branch
+    /// no current member holds a key for.
+    pub fn merge_anchor(&mut self) -> Option<NewCommit> {
+        let _hash = self
+            .doc
+            .empty_commit(automerge::transaction::CommitOptions::default());
+        let change = self.doc.get_last_local_change()?;
+        let head = CommitId::new(change.hash().0);
+        let _known = self.applied.insert(head);
+        Some(NewCommit {
+            head,
+            parents: change.deps().iter().map(|h| CommitId::new(h.0)).collect(),
+            blob: Blob::new(change.raw_bytes().to_vec()),
+        })
+    }
+
+    /// Apply decoded changes to the document.
     ///
     /// Changes may arrive before their dependencies (sync is a set
     /// reconciliation, not a topological replay); automerge queues a change
     /// whose deps are missing and applies it when they arrive, so the whole
     /// batch goes in as one call and order does not matter.
-    pub fn apply(&mut self, items: Vec<(CommitId, Vec<u8>)>) -> bool {
+    pub fn apply(&mut self, items: Vec<(CommitId, Vec<u8>)>) -> Absorbed {
         let mut ids = Vec::new();
         let mut changes = Vec::new();
+        let mut content = false;
         for (id, blob) in items {
             if self.applied.contains(&id) {
                 continue;
@@ -151,17 +200,23 @@ impl Document {
             let Ok(change) = automerge::Change::from_bytes(blob) else {
                 continue;
             };
+            // A change with no operations is a merge anchor, somebody else's
+            // or an older one of ours. It is not a reason to author another.
+            content |= !change.is_empty();
             ids.push(id);
             changes.push(change);
         }
         if changes.is_empty() {
-            return false;
+            return Absorbed::default();
         }
         if self.doc.apply_changes(changes).is_err() {
-            return false;
+            return Absorbed::default();
         }
         self.applied.extend(ids);
-        true
+        Absorbed {
+            landed: true,
+            content,
+        }
     }
 
     /// Run one transaction and, if it produced a change, record the commit

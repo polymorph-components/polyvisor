@@ -500,7 +500,25 @@ impl Kernel {
         }
     }
 
-    /// Push, then pull. Answers whether the pull landed anything.
+    /// Pull, then push. Answers whether the pull landed anything.
+    ///
+    /// The order matters, and it is the read-back order
+    /// (`docs/design.md` §"Read-back and partitions"). A device coming back
+    /// online holds writes sealed under whatever epoch it last knew. If it
+    /// pushed first, those objects would reach the store ahead of any head that
+    /// connects them, and a member enrolled since would find them
+    /// undecryptable. Pulling first means this device ingests the group's
+    /// current keyhive state and merges before it publishes, so where its
+    /// writes are *concurrent* with the group's they go up alongside the merge
+    /// anchor that names their keys.
+    ///
+    /// It does not close the linear case, and that is worth naming rather than
+    /// implying: a device that was merely behind — its writes sit on top of
+    /// what the group already had, so the ingest produces no divergence and no
+    /// anchor — pushes commits that a later-enrolled member still cannot open
+    /// until somebody writes on top of them. That write happens on the next
+    /// local mutation, whose envelope names this frontier; until then the
+    /// branch is latency, not loss.
     async fn sync_attempt(self: &Rc<Self>, name_key: &[u8; 32]) -> Result<bool, Trouble> {
         let folder = self.drive_folder(name_key).await?;
         let engine = self
@@ -508,25 +526,6 @@ impl Kernel {
             .map_err(|e| Trouble::Hiccup(e.message.clone()))?;
 
         let remote = self.drive_list(&folder).await?;
-        let present: BTreeSet<&str> = remote.iter().map(|(_, name)| name.as_str()).collect();
-
-        // Push: one object per item the store lacks, and never a second
-        // upload of a name it has — the name *is* the item's digest pair, so
-        // an object that exists is already these bytes.
-        let mut pushed = false;
-        for item in engine.items() {
-            let name = object_name(name_key, &item.tree, &item.commit);
-            if present.contains(name.as_str()) {
-                continue;
-            }
-            let body = serde_json::to_vec(&item)
-                .map_err(|e| Trouble::Hiccup(format!("an item could not be written: {e}")))?;
-            self.drive_create(&folder, &name, body).await?;
-            pushed = true;
-        }
-        if pushed {
-            self.drive.borrow_mut().last_push = self.seams.clock.now_ms();
-        }
 
         // Pull: everything the store holds under a name this device cannot
         // account for. `mine` is derived rather than listed, so an item this
@@ -556,27 +555,54 @@ impl Kernel {
                 }
             }
         }
-        if fetched.is_empty() {
-            return Ok(false);
-        }
         // The group this pass was reading for must still be this device's
         // group. Pairing replaces both at once — the group document and the
-        // name key with it (`Engine::adopt_us`) — so a pass that started
-        // before that landed is holding objects named under the group this
-        // device has just *stopped* being: its own group of one. Installing
-        // them would put the commits `adopt_us` deliberately removed back
-        // into the adopted document's tree, which is the one thing that
-        // function exists to prevent, and the device would end up in neither
-        // group cleanly. The pass is dropped; the next one reads the new
-        // group's names.
+        // name key with it (`Engine::adopt_us`) — so a pass that started before
+        // that landed is holding objects named under the group this device has
+        // just *stopped* being: its own group of one. Installing them would put
+        // the commits `adopt_us` deliberately removed back into the adopted
+        // document's tree, which is the one thing that function exists to
+        // prevent, and the device would end up in neither group cleanly.
+        //
+        // Checked before the push as well as the pull, and for the mirror
+        // reason: the push writes objects under `name_key`, and a device that
+        // has just joined a group must not scatter its abandoned group-of-one's
+        // commits into that group's folder under the old names. The pass is
+        // dropped; the next one reads and writes the new group's names.
         if engine.name_key().as_ref() != Some(name_key) {
             return Ok(false);
         }
-        let landed = engine
-            .ingest_items(fetched)
-            .await
-            .map_err(Trouble::Hiccup)?;
-        self.drive.borrow_mut().last_pull = self.seams.clock.now_ms();
+
+        let mut landed = false;
+        if !fetched.is_empty() {
+            landed = engine
+                .ingest_items(fetched)
+                .await
+                .map_err(Trouble::Hiccup)?;
+            self.drive.borrow_mut().last_pull = self.seams.clock.now_ms();
+        }
+
+        // Push: one object per item the store lacks, and never a second
+        // upload of a name it has — the name *is* the item's digest pair, so
+        // an object that exists is already these bytes. Read after the pull,
+        // so a merge anchor the ingest just authored goes up in this same
+        // pass rather than waiting for the next one.
+        let present: BTreeSet<&str> = remote.iter().map(|(_, name)| name.as_str()).collect();
+        let mut pushed = false;
+        for item in engine.items() {
+            let name = object_name(name_key, &item.tree, &item.commit);
+            if present.contains(name.as_str()) {
+                continue;
+            }
+            let body = serde_json::to_vec(&item)
+                .map_err(|e| Trouble::Hiccup(format!("an item could not be written: {e}")))?;
+            self.drive_create(&folder, &name, body).await?;
+            pushed = true;
+        }
+        if pushed {
+            self.drive.borrow_mut().last_push = self.seams.clock.now_ms();
+        }
+
         Ok(landed)
     }
 
