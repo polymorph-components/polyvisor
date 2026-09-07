@@ -52,6 +52,28 @@ label { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
 .device-row { display: flex; align-items: center; gap: 8px; align-self: stretch; }
 .device-row-name { flex: 1; min-width: 0; }
 
+/* Sync. An endpoint id is machine text, not a voice: monospace so it can be
+   read off a screen character by character, and `user-select: all` so one
+   click takes the whole id — the visor has no clipboard capability, so
+   selection is the only copy it can offer.
+
+   It is also kept to one line (`nowrap`, scrolled rather than wrapped)
+   because of *when* it arrives: the bind completes after first paint, so
+   the id replaces the "binding…" placeholder in a sheet the user already
+   has open. A wrapping id would be one line as a placeholder and two or
+   three as an id, and everything below it in the drawer — "Other devices",
+   erase — would jump under the pointer at an arbitrary moment. One line
+   either way makes that swap layout-neutral. `user-select: all` still takes
+   the whole id, scrolled or not. */
+.sync-self { display: flex; align-items: center; gap: 8px; }
+.endpoint-id {
+  font-family: ui-monospace, monospace;
+  user-select: all;
+  white-space: nowrap;
+  overflow-x: auto;
+}
+.peer-row { display: flex; align-items: center; gap: 8px; align-self: stretch; }
+
 /* Unclaimed: before `device.status` reports `open` there is no identity to
    show, so the strip wears zero chroma — no hue, no name, no word. The
    circle gets its grey here and *only* here: the painted hue is an inline
@@ -109,5 +131,22 @@ mod tests {
         // reaches the DOM only through the inline style the open branch of
         // `Identity` emits.
         assert!(!CSS.contains("hsl("));
+    }
+
+    /// An endpoint id lands in an already-open Settings sheet: the bind
+    /// completes after first paint, so the id replaces the "binding…"
+    /// placeholder under the user's pointer. It must not change the row's
+    /// height doing it, or the controls below it move mid-click — so the
+    /// id is scrolled on one line and never wrapped.
+    #[test]
+    fn stylesheet_keeps_the_endpoint_id_on_one_line() {
+        assert!(
+            CSS.contains("white-space: nowrap;"),
+            "the endpoint id must not wrap: it arrives late, and a row that \
+             grows moves everything below it"
+        );
+        assert!(!CSS.contains("overflow-wrap: anywhere"));
+        // Scrolled, not clipped: the whole id has to remain readable.
+        assert!(CSS.contains("overflow-x: auto;"));
     }
 }

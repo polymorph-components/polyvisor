@@ -16,6 +16,21 @@ test:
 build-wasm:
     cargo build --workspace --target wasm32-wasip2 --release
 
+# Plug polymorph-iroh's endpoint component into the runtime.
+#
+# The runtime imports `polymorph:iroh/{endpoint,identity-from-keys}` and
+# nothing in this repository implements them (internal.wit `world runtime`:
+# "the endpoint component ... composed in at build time with `wac plug`").
+# What the worker instantiates is therefore never the cargo artifact but this
+# composition, whose remaining imports are the endpoint's own — websocket,
+# webrtc-datachannels, webcrypto, a sockets stub — which the worker glue
+# provides.
+compose:
+    deno run -A web/fetch-endpoint.ts
+    wac plug target/wasm32-wasip2/release/polyvisor_runtime.wasm \
+        --plug target/iroh_endpoint-0.6.0.wasm \
+        -o target/polyvisor_runtime.composed.wasm
+
 # web/dist: exactly what a home origin serves.
 site:
     deno task build
@@ -25,7 +40,7 @@ site:
 site-fixtures:
     deno task build:fixtures
 
-e2e: build-wasm site-fixtures
+e2e: build-wasm compose site-fixtures
     deno task e2e
 
 # Everything CI runs, in order (docs/design.md "Delivery": cargo test,
@@ -33,4 +48,4 @@ e2e: build-wasm site-fixtures
 # polyengine's translator over every component, which catches canonical-ABI
 # errors `wasm-tools validate` accepts (an async lowering of a sync WIT
 # function, M1).
-ci: wit check test build-wasm site
+ci: wit check test build-wasm compose site

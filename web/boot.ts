@@ -16,6 +16,7 @@ const I = {
   device: "polyvisor:internal/device@0.1.0",
   store: "polyvisor:internal/store@0.1.0",
   apps: "polyvisor:internal/apps@0.1.0",
+  sync: "polyvisor:internal/sync@0.1.0",
   events: "polyvisor:internal/events@0.1.0",
   shell: "polyvisor:internal/shell@0.1.0",
 } as const;
@@ -25,7 +26,7 @@ interface ComponentArtifacts {
   plan: string;
 }
 
-/** What the e2e scenarios read (`instantiates-without-jspi`): the page's own
+/** What the e2e scenarios read (`visor-and-frame-without-jspi`): the page's own
  * record that the worker got its runtime up, which the main thread cannot
  * see any other way. */
 const marks: { workerBooted: boolean } = {
@@ -99,10 +100,59 @@ const worker = new SharedWorker("./worker.js", {
 });
 const control = worker.port;
 
+// A worker that dies on its own script is otherwise SILENT: `onconnect`
+// never fires, the hello sits unread, and the visor waits on `workerBooted`
+// forever with nothing to say why. This is the page's only notification, so
+// it is the difference between a diagnosis and a hang.
+//
+// It is not a complete net. Chromium fires nothing at all for a module
+// SharedWorker that fails to *start* — the failure this milestone spent its
+// afternoon on (see web/platform/no-node-datachannel.ts) presented exactly
+// that way. This catches the case it can: a script that throws while
+// evaluating.
+worker.addEventListener("error", (ev: Event) => {
+  const e = ev as ErrorEvent;
+  fatal(
+    `this device's worker could not start: ${
+      e.message || "the browser refused the worker script"
+    }${e.filename ? ` (${e.filename}:${e.lineno})` : ""}`,
+  );
+});
+
 // First message on the port, before any RPC: the worker boots its runtime
 // against the device the FIRST hello names (`lifecycle.boot-config.device`).
 // A later hello for the same id is a no-op — that is just another tab.
-control.postMessage({ t: "hello", device, homeOrigin: location.origin });
+//
+// The relay comes with it. It is the home origin's deployment configuration
+// (`config.json`, written by web/build.ts; the e2e harness serves its own),
+// not something a tab may choose, and `lifecycle.boot-config.relay` is not
+// optional — a device with no relay binds no endpoint and can never be
+// dialed. So a config that will not load is fatal rather than a default
+// quietly substituted here: silently binding a whole origin's devices to
+// some other relay than the one the operator published is worse than a
+// visible failure.
+fetch(new URL("config.json", location.href), { cache: "no-store" })
+  .then(async (res) => {
+    if (!res.ok) {
+      throw new Error(`config.json: the origin answered ${res.status}`);
+    }
+    const relay = (await res.json() as { relay?: unknown }).relay;
+    if (typeof relay !== "string" || relay === "") {
+      throw new Error("config.json names no relay");
+    }
+    control.postMessage({
+      t: "hello",
+      device,
+      homeOrigin: location.origin,
+      relay,
+    });
+  })
+  .catch((err: unknown) => {
+    fatal(
+      `this origin's configuration could not be read: ` +
+        String((err as Error)?.message ?? err),
+    );
+  });
 
 /** Frame-port replies, keyed by session: `shell.open-frame` awaits one. */
 const framePortWaiters = new Map<
@@ -129,7 +179,13 @@ control.addEventListener("message", (ev: MessageEvent) => {
   }
 });
 
-const kernel = proxyInterfaces(control, [I.device, I.store, I.apps, I.events]);
+const kernel = proxyInterfaces(control, [
+  I.device,
+  I.store,
+  I.apps,
+  I.sync,
+  I.events,
+]);
 const apps = kernel[I.apps] as {
   component(session: number): Promise<ComponentArtifacts>;
   abort(session: number, reason: string): Promise<void>;

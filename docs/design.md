@@ -101,9 +101,23 @@ checkpoint path bound `wasi:filesystem@0.2` (sync WIT) over OPFS
 
 Ruling: the runtime uses `wasi:filesystem@0.3` (async in WIT) through
 generated bindings, not `std::fs`; every glue-implemented import is
-async in WIT; the embedder forces `jspi: false`, so a regression fails
-loudly. The browser floor is therefore wasm multi-memory (runtime-linked
-composition) and nothing else.
+async in WIT; the visor and frame embedders force `jspi: false`, so a
+regression there fails loudly.
+
+**The worker is the one exception, for now.** The composed iroh endpoint
+authenticates its QUIC connections with rustls, and rustls has no async
+signing path: `Signer::sign` is synchronous, and polymorph-iroh
+implements it as `block_on` over the async `polymorph:webcrypto` sign
+import (`core/src/crypto/sign.rs`). A sync lower of an async import is
+exactly what JSPI exists for, so the accept side of every connection
+needs it (found in M3a: with `jspi: false` the acceptor stalls in
+`CertificateVerify`). The general fact: a platform-held, non-extractable
+key as the TLS identity implies JSPI in a browser. So the worker is
+instantiated with `jspi: true`, tolerated only until the transport's
+signer is in-guest (polymorph-iroh: an identity built from a seed, which
+is the posture the kernel already holds); then the worker returns to
+`jspi: false` and the browser floor is wasm multi-memory alone. The
+visor and frame realms never needed JSPI and stay without it.
 
 ## The app frame
 
@@ -167,8 +181,8 @@ form. Polyvisor owns five implementations:
 
 | Trait | Implementation |
 |---|---|
-| `Transport` | one per connection over `polymorph:iroh` streams (relay via `polymorph:websocket`); framing per `subduction_iroh` so native subduction peers interoperate |
-| `Storage` | sedimentree items in the device's sealed state root (`wasi:filesystem@0.3`) |
+| `Transport` | one per connection over `polymorph:iroh` streams, relay-only: WebRTC is off in the worker because a SharedWorker has no `RTCPeerConnection` (the host backend never resolves there). Framing per `subduction_iroh` (u32 BE length prefix) so native subduction peers interoperate |
+| `Storage` | M3a: an in-memory item store serialized into the sealed checkpoint with the automerge docs. Items in their own files under the state root is the follow-up once checkpoint size matters |
 | `Policy` | the keyhive pull/read gate — ours, since `subduction_keyhive` is still legacy upstream; mined from it for semantics |
 | `Signer` / `NodeEffect::Sign` | M3a: `ed25519-dalek` over a seed held in the sealed checkpoint (the seed posture; the same seed, imported through `polymorph:webcrypto`, builds the iroh identity). Later: a non-extractable platform key — signing is an effect with external custody, which is exactly what that needs |
 | `Clock` | `wasi:clocks@0.3` |
@@ -214,8 +228,9 @@ is kernel logic over `kv`, `locks` and the OPFS state root.
   worker memory only. Sealing is pure Rust in the kernel (`aes-gcm`,
   `argon2`) with the key as bytes: a non-extractable WebCrypto handle
   persisted in IndexedDB would rest under the same profile protection,
-  so it buys nothing at this tier. Platform-held keys enter with the
-  signing identity (M3) and the passkey PRF rung (M5).
+  so it buys nothing at this tier. The signing identity is a seed in the
+  same sealed checkpoint (M3a); platform-held keys enter with the passkey
+  PRF rung (M5) and, for the transport, once its TLS signer is in-guest.
 - **Checkpoints** are AES-GCM over the kernel's serialized state, written
   to `/<id>/gen-<n>/` on the OPFS root through `wasi:filesystem@0.3` after
   every mutation (state is small until the engine lands; a debounce is a

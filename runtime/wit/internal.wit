@@ -356,7 +356,9 @@ world runtime {
     /// the three `*-via-stream`), and the OPFS host answers
     /// `read-directory` with a Promise. So the kernel never lists a
     /// directory: every path it touches is named, from a generation
-    /// pointer it keeps in `kv`. That is what keeps the worker JSPI-free.
+    /// pointer it keeps in `kv`. That is what keeps the kernel's filesystem
+    /// path JSPI-free (the worker itself runs with JSPI for the endpoint's
+    /// TLS signer — docs/design.md "No JSPI").
     import wasi:filesystem/types@0.3.1;
     import wasi:filesystem/preopens@0.3.1;
     /// The transport. The endpoint component (polymorph-iroh's, composed

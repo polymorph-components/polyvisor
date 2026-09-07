@@ -25,7 +25,7 @@ jobs:
           deno-version: v2.x
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-tools,just
+          tool: wasm-tools,just,wac-cli
       - uses: Swatinem/rust-cache@v2
       - run: just ci
 
@@ -40,9 +40,23 @@ jobs:
           deno-version: v2.x
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-tools,just
+          tool: wasm-tools,just,wac-cli
       - uses: Swatinem/rust-cache@v2
       # Chromium plus its shared-library deps, at the exact version deno.json
       # imports — a newer CLI fetches a build the library will not find.
       - run: npx -y playwright@1.62.1 install --with-deps chromium
+      # The relay the e2e scenarios bind their endpoints through: the harness
+      # spawns `iroh-relay --dev` from PATH, so the binary only has to be
+      # there. Taken from the upstream release asset rather than built:
+      # `cargo install iroh-relay` is a multi-minute compile of the whole
+      # iroh tree on every cache miss, and `cargo binstall` would resolve to
+      # this same asset through one more tool. Pinned to the version
+      # developers run locally.
+      - name: install iroh-relay
+        run: |
+          curl -fsSL -o /tmp/iroh-relay.tar.gz \
+            https://github.com/n0-computer/iroh/releases/download/v1.1.0/iroh-relay-v1.1.0-x86_64-unknown-linux-gnu.tar.gz
+          tar -xzf /tmp/iroh-relay.tar.gz -C /tmp
+          install -m 0755 /tmp/iroh-relay "$HOME/.cargo/bin/iroh-relay"
+          iroh-relay --version
       - run: just e2e
