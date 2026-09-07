@@ -683,25 +683,23 @@ impl guest::apps::Guest for Component {
     }
 }
 
-impl guest::event_source::Guest for Component {
-    async fn drain() -> Vec<guest::event_source::Event> {
-        // Before boot there is nothing to drain, and `drain` has no error
-        // channel: an empty list is the honest answer.
+impl guest::events::Guest for Component {
+    async fn next() -> guest::events::Event {
+        // Before boot there is no queue and nothing can be pushed onto one,
+        // and `next` has no error channel: parking is the honest answer.
+        // The worker starts its pump only after `lifecycle.boot` returns
+        // anyway, so nothing waits here in practice.
         let Ok(kernel) = kernel() else {
-            return Vec::new();
+            return std::future::pending().await;
         };
-        kernel
-            .drain_events()
-            .into_iter()
-            .map(|event| match event {
-                polyvisor_kernel::Event::SessionEnded(session, why) => {
-                    guest::event_source::Event::SessionEnded((session, why))
-                }
-                polyvisor_kernel::Event::PairingChanged(p) => {
-                    guest::event_source::Event::PairingChanged(phase(p))
-                }
-            })
-            .collect()
+        match kernel.next_event().await {
+            polyvisor_kernel::Event::SessionEnded(session, why) => {
+                guest::events::Event::SessionEnded((session, why))
+            }
+            polyvisor_kernel::Event::PairingChanged(p) => {
+                guest::events::Event::PairingChanged(phase(p))
+            }
+        }
     }
 }
 

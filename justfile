@@ -28,7 +28,7 @@ build-wasm:
 compose:
     deno run -A web/fetch-endpoint.ts
     wac plug target/wasm32-wasip2/release/polyvisor_runtime.wasm \
-        --plug target/iroh_endpoint-0.6.0.wasm \
+        --plug target/iroh_endpoint.wasm \
         -o target/polyvisor_runtime.composed.wasm
 
 # web/dist: exactly what a home origin serves.

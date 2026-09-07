@@ -25,13 +25,28 @@ import { join } from "@std/path";
 
 import { loadArtifacts } from "@polymorph/iroh";
 
-/** The pinned endpoint build. Must track deno.json's `@polymorph/iroh`
- * specifier: the filename carries the version so a bump cannot silently
- * reuse a stale artifact, and `just compose` names the same path. */
-const VERSION = "0.6.0";
+// The pin is `import.meta.resolve`, not a literal here: deno.json maps
+// `@polymorph/iroh` to a jsr semver range, and `deno.lock` is what actually
+// resolves it to a concrete version each install. Resolving the specifier
+// yields `https://jsr.io/@polymorph/iroh/<version>/...`; parsing <version>
+// out of that URL means the cache filename always names the version deno.lock
+// actually picked, so a lockfile bump cannot silently reuse a stale artifact.
+// `wac plug` (justfile `compose`) can't name a versioned path without
+// re-deriving the version itself, so after fetching we also copy to a
+// version-free stable path (`iroh_endpoint.wasm`) that's the one the
+// justfile plugs.
+const resolved = import.meta.resolve("@polymorph/iroh");
+const match = resolved.match(/^https:\/\/jsr\.io\/@polymorph\/iroh\/([^/]+)\//);
+if (!match) {
+  throw new Error(
+    `fetch-endpoint: could not parse a version out of resolved specifier ${resolved}`,
+  );
+}
+const VERSION = match[1];
 
 const ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const OUT = join(ROOT, "target", `iroh_endpoint-${VERSION}.wasm`);
+const STABLE = join(ROOT, "target", `iroh_endpoint.wasm`);
 
 async function exists(path: string): Promise<boolean> {
   try {
@@ -49,3 +64,4 @@ if (await exists(OUT)) {
   await Deno.writeFile(OUT, componentBytes);
   console.log(`fetch-endpoint: wrote ${OUT} (${componentBytes.length} bytes)`);
 }
+await Deno.copyFile(OUT, STABLE);

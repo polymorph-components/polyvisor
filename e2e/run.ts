@@ -336,10 +336,12 @@ async function claimed(page: Page): Promise<boolean> {
 // workaround for a missing feature; polling chrome is a thing the milestone
 // deliberately does not have.
 //
-// Refresh is also what carries the kernel's `events.pairing-changed`
-// across: the worker drains the runtime after every export call it
-// dispatches (internal.wit `event-source`), and a phase the OTHER device
-// caused has no export activation of ours behind it until we make one.
+// Pairing phases are the exception, and they are not a press: the kernel
+// pushes `events.pairing-changed` on every transition and the runtime's
+// `events.next` parks, so a phase the OTHER device caused reaches this
+// screen with nothing pressed here (internal.wit `interface events`). The
+// scenarios below therefore wait on those without pressing Refresh, which
+// is what makes them exercise the push path at all.
 // ---------------------------------------------------------------------------
 
 const devicesSheet = (page: Page) => sheet(page, "Devices");
@@ -389,29 +391,35 @@ async function endpointId(page: Page): Promise<string> {
   }
 }
 
-/** Wait for something in the Devices section, pressing Refresh between
- * attempts — the only way a phase the other device caused reaches this
- * screen. A pairing failure is worth more than a timeout, so it ends the
- * wait with the kernel's own words. */
+/** Wait for something in the Devices section. `refresh` says how what is
+ * waited for arrives: `true` for a pull-only read (`sync.members`,
+ * `sync.peers`) that only a Refresh press re-reads, `false` for a pairing
+ * phase, which the kernel pushes. It is required at every call site
+ * because pressing Refresh on a pushed value would hide a broken event
+ * path behind a poll. A pairing failure is worth more than a timeout, so
+ * it ends the wait with the kernel's own words. */
 async function waitInDevices(
   page: Page,
   what: string,
   ready: () => Promise<boolean>,
-  ms = 60_000,
+  { refresh, ms = 60_000 }: { refresh: boolean; ms?: number },
 ): Promise<void> {
   const deadline = performance.now() + ms;
   for (;;) {
     await openSettings(page);
     if (await ready()) return;
     const failed = devicesSheet(page).locator(".sheet-error");
-    if (await failed.count() > 0) {
+    // An error that appears between the predicate's read and this one may
+    // be the very thing the predicate is waiting for (a caller that expects
+    // a failure), so ask again before treating it as the wait's abort.
+    if (await failed.count() > 0 && !(await ready())) {
       throw new Failure(
         `${what}: the visor showed ${await failed.textContent()}`,
       );
     }
     if (performance.now() > deadline) throw new Failure(`never saw ${what}`);
     await new Promise((r) => setTimeout(r, 500));
-    await refreshSettings(page);
+    if (refresh) await refreshSettings(page);
   }
 }
 
@@ -427,6 +435,7 @@ async function offerPairing(page: Page): Promise<string> {
     page,
     "a pairing code",
     async () => await code.count() > 0,
+    { refresh: false },
   );
   return (await code.textContent() ?? "").trim();
 }
@@ -448,6 +457,7 @@ async function sasDigits(page: Page): Promise<string> {
     page,
     "the pairing digits",
     async () => await sas.count() > 0,
+    { refresh: false },
   );
   return (await sas.textContent() ?? "").trim();
 }
@@ -460,6 +470,7 @@ async function waitForMember(page: Page, peer: string): Promise<void> {
     async () =>
       await devicesSheet(page).locator(".member-row").filter({ hasText: peer })
         .count() > 0,
+    { refresh: true },
   );
 }
 
@@ -1226,7 +1237,7 @@ const scenarios: Scenario[] = [
             if (await err.count() === 0) return false;
             return (await err.textContent() ?? "").includes("other device");
           },
-          15_000,
+          { refresh: false, ms: 15_000 },
         );
 
         // Neither device is in the other's group: a declined ceremony never

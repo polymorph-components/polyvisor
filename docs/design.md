@@ -70,14 +70,17 @@ Rules for `polyvisor:internal`:
    arrived on and supplied as a `session-id` parameter; never from the
    caller. Each public service interface has an internal mirror with the
    session first (`app-services`).
-4. **Kernel events reach the visor as a long poll** (`events.next`,
-   served by each visor's glue from a local queue). The runtime's side is
-   a non-parking `event-source.drain` the worker glue calls after every
-   export it dispatches: polyengine traps an async export parked on a
-   guest-internal waker with no host call outstanding as a deadlock
-   (polyengine#292; wasmtime stays pending), and until the engine lands
-   every event is born inside a glue-dispatched export anyway. No
-   callbacks, no second mechanism. What the glue itself observes (a frame torn down by
+4. **Kernel events reach the visor as a long poll** (`events.next`). The
+   runtime exports it and it parks while its queue is empty; the worker
+   glue runs one pump over that export and fans each event into every
+   connected tab's queue, and each visor's glue serves the visor's own
+   `events.next` import from that queue. So an event born of network
+   activity alone — the other device confirming a pairing, an enrollment
+   landing, a peer closing — reaches the screen with nothing pressed on
+   this device. (This was briefly a non-parking `event-source.drain`
+   while polyengine#292 stood; 0.6.6 fixed it and 0.6.7 fixes the lift
+   regression that fix introduced, polyengine#312.) No callbacks, no
+   second mechanism. What the glue itself observes (a frame torn down by
    the receiver) enters the same path through `apps.abort`, so the visor
    has one source of truth for session endings; `apps.close` — the
    visor's own act — emits nothing.
@@ -380,12 +383,12 @@ native tests, so browser gates are mandatory for every visor change.
 |---|---|---|
 | Rust | 1.98.1 | current stable; satisfies stream-dom (1.98), subduction (1.91), keyhive (1.90) |
 | `wit-bindgen` | `=0.60.0`, workspace-wide | must equal stream-dom's pin: `StreamReader<u8>` (a wit-bindgen runtime type) crosses the delegation from our world's `run` into `stream_dom_dioxus::driver::run`. Different wit-bindgen versions *can* coexist in one component (the `wasip3_task_set` weak-symbol ABI exists for exactly that), but not across a shared runtime type. Bumps follow stream-dom's. `generate!` never sets `async: true`: that lowers sync WIT functions (resource constructors) async, which the canonical ABI forbids and only the translator catches; WIT's own `async func` annotations are the source of truth |
-| `@polyengine/*` | 0.6.4, one version across the graph | first release with the #289 driver fix; brand symbols are per-version, so a partial upgrade fails at `instanceof` |
+| `@polyengine/*` | 0.6.7, one version across the graph | first release where an async export may park on a guest waker (#292) without the 0.6.6 lift regression (#312); brand symbols are per-version, so a partial upgrade fails at `instanceof` |
 | `dioxus` | `=0.7.10` | dioxus-core state is shared with `stream-dom-dioxus`; skew breaks the build |
 | polymorph-stream-dom | git rev (see Cargo.toml / deno.json) | unpublished, moving; policy object and asset handles landed in #15 |
 | subduction | git `sansio` rev | above |
 | keyhive | git rev `a509a2d` | `keyhive_core` / `keyhive_crypto` / `beekem`, unreleased and moving. The sealed plaintext is keyhive's own `Envelope` and the read-back walk is keyhive's own `try_causal_decrypt`, so a rev bump is a wire-format change for every stored blob: its own PR |
-| `@polymorph/*` | 0.6.0 | the 2026-09-05 cut matching polyengine 0.6.3 |
+| `@polymorph/*` | 0.6.1 (iroh, webcrypto, websocket), 0.6.2 (webrtc-datachannels) | the cuts current at the polyengine 0.6.7 pin; taken within the `^0.6` range |
 | polymorph:iroh WIT | provisional | being upgraded upstream in parallel; re-checked before M3a, the first milestone that exercises it |
 | `wasi:*` WIT | 0.3.1 (consolidated WASI release) | what `@polyengine/wasi` serves on the `@0.3` track |
 

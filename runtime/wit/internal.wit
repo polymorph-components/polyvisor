@@ -386,8 +386,16 @@ interface apps {
     abort: async func(session: session-id, reason: string);
 }
 
-/// Kernel-originated events, as the visor consumes them: a long poll the
-/// visor's glue serves from a per-tab queue.
+/// Kernel-originated events: a long poll. The runtime exports it and the
+/// worker glue runs one pump over that export, fanning each event out to
+/// every connected tab's queue; the visor imports it and its own glue
+/// serves the poll from that tab's queue. Same interface, two sides of the
+/// seam — nothing links the two directly.
+///
+/// Because the runtime's side parks, an event needs no call to carry it: a
+/// transition born of network activity alone (the other device confirming,
+/// an enrollment landing, a peer closing) reaches the visor with no press
+/// on this device.
 interface events {
     use types.{session-id, phase};
 
@@ -400,32 +408,16 @@ interface events {
         /// transition, including the ones the visor did not cause (the peer
         /// confirming, an offer expiring, the enrollment landing).
         ///
-        /// The visor has no timer and `pairing.status` may not park
-        /// (polyengine#292 — see `event-source`), so a ceremony that
-        /// advances because the *other* device acted has no other way to
-        /// reach the screen. `status` remains the authority and the visor
-        /// re-reads it after every act of its own; this is the push that
-        /// makes waiting cost nothing.
+        /// The visor has no timer and `pairing.status` may not park, so a
+        /// ceremony that advances because the *other* device acted has no
+        /// other way to reach the screen. `status` remains the authority
+        /// and the visor re-reads it after every act of its own; this is
+        /// the push that makes waiting cost nothing.
         pairing-changed(phase),
     }
 
     /// Resolves with the next event; parks while there is none.
     next: async func() -> event;
-}
-
-/// Kernel-originated events, as the runtime produces them. Non-parking:
-/// the worker glue drains after every export call it dispatches and fans
-/// the result out to every tab's queue. Until the engine lands, every
-/// event is born inside an export activation the glue made, so draining
-/// there misses nothing. A parking `next` export was the first design;
-/// polyengine traps an async export parked on a guest-internal waker with
-/// no host call outstanding as a deadlock (polyengine#292), where wasmtime
-/// would stay pending. Revisit when that is resolved or when the engine
-/// produces events from host-call completions.
-interface event-source {
-    use events.{event};
-
-    drain: async func() -> list<event>;
 }
 
 /// Service dispatch for app sessions: each public service interface in
@@ -523,7 +515,7 @@ world runtime {
     export storage;
     export store;
     export apps;
-    export event-source;
+    export events;
     export app-services;
 }
 

@@ -127,8 +127,7 @@ impl Gate {
 /// `pairing.status`, and the kernel additionally pushes
 /// `events.pairing-changed` on every transition (including the ones the
 /// *other* device caused, which is the only way they could arrive — this
-/// world has no timer, and `pairing.status` may not park; internal.wit
-/// `event-source`, polyengine#292).
+/// world has no timer, and `pairing.status` may not park).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub(crate) enum Phase {
     #[default]
