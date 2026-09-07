@@ -409,7 +409,10 @@ async function waitInDevices(
     await openSettings(page);
     if (await ready()) return;
     const failed = devicesSheet(page).locator(".sheet-error");
-    if (await failed.count() > 0) {
+    // An error that appears between the predicate's read and this one may
+    // be the very thing the predicate is waiting for (a caller that expects
+    // a failure), so ask again before treating it as the wait's abort.
+    if (await failed.count() > 0 && !(await ready())) {
       throw new Failure(
         `${what}: the visor showed ${await failed.textContent()}`,
       );
