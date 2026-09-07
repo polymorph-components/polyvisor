@@ -25,7 +25,7 @@ pub(crate) struct App {
 /// `name`/`hue`/`word` are empty and zero while sealed (internal.wit
 /// `device`), which is exactly why the strip keys its dress off `state`
 /// and never off "is the name empty": an unpainted anchor must be
-/// unpaintable before the seal opens, not merely usually blank.
+/// unpaintable while the seal is shut, not merely usually blank.
 pub(crate) struct Status {
     pub(crate) id: String,
     pub(crate) state: DeviceState,
@@ -38,10 +38,13 @@ pub(crate) struct Status {
 }
 
 impl Status {
-    /// The seal is open: personal state is readable, and the rest of the
-    /// kernel answers at all.
-    pub(crate) fn is_open(&self) -> bool {
-        self.state == DeviceState::Open
+    /// The seal is shut. internal.wit `device`: `status` then answers with
+    /// the id and state only, and every other kernel call is `unavailable`
+    /// until `unseal` — except `erase` and `store.devices`. This is the
+    /// visor's one gate, because the same doc rules that "`fresh` is not a
+    /// gate: an ephemeral device is fully usable".
+    pub(crate) fn is_sealed(&self) -> bool {
+        self.state == DeviceState::Sealed
     }
 }
 

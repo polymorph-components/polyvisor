@@ -26,7 +26,7 @@ use exports::polyvisor::internal as guest;
 use polyvisor::internal::types::{Error, ErrorCode};
 use polyvisor::internal::{kv, locks};
 use wasi::filesystem::preopens;
-use wasi::filesystem::types::{Descriptor, DescriptorFlags, DescriptorType, OpenFlags, PathFlags};
+use wasi::filesystem::types::{Descriptor, DescriptorFlags, OpenFlags, PathFlags};
 
 thread_local! {
     /// `Rc` so a call can take a handle and await without holding the cell
@@ -170,10 +170,19 @@ async fn http_get(url: &str) -> Result<Vec<u8>, String> {
 
 // -- the state root ------------------------------------------------------------
 
-// `wasi:filesystem@0.3` over the OPFS root the glue preopens at `/`. The
-// kernel's `Files` seam has no error channel on purpose (see its docs): a
-// read that fails is `None`, a write that fails is a generation that will not
-// verify, and the checkpoint loader already falls back.
+// `wasi:filesystem@0.3` over the OPFS root the glue preopens at `/`.
+//
+// Nothing here lists a directory. `read-directory` is one of the four
+// stream-returning functions the 0.3 track left sync in WIT, and the OPFS
+// host answers it with a Promise, which traps a worker that runs without
+// JSPI (internal.wit `world runtime`). Every path below arrives named from
+// the kernel, which keeps its generation pointer in `kv` for exactly this
+// reason.
+//
+// The kernel's `Files` seam has no error channel either (see its docs): a
+// read that fails is `None`, a write that fails is a generation the pointer
+// never advances to, and a removal that fails is a path the next write
+// overwrites.
 
 thread_local! {
     /// The preopened root, looked up once. `get-directories` mints a fresh
@@ -186,26 +195,22 @@ fn root() -> Option<Rc<Descriptor>> {
     if let Some(root) = ROOT.with(|r| r.borrow().clone()) {
         return Some(root);
     }
-    // The glue preopens exactly one directory, the origin's OPFS, at `/`.
-    // Prefer that name and fall back to the first preopen rather than
-    // failing, so a host that spells its root differently still works.
+    // internal.wit `world runtime`: "the glue preopens the origin's OPFS at
+    // `/`". Only that name. Falling back to whatever came first would mean
+    // writing a device's state into some other host's directory on the
+    // strength of a guess; no preopen at `/` is a glue that has not held up
+    // its end, and the honest answer is that there is no state root.
     let mut preopens = preopens::get_directories();
-    let index = preopens
-        .iter()
-        .position(|(_, path)| path == "/")
-        .unwrap_or(0);
-    if index >= preopens.len() {
-        return None;
-    }
+    let index = preopens.iter().position(|(_, path)| path == "/")?;
     let root = Rc::new(preopens.swap_remove(index).0);
     ROOT.with(|r| *r.borrow_mut() = Some(root.clone()));
     Some(root)
 }
 
-/// The kernel speaks absolute paths within the root; `open-at` speaks
-/// relative ones.
-fn relative(path: &str) -> &str {
-    path.trim_start_matches('/')
+/// The kernel speaks absolute paths within the root; `open-at` and its
+/// siblings speak relative ones.
+fn relative(path: &str) -> String {
+    path.trim_start_matches('/').to_string()
 }
 
 struct StateRoot;
@@ -214,25 +219,21 @@ impl Files for StateRoot {
     fn read(&self, path: String) -> LocalFuture<'_, Option<Vec<u8>>> {
         Box::pin(async move { read_file(&path).await })
     }
-    fn write(&self, path: String, bytes: Vec<u8>) -> LocalFuture<'_, ()> {
+    fn write(&self, path: String, bytes: Vec<u8>) -> LocalFuture<'_, Result<(), ()>> {
         Box::pin(async move { write_file(&path, bytes).await })
     }
-    fn remove_dir_all(&self, path: String) -> LocalFuture<'_, ()> {
+    fn remove_file(&self, path: String) -> LocalFuture<'_, ()> {
         Box::pin(async move {
-            let Some(root) = root() else { return };
-            remove_all(&root, relative(&path).to_string()).await;
+            if let Some(root) = root() {
+                let _ = root.unlink_file_at(relative(&path)).await;
+            }
         })
     }
-    fn list(&self, dir: String) -> LocalFuture<'_, Vec<String>> {
+    fn remove_dir(&self, path: String) -> LocalFuture<'_, ()> {
         Box::pin(async move {
-            let Some(root) = root() else {
-                return Vec::new();
-            };
-            entries(&root, relative(&dir))
-                .await
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect()
+            if let Some(root) = root() {
+                let _ = root.remove_directory_at(relative(&path)).await;
+            }
         })
     }
 }
@@ -242,7 +243,7 @@ async fn read_file(path: &str) -> Option<Vec<u8>> {
     let file = root
         .open_at(
             PathFlags::empty(),
-            relative(path).to_string(),
+            relative(path),
             OpenFlags::empty(),
             DescriptorFlags::READ,
         )
@@ -256,8 +257,12 @@ async fn read_file(path: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-async fn write_file(path: &str, bytes: Vec<u8>) {
-    let Some(root) = root() else { return };
+/// `Err(())` for anything that kept the whole buffer from reaching the file.
+/// The kernel turns that into a checkpoint that does not advance its pointer,
+/// so the distinction between "no root", "would not open" and "the stream
+/// closed early" buys nothing downstream.
+async fn write_file(path: &str, bytes: Vec<u8>) -> Result<(), ()> {
+    let root = root().ok_or(())?;
     let path = relative(path);
     // `open-at` will not create the parents, and a checkpoint writes into a
     // generation directory that has never existed.
@@ -269,21 +274,20 @@ async fn write_file(path: &str, bytes: Vec<u8>) {
             prefix.push('/');
         }
         prefix.push_str(component);
-        // `exist` is the normal answer on every write after the first.
+        // `exist` is the normal answer on every write after the first, and a
+        // real failure here surfaces as the `open-at` below failing.
         let _ = root.create_directory_at(prefix.clone()).await;
     }
 
-    let Ok(file) = root
+    let file = root
         .open_at(
             PathFlags::empty(),
-            path.to_string(),
+            path,
             OpenFlags::CREATE | OpenFlags::TRUNCATE,
             DescriptorFlags::WRITE,
         )
         .await
-    else {
-        return;
-    };
+        .map_err(|_| ())?;
 
     // `write-via-stream` is a sync function returning the completion future:
     // hand the host the readable end first, then fill it, then drop the
@@ -292,49 +296,15 @@ async fn write_file(path: &str, bytes: Vec<u8>) {
     let done = file.write_via_stream(reader, 0);
     let unwritten = writer.write_all(bytes).await;
     drop(writer);
-    let _ = done.await;
-    debug_assert!(unwritten.is_empty(), "the host closed the stream early");
-}
-
-/// `(name, is_directory)` for everything directly under `dir`. Empty for a
-/// directory that is not there, which is what the kernel's `list` promises.
-async fn entries(root: &Descriptor, dir: &str) -> Vec<(String, bool)> {
-    let Ok(handle) = root
-        .open_at(
-            PathFlags::empty(),
-            dir.to_string(),
-            OpenFlags::DIRECTORY,
-            DescriptorFlags::READ,
-        )
-        .await
-    else {
-        return Vec::new();
-    };
-    let (stream, result) = handle.read_directory();
-    let entries = stream.collect().await;
-    if result.await.is_err() {
-        return Vec::new();
+    let completed = done.await.is_ok();
+    // A non-empty remainder means the host closed the stream early: the file
+    // now holds a prefix of what was asked for, which is precisely the torn
+    // write the pointer must not advance over.
+    if unwritten.is_empty() && completed {
+        Ok(())
+    } else {
+        Err(())
     }
-    entries
-        .into_iter()
-        .map(|entry| (entry.name, matches!(entry.type_, DescriptorType::Directory)))
-        .collect()
-}
-
-/// Recursive removal: `wasi:filesystem` has no `rm -r`, only the two leaf
-/// verbs, so the walk is ours. Boxed because it recurses.
-fn remove_all<'a>(root: &'a Descriptor, dir: String) -> LocalFuture<'a, ()> {
-    Box::pin(async move {
-        for (name, is_dir) in entries(root, &dir).await {
-            let child = format!("{dir}/{name}");
-            if is_dir {
-                remove_all(root, child).await;
-            } else {
-                let _ = root.unlink_file_at(child).await;
-            }
-        }
-        let _ = root.remove_directory_at(dir).await;
-    })
 }
 
 // -- exports -----------------------------------------------------------------
@@ -495,19 +465,22 @@ impl guest::apps::Guest for Component {
     }
 }
 
-impl guest::events::Guest for Component {
-    async fn next() -> guest::events::Event {
-        // `next` has no error channel, and its contract is to park while
-        // there is nothing. Before boot there can never be anything, so
-        // parking forever is the honest answer; the glue boots first.
+impl guest::event_source::Guest for Component {
+    async fn drain() -> Vec<guest::event_source::Event> {
+        // Before boot there is nothing to drain, and `drain` has no error
+        // channel: an empty list is the honest answer.
         let Ok(kernel) = kernel() else {
-            return std::future::pending().await;
+            return Vec::new();
         };
-        match kernel.next_event().await {
-            polyvisor_kernel::Event::SessionEnded(session, why) => {
-                guest::events::Event::SessionEnded((session, why))
-            }
-        }
+        kernel
+            .drain_events()
+            .into_iter()
+            .map(|event| match event {
+                polyvisor_kernel::Event::SessionEnded(session, why) => {
+                    guest::event_source::Event::SessionEnded((session, why))
+                }
+            })
+            .collect()
     }
 }
 

@@ -39,13 +39,25 @@ function el(id: string): HTMLElement {
   return node;
 }
 
+/** The last fatal, if there was one. Also the flag `main` checks: a fatal
+ * that landed while the visor was still being fetched or mounted must not be
+ * painted over by the mount that followed it. */
+let fatalMessage: string | undefined;
+
+function paintFatal(): void {
+  if (fatalMessage === undefined) return;
+  const visor = document.getElementById("visor");
+  if (visor !== null) {
+    visor.textContent =
+      `This device could not start its visor. ${fatalMessage}`;
+  }
+}
+
 /** The framework's own voice, for when there are no trusted pixels to say
  * it with: the visor could not be brought up. */
 function fatal(message: string): void {
-  const visor = document.getElementById("visor");
-  if (visor !== null) {
-    visor.textContent = `This device could not start its visor. ${message}`;
-  }
+  fatalMessage = message;
+  paintFatal();
   console.error("polyvisor: fatal:", message);
 }
 
@@ -331,6 +343,11 @@ async function main(): Promise<void> {
     },
   };
 
+  // A fatal that arrived while the artifacts were being fetched: the worker
+  // has told us this tab cannot be served, so there is nothing honest to
+  // mount and the framework's text stands.
+  if (fatalMessage !== undefined) return;
+
   // No policy: the visor IS the trusted pixels (docs/design.md "Realms").
   await mountProducer({
     source: artifactsFromEnvelope(visor.plan, visor.wasm),
@@ -338,6 +355,11 @@ async function main(): Promise<void> {
     imports: { ...kernel, [I.shell]: shell },
     onError: (err) => fatal(String((err as Error)?.message ?? err)),
   });
+
+  // ...and one that arrived DURING the mount, which paints into the same
+  // node. The mount had already claimed the element by then, so the text has
+  // to be restated rather than merely flagged.
+  paintFatal();
 }
 
 main().catch((err: unknown) => fatal(String((err as Error)?.message ?? err)));

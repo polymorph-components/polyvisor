@@ -38,10 +38,16 @@ pub type LocalFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 /// The unsealed key/value store (`polyvisor:internal/kv`). Arguments are
 /// owned so the returned future borrows only the store.
 ///
-/// The kernel keeps exactly two kinds of key here: `index/<id>`, one JSON row
-/// per device, and `dev/<id>/...`, the small records a device needs before
-/// its state root is readable (its data key, wrapped or not). Everything else
-/// is in the sealed namespace.
+/// The kernel keeps exactly two kinds of key here:
+///
+/// - `index/<id>` — one JSON row per device, the only record readable before
+///   any seal opens (docs/design.md "Devices");
+/// - `dev/<id>/...` — the small records a device needs before its state root
+///   is readable: `dek` or `dek-wrapped`, and `gen`, the generation pointer.
+///
+/// `gen` is here rather than in the state root because it is the checkpoint's
+/// commit point and the kernel cannot list a directory to find it (see
+/// [`Files`]). Everything else is in the sealed namespace.
 pub trait Platform {
     fn get(&self, key: String) -> LocalFuture<'_, Option<Vec<u8>>>;
     fn set(&self, key: String, value: Vec<u8>) -> LocalFuture<'_, ()>;
@@ -53,18 +59,25 @@ pub trait Platform {
 /// The state root: the origin's OPFS, preopened at `/` by the glue. Paths are
 /// absolute within that root; the kernel only ever touches `/<id>/...`.
 ///
-/// Deliberately four verbs and no error channel. Storage that fails is not
-/// something the kernel can act on differently from storage that is empty —
-/// a checkpoint that did not land is a generation that will not verify, and
-/// the loader already falls back. `write` creates missing parent directories;
-/// `read` answers `None` for anything absent or unreadable; `list` answers
-/// the entry names directly under `dir`, empty if there is no such directory;
-/// `remove_dir_all` is recursive and succeeds silently on nothing.
+/// Four verbs and no listing. `read-directory` is one of the four
+/// `wasi:filesystem@0.3` functions that stayed sync in WIT, and the OPFS host
+/// answers it with a Promise, which traps a JSPI-free worker (internal.wit
+/// `world runtime`). Every path the kernel touches is therefore named, from
+/// the generation pointer it keeps in `kv`.
+///
+/// Only `write` reports failure, and only as `Err(())` — there is nothing to
+/// say about it beyond that it did not happen, and the kernel's answer is the
+/// same either way: refuse to advance the pointer, so the checkpoint the
+/// caller was promised is not silently the previous one. `read` answers
+/// `None` for anything absent or unreadable; `remove_file` and `remove_dir`
+/// are best effort and succeed silently on nothing, because a path that
+/// outlives its removal is collected by name on the next write or destroy.
+/// `write` creates missing parent directories.
 pub trait Files {
     fn read(&self, path: String) -> LocalFuture<'_, Option<Vec<u8>>>;
-    fn write(&self, path: String, bytes: Vec<u8>) -> LocalFuture<'_, ()>;
-    fn remove_dir_all(&self, path: String) -> LocalFuture<'_, ()>;
-    fn list(&self, dir: String) -> LocalFuture<'_, Vec<String>>;
+    fn write(&self, path: String, bytes: Vec<u8>) -> LocalFuture<'_, Result<(), ()>>;
+    fn remove_file(&self, path: String) -> LocalFuture<'_, ()>;
+    fn remove_dir(&self, path: String) -> LocalFuture<'_, ()>;
 }
 
 /// Web Locks, read side (`polyvisor:internal/locks`). The kernel asks only
@@ -158,7 +171,8 @@ struct DeviceState {
     /// `device`), so it is not in memory either.
     device: Option<Device>,
     tasks: BTreeMap<String, TaskList>,
-    /// The highest generation seen on disk; the next checkpoint is this + 1.
+    /// The pointed generation in `kv`; the next checkpoint is this + 1,
+    /// whether or not it was the one that loaded (see `checkpoint`).
     generation: u64,
     /// Terminal after `erase`.
     erased: bool,
@@ -227,14 +241,11 @@ impl Kernel {
 
     /// The state as `device.status` reports it.
     ///
-    /// CONTRACT: internal.wit gives three states and the dispatch says a
-    /// fresh device boots "open" while docs/design.md says "a device starts
-    /// `fresh` (ephemeral tier)". Read together, `fresh` and `open` are not
-    /// two degrees of readiness but two tiers: `sealed` while a passphrase
-    /// device is locked, `fresh` while the device has not been kept, `open`
-    /// once it has. That is the only reading under which `fresh` is ever
-    /// reported at all, and it is what the visor's "Keep this device" prompt
-    /// keys off.
+    /// `fresh` and `open` are two tiers, not two degrees of readiness:
+    /// `sealed` while a passphrase device is locked, `fresh` while the device
+    /// has not been kept, `open` once it has. internal.wit `device`: "`fresh`
+    /// is not a gate: an ephemeral device is fully usable" — which is why
+    /// [`Kernel::open`] passes it.
     fn state(&self) -> State {
         let state = self.state.borrow();
         if state.erased {
@@ -249,9 +260,10 @@ impl Kernel {
         }
     }
 
-    /// The gate every export but `device.status` and `store.devices` passes
-    /// through: internal.wit `device` — "every other kernel call is
-    /// `unavailable` until `unseal`".
+    /// The gate every export but `device.status`, `store.devices` and
+    /// `device.erase` passes through: internal.wit `device` — "every other
+    /// kernel call is `unavailable` until `unseal`". `fresh` passes: it is a
+    /// tier, not a lock.
     fn open(&self) -> Result<(), Error> {
         match self.state() {
             State::Fresh | State::Open => Ok(()),
@@ -367,34 +379,46 @@ impl Kernel {
             .dek
             .clone()
             .expect("open implies a data key");
-        match &passphrase {
-            None => {
-                // Rests open: the key is already unwrapped in the namespace,
-                // where it stays. Nothing to write but the row.
-            }
-            Some(passphrase) => {
-                let wrapped =
-                    WrappedDek::wrap(self.seams.rng.as_ref(), &dek, passphrase, &self.id)?;
-                self.seams
-                    .platform
-                    .set(self.dek_wrapped_key(), wrapped.encode()?)
-                    .await;
-                // Only after the wrapped record is durable: a crash between
-                // the two leaves a device that still rests open, which is
-                // recoverable; the other order loses the key outright.
-                self.seams.platform.delete(self.dek_key()).await;
-            }
+        let rest = if passphrase.is_some() {
+            Rest::Passphrase
+        } else {
+            Rest::RestsOpen
+        };
+
+        // Order matters, and the order is: wrapped key, then row, then delete
+        // the unwrapped key. Every prefix of it is a device that still opens.
+        // Writing the row first would leave a crash window in which the row
+        // says `passphrase` and no wrapped key exists — a device sealed
+        // against nothing, unrecoverable. Deleting the unwrapped key before
+        // the row would leave a device the row calls `rests-open` whose key
+        // is gone, which `resume` refuses to boot.
+        if let Some(passphrase) = &passphrase {
+            let wrapped = WrappedDek::wrap(self.seams.rng.as_ref(), &dek, passphrase, &self.id)?;
+            self.seams
+                .platform
+                .set(self.dek_wrapped_key(), wrapped.encode()?)
+                .await;
         }
-        {
+
+        let row = {
             let mut state = self.state.borrow_mut();
             state.row.petname = petname;
             state.row.tier = Tier::Durable;
-            state.row.rest = if passphrase.is_some() {
-                Rest::Passphrase
-            } else {
-                Rest::RestsOpen
-            };
+            state.row.rest = rest;
+            state.row.encode()?
+        };
+        self.seams
+            .platform
+            .set(store::index_key(&self.id), row)
+            .await;
+
+        if rest == Rest::Passphrase {
+            // Last. A crash before this leaves a device whose row already
+            // says `passphrase`; `resume` finds the stale unwrapped key and
+            // deletes it there, which is the same end state.
+            self.seams.platform.delete(self.dek_key()).await;
         }
+
         self.checkpoint().await
     }
 
@@ -421,13 +445,28 @@ impl Kernel {
                 "the passphrase did not open this device",
             )
         })?;
-        let (generation, snapshot) =
-            checkpoint::load(self.seams.files.as_ref(), &dek, &self.id).await?;
+        let (generation, snapshot) = checkpoint::load(
+            self.seams.files.as_ref(),
+            self.seams.platform.as_ref(),
+            &dek,
+            &self.id,
+        )
+        .await?;
+        // A device that rests under a passphrase is durable by construction,
+        // so `open_or_mint` refuses a missing state rather than inventing an
+        // anchor: unsealing into a blank device would be indistinguishable
+        // from unsealing into the right one.
+        let (restored, generation) = open_or_mint(
+            &self.seams,
+            &self.id,
+            &dek,
+            Tier::Durable,
+            generation,
+            snapshot,
+        )
+        .await?;
         {
             let mut state = self.state.borrow_mut();
-            let restored = snapshot.unwrap_or_else(|| {
-                checkpoint::Snapshot::new(Device::mint(&self.id), BTreeMap::new())
-            });
             state.device = Some(restored.device);
             state.tasks = restored.tasks;
             state.generation = generation;
@@ -441,12 +480,11 @@ impl Kernel {
     /// row. Terminal — every later call answers `unavailable`, and the visor
     /// switches away (`shell.switch-device`).
     pub async fn erase(&self) -> Result<(), Error> {
-        // CONTRACT: internal.wit says every kernel call but `status` is
-        // `unavailable` while sealed, and `erase` is one of them, so a device
-        // whose passphrase is forgotten cannot be erased from its own worker.
-        // That is the conservative reading of the contract as written; it is
-        // flagged, because the entry picker plausibly wants the opposite.
-        self.open()?;
+        // Allowed while sealed: internal.wit `device` — "except `erase`,
+        // which needs no key (a forgotten passphrase must not make a device
+        // un-erasable)". Nothing here reads the DEK; the namespace is removed
+        // by name and the row by key.
+        self.not_erased()?;
         store::destroy(
             self.seams.platform.as_ref(),
             self.seams.files.as_ref(),
@@ -504,6 +542,7 @@ impl Kernel {
         };
         checkpoint::write(
             self.seams.files.as_ref(),
+            self.seams.platform.as_ref(),
             self.seams.rng.as_ref(),
             &dek,
             &self.id,
@@ -692,9 +731,12 @@ impl Kernel {
 
     // -- events --------------------------------------------------------------
 
-    /// Parks until an event exists.
-    pub fn next_event(&self) -> impl Future<Output = Event> + '_ {
-        self.events.next()
+    /// Everything queued since the last drain, in order (internal.wit
+    /// `event-source.drain`). Never parks: the glue drains after every export
+    /// call it dispatches, and an async export parked on a guest-internal
+    /// waker is a deadlock to polyengine (polyengine#292).
+    pub fn drain_events(&self) -> Vec<Event> {
+        self.events.drain()
     }
 
     /// The other half of [`Kernel::abort`]: an ending the visor did not ask
@@ -706,8 +748,14 @@ impl Kernel {
 }
 
 /// A device the index has never heard of: mint its anchor and its data key,
-/// write both, and record the row. Ephemeral and resting open, because that
-/// is what "not yet kept" means.
+/// write both, record the row, and checkpoint at once.
+///
+/// The checkpoint is not deferred to the first mutation, because the anchor
+/// is *drawn* rather than derived (see [`Device::mint`]): an ephemeral device
+/// that was booted and reloaded without being touched would otherwise come
+/// back a different colour with a different word, which is the one thing the
+/// anchor may not do. Ephemeral and resting open, because that is what "not
+/// yet kept" means.
 async fn mint(seams: &Seams, id: &str, now: u64) -> Result<DeviceState, Error> {
     let dek = Dek::mint(seams.rng.as_ref());
     seams
@@ -719,15 +767,38 @@ async fn mint(seams: &Seams, id: &str, now: u64) -> Result<DeviceState, Error> {
         .platform
         .set(store::index_key(id), row.encode()?)
         .await;
+
+    let (snapshot, generation) = mint_anchor(seams, id, &dek).await;
+
     Ok(DeviceState {
         row,
         dek: Some(dek),
         wrapped: None,
-        device: Some(Device::mint(id)),
-        tasks: BTreeMap::new(),
-        generation: 0,
+        device: Some(snapshot.device),
+        tasks: snapshot.tasks,
+        generation,
         erased: false,
     })
+}
+
+/// Draw an anchor and commit it as generation 1, returning the generation
+/// that actually landed. A failure here is not fatal — the device is usable
+/// and its anchor is in memory — but it leaves the pointer at 0, which is
+/// what makes the *next* boot's re-mint legal (see [`open_or_mint`]).
+async fn mint_anchor(seams: &Seams, id: &str, dek: &Dek) -> (checkpoint::Snapshot, u64) {
+    let snapshot = checkpoint::Snapshot::new(Device::mint(seams.rng.as_ref()), BTreeMap::new());
+    let committed = checkpoint::write(
+        seams.files.as_ref(),
+        seams.platform.as_ref(),
+        seams.rng.as_ref(),
+        dek,
+        id,
+        1,
+        &snapshot,
+    )
+    .await
+    .is_ok();
+    (snapshot, if committed { 1 } else { 0 })
 }
 
 /// A device the index knows. How it rests decides whether this boot can read
@@ -747,6 +818,14 @@ async fn resume(seams: &Seams, id: &str, row: IndexRow, now: u64) -> Result<Devi
                         "this device rests under a passphrase but its wrapped key is missing",
                     )
                 })?;
+            // The tail of `keep`: a crash between writing the row and
+            // deleting the unwrapped key leaves both keys in `kv`, and the
+            // unwrapped one opens the device without the passphrase. Finish
+            // the job here, before anything else can read it.
+            let stale = format!("{}dek", store::dev_prefix(id));
+            if seams.platform.get(stale.clone()).await.is_some() {
+                seams.platform.delete(stale).await;
+            }
             Ok(DeviceState {
                 row,
                 dek: None,
@@ -766,12 +845,10 @@ async fn resume(seams: &Seams, id: &str, row: IndexRow, now: u64) -> Result<Devi
                     Error::new(ErrorCode::Failed, "this device's data key is missing")
                 })?;
             let dek = Dek::decode(&bytes)?;
-            let (generation, snapshot) = checkpoint::load(seams.files.as_ref(), &dek, id).await?;
-            // No checkpoint yet is the normal state of a device that has been
-            // booted but never mutated: re-mint the anchor, which is derived
-            // from the id and therefore the same one.
-            let snapshot = snapshot
-                .unwrap_or_else(|| checkpoint::Snapshot::new(Device::mint(id), BTreeMap::new()));
+            let (generation, snapshot) =
+                checkpoint::load(seams.files.as_ref(), seams.platform.as_ref(), &dek, id).await?;
+            let (snapshot, generation) =
+                open_or_mint(seams, id, &dek, row.tier, generation, snapshot).await?;
             Ok(DeviceState {
                 row,
                 dek: Some(dek),
@@ -782,6 +859,36 @@ async fn resume(seams: &Seams, id: &str, row: IndexRow, now: u64) -> Result<Devi
                 erased: false,
             })
         }
+    }
+}
+
+/// What to do when no generation verified.
+///
+/// For a durable device: nothing. It was kept, so it has been checkpointed,
+/// so a missing state is storage loss — and silently handing the user a blank
+/// device with a new colour would look exactly like the device they kept,
+/// which is worse than refusing to boot.
+///
+/// For an ephemeral device the one legal case is a mint whose first
+/// checkpoint failed (see [`mint`]), which the pointer still sitting at 0
+/// identifies exactly: there is nothing to lose, so draw again and commit
+/// this time. The anchor differs from the one the failed boot showed, which
+/// is the cost of the draw not having landed.
+async fn open_or_mint(
+    seams: &Seams,
+    id: &str,
+    dek: &Dek,
+    tier: Tier,
+    generation: u64,
+    snapshot: Option<checkpoint::Snapshot>,
+) -> Result<(checkpoint::Snapshot, u64), Error> {
+    match snapshot {
+        Some(snapshot) => Ok((snapshot, generation)),
+        None if tier == Tier::Ephemeral && generation == 0 => Ok(mint_anchor(seams, id, dek).await),
+        None => Err(Error::new(
+            ErrorCode::Failed,
+            "this device's state did not open",
+        )),
     }
 }
 

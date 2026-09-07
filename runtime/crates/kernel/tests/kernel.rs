@@ -5,9 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 use polyvisor_kernel::{
     BootConfig, Clock, Error, ErrorCode, Event, Fetch, Files, IndexRow, Kernel, LEASE_TTL_MS,
@@ -30,25 +28,43 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 
 type Store = Rc<RefCell<BTreeMap<String, Vec<u8>>>>;
 
+/// The kv, with a one-shot trap: `abort_on(key)` makes the *next* `set` of
+/// that key panic, which is how a test stands in for the worker dying
+/// mid-sequence. `Kernel::boot` and the mutation paths are plain `async fn`s
+/// over these fakes, so an unwind here leaves exactly the persisted prefix
+/// the crash would have left.
 #[derive(Default, Clone)]
-struct FakeKv(Store);
+struct FakeKv {
+    store: Store,
+    abort_on: Rc<RefCell<Option<String>>>,
+}
+
+impl FakeKv {
+    fn abort_on(&self, key: &str) {
+        *self.abort_on.borrow_mut() = Some(key.to_string());
+    }
+}
 
 impl Platform for FakeKv {
     fn get(&self, key: String) -> LocalFuture<'_, Option<Vec<u8>>> {
-        let value = self.0.borrow().get(&key).cloned();
+        let value = self.store.borrow().get(&key).cloned();
         Box::pin(async move { value })
     }
     fn set(&self, key: String, value: Vec<u8>) -> LocalFuture<'_, ()> {
-        self.0.borrow_mut().insert(key, value);
+        if self.abort_on.borrow().as_deref() == Some(key.as_str()) {
+            self.abort_on.borrow_mut().take();
+            panic!("the worker died before `set {key}`");
+        }
+        self.store.borrow_mut().insert(key, value);
         Box::pin(async {})
     }
     fn delete(&self, key: String) -> LocalFuture<'_, ()> {
-        self.0.borrow_mut().remove(&key);
+        self.store.borrow_mut().remove(&key);
         Box::pin(async {})
     }
     fn keys(&self, prefix: String) -> LocalFuture<'_, Vec<String>> {
         let keys: Vec<String> = self
-            .0
+            .store
             .borrow()
             .keys()
             .filter(|k| k.starts_with(&prefix))
@@ -59,44 +75,58 @@ impl Platform for FakeKv {
 }
 
 /// A flat path -> bytes map, which is what OPFS is behind its directory
-/// handles: a directory exists exactly where a file is under it.
+/// handles: a directory exists exactly where a file is under it. There is no
+/// `list`, because the kernel has none — the seam is `read`/`write`/
+/// `remove_file`/`remove_dir` and every path is named.
 #[derive(Default, Clone)]
-struct FakeFiles(Store);
+struct FakeFiles {
+    store: Store,
+    /// How many of the next writes report failure without storing anything.
+    failures: Rc<Cell<u32>>,
+}
 
 impl FakeFiles {
     fn paths(&self) -> Vec<String> {
-        self.0.borrow().keys().cloned().collect()
+        self.store.borrow().keys().cloned().collect()
     }
     fn under(&self, prefix: &str) -> bool {
         self.paths().iter().any(|p| p.starts_with(prefix))
+    }
+    fn has(&self, path: &str) -> bool {
+        self.store.borrow().contains_key(path)
+    }
+    fn get(&self, path: &str) -> Option<Vec<u8>> {
+        self.store.borrow().get(path).cloned()
+    }
+    /// The next `n` writes fail — a full disk, a revoked handle, an evicted
+    /// OPFS. The kernel may not advance its pointer over any of them.
+    fn fail_next_writes(&self, n: u32) {
+        self.failures.set(n);
     }
 }
 
 impl Files for FakeFiles {
     fn read(&self, path: String) -> LocalFuture<'_, Option<Vec<u8>>> {
-        let value = self.0.borrow().get(&path).cloned();
+        let value = self.store.borrow().get(&path).cloned();
         Box::pin(async move { value })
     }
-    fn write(&self, path: String, bytes: Vec<u8>) -> LocalFuture<'_, ()> {
-        self.0.borrow_mut().insert(path, bytes);
+    fn write(&self, path: String, bytes: Vec<u8>) -> LocalFuture<'_, Result<(), ()>> {
+        if self.failures.get() > 0 {
+            self.failures.set(self.failures.get() - 1);
+            return Box::pin(async { Err(()) });
+        }
+        self.store.borrow_mut().insert(path, bytes);
+        Box::pin(async { Ok(()) })
+    }
+    fn remove_file(&self, path: String) -> LocalFuture<'_, ()> {
+        self.store.borrow_mut().remove(&path);
         Box::pin(async {})
     }
-    fn remove_dir_all(&self, path: String) -> LocalFuture<'_, ()> {
-        let prefix = format!("{path}/");
-        self.0.borrow_mut().retain(|k, _| !k.starts_with(&prefix));
+    fn remove_dir(&self, _path: String) -> LocalFuture<'_, ()> {
+        // Directories are implied by the files under them here, so removing
+        // one is a no-op — and removing a *non-empty* one has to stay a
+        // no-op, or these tests would hide the kernel forgetting a file.
         Box::pin(async {})
-    }
-    fn list(&self, dir: String) -> LocalFuture<'_, Vec<String>> {
-        let prefix = format!("{dir}/");
-        let names: BTreeSet<String> = self
-            .0
-            .borrow()
-            .keys()
-            .filter_map(|k| k.strip_prefix(&prefix))
-            .map(|rest| rest.split('/').next().unwrap_or(rest).to_string())
-            .collect();
-        let names: Vec<String> = names.into_iter().collect();
-        Box::pin(async move { names })
     }
 }
 
@@ -299,16 +329,16 @@ impl World {
     }
 
     fn kv_has(&self, key: &str) -> bool {
-        self.kv.0.borrow().contains_key(key)
+        self.kv.store.borrow().contains_key(key)
     }
 
     fn kv_put(&self, key: &str, value: Vec<u8>) {
-        self.kv.0.borrow_mut().insert(key.to_string(), value);
+        self.kv.store.borrow_mut().insert(key.to_string(), value);
     }
 
     fn row(&self, id: &str) -> Option<IndexRow> {
         self.kv
-            .0
+            .store
             .borrow()
             .get(&format!("index/{id}"))
             .map(|bytes| IndexRow::decode(bytes).unwrap())
@@ -318,9 +348,34 @@ impl World {
         self.kv_put(&format!("index/{}", row.id), row.encode().unwrap());
     }
 
-    /// The generation directory names on disk, ascending.
-    fn generations(&self, id: &str) -> Vec<String> {
-        block_on(self.files.list(format!("/{id}")))
+    /// The committed generation, as the kv pointer records it. 0 before the
+    /// first checkpoint.
+    fn pointer(&self, id: &str) -> u64 {
+        self.kv
+            .store
+            .borrow()
+            .get(&format!("dev/{id}/gen"))
+            .map(|bytes| String::from_utf8(bytes.clone()).unwrap().parse().unwrap())
+            .unwrap_or(0)
+    }
+
+    /// Which generation directories still have files in them, ascending.
+    fn generations(&self, id: &str) -> Vec<u64> {
+        let mut found: Vec<u64> = self
+            .files
+            .paths()
+            .iter()
+            .filter_map(|p| {
+                p.strip_prefix(&format!("/{id}/gen-"))?
+                    .split('/')
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+        found
     }
 }
 
@@ -336,7 +391,7 @@ fn session(kernel: &Kernel) -> u32 {
 // -- boot, identity, checkpoint ----------------------------------------------
 
 #[test]
-fn a_fresh_boot_writes_a_row_and_a_key_and_no_checkpoint() {
+fn a_fresh_boot_writes_a_row_a_key_and_its_anchor() {
     let world = World::default();
     let kernel = world.boot();
 
@@ -354,22 +409,73 @@ fn a_fresh_boot_writes_a_row_and_a_key_and_no_checkpoint() {
         world.kv_has(&format!("dev/{ID}/dek")),
         "rests-open is the ephemeral default: the key sits unwrapped"
     );
-    // Nothing reaches the state root until there is something to save.
-    assert!(world.files.paths().is_empty());
+    // Generation 1 is written by `boot`, not deferred to the first mutation:
+    // the anchor is drawn, so it has to be durable before anyone sees it.
+    assert_eq!(world.generations(ID), [1]);
+    assert_eq!(world.pointer(ID), 1);
 
     block_on(kernel.set_name("study".into())).unwrap();
-    assert_eq!(world.generations(ID), ["gen-1"]);
+    assert_eq!(world.generations(ID), [2]);
+    assert_eq!(world.pointer(ID), 2);
 }
 
 #[test]
-fn the_anchor_is_derived_from_the_id_and_survives_a_reload() {
+fn the_anchor_is_drawn_once_and_survives_an_untouched_reload() {
+    // The anchor is drawn from the RNG, never derived from the id: the id is
+    // public, and a hue and word anyone could compute from it would be the
+    // visor's anti-impostor signal given away. Drawn means it must be
+    // checkpointed at mint, or a reload would repaint the device.
     let world = World::default();
     let minted = world.boot().device_status().unwrap();
-    assert_eq!(world.boot().device_status().unwrap(), minted);
+    assert_eq!(
+        world.boot().device_status().unwrap(),
+        minted,
+        "a reload with no mutation in between restores the same anchor"
+    );
 
-    // A different id is a different device, anchor and all.
+    // A second device draws its own, from the same generator.
     let other = world.try_boot_as("beef").unwrap().device_status().unwrap();
     assert_ne!(other.word, minted.word);
+    assert_ne!(other.hue, minted.hue);
+}
+
+#[test]
+fn an_anchor_whose_first_checkpoint_failed_is_re_minted() {
+    // The one case in which a missing state is legal: an ephemeral device
+    // whose mint never committed (pointer 0). There is nothing to lose, so
+    // the next boot draws again rather than refusing.
+    let world = World::default();
+    // One failure is enough: `checkpoint::write` stops at the first, so the
+    // MANIFEST is never attempted.
+    world.files.fail_next_writes(1);
+    let first = world.boot().device_status().unwrap();
+    assert_eq!(world.pointer(ID), 0, "the pointer never advanced");
+    assert!(world.files.paths().is_empty());
+
+    let second = world.boot().device_status().unwrap();
+    assert_eq!(second.id, first.id);
+    assert_eq!(world.pointer(ID), 1, "this boot's mint did commit");
+    assert_eq!(world.boot().device_status().unwrap(), second);
+}
+
+#[test]
+fn a_durable_device_whose_state_does_not_open_refuses_to_boot() {
+    // The opposite case: a kept device has been checkpointed, so a state that
+    // will not open is storage loss. Handing back a blank device with a new
+    // colour would be indistinguishable from the one the user kept.
+    let world = World::default();
+    {
+        let kernel = world.boot();
+        block_on(kernel.keep("desk".into(), None)).unwrap();
+    }
+    for path in world.files.paths() {
+        block_on(world.files.remove_file(path));
+    }
+    let Err(err) = world.try_boot() else {
+        panic!("a durable device with no readable state must not boot");
+    };
+    assert_eq!(err.code, ErrorCode::Failed);
+    assert_eq!(err.message, "this device's state did not open");
 }
 
 #[test]
@@ -534,6 +640,45 @@ fn a_device_that_is_already_open_cannot_be_unsealed() {
 // -- erase -------------------------------------------------------------------
 
 #[test]
+fn a_sealed_device_can_still_be_erased() {
+    // internal.wit `device`: erase "needs no key (a forgotten passphrase must
+    // not make a device un-erasable)".
+    let world = World::default();
+    {
+        let kernel = world.boot();
+        block_on(kernel.set_name("study".into())).unwrap();
+        block_on(kernel.keep("desk".into(), Some("open sesame".into()))).unwrap();
+    }
+    let kernel = world.boot();
+    assert_eq!(kernel.device_status().unwrap().state, State::Sealed);
+
+    block_on(kernel.erase()).unwrap();
+    assert!(!world.files.under(&format!("/{ID}/")));
+    assert!(!world.kv_has(&format!("index/{ID}")));
+    assert!(!world.kv_has(&format!("dev/{ID}/dek-wrapped")));
+    assert!(!world.kv_has(&format!("dev/{ID}/gen")));
+}
+
+#[test]
+fn every_export_works_on_a_fresh_device() {
+    // internal.wit `device`: "`fresh` is not a gate: an ephemeral device is
+    // fully usable". The M1 e2e run never keeps a device, so this is the
+    // whole of it working.
+    let world = World::default();
+    let kernel = world.boot();
+    assert_eq!(kernel.device_status().unwrap().state, State::Fresh);
+    block_on(kernel.set_name("study".into())).unwrap();
+    block_on(kernel.set_hue(120)).unwrap();
+    block_on(kernel.reroll_word()).unwrap();
+    assert_eq!(block_on(kernel.devices()).unwrap().len(), 1);
+    assert_eq!(kernel.installed().unwrap().len(), 1);
+    let s = session(&kernel);
+    block_on(kernel.component(s)).unwrap();
+    kernel.assets(s).unwrap();
+    block_on(kernel.tasks_add(s, "milk".into())).unwrap();
+}
+
+#[test]
 fn erase_destroys_the_namespace_and_the_row_and_is_terminal() {
     let world = World::default();
     let kernel = world.boot();
@@ -541,9 +686,13 @@ fn erase_destroys_the_namespace_and_the_row_and_is_terminal() {
     assert!(!world.files.paths().is_empty());
 
     block_on(kernel.erase()).unwrap();
-    assert!(world.files.paths().is_empty());
+    assert!(
+        world.files.paths().is_empty(),
+        "every named path was removed"
+    );
     assert!(!world.kv_has(&format!("index/{ID}")));
     assert!(!world.kv_has(&format!("dev/{ID}/dek")));
+    assert!(!world.kv_has(&format!("dev/{ID}/gen")));
 
     for code in [
         kernel.device_status().unwrap_err().code,
@@ -566,7 +715,9 @@ fn plant(world: &World, id: &str, tier: Tier, last_used: u64) {
         world
             .files
             .write(format!("/{id}/gen-1/state"), b"whatever".to_vec()),
-    );
+    )
+    .unwrap();
+    world.kv_put(&format!("dev/{id}/gen"), b"1".to_vec());
     world.kv_put(&format!("dev/{id}/dek"), vec![0; 32]);
 }
 
@@ -612,47 +763,234 @@ fn the_sweep_never_takes_the_device_it_is_booting() {
 // -- generations -------------------------------------------------------------
 
 #[test]
-fn a_complete_generation_replaces_every_older_one() {
+fn a_committed_generation_replaces_the_one_before_it() {
     let world = World::default();
     let kernel = world.boot();
-    for (n, name) in [(1, "one"), (2, "two"), (3, "three")] {
+    // Generation 1 is the mint, so the first mutation is 2.
+    for (n, name) in [(2, "one"), (3, "two"), (4, "three")] {
         block_on(kernel.set_name(name.into())).unwrap();
-        assert_eq!(world.generations(ID), [format!("gen-{n}")]);
+        assert_eq!(world.generations(ID), [n], "only the newest is kept");
+        assert_eq!(world.pointer(ID), n);
     }
     assert_eq!(world.boot().device_status().unwrap().name, "three");
 }
 
-#[test]
-fn a_torn_newest_generation_falls_back_to_the_last_complete_one() {
-    let world = World::default();
-    {
-        let kernel = world.boot();
-        block_on(kernel.set_name("complete".into())).unwrap();
-    }
+/// The two files of a generation, so a test can put back what the kernel's
+/// cleanup removed and reconstruct a crash state exactly.
+fn snapshot_generation(world: &World, id: &str, n: u64) -> (Vec<u8>, Vec<u8>) {
+    let files = world.files.store.borrow();
+    (
+        files[&format!("/{id}/gen-{n}/state")].clone(),
+        files[&format!("/{id}/gen-{n}/MANIFEST")].clone(),
+    )
+}
 
-    // The crash the MANIFEST-last rule exists for: a `gen-2/state` that
-    // landed and a `gen-2/MANIFEST` that never did.
+fn restore_generation(world: &World, id: &str, n: u64, bytes: (Vec<u8>, Vec<u8>)) {
+    block_on(world.files.write(format!("/{id}/gen-{n}/state"), bytes.0)).unwrap();
     block_on(
         world
             .files
-            .write(format!("/{ID}/gen-2/state"), b"half a write".to_vec()),
-    );
-    assert_eq!(world.generations(ID), ["gen-1", "gen-2"]);
-    assert_eq!(world.boot().device_status().unwrap().name, "complete");
+            .write(format!("/{id}/gen-{n}/MANIFEST"), bytes.1),
+    )
+    .unwrap();
+}
 
-    // Same answer when the MANIFEST is there but disagrees with the bytes.
-    block_on(world.files.write(
-        format!("/{ID}/gen-2/MANIFEST"),
-        br#"{"v":2,"generation":2,"sha256":"00"}"#.to_vec(),
-    ));
-    assert_eq!(world.boot().device_status().unwrap().name, "complete");
+#[test]
+fn a_generation_the_pointer_never_reached_falls_back_to_the_committed_one() {
+    let world = World::default();
+    {
+        let kernel = world.boot();
+        block_on(kernel.set_name("one".into())).unwrap();
+        block_on(kernel.set_name("committed".into())).unwrap();
+    }
+    assert_eq!(world.pointer(ID), 3);
+    let committed = snapshot_generation(&world, ID, 3);
 
-    // And the next checkpoint continues past the torn generation rather than
-    // writing half of it again.
+    // The crash the pointer-last rule exists for: `gen-4` landed whole, the
+    // pointer never advanced to it, and the cleanup that would have removed
+    // `gen-3` never ran either.
+    {
+        let kernel = world.boot();
+        block_on(kernel.set_name("uncommitted".into())).unwrap();
+    }
+    restore_generation(&world, ID, 3, committed);
+    world.kv_put(&format!("dev/{ID}/gen"), b"3".to_vec());
+    assert!(world.files.has(&format!("/{ID}/gen-4/MANIFEST")));
+
+    // The pointer is the commit point, so the whole `gen-4` is invisible.
+    assert_eq!(world.boot().device_status().unwrap().name, "committed");
+
+    // And the next write reuses generation 4, overwriting what was there.
     let kernel = world.boot();
     block_on(kernel.set_name("after".into())).unwrap();
-    assert_eq!(world.generations(ID), ["gen-3"]);
+    assert_eq!(world.pointer(ID), 4);
+    assert_eq!(world.generations(ID), [4]);
     assert_eq!(world.boot().device_status().unwrap().name, "after");
+}
+
+#[test]
+fn a_torn_pointed_generation_falls_back_to_its_predecessor() {
+    // A crash *during* `gen-3/state` leaves the pointer at 3 only if the
+    // pointer write also happened — it cannot here, but a half-written file
+    // under a pointer that did advance is the shape the fallback exists for,
+    // and `gen-2` is guaranteed intact because the pointer only left it once
+    // `gen-3` was whole.
+    let world = World::default();
+    {
+        let kernel = world.boot();
+        block_on(kernel.set_name("one".into())).unwrap();
+        block_on(kernel.set_name("two".into())).unwrap();
+    }
+    // Keep gen-2 alive past the cleanup by re-planting it, then corrupt the
+    // generation the pointer names.
+    let previous = snapshot_generation(&world, ID, 3);
+    {
+        let kernel = world.boot();
+        block_on(kernel.set_name("three".into())).unwrap();
+    }
+    restore_generation(&world, ID, 3, previous);
+    block_on(
+        world
+            .files
+            .write(format!("/{ID}/gen-4/state"), b"half a write".to_vec()),
+    )
+    .unwrap();
+    assert_eq!(world.pointer(ID), 4);
+
+    assert_eq!(world.boot().device_status().unwrap().name, "two");
+}
+
+#[test]
+fn a_write_that_fails_does_not_advance_the_pointer() {
+    let world = World::default();
+    let kernel = world.boot();
+    block_on(kernel.set_name("committed".into())).unwrap();
+    assert_eq!(world.pointer(ID), 2);
+    let intact = snapshot_generation(&world, ID, 2);
+
+    world.files.fail_next_writes(1);
+    let err = block_on(kernel.set_name("lost".into())).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Failed);
+    assert_eq!(err.message, "this device's state could not be written");
+
+    // The pointer did not move, the generation it names is untouched, and no
+    // cleanup ran: the previous checkpoint is still exactly what a boot gets.
+    assert_eq!(world.pointer(ID), 2);
+    assert_eq!(snapshot_generation(&world, ID, 2), intact);
+    assert_eq!(world.boot().device_status().unwrap().name, "committed");
+
+    // The next write takes the same generation number and succeeds.
+    block_on(kernel.set_name("after".into())).unwrap();
+    assert_eq!(world.pointer(ID), 3);
+    assert_eq!(world.generations(ID), [3]);
+    assert_eq!(world.boot().device_status().unwrap().name, "after");
+}
+
+#[test]
+fn a_crash_between_wrapping_the_key_and_deleting_it_still_seals() {
+    // `keep` writes the wrapped key, then the row, then deletes the
+    // unwrapped one. Die on the row write: the wrapped key is durable and
+    // the plaintext one is still sitting in `kv`.
+    let world = World::default();
+    {
+        let kernel = world.boot();
+        block_on(kernel.set_name("study".into())).unwrap();
+        world.kv.abort_on(&format!("index/{ID}"));
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            block_on(kernel.keep("desk".into(), Some("open sesame".into())))
+        }));
+        assert!(died.is_err(), "the fake was supposed to abort the worker");
+    }
+    assert!(world.kv_has(&format!("dev/{ID}/dek-wrapped")));
+    assert!(
+        world.kv_has(&format!("dev/{ID}/dek")),
+        "the delete never ran"
+    );
+
+    // The row still says rests-open, so this boot opens on the plaintext key
+    // — which is the honest state: the promotion never committed.
+    let kernel = world.boot();
+    assert_eq!(kernel.device_status().unwrap().rest, Rest::RestsOpen);
+
+    // Retrying the keep is the recovery, and it commits this time.
+    block_on(kernel.keep("desk".into(), Some("open sesame".into()))).unwrap();
+    assert!(!world.kv_has(&format!("dev/{ID}/dek")));
+
+    let kernel = world.boot();
+    assert_eq!(kernel.device_status().unwrap().state, State::Sealed);
+    block_on(kernel.unseal("open sesame".into())).unwrap();
+    assert_eq!(kernel.device_status().unwrap().name, "study");
+}
+
+#[test]
+fn a_row_that_says_passphrase_loses_any_lingering_plaintext_key() {
+    // The other side of the same window: the row landed and the delete did
+    // not. A plaintext key beside a `passphrase` row opens the device without
+    // the passphrase, so `resume` finishes the job before anything reads it.
+    let world = World::default();
+    {
+        let kernel = world.boot();
+        block_on(kernel.set_name("study".into())).unwrap();
+        let dek = world.kv.store.borrow()[&format!("dev/{ID}/dek")].clone();
+        block_on(kernel.keep("desk".into(), Some("open sesame".into()))).unwrap();
+        // Put it back, as a crash before the delete would have left it.
+        world.kv_put(&format!("dev/{ID}/dek"), dek);
+    }
+
+    let kernel = world.boot();
+    assert!(
+        !world.kv_has(&format!("dev/{ID}/dek")),
+        "resume deleted the stale plaintext key"
+    );
+    assert_eq!(kernel.device_status().unwrap().state, State::Sealed);
+    block_on(kernel.unseal("open sesame".into())).unwrap();
+    assert_eq!(kernel.device_status().unwrap().name, "study");
+}
+
+#[test]
+fn two_checkpoints_of_the_same_state_are_different_bytes() {
+    // Every seal draws a fresh nonce. Identical plaintext producing identical
+    // ciphertext would leak "nothing changed" to anyone who can see the
+    // state root, and reusing a nonce under one key is worse than that.
+    let world = World::default();
+    let kernel = world.boot();
+    block_on(kernel.set_name("study".into())).unwrap();
+    let first = world.files.get(&format!("/{ID}/gen-2/state")).unwrap();
+    block_on(kernel.set_name("study".into())).unwrap();
+    let second = world.files.get(&format!("/{ID}/gen-3/state")).unwrap();
+
+    assert_eq!(
+        world.boot().device_status().unwrap().name,
+        "study",
+        "the same state, written twice"
+    );
+    assert_ne!(first, second, "same plaintext, different ciphertext");
+    assert_ne!(first[..12], second[..12], "the nonce prefix is fresh");
+}
+
+#[test]
+fn a_wrapped_key_copied_under_another_id_does_not_unwrap() {
+    // The wrap's associated data is the device id, so moving the record into
+    // another device's namespace does not let that device's passphrase
+    // prompt open it — the same binding the checkpoint has.
+    let world = World::default();
+    {
+        let kernel = world.boot();
+        block_on(kernel.keep("desk".into(), Some("open sesame".into()))).unwrap();
+    }
+    let wrapped = world.kv.store.borrow()[&format!("dev/{ID}/dek-wrapped")].clone();
+
+    let mut row = IndexRow::fresh("other", world.clock.0.get());
+    row.tier = Tier::Durable;
+    row.rest = Rest::Passphrase;
+    world.put_row(&row);
+    world.kv_put("dev/other/dek-wrapped", wrapped);
+
+    let kernel = world.try_boot_as("other").unwrap();
+    assert_eq!(kernel.device_status().unwrap().state, State::Sealed);
+    let refused = block_on(kernel.unseal("open sesame".into())).unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Refused);
+    assert_eq!(refused.message, "the passphrase did not open this device");
 }
 
 #[test]
@@ -666,21 +1004,25 @@ fn a_checkpoint_moved_into_another_namespace_does_not_open() {
     }
     let moved: Vec<(String, Vec<u8>)> = world
         .files
-        .0
+        .store
         .borrow()
         .iter()
         .map(|(k, v)| (k.replace(&format!("/{ID}/"), "/other/"), v.clone()))
         .collect();
     for (path, bytes) in moved {
-        block_on(world.files.write(path, bytes));
+        block_on(world.files.write(path, bytes)).unwrap();
     }
-    let dek = world.kv.0.borrow()[&format!("dev/{ID}/dek")].clone();
+    let dek = world.kv.store.borrow()[&format!("dev/{ID}/dek")].clone();
     world.kv_put("dev/other/dek", dek);
+    world.kv_put("dev/other/gen", world.pointer(ID).to_string().into_bytes());
     world.put_row(&IndexRow::fresh("other", world.clock.0.get()));
 
-    // It boots — with nothing restored.
-    let status = world.try_boot_as("other").unwrap().device_status().unwrap();
-    assert_eq!(status.name, "");
+    // It does not boot: the pointer names a generation, so an unreadable one
+    // is loss, not absence. Silently blanking it is what rule 5 forbids.
+    let Err(err) = world.try_boot_as("other") else {
+        panic!("a checkpoint that does not authenticate must not be ignored");
+    };
+    assert_eq!(err.message, "this device's state did not open");
 }
 
 #[test]
@@ -737,7 +1079,7 @@ fn sessions_are_monotonic_and_close_is_idempotent() {
     // Ids are never reused: the next launch is 3, not the freed 1.
     assert_eq!(session(&kernel), 3);
     // And closing emits nothing — it is the visor's own act.
-    assert!(pending(&kernel));
+    assert!(quiet(&kernel));
 }
 
 #[test]
@@ -867,39 +1209,30 @@ fn every_mutation_advances_the_revision_and_ids_order_the_items() {
 
 // -- events ------------------------------------------------------------------
 
-struct Flag(AtomicBool);
-
-impl Wake for Flag {
-    fn wake(self: Arc<Self>) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
-/// True while `next_event` has nothing to hand over.
-fn pending(kernel: &Kernel) -> bool {
-    let waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    let mut next = std::pin::pin!(kernel.next_event());
-    next.as_mut().poll(&mut cx).is_pending()
+/// True while nothing is queued. Draining is the only way to ask, and it is
+/// destructive, which is the whole of the `event-source` contract.
+fn quiet(kernel: &Kernel) -> bool {
+    kernel.drain_events().is_empty()
 }
 
 #[test]
-fn next_parks_until_an_event_arrives_and_wakes_the_waiter() {
+fn drain_returns_everything_queued_in_order_and_empties_the_queue() {
+    // internal.wit `event-source`: non-parking. The glue drains after every
+    // export call it dispatches, so `drain` must answer immediately and must
+    // not hand the same event over twice.
     let kernel = boot();
-    let flag = Arc::new(Flag(AtomicBool::new(false)));
-    let waker = Waker::from(flag.clone());
-    let mut cx = Context::from_waker(&waker);
-    let mut next = std::pin::pin!(kernel.next_event());
+    assert!(quiet(&kernel));
 
-    assert!(next.as_mut().poll(&mut cx).is_pending());
-    assert!(!flag.0.load(Ordering::SeqCst));
-
-    kernel.push_event(Event::SessionEnded(1, "gone".into()));
-    assert!(flag.0.load(Ordering::SeqCst), "the parked waiter was woken");
+    kernel.push_event(Event::SessionEnded(1, "first".into()));
+    kernel.push_event(Event::SessionEnded(2, "second".into()));
     assert_eq!(
-        next.as_mut().poll(&mut cx),
-        Poll::Ready(Event::SessionEnded(1, "gone".into()))
+        kernel.drain_events(),
+        vec![
+            Event::SessionEnded(1, "first".into()),
+            Event::SessionEnded(2, "second".into()),
+        ]
     );
+    assert!(quiet(&kernel), "a drained event is gone");
 }
 
 #[test]
@@ -917,20 +1250,23 @@ fn abort_ends_the_session_and_announces_it_once() {
         "the session is no longer live"
     );
     assert_eq!(
-        block_on(kernel.next_event()),
-        Event::SessionEnded(s, "the app's frame was closed: policy".into())
+        kernel.drain_events(),
+        vec![Event::SessionEnded(
+            s,
+            "the app's frame was closed: policy".into()
+        )]
     );
 
     // Idempotent: a second abort of the same session announces nothing.
     kernel.abort(s, "again".into());
-    assert!(pending(&kernel));
+    assert!(quiet(&kernel));
 }
 
 #[test]
 fn aborting_an_unknown_session_is_a_no_op() {
     let kernel = boot();
     kernel.abort(404, "never existed".into());
-    assert!(pending(&kernel));
+    assert!(quiet(&kernel));
 }
 
 #[test]
@@ -941,5 +1277,5 @@ fn close_then_abort_announces_nothing() {
     let s = session(&kernel);
     kernel.close(s);
     kernel.abort(s, "the app's frame was closed: gone".into());
-    assert!(pending(&kernel));
+    assert!(quiet(&kernel));
 }

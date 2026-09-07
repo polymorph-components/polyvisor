@@ -21,7 +21,7 @@
 use dioxus::prelude::*;
 
 use crate::kernel::{self, App, Entry, Event, SessionId, Status};
-use crate::state::{Action, DeviceState, Drawer, Rest, Tenant, Tier, boot_drawer};
+use crate::state::{Action, Drawer, Rest, Tenant, Tier, boot_drawer};
 use crate::style::CSS;
 use crate::voice::{AppText, AppVoice, Voice, coarse_age};
 
@@ -34,10 +34,12 @@ enum Notice {
     Ended { app: AppText, reason: String },
 }
 
-/// Read the device's identity, and the app list if the seal is open. The
-/// app list is skipped while sealed on purpose: every kernel call other
-/// than `status`/`unseal` answers `unavailable` then (internal.wit
-/// `device`), so asking would only manufacture an error to show.
+/// Read the device's identity, and the app list unless the device is
+/// sealed. The app list is skipped while sealed on purpose: every kernel
+/// call other than `status`/`unseal`/`erase` answers `unavailable` then
+/// (internal.wit `device`), so asking would only manufacture an error to
+/// show. A `fresh` device is read in full — it is not sealed, and
+/// internal.wit `device` rules that "`fresh` is not a gate".
 async fn read_identity(
     mut status: Signal<Option<Status>>,
     mut apps: Signal<Vec<App>>,
@@ -49,9 +51,9 @@ async fn read_identity(
             return;
         }
         Ok(s) => {
-            let open = s.is_open();
+            let sealed = s.is_sealed();
             status.set(Some(s));
-            if !open {
+            if sealed {
                 apps.set(Vec::new());
                 return;
             }
@@ -144,21 +146,15 @@ pub(crate) fn Visor() -> Element {
     let live = session.read().as_ref().map(|(id, app)| (*id, app.clone()));
     let tenant = drawer().tenant();
     let ident = Ident::of(&status.read());
-    // The whole strip wears the unclaimed dress until the seal is open, so
-    // "no identity yet" is one fact with one rendering, not a per-element
-    // negotiation.
+    // The whole strip wears the unclaimed dress while the seal is shut, so
+    // "no identity to show" is one fact with one rendering, not a
+    // per-element negotiation.
     //
-    // CONTRACT: the dispatch is literal — "until `device.status()` reports
-    // state `open`" — so `fresh` is dressed and gated exactly like `sealed`:
-    // grey strip, no hue, Apps and Settings unavailable. That is only
-    // coherent if the kernel reports `open` for a usable ephemeral device
-    // and reserves `fresh` for a boot that still has a decision pending;
-    // if a device that the user chose to keep with "Start fresh here" goes
-    // on reporting `fresh`, this leaves it permanently unusable. Reading it
-    // the other way (paint `fresh` too) would paint the anchor colour on a
-    // screen a page could imitate, which design.md "Devices" forbids
-    // outright — so the conservative reading is the one implemented, and
-    // the kernel side is where the question has to be settled.
+    // The predicate is `state != sealed`, not `state == open`. internal.wit
+    // `device`: "`fresh` is not a gate: an ephemeral device is fully
+    // usable, and its colour is freshly minted, so painting it before
+    // \"keep\" gives an impostor nothing." Only the passphrase tier has a
+    // screen worth imitating, and that is the one this greys.
     let claimed = matches!(ident, Ident::Open(_));
     let strip_class = if claimed { "" } else { "unclaimed" };
     let (self_id, tier, rest, petname) = match status.read().as_ref() {
@@ -316,16 +312,17 @@ pub(crate) fn Visor() -> Element {
 }
 
 /// The identity as the strip draws it. Three cases, not an `Option`, so
-/// "we have not asked yet" and "the kernel answered, and there is no open
-/// device" are different sentences — and so that the only variant carrying
-/// a hue is the one the kernel said `open` for.
+/// "we have not asked yet" and "the kernel answered, and this device is
+/// sealed" are different sentences — and so that the only variant carrying
+/// a hue is one the kernel said was unsealed.
 #[derive(Clone, PartialEq)]
 enum Ident {
     /// No answer from `device.status` yet.
     Waking,
-    /// Answered, and the device is `fresh` or `sealed`: nothing personal
-    /// is readable, so nothing personal is drawn.
+    /// Answered `sealed`: nothing personal is readable (name, hue and word
+    /// come back blank), so nothing personal is drawn.
     Unclaimed,
+    /// `fresh` or `open` — both fully usable, both painted.
     Open(Anchor),
 }
 
@@ -333,8 +330,8 @@ impl Ident {
     fn of(status: &Option<Status>) -> Ident {
         match status {
             None => Ident::Waking,
-            Some(s) if s.state == DeviceState::Open => Ident::Open(Anchor::of(s)),
-            Some(_) => Ident::Unclaimed,
+            Some(s) if s.is_sealed() => Ident::Unclaimed,
+            Some(s) => Ident::Open(Anchor::of(s)),
         }
     }
 }
@@ -441,6 +438,11 @@ fn UnsealSheet(petname: String, on_open: EventHandler<()>) -> Element {
             if let Some(message) = error() {
                 div { class: "{Voice::Framework.class()} sheet-error", "{message}" }
             }
+            // A forgotten passphrase is exactly when erase is needed, and
+            // internal.wit `device` permits it while sealed for that
+            // reason: "a forgotten passphrase must not make a device
+            // un-erasable". Same two-step confirm as in Settings.
+            EraseControl {}
         }
     }
 }

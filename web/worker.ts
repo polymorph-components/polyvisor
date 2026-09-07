@@ -4,9 +4,10 @@
 //
 // Two kinds of port exist and the difference is the whole security story:
 //
-//   control port — a tab's own connect port. Serves `device`, `apps` and
-//                  `events` straight off the runtime's exports, because the
-//                  visor on the other end is trusted pixels.
+//   control port — a tab's own connect port. Serves `device`, `store` and
+//                  `apps` straight off the runtime's exports, because the
+//                  visor on the other end is trusted pixels, plus `events`
+//                  from that tab's own queue.
 //   session port — minted per `{t:"frame-port", session}` and bound HERE to
 //                  that session id. Serves exactly `polyvisor:app/tasks` and
 //                  three members of `polyvisor:internal/apps`, each called
@@ -41,6 +42,7 @@ const I = {
   store: "polyvisor:internal/store@0.1.0",
   apps: "polyvisor:internal/apps@0.1.0",
   events: "polyvisor:internal/events@0.1.0",
+  eventSource: "polyvisor:internal/event-source@0.1.0",
   appServices: "polyvisor:internal/app-services@0.1.0",
   locks: "polyvisor:internal/locks@0.1.0",
   tasks: "polyvisor:app/tasks@0.1.0",
@@ -55,9 +57,10 @@ interface KernelEvent {
 }
 
 /** One connected tab. `queue`/`waiter` are that tab's copy of the kernel
- * event stream: the worker long-polls `events.next` once and fans each
- * event out to every tab, whose own glue serves the visor's `events.next`
- * import from a local queue (internal.wit `interface events`). */
+ * event stream: the worker drains the runtime after every export call it
+ * dispatches and fans each event out to every tab, whose own glue serves the
+ * visor's `events.next` import from a local queue (internal.wit
+ * `interface events`). */
 interface Tab {
   port: MessagePort;
   queue: KernelEvent[];
@@ -83,6 +86,8 @@ const tabs = new Set<Tab>();
 interface Hello {
   device: string;
   homeOrigin: string;
+  /** Resolves when this worker actually HOLDS `pm-device-<device>`. */
+  lock: Promise<void>;
 }
 
 let hello: Hello | undefined;
@@ -95,17 +100,30 @@ const helloed = new Promise<Hello>((resolve) => {
  * the worker's lifetime and released only when the worker dies, which is
  * what lets the kernel's sweep tell a dead namespace from a live one.
  *
- * The request promise is deliberately never awaited — the callback never
- * settles, so awaiting it would park here forever. The reference keeps the
+ * Returns a promise that resolves when the lock is GRANTED, not when it is
+ * requested — `navigator.locks.request` is asynchronous, so between the call
+ * and the callback running this device's lock is not held and a sibling
+ * worker's sweep would read it as free. The boot awaits this before the
+ * kernel exists, which is the only window where the kernel's own state root
+ * is on disk with nothing claiming it.
+ *
+ * The request promise itself is deliberately never awaited — the callback
+ * never settles, so awaiting it would park forever. `deviceLock` keeps the
  * whole chain alive and says so.
  */
 let deviceLock: Promise<unknown> | undefined;
 
-function holdDeviceLock(device: string): void {
-  deviceLock = navigator.locks.request(
-    `pm-device-${device}`,
-    () => new Promise<never>(() => {}),
-  );
+function holdDeviceLock(device: string): Promise<void> {
+  return new Promise<void>((granted, failed) => {
+    deviceLock = navigator.locks.request(`pm-device-${device}`, () => {
+      granted();
+      return new Promise<never>(() => {});
+    });
+    // A request that cannot be granted at all (a bad name, a browser that
+    // refuses) must fail the boot rather than leave it parked: the lock is
+    // not decoration, it is what makes the sweep safe.
+    deviceLock.catch(failed);
+  });
 }
 
 /** Answers `locks.is-held` off the browser's own lock table. `query()` lists
@@ -171,7 +189,12 @@ async function loadRuntime(device: string): Promise<Exports> {
  * the first tab says which device this worker is: the id exists before the
  * kernel does and only a tab can supply it. */
 const ready: Promise<Exports> = (async () => {
-  const { device, homeOrigin } = await helloed;
+  const { device, homeOrigin, lock } = await helloed;
+  // Before the kernel exists: `lifecycle.boot` runs the sweep, and a sweep
+  // that ran while a sibling worker's lock was merely REQUESTED would read
+  // that device as dead and collect a live namespace. Held first, booted
+  // second.
+  await lock;
   const exports_ = await loadRuntime(device);
   const boot = exports_[I.lifecycle].boot as (
     c: { homeOrigin: string; device: string },
@@ -180,7 +203,6 @@ const ready: Promise<Exports> = (async () => {
   // `location.origin` is spelled that way, and every tab that can reach this
   // worker is on the home origin by construction.
   await boot({ homeOrigin, device });
-  startEventPump(exports_);
   return exports_;
 })();
 
@@ -189,26 +211,85 @@ ready.catch((err: unknown) => {
   for (const tab of tabs) tab.port.postMessage({ t: "fatal", message });
 });
 
-function startEventPump(exports_: Exports): void {
-  const next = exports_[I.events].next as () => Promise<KernelEvent>;
-  void (async () => {
-    for (;;) {
-      const ev = await next();
-      for (const tab of tabs) {
-        if (tab.waiter) {
-          const w = tab.waiter;
-          tab.waiter = undefined;
-          w(ev);
-        } else {
-          tab.queue.push(ev);
-          if (tab.queue.length > QUEUE_LIMIT) tab.queue.shift();
-        }
+// ---------------------------------------------------------------------------
+// Events: drain after every dispatched export call
+//
+// internal.wit `interface event-source` and design.md "Contracts" rule 4.
+// The first design was a parking `events.next` export the worker long-polled;
+// polyengine traps an async export parked on a guest-internal waker with no
+// host call outstanding as a deadlock (polyengine#292), where wasmtime would
+// stay pending. So the runtime's side is `event-source.drain`, which never
+// parks, and the glue calls it after every export activation it made.
+//
+// That misses nothing while the kernel is the only producer: every event is
+// born inside an export call the glue itself dispatched. When the engine
+// starts producing events from host-call completions, this is the site that
+// has to change (and the WIT doc says so).
+// ---------------------------------------------------------------------------
+
+function fanOut(events: KernelEvent[]): void {
+  for (const ev of events) {
+    for (const tab of tabs) {
+      if (tab.waiter) {
+        const w = tab.waiter;
+        tab.waiter = undefined;
+        w(ev);
+      } else {
+        tab.queue.push(ev);
+        if (tab.queue.length > QUEUE_LIMIT) tab.queue.shift();
       }
     }
-  })().catch(() => {
-    // The pump is the only reader of `events.next`; if it dies the kernel
-    // has stopped, which the tabs learn from their next call failing.
-  });
+  }
+}
+
+/** Drain the runtime and fan out. Never throws: a drain that failed must not
+ * turn into the answer of the call it followed, and it must not replace the
+ * error of a call that had already failed. */
+async function drainEvents(): Promise<void> {
+  let exports_: Exports;
+  try {
+    exports_ = await ready;
+  } catch {
+    return; // Not booted: `ready.catch` already told every tab.
+  }
+  try {
+    const drain = exports_[I.eventSource].drain as () => Promise<KernelEvent[]>;
+    fanOut(await drain());
+  } catch (err: unknown) {
+    console.error(
+      "polyvisor: draining the kernel's events failed:",
+      (err as Error)?.message ?? err,
+    );
+  }
+}
+
+/**
+ * Wrap every member of an RPC impl so the kernel is drained after the call.
+ *
+ * One helper rather than a `drainEvents()` at each forwarding site: a
+ * forwarding site that forgets it strands events until the next call that
+ * did not, which is a bug that only shows up as a stale visor. Every place
+ * this worker dispatches a runtime export on behalf of a tab or a session
+ * port goes through here.
+ *
+ * `finally`, not "on success": an export that failed may still have pushed
+ * an event before failing (`apps.launch` that opened and then closed a
+ * session), and the original rejection is what propagates either way.
+ */
+function draining<T extends Record<string, (...args: never[]) => unknown>>(
+  impl: T,
+): T {
+  const wrapped: Record<string, unknown> = {};
+  for (const [name, fn] of Object.entries(impl)) {
+    wrapped[name] = async (...args: unknown[]) => {
+      try {
+        return await (fn as (...a: unknown[]) => unknown)(...args);
+      } finally {
+        await drainEvents();
+      }
+    };
+  }
+  return wrapped as T;
 }
 
 /** Bind a fresh MessageChannel to `session` and serve the session's two
@@ -221,7 +302,7 @@ function mintSessionPort(
   const apps = exports_[I.apps];
   const { port1, port2 } = new MessageChannel();
   serveInterfaces(port1, {
-    [I.tasks]: {
+    [I.tasks]: draining({
       revision: () => svc.tasksRevision(session),
       items: () => svc.tasksItems(session),
       add: (title: string) => svc.tasksAdd(session, title),
@@ -230,14 +311,14 @@ function mintSessionPort(
       setTitle: (id: string, title: string) =>
         svc.tasksSetTitle(session, id, title),
       remove: (id: string) => svc.tasksRemove(session, id),
-    },
+    }),
     // Only these three: a session port is not a way to enumerate or launch
     // apps.
-    [I.apps]: {
+    [I.apps]: draining({
       component: () => apps.component(session),
       assets: () => apps.assets(session),
       asset: (handle: Uint8Array) => apps.asset(session, handle),
-    },
+    }),
   });
   return port2;
 }
@@ -260,19 +341,23 @@ self.onconnect = (ev: MessageEvent) => {
       const device = String((data as { device: string }).device);
       const homeOrigin = String((data as { homeOrigin: string }).homeOrigin);
       if (hello === undefined) {
-        hello = { device, homeOrigin };
-        holdDeviceLock(device);
+        hello = { device, homeOrigin, lock: holdDeviceLock(device) };
         announce(hello);
       } else if (hello.device !== device) {
         // One worker, one device (docs/design.md "Devices"). Two ids on one
         // worker means the name did not separate them, and serving the tab
-        // anyway would show it another device's pixels.
+        // anyway would show it another device's pixels. So the port is told
+        // and then dropped: a tab that cannot be served correctly must not
+        // go on being served at all, and it must not keep receiving this
+        // device's events.
         port.postMessage({
           t: "fatal",
           message:
             `this worker is device ${hello.device}, not ${device} — the ` +
             `browser matched two SharedWorker names to one worker`,
         });
+        tabs.delete(tab);
+        port.close();
       }
       return;
     }
@@ -292,7 +377,7 @@ self.onconnect = (ev: MessageEvent) => {
   });
 
   serveInterfaces(port, {
-    [I.device]: {
+    [I.device]: draining({
       status: async () => (await ready)[I.device].status(),
       setName: async (name: string) => (await ready)[I.device].setName(name),
       setHue: async (hue: number) => (await ready)[I.device].setHue(hue),
@@ -302,11 +387,11 @@ self.onconnect = (ev: MessageEvent) => {
       unseal: async (passphrase: string) =>
         (await ready)[I.device].unseal(passphrase),
       erase: async () => (await ready)[I.device].erase(),
-    },
-    [I.store]: {
+    }),
+    [I.store]: draining({
       devices: async () => (await ready)[I.store].devices(),
-    },
-    [I.apps]: {
+    }),
+    [I.apps]: draining({
       installed: async () => (await ready)[I.apps].installed(),
       launch: async (app: string) => (await ready)[I.apps].launch(app),
       sessionApp: async (s: number) => (await ready)[I.apps].sessionApp(s),
@@ -321,7 +406,9 @@ self.onconnect = (ev: MessageEvent) => {
       // itself with a reason of its own composing.
       abort: async (s: number, reason: string) =>
         (await ready)[I.apps].abort(s, reason),
-    },
+    }),
+    // NOT `draining`: this is the tab's own local queue, not a runtime
+    // export — draining here would recurse into a call that never happened.
     [I.events]: {
       // Parks while the tab's queue is empty, exactly as the WIT says. One
       // waiter per tab: a second concurrent `next()` would silently replace

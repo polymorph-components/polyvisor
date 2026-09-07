@@ -217,9 +217,17 @@ is kernel logic over `kv`, `locks` and the OPFS state root.
   so it buys nothing at this tier. Platform-held keys enter with the
   signing identity (M3) and the passkey PRF rung (M5).
 - **Checkpoints** are AES-GCM over the kernel's serialized state, written
-  to `/<id>/` on the OPFS root through `wasi:filesystem@0.3` after every
-  mutation (state is small until the engine lands; a debounce is a later
-  optimization). Generation directories, manifest written last.
+  to `/<id>/gen-<n>/` on the OPFS root through `wasi:filesystem@0.3` after
+  every mutation (state is small until the engine lands; a debounce is a
+  later optimization). Commit protocol: state, then MANIFEST (generation +
+  digest), then the generation pointer in `kv` — the pointer is the commit
+  point, a failed write never advances it, and a load falls back one
+  generation. The kernel never lists a directory: `read-directory` is one
+  of four sync functions left on the 0.3 track and its OPFS host answers
+  with a Promise (JSPI), so every path is named from the pointer and
+  removal reaches n+1 down to n-2 by name. The anchor (hue, word) is drawn
+  from the RNG and checkpointed at mint — a value derived from the public
+  id would be readable before unseal.
 - **Switching devices is a reload** (`shell.switch-device`): the anchor
   changes and the page restarts against another worker. Erase destroys
   the namespace and the index row, then switches to a fresh device.

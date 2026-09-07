@@ -17,7 +17,7 @@ const WORDS: &str = include_str!("../eff_short_wordlist.txt");
 /// `polyvisor:internal/device.state`, plus the terminal state an erased
 /// device sits in. `Erased` has no WIT spelling on purpose: after `erase`
 /// there is no device left to describe, so every export answers
-/// `unavailable` (see `Kernel::live`).
+/// `unavailable` (see `Kernel::not_erased`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Fresh,
@@ -126,20 +126,20 @@ pub struct Device {
 }
 
 impl Device {
-    /// A fresh device's anchor, derived from the id the glue minted.
+    /// A fresh device's anchor.
     ///
-    /// CONTRACT: the dispatch says "mint id-derived state as M1 (hue, word,
-    /// name \"\")". M1 drew both from `wasi:random`; there was no id to derive
-    /// from, because M1 minted the id itself. Deriving from the id is the
-    /// reading that makes the adjective true and costs nothing: the id is 16
-    /// random bytes from the glue, so a hue/word derived from it is exactly as
-    /// unpredictable, and a device's anchor is then reproducible from its id
-    /// alone. Domain-separated so the two draws are independent.
-    pub fn mint(id: &str) -> Device {
+    /// Drawn from the RNG, not derived from the id: the id is public (it
+    /// names the SharedWorker and sits in every index row), and internal.wit
+    /// `device` says nothing personal is readable before unseal. A hue and a
+    /// word that are a pure function of the id would be readable by anyone
+    /// who knows the id, which is exactly the visor's anti-impostor signal
+    /// given away. Because it is drawn rather than derived, the anchor has to
+    /// be checkpointed at once — see `Kernel::boot`'s mint path.
+    pub fn mint(rng: &dyn crate::Rng) -> Device {
         Device {
             name: String::new(),
-            hue: (draw(id, "hue") % 360) as u16,
-            word: word_at(draw(id, "word")),
+            hue: (draw(rng) % 360) as u16,
+            word: word_at(draw(rng)),
         }
     }
 
@@ -147,9 +147,7 @@ impl Device {
     /// read as a broken button.
     pub fn reroll(&self, rng: &dyn crate::Rng) -> String {
         loop {
-            let mut bytes = [0u8; 4];
-            rng.fill(&mut bytes);
-            let word = word_at(u32::from_le_bytes(bytes));
+            let word = word_at(draw(rng));
             if word != self.word {
                 return word;
             }
@@ -165,12 +163,8 @@ fn word_at(draw: u32) -> String {
     WORD_LIST[draw as usize % WORD_LIST.len()].to_string()
 }
 
-fn draw(id: &str, domain: &str) -> u32 {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::new()
-        .chain_update(domain.as_bytes())
-        .chain_update(b":")
-        .chain_update(id.as_bytes())
-        .finalize();
-    u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]])
+fn draw(rng: &dyn crate::Rng) -> u32 {
+    let mut bytes = [0u8; 4];
+    rng.fill(&mut bytes);
+    u32::from_le_bytes(bytes)
 }

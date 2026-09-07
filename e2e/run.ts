@@ -127,14 +127,29 @@ function sheet(page: Page, head: string | RegExp) {
   return drawer(page).locator(".sheet").filter({ hasText: head }).first();
 }
 
-/** Launch an installed app by its title and wait for its frame. */
-async function launchApp(page: Page, title: string): Promise<void> {
+/**
+ * Launch an installed app by its title.
+ *
+ * `awaitFrame` is false for an app that is expected to be refused: the
+ * hostile fixture's frame can be torn down before a `waitForSelector` on it
+ * ever polls, and "the frame existed for a moment" is not part of any claim
+ * — the claim is what the strip says afterwards.
+ */
+async function launchApp(
+  page: Page,
+  title: string,
+  awaitFrame = true,
+): Promise<void> {
   await openTenant(page, "Apps");
   const row = drawer(page).locator(".app-row").filter({ hasText: title })
     .first();
   await row.waitFor({ timeout: 10_000 });
   await row.getByRole("button", { name: "Open", exact: true }).click();
-  await page.waitForSelector("#app-zone iframe[sandbox]", { timeout: 30_000 });
+  if (awaitFrame) {
+    await page.waitForSelector("#app-zone iframe[sandbox]", {
+      timeout: 30_000,
+    });
+  }
 }
 
 async function launchTodoMvc(page: Page): Promise<void> {
@@ -188,12 +203,11 @@ async function claimed(page: Page): Promise<boolean> {
   if (cls.includes("unclaimed") && painted) {
     throw new Failure(
       "the strip is unclaimed and yet the anchor colour is painted — " +
-        "docs/design.md \"Devices\" forbids exactly that",
+        'docs/design.md "Devices" forbids exactly that',
     );
   }
   return !cls.includes("unclaimed");
 }
-
 
 // ---------------------------------------------------------------------------
 // Scenarios
@@ -300,7 +314,7 @@ const scenarios: Scenario[] = [
       // table refuses. The rejection closes the mutation stream, the frame
       // reports it, and the glue tears the frame down and calls `apps.abort`
       // — which is what puts `session-ended` in the strip.
-      await launchApp(page, "Hostile fixture");
+      await launchApp(page, "Hostile fixture", false);
 
       await page.waitForFunction(
         () => document.querySelector("#app-zone iframe") === null,
@@ -308,16 +322,24 @@ const scenarios: Scenario[] = [
         { timeout: 5_000 },
       );
 
+      // Settle before measuring, and settle on facts rather than on a
+      // timeout: the strip's claim is about where it ends up, and launching
+      // went through the Apps drawer, which is part of the visor's own tree
+      // and legitimately moves the strip while it is open. Comparing a
+      // drawer-open frame against a drawer-closed baseline would fail for a
+      // reason that has nothing to do with the app.
+      const context = page.locator("#visor-context");
+      await context.getByText("ended", { exact: false }).waitFor({
+        timeout: 10_000,
+      });
+      await drawer(page).waitFor({ state: "detached", timeout: 10_000 });
+
       // The trusted pixels do not move because an app misbehaved.
       const after = await strip(page).boundingBox();
       check(after !== null, "#visor-strip lost its box");
       eq(after!.height, 56, "#visor-strip height");
       eq(after, before, "#visor-strip geometry moved when the session ended");
 
-      const context = page.locator("#visor-context");
-      await context.getByText("ended", { exact: false }).waitFor({
-        timeout: 10_000,
-      });
       // Framework voice for the reason, the app's own title plated: the
       // publisher's text never enters the sentence unquoted.
       eq(
@@ -341,13 +363,16 @@ const scenarios: Scenario[] = [
       await visorReady(page);
 
       // Rests open: no ceremony at all on the next boot, and the name the
-      // user set before keeping is still the device's.
+      // user set before keeping is still the device's. The text wait comes
+      // first on purpose — the strip paints before `device.status` answers,
+      // so asserting `claimed` on the bare strip would only observe the
+      // waking state.
+      await strip(page).getByText("the workbench").waitFor({ timeout: 15_000 });
       check(
         await sheet(page, "is sealed").count() === 0,
         "a rests-open device asked to be unsealed",
       );
       check(await claimed(page), "the strip did not paint an identity");
-      await strip(page).getByText("the workbench").waitFor({ timeout: 10_000 });
     },
   },
 
@@ -362,12 +387,13 @@ const scenarios: Scenario[] = [
       await page.reload();
       await visorReady(page);
 
-      // Nothing personal is readable — or renderable — before the seal
-      // opens (internal.wit `interface device`). `claimed` fails loudly if
-      // the hue were painted anyway.
-      check(!await claimed(page), "a sealed boot painted an identity");
+      // The sealed boot's own ceremony is the proof that `device.status`
+      // answered; only then does "nothing personal is painted" mean
+      // anything (internal.wit `interface device`). `claimed` fails loudly
+      // if the hue were painted anyway.
       const unseal = sheet(page, "is sealed");
-      await unseal.waitFor({ timeout: 10_000 });
+      await unseal.waitFor({ timeout: 15_000 });
+      check(!await claimed(page), "a sealed boot painted an identity");
 
       const field = unseal.locator("input[type=password]");
       const press = unseal.getByRole("button", { name: "Unseal", exact: true });
@@ -389,6 +415,11 @@ const scenarios: Scenario[] = [
     async run(ctx, origin) {
       const page = await open(ctx, origin);
       await visorReady(page);
+      const erased = await page.evaluate(
+        (key) => sessionStorage.getItem(key),
+        ANCHOR,
+      );
+      check(erased !== null, "the tab has no device anchor to erase");
       await keepDevice(page, "laptop");
 
       // Two presses: the first only arms it (visor/src/ui.rs `EraseControl`).
@@ -397,13 +428,17 @@ const scenarios: Scenario[] = [
       await drawer(page).getByRole("button", { name: /^Erase —/ }).click();
 
       // `erase` ends with `shell.switch-device(none)`: the anchor is dropped
-      // and the page reloads onto a device that has never existed.
+      // and the page reloads onto a device that has never existed. Wait for
+      // the anchor to CHANGE, not to be null — the null window is one
+      // navigation wide, and the next boot mints its replacement at once.
       await page.waitForFunction(
-        (key) => sessionStorage.getItem(key) === null,
-        ANCHOR,
+        ([key, gone]) => {
+          const now = sessionStorage.getItem(key);
+          return now !== null && now !== gone;
+        },
+        [ANCHOR, erased] as const,
         { timeout: 15_000 },
       );
-      await page.waitForLoadState("load");
       await visorReady(page);
       await strip(page).getByText("this device").waitFor({ timeout: 15_000 });
 

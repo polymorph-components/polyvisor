@@ -37,29 +37,40 @@ pub fn dev_prefix(id: &str) -> String {
 
 pub const INDEX_PREFIX: &str = "index/";
 
-/// Every index row, in id order. Rows that cannot be read are an error: the
-/// picker showing a partial list would be worse than showing none.
+/// Every index row this runtime can read, in id order.
+///
+/// A row that does not decode is skipped, not an error: it is a row from a
+/// future schema or a corrupt one, and neither is something to say to the
+/// user or to refuse the whole picker over. It is also not something to
+/// *delete* — a newer runtime in another tab may own it. The key stays out of
+/// every message for the same reason: there is nothing actionable in it.
 pub async fn rows(platform: &dyn Platform) -> Result<Vec<IndexRow>, Error> {
     let mut keys = platform.keys(INDEX_PREFIX.to_string()).await;
     keys.sort();
     let mut rows = Vec::with_capacity(keys.len());
     for key in keys {
-        let Some(bytes) = platform.get(key).await else {
-            // Deleted between `keys` and `get` — an erase or a sweep racing
-            // us. A row that is gone is simply not in the list.
-            continue;
-        };
-        rows.push(IndexRow::decode(&bytes)?);
+        // A row missing between `keys` and `get` is an erase or a sweep
+        // racing us; a row that is gone is simply not in the list.
+        if let Some(bytes) = platform.get(key).await
+            && let Ok(row) = IndexRow::decode(&bytes)
+        {
+            rows.push(row);
+        }
     }
     Ok(rows)
 }
 
-/// Destroy a device's namespace, its small records and its index row. The
-/// order matters only in that the index row goes last: a row without a
-/// namespace is recoverable (it boots as a device whose checkpoint is
-/// missing), a namespace without a row is unreachable garbage.
+/// Destroy a device's namespace, its small records and its index row.
+///
+/// The namespace is removed by name — the kernel cannot list a directory
+/// (internal.wit `world runtime`) — so this reads the device's generation
+/// pointer first and hands it to [`crate::checkpoint::destroy`], which knows
+/// every path the kernel can have written. The index row goes last: a row
+/// without a namespace is recoverable (it boots as a device whose checkpoint
+/// is missing), a namespace without a row is unreachable garbage.
 pub async fn destroy(platform: &dyn Platform, files: &dyn Files, id: &str) {
-    files.remove_dir_all(crate::checkpoint::namespace(id)).await;
+    let pointer = crate::checkpoint::pointer(platform, id).await;
+    crate::checkpoint::destroy(files, id, pointer).await;
     for key in platform.keys(dev_prefix(id)).await {
         platform.delete(key).await;
     }
@@ -76,6 +87,9 @@ pub async fn sweep(
     ours: &str,
     now: u64,
 ) -> Result<Vec<String>, Error> {
+    // `rows` has already skipped anything undecodable, which is what the
+    // sweep wants too: a row it cannot read is a row it cannot judge, and
+    // destroying a namespace on a guess is unrecoverable.
     let mut swept = Vec::new();
     for row in rows(platform).await? {
         if row.id == ours || row.tier != Tier::Ephemeral {
