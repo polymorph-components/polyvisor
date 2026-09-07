@@ -18,9 +18,15 @@
 //!   users compare them, and **both** confirm. Only then does the adder write
 //!   the joiner into the user-system document and send it over.
 //! - The joiner **adopts** that document — its group of one is discarded —
-//!   and only then dials the adder on the subduction ALPN. That order is
-//!   load-bearing: the membership check on a subduction connection consults
-//!   the group, and both sides must already agree on it before the dial.
+//!   acknowledges with ENROLLED (PAIRING.md §2 step 8, added here), and only
+//!   then dials the adder on the subduction ALPN. That order is load-bearing:
+//!   the membership check on a subduction connection consults the group, and
+//!   both sides must already agree on it before the dial.
+//! - The adder does not return until that acknowledgement arrives or the wire
+//!   ends. Ending the ceremony closes the transport, and on QUIC a close that
+//!   overtakes the peer's read throws away the bytes it has not read — which
+//!   silently cost the joiner the ENROLL frame itself. The ack is the read
+//!   receipt; nothing about it is a timeout or a sleep.
 //!
 //! Pairing has its own ALPN ([`crate::PAIRING_ALPN`]) so the accept loop can
 //! route by it; a pairing connection is answered only while an offer is open.
@@ -416,6 +422,31 @@ impl Kernel {
             },
         )
         .await?;
+
+        // **Wait for the joiner's ENROLLED before returning.** Returning here
+        // ends the ceremony, and `finish` closes the transport — which on the
+        // iroh path is `send.finish()` followed immediately by
+        // `connection.close()`. A QUIC CONNECTION_CLOSE that arrives before
+        // the peer has read the stream's final bytes discards them (quinn
+        // drops unread stream data on close), so an adder that closed the
+        // moment ENROLL was *written* raced the joiner into reading EOF
+        // instead of the enrollment — the joiner ended `failed("the other
+        // device went away")` while the adder's group already held both
+        // devices. The ack is the read receipt: it cannot arrive until the
+        // joiner has consumed ENROLL, so waiting for it is what keeps the
+        // connection open exactly long enough.
+        //
+        // Every way of not getting it is still `Done`, and that is not
+        // laxity. The grant already happened on this device — the joiner is
+        // in the group document and in the keyhive group, and both are
+        // checkpointed below whatever the wire does next. A joiner that
+        // adopted and lost the ack is enrolled; a joiner that never adopted
+        // will be told it is a member by the group document itself on the
+        // first sync. Failing here would report a ceremony that did happen as
+        // one that did not, and leave the two devices disagreeing about it.
+        // Any answer ends the wait, `Cancel` included: a joiner that walked
+        // away after this point walked away from a membership it already has.
+        let _receipt = frames.next().await;
         self.checkpoint().await.map_err(|e| e.message)?;
         Ok(())
     }
@@ -594,6 +625,16 @@ impl Kernel {
         engine.adopt_us(&us, adder_key, name_key).await?;
         engine.adopt_keyhive(&keyhive, &read_back).await?;
         self.checkpoint().await.map_err(|e| e.message)?;
+        // The read receipt, and it is sent *after* the adoption is on disk:
+        // it says "the enrollment landed here", so it may not run ahead of
+        // the enrollment landing. The adder is parked on this and closes the
+        // connection when it arrives — see the wait in `run_adder` for the
+        // discarded-bytes race it exists to close.
+        //
+        // A send that fails is not a failed ceremony: this device has adopted
+        // the group and checkpointed it, and the adder treats a missing ack
+        // as enrollment all the same.
+        let _acked = send_frame(transport.as_ref(), &Frame::Enrolled).await;
         Ok(())
     }
 
@@ -742,6 +783,16 @@ enum Frame {
         /// invisible store beside the group's.
         name_key: Vec<u8>,
     },
+    /// Joiner → adder, last: the enrollment has been adopted *and*
+    /// checkpointed here (PAIRING.md §2 step 8). It carries nothing — the
+    /// message is that it arrived at all.
+    ///
+    /// It exists for the connection's sake rather than the protocol's: the
+    /// adder waits for it before returning, because returning closes the
+    /// transport and a close that overtakes the peer's read discards the
+    /// bytes it has not read yet (see [`Kernel::run_adder`]). An
+    /// acknowledgement is the only thing that can prove ENROLL was consumed.
+    Enrolled,
     Refused,
     Cancel,
 }

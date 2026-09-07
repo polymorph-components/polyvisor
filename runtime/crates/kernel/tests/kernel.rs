@@ -3392,3 +3392,140 @@ fn a_device_that_unseals_catches_up_with_the_store() {
     );
     assert_eq!(kernel.storage_status().unwrap().state, "connected");
 }
+
+#[test]
+fn the_adder_is_not_done_until_the_joiner_has_adopted() {
+    // The ordering the ENROLLED acknowledgement buys. Ending the ceremony is
+    // what closes the transport, and on the iroh path that close discards
+    // whatever the peer has not read yet — so an adder that finished the
+    // moment it *wrote* ENROLL could take the frame away from the joiner
+    // before it was read. The adder must therefore not reach `Done` until
+    // the joiner has adopted, checkpointed and said so.
+    //
+    // The fake transport here is a channel and cannot model QUIC throwing
+    // bytes away, so what is asserted is the ordering that makes the discard
+    // impossible: on no turn is the adder finished while the joiner is not.
+    let here = World::default();
+    let there = here.peer();
+    let joiner = here.boot();
+    let adder = there.boot();
+    settle();
+
+    let code = block_on(joiner.pairing_offer()).unwrap();
+    block_on(adder.pairing_claim(code)).unwrap();
+    settle_until(|| async {
+        matches!(
+            (
+                joiner.pairing_status().unwrap(),
+                adder.pairing_status().unwrap()
+            ),
+            (Phase::AwaitingConfirm(_), Phase::AwaitingConfirm(_))
+        )
+        .then_some(())
+    });
+    joiner.pairing_confirm().unwrap();
+    adder.pairing_confirm().unwrap();
+
+    // One turn at a time from here, watching both phases: the enrollment,
+    // the adoption and the acknowledgement all happen inside this window.
+    let mut adder_finished_alone = 0;
+    let mut both = false;
+    for _ in 0..8192 {
+        let (j, a) = (
+            joiner.pairing_status().unwrap(),
+            adder.pairing_status().unwrap(),
+        );
+        if let Phase::Failed(why) = &j {
+            panic!("the joiner failed: {why}");
+        }
+        if let Phase::Failed(why) = &a {
+            panic!("the adder failed: {why}");
+        }
+        if a == Phase::Done && j != Phase::Done {
+            adder_finished_alone += 1;
+        }
+        if a == Phase::Done && j == Phase::Done {
+            both = true;
+            break;
+        }
+        block_on(yield_now());
+    }
+    assert!(both, "the ceremony never finished");
+    assert_eq!(
+        adder_finished_alone, 0,
+        "the adder finished — and so closed the connection — while the \
+         joiner was still reading the enrollment off it"
+    );
+
+    // And the enrollment is what both devices ended up with.
+    settle();
+    assert_eq!(member_ids(&joiner).len(), 2);
+    assert_eq!(member_ids(&adder).len(), 2);
+}
+
+#[test]
+fn a_device_that_joins_a_group_stops_reading_its_old_folder() {
+    // The regression this closes, and it cost a device its membership: both
+    // devices connect the same Drive account *before* pairing, so each has a
+    // folder of its own, named under its own key. Pairing gives the joiner
+    // the adder's name key — and therefore the adder's folder — but the
+    // joiner's Drive client had already cached the folder id it resolved
+    // under the old key. The next pass listed the joiner's OWN pre-pairing
+    // folder, found its own group-of-one commits under names the new key
+    // does not derive, took them for a peer's, and installed them. That
+    // resurrected the group document `adopt_us` had just deleted: the joiner
+    // fell back to a group of one, checkpointed it, and from then on read
+    // every real member's item as an outsider's.
+    let drive = FakeDrive::shared();
+    let here = World::default().with_drive(&drive);
+    let there = here.peer().with_drive(&drive);
+    let joiner = here.boot();
+    let adder = there.boot();
+    let (sj, sa) = (session(&joiner), session(&adder));
+    settle();
+
+    // Each one connects and pushes its own group's items first: two folders,
+    // and the joiner's holds its group-of-one document.
+    connect_store(&joiner);
+    connect_store(&adder);
+    block_on(joiner.tasks_add(sj, "from the joiner".to_string())).unwrap();
+    block_on(adder.tasks_add(sa, "from the adder".to_string())).unwrap();
+    settle();
+    assert_eq!(drive.folders().len(), 2, "two groups, two folders");
+
+    let _sas = pair(&joiner, &adder);
+    settle();
+    let members = member_ids(&joiner);
+    assert_eq!(
+        members.len(),
+        2,
+        "the joiner lost the group it had just adopted: {members:?}"
+    );
+
+    // And it keeps it: the pass after the adoption is the one that used to
+    // do the damage.
+    block_on(joiner.sync_now()).unwrap();
+    settle();
+    assert_eq!(member_ids(&joiner).len(), 2, "a later pass undid the join");
+    assert_eq!(
+        member_ids(&adder).len(),
+        2,
+        "the adder's own group did not survive"
+    );
+
+    // The joiner now writes into the adder's folder, not its own: one group,
+    // one place, which is what makes the store a shared one at all.
+    assert_eq!(
+        drive.folders().len(),
+        2,
+        "the joiner minted a third folder instead of joining the group's"
+    );
+    let seen = settle_until(|| async {
+        let _synced = joiner.sync_now().await;
+        let titles = titles(&joiner, sj).await;
+        titles
+            .contains(&"from the adder".to_string())
+            .then_some(titles)
+    });
+    assert!(seen.contains(&"from the adder".to_string()));
+}

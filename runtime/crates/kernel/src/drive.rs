@@ -189,10 +189,21 @@ pub struct Drive {
     last_push: u64,
     pending: Option<Ceremony>,
     trouble: Option<Trouble>,
-    /// The group's folder id, resolved once per worker. Ids are public
-    /// addressing and re-resolvable in one list, so this is a cache and never
-    /// state: a worker that lost it costs one request.
-    folder: Option<String>,
+    /// The group's folder id, and the name key it was resolved under. Ids are
+    /// public addressing and re-resolvable in one list, so this is a cache and
+    /// never state: a worker that lost it costs one request.
+    ///
+    /// **Keyed by the name key, and that is the whole point.** Pairing
+    /// replaces the group and its name key at once (`Engine::adopt_us`), so a
+    /// folder id resolved before an adoption names the *previous* group's
+    /// folder — this device's own group of one. Kept unkeyed, the next pass
+    /// listed that folder, found this device's own pre-pairing objects under
+    /// names the new key does not derive, took them for a peer's, and
+    /// installed them: the group-of-one commits `adopt_us` had just deleted
+    /// came back through the store and overwrote the adopted group document.
+    /// The device then held a group of one again, checkpointed it, and read
+    /// every real member's item as an outsider's.
+    folder: Option<([u8; 32], String)>,
     /// Object ids whose bytes were not an item at all. Beside `folder` and
     /// for the same reason — a cache, not state: the folder is the user's own
     /// Drive and something else may have left a file in it, and without this
@@ -548,6 +559,19 @@ impl Kernel {
         if fetched.is_empty() {
             return Ok(false);
         }
+        // The group this pass was reading for must still be this device's
+        // group. Pairing replaces both at once — the group document and the
+        // name key with it (`Engine::adopt_us`) — so a pass that started
+        // before that landed is holding objects named under the group this
+        // device has just *stopped* being: its own group of one. Installing
+        // them would put the commits `adopt_us` deliberately removed back
+        // into the adopted document's tree, which is the one thing that
+        // function exists to prevent, and the device would end up in neither
+        // group cleanly. The pass is dropped; the next one reads the new
+        // group's names.
+        if engine.name_key().as_ref() != Some(name_key) {
+            return Ok(false);
+        }
         let landed = engine
             .ingest_items(fetched)
             .await
@@ -568,7 +592,9 @@ impl Kernel {
     /// either device resolves the other. Closing it properly wants a
     /// de-duplication pass, which is a design call and not a comment.
     async fn drive_folder(self: &Rc<Self>, name_key: &[u8; 32]) -> Result<String, Trouble> {
-        if let Some(id) = self.drive.borrow().folder.clone() {
+        if let Some((cached_key, id)) = self.drive.borrow().folder.clone()
+            && &cached_key == name_key
+        {
             return Ok(id);
         }
         let name = folder_name(name_key);
@@ -605,7 +631,13 @@ impl Kernel {
                     .to_string()
             }
         };
-        self.drive.borrow_mut().folder = Some(id.clone());
+        {
+            let mut drive = self.drive.borrow_mut();
+            drive.folder = Some((*name_key, id.clone()));
+            // The rejected ids were that folder's: an id names a file in one
+            // Drive, and nothing says the two folders number theirs apart.
+            drive.rejected.clear();
+        }
         Ok(id)
     }
 
