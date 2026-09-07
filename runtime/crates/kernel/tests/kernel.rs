@@ -13,8 +13,8 @@ use futures::stream::StreamExt as _;
 use futures::{executor::LocalPool, task::LocalSpawnExt as _};
 use polyvisor_kernel::{
     Accepted, BootConfig, Bound, Clock, Dialed, EngineTransport, Error, ErrorCode, Event, Fetch,
-    Files, IndexRow, Kernel, LEASE_TTL_MS, LocalFuture, Locks, Net, NetHandle, Phase, Platform,
-    Rest, Rng, Seams, Spawn, State, Tier,
+    Files, HttpResponse, IndexRow, Kernel, LEASE_TTL_MS, LocalFuture, Locks, Net, NetHandle, Phase,
+    Platform, Rest, Rng, Seams, Spawn, State, Tier,
 };
 
 // -- harness -----------------------------------------------------------------
@@ -611,21 +611,57 @@ impl Clock for FakeClock {
 }
 
 #[derive(Default, Clone)]
-struct FakeFetch(Rc<RefCell<BTreeMap<String, Vec<u8>>>>);
+struct FakeFetch {
+    routes: Rc<RefCell<BTreeMap<String, Vec<u8>>>>,
+    /// The store this world's requests reach, when it has one. Shared between
+    /// worlds by cloning the `Rc`: that is what "the same Google account" is
+    /// here.
+    drive: Option<Rc<FakeDrive>>,
+}
 
 impl FakeFetch {
     fn route(self, url: &str, body: impl AsRef<[u8]>) -> Self {
-        self.0
+        self.routes
             .borrow_mut()
             .insert(url.to_string(), body.as_ref().to_vec());
         self
     }
+
+    fn with_drive(self, drive: Rc<FakeDrive>) -> Self {
+        FakeFetch {
+            drive: Some(drive),
+            ..self
+        }
+    }
 }
 
 impl Fetch for FakeFetch {
-    fn get(&self, url: String) -> LocalFuture<'_, Result<Vec<u8>, String>> {
-        let found = self.0.borrow().get(&url).cloned();
-        Box::pin(async move { found.ok_or_else(|| "404".to_string()) })
+    fn request(
+        &self,
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> LocalFuture<'_, Result<HttpResponse, String>> {
+        let answer = match &self.drive {
+            Some(drive) if !url.starts_with(ORIGIN) => drive.answer(&method, &url, &headers, &body),
+            _ => {
+                let found = self.routes.borrow().get(&url).cloned();
+                match found {
+                    Some(body) => HttpResponse {
+                        status: 200,
+                        headers: Vec::new(),
+                        body,
+                    },
+                    None => HttpResponse {
+                        status: 404,
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                    },
+                }
+            }
+        };
+        Box::pin(async move { Ok(answer) })
     }
 }
 
@@ -683,6 +719,384 @@ impl Rng for FakeRng {
             *slot = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u8;
         }
     }
+}
+
+// -- the store fake ----------------------------------------------------------
+
+/// Google Drive and its OAuth endpoints, in process.
+///
+/// It answers exactly the subset `polyvisor_kernel::drive`'s module docs
+/// write down, and `e2e/fake-drive.ts` answers the same one over HTTP: two
+/// fakes, one list, so a request that works here works there. Anything else
+/// is a 400 naming the shape, which is how a kernel that grew a new request
+/// finds out that both fakes have to follow.
+///
+/// EVERY TOKEN IT MINTS IS SYNTHETIC AND LABELLED AS SUCH: they are counters
+/// with a prefix, never anything resembling a real credential.
+#[derive(Default)]
+struct FakeDrive {
+    files: RefCell<BTreeMap<String, FakeFile>>,
+    minted: Cell<u64>,
+    /// Access tokens that still work. `revoke_access` empties it, which is
+    /// how a test stands in for an expired token.
+    access: RefCell<BTreeSet<String>>,
+    /// Refresh tokens that still work.
+    refresh: RefCell<BTreeSet<String>>,
+    /// Every request, as `METHOD path`, so a test can count uploads.
+    log: RefCell<Vec<String>>,
+}
+
+#[derive(Clone)]
+struct FakeFile {
+    name: String,
+    parent: String,
+    folder: bool,
+    body: Vec<u8>,
+}
+
+const DRIVE_API: &str = "https://drive.example";
+const DRIVE_OAUTH: &str = "https://oauth.example";
+const PAGE_URL: &str = "https://home.example/";
+
+impl FakeDrive {
+    fn shared() -> Rc<FakeDrive> {
+        Rc::default()
+    }
+
+    /// Every access token stops working — the state Google leaves a client in
+    /// when its access token lapses. The refresh token is untouched, so the
+    /// kernel's one refresh is what recovers.
+    fn revoke_access(&self) {
+        self.access.borrow_mut().clear();
+    }
+
+    /// The refresh tokens stop working too: a consent the user withdrew.
+    fn revoke_refresh(&self) {
+        self.refresh.borrow_mut().clear();
+    }
+
+    /// The names of every object in the one folder this group writes to.
+    fn objects(&self) -> Vec<String> {
+        self.files
+            .borrow()
+            .values()
+            .filter(|file| !file.folder)
+            .map(|file| file.name.clone())
+            .collect()
+    }
+
+    fn folders(&self) -> Vec<String> {
+        self.files
+            .borrow()
+            .values()
+            .filter(|file| file.folder)
+            .map(|file| file.name.clone())
+            .collect()
+    }
+
+    /// Every request this fake has answered, for a test that cares whether a
+    /// round trip happened at all.
+    fn requests(&self) -> usize {
+        self.log.borrow().len()
+    }
+
+    /// How many times one object's bytes were read.
+    fn reads_of(&self, name: &str) -> usize {
+        let id = self
+            .files
+            .borrow()
+            .iter()
+            .find(|(_, file)| file.name == name)
+            .map(|(id, _)| id.clone())
+            .expect("a planted object");
+        self.log
+            .borrow()
+            .iter()
+            .filter(|entry| entry == &&format!("GET /drive/v3/files/{id}"))
+            .count()
+    }
+
+    /// Put a file in the group's folder that is not one of ours — the case
+    /// the folder is the user's own Drive makes ordinary.
+    fn plant(&self, name: &str, body: &[u8]) {
+        let folder = self
+            .files
+            .borrow()
+            .iter()
+            .find(|(_, file)| file.folder)
+            .map(|(id, _)| id.clone())
+            .expect("the group's folder");
+        let id = self.mint("id");
+        self.files.borrow_mut().insert(
+            id,
+            FakeFile {
+                name: name.to_string(),
+                parent: folder,
+                folder: false,
+                body: body.to_vec(),
+            },
+        );
+    }
+
+    fn uploads(&self) -> usize {
+        self.log
+            .borrow()
+            .iter()
+            .filter(|entry| entry.starts_with("POST /upload/"))
+            .count()
+    }
+
+    fn mint(&self, what: &str) -> String {
+        self.minted.set(self.minted.get() + 1);
+        format!("synthetic-{what}-{}", self.minted.get())
+    }
+
+    fn answer(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> HttpResponse {
+        let (base, rest) = split_base(url);
+        let (path, query) = match rest.split_once('?') {
+            Some((path, query)) => (path, query),
+            None => (rest, ""),
+        };
+        self.log.borrow_mut().push(format!("{method} {path}"));
+        match (base.as_str(), method, path) {
+            (DRIVE_OAUTH, "POST", "/token") => self.token(body),
+            (DRIVE_API, _, _) => {
+                if !self.authorized(headers) {
+                    return json_response(401, r#"{"error":{"message":"invalid bearer"}}"#);
+                }
+                match (method, path) {
+                    ("GET", "/drive/v3/files") => self.list(query),
+                    ("POST", "/drive/v3/files") => self.create_folder(body),
+                    ("POST", "/upload/drive/v3/files") => self.create_object(body),
+                    ("GET", _) if path.starts_with("/drive/v3/files/") => {
+                        self.read(&path["/drive/v3/files/".len()..], query)
+                    }
+                    _ => json_response(400, r#"{"error":{"message":"no such Drive request"}}"#),
+                }
+            }
+            _ => json_response(400, r#"{"error":{"message":"no such endpoint"}}"#),
+        }
+    }
+
+    fn authorized(&self, headers: &[(String, String)]) -> bool {
+        headers.iter().any(|(name, value)| {
+            name == "authorization"
+                && value
+                    .strip_prefix("Bearer ")
+                    .is_some_and(|token| self.access.borrow().contains(token))
+        })
+    }
+
+    /// Both grants. A code is accepted whatever it says: the popup is the
+    /// page's business and the fake never rendered one, so there is nothing
+    /// for the code to be wrong about — what the ceremony proves here is that
+    /// the kernel sent a verifier and a redirect at all.
+    fn token(&self, body: &[u8]) -> HttpResponse {
+        let form: BTreeMap<String, String> = String::from_utf8_lossy(body)
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(k, v)| (percent_decode(k), percent_decode(v)))
+            .collect();
+        match form.get("grant_type").map(String::as_str) {
+            Some("authorization_code") => {
+                for wanted in ["code", "code_verifier", "redirect_uri", "client_id"] {
+                    if !form.contains_key(wanted) {
+                        return json_response(400, r#"{"error":"invalid_request"}"#);
+                    }
+                }
+                let access = self.mint("access");
+                let refresh = self.mint("refresh");
+                self.access.borrow_mut().insert(access.clone());
+                self.refresh.borrow_mut().insert(refresh.clone());
+                json_response(
+                    200,
+                    &format!(
+                        r#"{{"access_token":"{access}","refresh_token":"{refresh}","expires_in":3600}}"#
+                    ),
+                )
+            }
+            Some("refresh_token") => {
+                let held = form.get("refresh_token").cloned().unwrap_or_default();
+                if !self.refresh.borrow().contains(&held) {
+                    return json_response(400, r#"{"error":"invalid_grant"}"#);
+                }
+                let access = self.mint("access");
+                self.access.borrow_mut().insert(access.clone());
+                json_response(
+                    200,
+                    &format!(r#"{{"access_token":"{access}","expires_in":3600}}"#),
+                )
+            }
+            _ => json_response(400, r#"{"error":"unsupported_grant_type"}"#),
+        }
+    }
+
+    /// `files.list` over the two `q` shapes the kernel emits, and no others.
+    fn list(&self, query: &str) -> HttpResponse {
+        let params = params(query);
+        if params.get("spaces").map(String::as_str) != Some("appDataFolder") {
+            return json_response(
+                400,
+                r#"{"error":{"message":"the space is not appDataFolder"}}"#,
+            );
+        }
+        let Some(q) = params.get("q") else {
+            return json_response(400, r#"{"error":{"message":"no q"}}"#);
+        };
+        let Some((name, parent)) = parse_q(q) else {
+            return json_response(400, r#"{"error":{"message":"unrecognised q"}}"#);
+        };
+        let files: Vec<String> = self
+            .files
+            .borrow()
+            .iter()
+            .filter(|(_, file)| file.parent == parent)
+            .filter(|(_, file)| name.as_ref().is_none_or(|name| &file.name == name))
+            .map(|(id, file)| format!(r#"{{"id":"{id}","name":"{}"}}"#, file.name))
+            .collect();
+        // One page: the kernel follows `nextPageToken` and this fake never
+        // sets one, which is the shape the e2e fake matches. The paging loop
+        // itself is exercised by neither — it is the archive's, verbatim.
+        json_response(200, &format!(r#"{{"files":[{}]}}"#, files.join(",")))
+    }
+
+    fn create_folder(&self, body: &[u8]) -> HttpResponse {
+        let Ok(meta) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return json_response(400, r#"{"error":{"message":"not JSON"}}"#);
+        };
+        let name = meta["name"].as_str().unwrap_or_default().to_string();
+        let parent = meta["parents"][0].as_str().unwrap_or_default().to_string();
+        if meta["mimeType"] != "application/vnd.google-apps.folder" {
+            return json_response(400, r#"{"error":{"message":"not a folder"}}"#);
+        }
+        let id = self.mint("id");
+        self.files.borrow_mut().insert(
+            id.clone(),
+            FakeFile {
+                name,
+                parent,
+                folder: true,
+                body: Vec::new(),
+            },
+        );
+        json_response(200, &format!(r#"{{"id":"{id}"}}"#))
+    }
+
+    fn create_object(&self, body: &[u8]) -> HttpResponse {
+        let Some((meta, content)) = multipart(body) else {
+            return json_response(400, r#"{"error":{"message":"not multipart/related"}}"#);
+        };
+        let name = meta["name"].as_str().unwrap_or_default().to_string();
+        let parent = meta["parents"][0].as_str().unwrap_or_default().to_string();
+        let id = self.mint("id");
+        self.files.borrow_mut().insert(
+            id.clone(),
+            FakeFile {
+                name,
+                parent,
+                folder: false,
+                body: content,
+            },
+        );
+        json_response(200, &format!(r#"{{"id":"{id}"}}"#))
+    }
+
+    fn read(&self, id: &str, query: &str) -> HttpResponse {
+        if params(query).get("alt").map(String::as_str) != Some("media") {
+            return json_response(400, r#"{"error":{"message":"only alt=media"}}"#);
+        }
+        match self.files.borrow().get(id) {
+            Some(file) => HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: file.body.clone(),
+            },
+            None => json_response(404, r#"{"error":{"message":"no such file"}}"#),
+        }
+    }
+}
+
+fn json_response(status: u16, body: &str) -> HttpResponse {
+    HttpResponse {
+        status,
+        headers: vec![("content-type".to_string(), "application/json".to_string())],
+        body: body.as_bytes().to_vec(),
+    }
+}
+
+/// `https://host` and the rest of the URL.
+fn split_base(url: &str) -> (String, &str) {
+    let (scheme, rest) = url.split_once("://").expect("an absolute URL");
+    match rest.find('/') {
+        Some(cut) => (format!("{scheme}://{}", &rest[..cut]), &rest[cut..]),
+        None => (format!("{scheme}://{rest}"), "/"),
+    }
+}
+
+fn params(query: &str) -> BTreeMap<String, String> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (percent_decode(k), percent_decode(v)))
+        .collect()
+}
+
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&raw[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// The two `q` shapes: `(name, parent)` for a resolve, `(None, parent)` for a
+/// folder listing. Anything else is `None` and answers 400 — the point of the
+/// fake is that it refuses a query the kernel is not documented to send.
+fn parse_q(q: &str) -> Option<(Option<String>, String)> {
+    let q = q.strip_suffix(" and trashed = false")?;
+    if let Some(rest) = q.strip_prefix("name = '") {
+        let (name, rest) = rest.split_once("' and '")?;
+        let parent = rest.strip_suffix("' in parents")?;
+        return Some((Some(name.to_string()), parent.to_string()));
+    }
+    let parent = q.strip_prefix('\'')?.strip_suffix("' in parents")?;
+    Some((None, parent.to_string()))
+}
+
+/// The metadata part and the media part of a `multipart/related` body.
+fn multipart(body: &[u8]) -> Option<(serde_json::Value, Vec<u8>)> {
+    let text = String::from_utf8_lossy(body).to_string();
+    let boundary = format!("--{}", text.lines().next()?.trim_start_matches("--").trim());
+    let separator = format!("\r\n{boundary}");
+    let head = find(body, b"\r\n\r\n")? + 4;
+    let meta_end = find(&body[head..], separator.as_bytes())? + head;
+    let meta: serde_json::Value = serde_json::from_slice(&body[head..meta_end]).ok()?;
+    let media_head = find(&body[meta_end..], b"\r\n\r\n")? + meta_end + 4;
+    let media_end = find(&body[media_head..], separator.as_bytes())? + media_head;
+    Some((meta, body[media_head..media_end].to_vec()))
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 const ORIGIN: &str = "https://home.example";
@@ -775,6 +1189,14 @@ impl World {
         }
     }
 
+    /// This browser profile, talking to `drive` as the user's own account.
+    fn with_drive(&self, drive: &Rc<FakeDrive>) -> World {
+        World {
+            fetch: self.fetch.clone().with_drive(Rc::clone(drive)),
+            ..self.clone()
+        }
+    }
+
     /// A second browser profile on the same fake network: separate storage,
     /// shared switchboard, so the two devices can dial each other.
     fn peer(&self) -> World {
@@ -794,6 +1216,9 @@ impl World {
             BootConfig {
                 home_origin: ORIGIN.to_string(),
                 device: id.to_string(),
+                page_url: PAGE_URL.to_string(),
+                drive_api: Some(DRIVE_API.to_string()),
+                drive_oauth: Some(DRIVE_OAUTH.to_string()),
             },
             Seams {
                 platform: Box::new(self.kv.clone()),
@@ -2552,4 +2977,555 @@ fn code_of(kernel: &Kernel) -> String {
         Phase::Offering(code) => code,
         other => panic!("this device is not showing a code: {other:?}"),
     }
+}
+
+// -- the durable store -------------------------------------------------------
+
+/// The state parameter the kernel put in the authorization URL: the popup
+/// carries it back, and the exchange refuses an answer that does not.
+fn oauth_state(url: &str) -> String {
+    let (_, rest) = split_base(url);
+    let query = rest.split_once('?').expect("an authorization URL").1;
+    params(query).get("state").cloned().expect("a state")
+}
+
+/// The whole consent ceremony, as the visor drives it: `oauth-start`, the
+/// popup (the page's, so here just the code coming back), `oauth-complete`.
+fn connect_store(kernel: &Rc<Kernel>) -> String {
+    let url = kernel
+        .oauth_start("client-id".to_string(), "client-secret".to_string())
+        .unwrap();
+    let state = oauth_state(&url);
+    block_on(kernel.oauth_complete("synthetic-code-1".to_string(), state)).unwrap();
+    settle();
+    url
+}
+
+#[test]
+fn consent_seals_tokens_that_survive_a_reload() {
+    let drive = FakeDrive::shared();
+    let world = World::default().with_drive(&drive);
+    let kernel = world.boot();
+    settle();
+    assert_eq!(kernel.storage_status().unwrap().state, "not connected");
+
+    let url = connect_store(&kernel);
+
+    // The authorization URL is PKCE's: a challenge, its method, the redirect
+    // the glue told the kernel about, and the appdata scope — the narrowest
+    // one Drive offers, which is what makes "user-only" the platform's rule
+    // rather than this code's promise.
+    let (base, rest) = split_base(&url);
+    assert_eq!(base, DRIVE_OAUTH);
+    let query = params(rest.split_once('?').unwrap().1);
+    assert_eq!(query["code_challenge_method"], "S256");
+    assert!(!query["code_challenge"].is_empty());
+    assert_eq!(query["redirect_uri"], PAGE_URL);
+    assert_eq!(query["client_id"], "client-id");
+    assert_eq!(
+        query["scope"],
+        "https://www.googleapis.com/auth/drive.appdata"
+    );
+    assert_eq!(query["access_type"], "offline");
+
+    let status = kernel.storage_status().unwrap();
+    assert_eq!(status.state, "connected");
+    assert_eq!(status.provider, "gdrive");
+
+    // Sealed, not merely in memory: a reload must not send the user back
+    // through a consent they already gave.
+    drop(kernel);
+    let again = world.boot();
+    settle();
+    assert_eq!(again.storage_status().unwrap().state, "connected");
+}
+
+#[test]
+fn a_second_answer_to_a_ceremony_is_refused_and_a_wrong_state_is_not_it() {
+    let drive = FakeDrive::shared();
+    let kernel = World::default().with_drive(&drive).boot();
+    settle();
+    let url = kernel
+        .oauth_start("client-id".to_string(), "client-secret".to_string())
+        .unwrap();
+    let state = oauth_state(&url);
+
+    // A popup answering with somebody else's state is not this ceremony's,
+    // and it does not get to cancel it.
+    let why =
+        block_on(kernel.oauth_complete("c".to_string(), "not-the-state".to_string())).unwrap_err();
+    assert_eq!(why.code, ErrorCode::Refused);
+    block_on(kernel.oauth_complete("synthetic-code-1".to_string(), state.clone())).unwrap();
+    settle();
+
+    // The code is one-shot, and so is the verifier it was bound to.
+    let why = block_on(kernel.oauth_complete("synthetic-code-1".to_string(), state)).unwrap_err();
+    assert_eq!(why.code, ErrorCode::Refused);
+    assert_eq!(kernel.storage_status().unwrap().state, "connected");
+}
+
+#[test]
+fn a_push_writes_one_object_per_item_and_never_writes_one_twice() {
+    let drive = FakeDrive::shared();
+    let world = World::default().with_drive(&drive);
+    let kernel = world.boot();
+    let session = session(&kernel);
+    settle();
+
+    connect_store(&kernel);
+    settle();
+    let founding = drive.objects().len();
+    assert!(founding > 0, "the group's own items are pushed at once");
+    assert_eq!(drive.folders().len(), 1, "one folder, named under the key");
+    assert!(drive.folders()[0].starts_with("polyvisor-"));
+
+    // A local mutation is its own trigger: nothing asked for this sync.
+    block_on(kernel.tasks_add(session, "buy milk".to_string())).unwrap();
+    settle();
+    let after = drive.objects();
+    assert!(
+        after.len() > founding,
+        "the task's commit reached the store: {founding} -> {}",
+        after.len()
+    );
+    let mut names = after.clone();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), after.len(), "no name is written twice");
+    assert_eq!(
+        drive.uploads(),
+        after.len(),
+        "every upload created an object nothing had"
+    );
+
+    // Asked again with nothing new: the listing already holds every name this
+    // device can derive, so not one byte goes up.
+    let uploads = drive.uploads();
+    block_on(kernel.sync_now()).unwrap();
+    settle();
+    assert_eq!(drive.uploads(), uploads, "a second sync re-uploads nothing");
+    assert_eq!(drive.objects().len(), after.len());
+    assert_eq!(kernel.storage_status().unwrap().state, "connected");
+    assert!(kernel.storage_status().unwrap().last_push > 0);
+}
+
+#[test]
+fn a_device_of_the_group_converges_through_the_store_with_no_peer() {
+    // The store's whole point: a device that was never online at the same
+    // moment as its peers still gets their changes.
+    let drive = FakeDrive::shared();
+    let here = World::default().with_drive(&drive);
+    let there = here.peer().with_drive(&drive);
+    let a = here.boot();
+    let b = there.boot();
+    let (sa, sb) = (session(&a), session(&b));
+    settle();
+
+    // Paired, so B holds A's group *and* A's store-name key: the second is
+    // what makes the two devices derive the same object names.
+    let _sas = pair(&b, &a);
+    connect_store(&a);
+    connect_store(&b);
+    settle();
+
+    // Now cut the network entirely. Anything B learns from here on came
+    // through the user's Drive and nowhere else.
+    let (ida, idb) = (
+        a.device_status().unwrap().endpoint_id,
+        b.device_status().unwrap().endpoint_id,
+    );
+    here.net.unplug(&ida);
+    here.net.unplug(&idb);
+    settle();
+
+    block_on(a.tasks_add(sa, "from A".to_string())).unwrap();
+    settle();
+    assert!(
+        drive.objects().len() > 1,
+        "A pushed the change it just made"
+    );
+
+    let seen = settle_until(|| async {
+        let _synced = b.sync_now().await;
+        let seen = titles(&b, sb).await;
+        (!seen.is_empty()).then_some(seen)
+    });
+    assert_eq!(seen, vec!["from A".to_string()]);
+    assert!(b.storage_status().unwrap().last_pull > 0);
+
+    // And it stayed: a pull is a change like any other, so it is
+    // checkpointed, so a reload still has it.
+    drop(b);
+    let again = there.boot();
+    let reopened = session(&again);
+    settle();
+    assert_eq!(
+        block_on(titles(&again, reopened)),
+        vec!["from A".to_string()]
+    );
+}
+
+#[test]
+fn a_device_outside_the_group_pulls_nothing_from_the_same_account() {
+    // The same Google account, and nothing crosses between the two groups:
+    // the names are derived under a key a stranger does not have, so a
+    // stranger's listing does not even name the objects — never mind that
+    // their contents are envelopes it could not open.
+    let drive = FakeDrive::shared();
+    let here = World::default().with_drive(&drive);
+    let elsewhere = here.peer_seeded(0xfeed_face_dead_beef).with_drive(&drive);
+    let a = here.boot();
+    let stranger = elsewhere.boot();
+    let (sa, ss) = (session(&a), session(&stranger));
+    settle();
+
+    connect_store(&a);
+    block_on(a.tasks_add(sa, "from A".to_string())).unwrap();
+    settle();
+    let theirs = drive.objects().len();
+
+    connect_store(&stranger);
+    block_on(stranger.sync_now()).unwrap();
+    settle();
+
+    assert!(
+        block_on(titles(&stranger, ss)).is_empty(),
+        "a device of another group learns nothing"
+    );
+    assert_eq!(
+        drive.folders().len(),
+        2,
+        "two groups, two folders, neither name derivable from the other"
+    );
+    assert!(
+        drive.objects().len() > theirs,
+        "the stranger wrote its own items, under its own names"
+    );
+}
+
+#[test]
+fn an_expired_token_is_refreshed_once_and_the_push_lands() {
+    let drive = FakeDrive::shared();
+    let world = World::default().with_drive(&drive);
+    let kernel = world.boot();
+    let live = session(&kernel);
+    settle();
+    connect_store(&kernel);
+    settle();
+    let before = drive.objects().len();
+
+    // The access token lapses; the refresh token still works, which is the
+    // ordinary case an hour into a session.
+    drive.revoke_access();
+    block_on(kernel.tasks_add(live, "after the lapse".to_string())).unwrap();
+    settle();
+
+    assert!(
+        drive.objects().len() > before,
+        "the 401 was answered with a refresh and the request retried"
+    );
+    assert_eq!(kernel.storage_status().unwrap().state, "connected");
+
+    // The new access token was sealed too: a reload resumes on it rather than
+    // on the one Google has already forgotten.
+    drop(kernel);
+    let again = world.boot();
+    let reopened = session(&again);
+    settle();
+    block_on(again.tasks_add(reopened, "after the reload".to_string())).unwrap();
+    settle();
+    assert_eq!(again.storage_status().unwrap().state, "connected");
+}
+
+#[test]
+fn a_refresh_that_fails_asks_for_re_authorization_and_stops_trying_unprompted() {
+    let drive = FakeDrive::shared();
+    let kernel = World::default().with_drive(&drive).boot();
+    let live = session(&kernel);
+    settle();
+    connect_store(&kernel);
+    settle();
+
+    // The consent itself is gone — the user withdrew it at Google. The
+    // access token is refused, and so is the refresh that would have fixed
+    // it.
+    drive.revoke_access();
+    drive.revoke_refresh();
+    block_on(kernel.sync_now()).unwrap();
+    settle();
+
+    let state = kernel.storage_status().unwrap().state;
+    assert!(
+        state.starts_with("needs re-authorization: "),
+        "framework voice, and it says what to do: {state}"
+    );
+    // The endpoint's own reason, and only the two fields OAuth defines for
+    // it: the answer is an untrusted service's bytes, so what reaches the
+    // visor is read out of them rather than echoed.
+    assert!(state.contains("invalid_grant"), "{state}");
+    assert!(!state.contains('{'), "the raw body was echoed: {state}");
+    // Still bound: the tokens are kept so the state can say what is wrong.
+    // Only `disconnect` forgets them.
+    assert_ne!(state, "not connected");
+
+    // And now nothing happens on its own. This state ends when the user
+    // acts, so a mutation that scheduled a sync would spend a round trip
+    // re-proving a token the endpoint has already refused — every mutation,
+    // for as long as the device runs.
+    let quiet = drive.requests();
+    block_on(kernel.tasks_add(live, "buy milk".to_string())).unwrap();
+    settle();
+    assert_eq!(
+        drive.requests(),
+        quiet,
+        "a local mutation kept asking a store that said no"
+    );
+
+    // Asked to, it tries again: "sync now" is the button someone presses to
+    // find out whether it is still true.
+    block_on(kernel.sync_now()).unwrap();
+    settle();
+    assert!(drive.requests() > quiet, "an explicit sync retries");
+    assert!(
+        kernel
+            .storage_status()
+            .unwrap()
+            .state
+            .starts_with("needs re-authorization: "),
+        "and it is still true"
+    );
+
+    // A fresh consent is the other act that clears it, and the mutation that
+    // was never pushed goes up with the next pass.
+    connect_store(&kernel);
+    settle();
+    assert_eq!(kernel.storage_status().unwrap().state, "connected");
+    assert!(drive.objects().len() > 1);
+}
+
+#[test]
+fn an_object_that_is_not_ours_is_read_once_and_not_again() {
+    // The folder is the user's own Drive: something else may leave a file in
+    // it, and it must not become a download on every sync for the life of
+    // the worker.
+    let drive = FakeDrive::shared();
+    let kernel = World::default().with_drive(&drive).boot();
+    settle();
+    connect_store(&kernel);
+    settle();
+    drive.plant("not-one-of-ours", b"a text file someone dropped in here");
+
+    block_on(kernel.sync_now()).unwrap();
+    settle();
+    assert_eq!(drive.reads_of("not-one-of-ours"), 1);
+
+    block_on(kernel.sync_now()).unwrap();
+    settle();
+    assert_eq!(
+        drive.reads_of("not-one-of-ours"),
+        1,
+        "the second pass fetched it again to reach the same conclusion"
+    );
+    assert_eq!(kernel.storage_status().unwrap().state, "connected");
+}
+
+#[test]
+fn disconnect_forgets_the_tokens_and_leaves_the_store_alone() {
+    let drive = FakeDrive::shared();
+    let world = World::default().with_drive(&drive);
+    let kernel = world.boot();
+    let session = session(&kernel);
+    settle();
+    connect_store(&kernel);
+    block_on(kernel.tasks_add(session, "buy milk".to_string())).unwrap();
+    settle();
+    let objects = drive.objects();
+    assert!(!objects.is_empty());
+
+    block_on(kernel.storage_disconnect()).unwrap();
+    settle();
+    assert_eq!(kernel.storage_status().unwrap().state, "not connected");
+    assert_eq!(
+        drive.objects(),
+        objects,
+        "forgetting an account is not deleting what it holds"
+    );
+
+    // Nothing pushes any more, and the reload agrees.
+    let uploads = drive.uploads();
+    block_on(kernel.tasks_add(session, "and bread".to_string())).unwrap();
+    settle();
+    assert_eq!(drive.uploads(), uploads);
+    drop(kernel);
+    let again = world.boot();
+    settle();
+    assert_eq!(again.storage_status().unwrap().state, "not connected");
+}
+
+#[test]
+fn a_device_that_unseals_catches_up_with_the_store() {
+    // A device that rests under a passphrase has been off; unsealing is the
+    // first moment it can pull what its group wrote meanwhile, so it is a
+    // boot trigger like any other.
+    let drive = FakeDrive::shared();
+    let world = World::default().with_drive(&drive);
+    {
+        let kernel = world.boot();
+        settle();
+        connect_store(&kernel);
+        block_on(kernel.keep("desk".to_string(), Some("open sesame".to_string()))).unwrap();
+        settle();
+    }
+
+    let kernel = world.boot();
+    settle();
+    assert_eq!(kernel.device_status().unwrap().state, State::Sealed);
+    // Nothing has been asked of the store: a sealed device has no tokens in
+    // memory, and no engine to have items for.
+    let asleep = drive.requests();
+
+    block_on(kernel.unseal("open sesame".to_string())).unwrap();
+    settle();
+    assert!(
+        drive.requests() > asleep,
+        "unsealing did not reach the store"
+    );
+    assert_eq!(kernel.storage_status().unwrap().state, "connected");
+}
+
+#[test]
+fn the_adder_is_not_done_until_the_joiner_has_adopted() {
+    // The ordering the ENROLLED acknowledgement buys. Ending the ceremony is
+    // what closes the transport, and on the iroh path that close discards
+    // whatever the peer has not read yet — so an adder that finished the
+    // moment it *wrote* ENROLL could take the frame away from the joiner
+    // before it was read. The adder must therefore not reach `Done` until
+    // the joiner has adopted, checkpointed and said so.
+    //
+    // The fake transport here is a channel and cannot model QUIC throwing
+    // bytes away, so what is asserted is the ordering that makes the discard
+    // impossible: on no turn is the adder finished while the joiner is not.
+    let here = World::default();
+    let there = here.peer();
+    let joiner = here.boot();
+    let adder = there.boot();
+    settle();
+
+    let code = block_on(joiner.pairing_offer()).unwrap();
+    block_on(adder.pairing_claim(code)).unwrap();
+    settle_until(|| async {
+        matches!(
+            (
+                joiner.pairing_status().unwrap(),
+                adder.pairing_status().unwrap()
+            ),
+            (Phase::AwaitingConfirm(_), Phase::AwaitingConfirm(_))
+        )
+        .then_some(())
+    });
+    joiner.pairing_confirm().unwrap();
+    adder.pairing_confirm().unwrap();
+
+    // One turn at a time from here, watching both phases: the enrollment,
+    // the adoption and the acknowledgement all happen inside this window.
+    let mut adder_finished_alone = 0;
+    let mut both = false;
+    for _ in 0..8192 {
+        let (j, a) = (
+            joiner.pairing_status().unwrap(),
+            adder.pairing_status().unwrap(),
+        );
+        if let Phase::Failed(why) = &j {
+            panic!("the joiner failed: {why}");
+        }
+        if let Phase::Failed(why) = &a {
+            panic!("the adder failed: {why}");
+        }
+        if a == Phase::Done && j != Phase::Done {
+            adder_finished_alone += 1;
+        }
+        if a == Phase::Done && j == Phase::Done {
+            both = true;
+            break;
+        }
+        block_on(yield_now());
+    }
+    assert!(both, "the ceremony never finished");
+    assert_eq!(
+        adder_finished_alone, 0,
+        "the adder finished — and so closed the connection — while the \
+         joiner was still reading the enrollment off it"
+    );
+
+    // And the enrollment is what both devices ended up with.
+    settle();
+    assert_eq!(member_ids(&joiner).len(), 2);
+    assert_eq!(member_ids(&adder).len(), 2);
+}
+
+#[test]
+fn a_device_that_joins_a_group_stops_reading_its_old_folder() {
+    // The regression this closes, and it cost a device its membership: both
+    // devices connect the same Drive account *before* pairing, so each has a
+    // folder of its own, named under its own key. Pairing gives the joiner
+    // the adder's name key — and therefore the adder's folder — but the
+    // joiner's Drive client had already cached the folder id it resolved
+    // under the old key. The next pass listed the joiner's OWN pre-pairing
+    // folder, found its own group-of-one commits under names the new key
+    // does not derive, took them for a peer's, and installed them. That
+    // resurrected the group document `adopt_us` had just deleted: the joiner
+    // fell back to a group of one, checkpointed it, and from then on read
+    // every real member's item as an outsider's.
+    let drive = FakeDrive::shared();
+    let here = World::default().with_drive(&drive);
+    let there = here.peer().with_drive(&drive);
+    let joiner = here.boot();
+    let adder = there.boot();
+    let (sj, sa) = (session(&joiner), session(&adder));
+    settle();
+
+    // Each one connects and pushes its own group's items first: two folders,
+    // and the joiner's holds its group-of-one document.
+    connect_store(&joiner);
+    connect_store(&adder);
+    block_on(joiner.tasks_add(sj, "from the joiner".to_string())).unwrap();
+    block_on(adder.tasks_add(sa, "from the adder".to_string())).unwrap();
+    settle();
+    assert_eq!(drive.folders().len(), 2, "two groups, two folders");
+
+    let _sas = pair(&joiner, &adder);
+    settle();
+    let members = member_ids(&joiner);
+    assert_eq!(
+        members.len(),
+        2,
+        "the joiner lost the group it had just adopted: {members:?}"
+    );
+
+    // And it keeps it: the pass after the adoption is the one that used to
+    // do the damage.
+    block_on(joiner.sync_now()).unwrap();
+    settle();
+    assert_eq!(member_ids(&joiner).len(), 2, "a later pass undid the join");
+    assert_eq!(
+        member_ids(&adder).len(),
+        2,
+        "the adder's own group did not survive"
+    );
+
+    // The joiner now writes into the adder's folder, not its own: one group,
+    // one place, which is what makes the store a shared one at all.
+    assert_eq!(
+        drive.folders().len(),
+        2,
+        "the joiner minted a third folder instead of joining the group's"
+    );
+    let seen = settle_until(|| async {
+        let _synced = joiner.sync_now().await;
+        let titles = titles(&joiner, sj).await;
+        titles
+            .contains(&"from the adder".to_string())
+            .then_some(titles)
+    });
+    assert!(seen.contains(&"from the adder".to_string()));
 }

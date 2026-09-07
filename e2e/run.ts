@@ -13,6 +13,9 @@ import { contentType } from "@std/media-types";
 import { copy } from "@std/fs";
 import { extname, join, normalize } from "@std/path";
 
+import type { FakeDrive } from "./fake-drive.ts";
+import { startFakeDrive } from "./fake-drive.ts";
+
 const BUILT = new URL("../web/dist", import.meta.url).pathname;
 
 // ---------------------------------------------------------------------------
@@ -135,12 +138,17 @@ async function startRelay(): Promise<Relay> {
  * gate that edited it in place would leave a checkout whose site points at
  * a relay that stopped existing when the run ended.
  */
-async function stageSite(relay: string): Promise<string> {
+async function stageSite(relay: string, drive: string): Promise<string> {
   const dist = await Deno.makeTempDir({ prefix: "polyvisor-dist-" });
   await copy(BUILT, dist, { overwrite: true });
+  // `drive_api`/`drive_oauth` are optional in the contract
+  // (`lifecycle.boot-config.drive-api`/`drive-oauth`: "`none` = Google's"),
+  // and this is the deployment that supplies them: one fake answers both
+  // the API paths and the OAuth paths, so both bases are its origin. A gate
+  // that left them out would talk to Google.
   await Deno.writeTextFile(
     join(dist, "config.json"),
-    JSON.stringify({ relay }),
+    JSON.stringify({ relay, drive_api: drive, drive_oauth: drive }),
   );
   return dist;
 }
@@ -166,8 +174,15 @@ interface Scenario {
   /** `ctx` is this scenario's own fresh context — one browser context is
    * one device (separate sessionStorage, separate SharedWorker). A
    * scenario that needs a *second* device makes its own context from
-   * `browser` and closes it itself. */
-  run(ctx: BrowserContext, origin: string, browser: Browser): Promise<void>;
+   * `browser` and closes it itself. `drive` is the run's fake store — the
+   * scenarios that use it read it as an oracle (what was actually pushed)
+   * and drive its control endpoint. */
+  run(
+    ctx: BrowserContext,
+    origin: string,
+    browser: Browser,
+    drive: FakeDrive,
+  ): Promise<void>;
 }
 
 /** Wait for the visor to have painted its strip, and fail loudly on the
@@ -496,6 +511,140 @@ async function waitForConnectedPeer(page: Page, peer: string): Promise<void> {
     }
     await new Promise((r) => setTimeout(r, 1_000));
     await refreshSettings(page);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Storage, as these scenarios drive it
+//
+// The section is Settings → "Storage" (visor/src/ui.rs `StorageSection`),
+// and like everything else in that drawer it is only ever as fresh as the
+// press that read it: the state line comes from `storage.status`, re-read
+// on the press that opens Settings and after every act in the section.
+//
+// The ceremony runs headless. "Connect Google Drive" opens a popup at the
+// URL the kernel minted; the fake's `/auth` 302s straight back to this
+// page's URL with `code` and `state`, that returning load posts the pair to
+// its opener and closes itself (web/boot.ts), and the opener's
+// `shell.open-popup` resolves with it. No consent screen exists to click.
+// ---------------------------------------------------------------------------
+
+const storageSheet = (page: Page) => sheet(page, "Storage");
+
+/** What the kernel says about the binding, in its own words. */
+async function storageState(page: Page): Promise<string> {
+  await openSettings(page);
+  const line = storageSheet(page).locator("#visor-storage-state");
+  await line.waitFor({ timeout: 15_000 });
+  return (await line.textContent() ?? "").trim();
+}
+
+/**
+ * A binding that is connected AND whose last sync finished.
+ *
+ * The kernel's four spellings (runtime/crates/kernel/src/drive.rs `state`):
+ * "not connected", "connected", "connected; the last sync did not finish:
+ * <why>", "needs re-authorization: <why>". The third starts with the same
+ * word as the healthy one, so matching the prefix alone would let a store
+ * that connects and then fails every sync pass every one of these
+ * scenarios — the exact equality below is what keeps that failure loud.
+ */
+function connectedCleanly(said: string): boolean {
+  return said === "connected";
+}
+
+/**
+ * Run the ceremony: type an (entirely synthetic) installed-app client pair,
+ * press Connect, and wait for the kernel to say the binding is connected.
+ *
+ * The pair is synthetic and labelled — the fake gates on PKCE, not on the
+ * client, and nothing real should ever be typed into it.
+ */
+async function connectDrive(page: Page): Promise<void> {
+  await openSettings(page);
+  const store = storageSheet(page);
+  await store.waitFor({ timeout: 15_000 });
+  const fields = store.locator("input[type=text]");
+  await fields.nth(0).fill("synthetic-client-1");
+  await fields.nth(1).fill("synthetic-client-secret-1");
+  await store.getByRole("button", { name: "Connect Google Drive" }).click();
+
+  const deadline = performance.now() + 60_000;
+  for (;;) {
+    const said = await storageState(page);
+    if (connectedCleanly(said)) return;
+    const failed = storageSheet(page).locator(".sheet-error");
+    if (await failed.count() > 0) {
+      throw new Failure(
+        `connecting the store: the visor showed ${await failed.textContent()}`,
+      );
+    }
+    if (performance.now() > deadline) {
+      throw new Failure(`the store never connected; it read "${said}"`);
+    }
+    await new Promise((r) => setTimeout(r, 500));
+    // Re-read: the ceremony completes in the kernel, and this world has no
+    // timer. Closing and reopening Settings is the press that reads.
+    await settingsButton(page).click();
+    await settingsButton(page).click();
+  }
+}
+
+/** Press "Sync now". A pass already running coalesces this one into it
+ * (`Kernel::sync_now`), so pressing again is always safe and never a second
+ * concurrent pass. */
+async function syncNow(page: Page): Promise<void> {
+  await openSettings(page);
+  await storageSheet(page).getByRole("button", { name: "Sync now" }).click();
+}
+
+/**
+ * Wait for a todo written on ANOTHER device to arrive through the store.
+ *
+ * Two things have to happen and neither is automatic here: a pull, which is
+ * the "Sync now" press, and a re-read by the app, which is the remount
+ * (`polyvisor:app/tasks` is pull-only and the guest re-reads at mount).
+ */
+async function pullUntilTodo(page: Page, title: string): Promise<void> {
+  const deadline = performance.now() + 120_000;
+  for (;;) {
+    await syncNow(page);
+    await new Promise((r) => setTimeout(r, 2_000));
+    await remountTodoMvc(page);
+    try {
+      await todoFrame(page).getByText(title).first().waitFor({ timeout: 3_000 });
+      return;
+    } catch {
+      if (performance.now() > deadline) {
+        throw new Failure(`"${title}" never arrived through the store`);
+      }
+    }
+  }
+}
+
+/** Press "Sync now" and wait for the fake to hold at least `want`
+ * objects. The fake is the oracle: what the visor says about a push is the
+ * kernel's report of it, and what was actually written is this. */
+async function syncUntil(
+  page: Page,
+  drive: FakeDrive,
+  want: number,
+  what: string,
+): Promise<void> {
+  const deadline = performance.now() + 90_000;
+  for (;;) {
+    await syncNow(page);
+    const settled = performance.now() + 10_000;
+    while (performance.now() < settled) {
+      if (drive.objects().length >= want) return;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    if (performance.now() > deadline) {
+      throw new Failure(
+        `${what}: the store holds ${drive.objects().length} object(s), ` +
+          `wanted at least ${want}`,
+      );
+    }
   }
 }
 
@@ -1025,6 +1174,183 @@ const scenarios: Scenario[] = [
   },
 
   {
+    // The ceremony, end to end and headless: the kernel mints the URL, the
+    // page opens the popup, the fake consents at once and redirects back,
+    // the returning load hands the pair to its opener, and the kernel
+    // exchanges and seals it (internal.wit `storage`, `shell.open-popup`).
+    name: "drive-connect",
+    async run(ctx, origin) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+
+      eq(
+        await storageState(page),
+        "not connected",
+        "a device with no store should say so, in the kernel's own words",
+      );
+      await connectDrive(page);
+
+      // The tokens are sealed in the kernel's checkpoint, not in the page:
+      // a reload has no ceremony to re-run and the binding is still there.
+      await page.reload();
+      await visorReady(page);
+      const said = await storageState(page);
+      check(
+        connectedCleanly(said),
+        `the binding did not survive a reload; it read "${said}"`,
+      );
+    },
+  },
+
+  {
+    // The store as a sync path: what one device pushed, another device of
+    // the SAME group pulls — with no live connection between them.
+    //
+    // Two claims, and the scenario is arranged around keeping each of them
+    // from being answered by the other path:
+    //
+    //   * ISOLATION. B, connected to the same Drive account but not in A's
+    //     group, has a different naming key, so every object A wrote sits
+    //     at a name B cannot derive. It sees nothing of A's. Asserted
+    //     while the two are unpaired, so no live path exists at all.
+    //   * THE STORE CARRIES. Pairing does bring a live path up, and it is
+    //     fast — so the todo this claim turns on is written while B's page
+    //     is CLOSED (no page, no worker, no endpoint), and A is gone
+    //     entirely before B comes back. The fake's `alt=media` counter is
+    //     the corroboration: B read objects out of the store, which a
+    //     device that converged over the wire never does.
+    name: "drive-round-trip",
+    async run(ctx, origin, browser, drive) {
+      const ctxB = await browser.newContext();
+      try {
+        const a = await open(ctx, origin);
+        await visorReady(a);
+        await launchTodoMvc(a);
+        await addTodo(a, "from A");
+        // Counted BEFORE the ceremony: connecting a store schedules a pass
+        // of its own, so a baseline taken afterwards would already include
+        // everything A has.
+        const before = drive.objects().length;
+        await connectDrive(a);
+        await syncUntil(a, drive, before + 1, "A's first push");
+
+        const b = await open(ctxB, origin);
+        await visorReady(b);
+        await connectDrive(b);
+        // B is not in A's group: it derives none of A's names, so its own
+        // sync reads nothing out of the store at all. `mediaReads` is the
+        // oracle for that — a name it cannot derive is a name it never
+        // asks `alt=media` for — and it is the stronger claim: the app
+        // never mounted "from A" is also true of a device that read the
+        // object and merely failed to decode it.
+        const readsBeforeB = drive.mediaReads();
+        await syncNow(b);
+        // `sync-now` returns once accepted, not once the pass settled
+        // (internal.wit `storage.sync-now`); a moment for the pass this
+        // scenario just triggered to actually run.
+        await b.waitForTimeout(2_000);
+        eq(
+          drive.mediaReads(),
+          readsBeforeB,
+          "a device outside the group read an object out of the store",
+        );
+        await launchTodoMvc(b);
+        // A remount is a fresh `tasks.items` read (the app polls; nothing
+        // pushes into a mounted frame), so this is B looking as hard as it
+        // can.
+        await remountTodoMvc(b);
+        eq(
+          await todoFrame(b).getByText("from A").count(),
+          0,
+          "a device outside the group read another group's objects",
+        );
+
+        // Now B joins A's group — which is what carries the naming key,
+        // and the only thing that changes.
+        const idA = await endpointId(a);
+        const idB = await endpointId(b);
+        await pair(a, b);
+        await waitForMember(a, idB);
+        await waitForMember(b, idA);
+
+        // B goes offline: navigating the tab away takes its SharedWorker
+        // with it (a worker lives while a client holds it), and with the
+        // worker goes the endpoint A could reach B on. Its device survives
+        // — the OPFS and the sealed tokens are the context's.
+        //
+        // NAVIGATED, not closed, and this is the whole reason: the device
+        // anchor is `sessionStorage` (web/boot.ts), which is per TAB. A
+        // second tab in the same context is a second DEVICE — no group, no
+        // tokens, nothing of B's — so closing this one would not put B to
+        // sleep, it would replace it.
+        await b.goto("about:blank");
+
+        // Written while B could not be listening, so the store is the only
+        // place it can reach B from.
+        const staged = drive.objects().length;
+        await addTodo(a, "posted while B was away");
+        await syncUntil(a, drive, staged + 1, "A's second push");
+
+        // ...and A goes away entirely: its context takes its worker, its
+        // endpoint and its OPFS with it.
+        await ctx.close();
+
+        const readsBefore = drive.mediaReads();
+        await b.goto(`${origin}/`);
+        await visorReady(b);
+        await pullUntilTodo(b, "posted while B was away");
+        check(
+          drive.mediaReads() > readsBefore,
+          "the todo arrived without B reading anything out of the store",
+        );
+      } finally {
+        await ctxB.close();
+      }
+    },
+  },
+
+  {
+    // The token dance. `/_fake/revoke-access` invalidates every access
+    // token and leaves the refresh tokens alive — an access token that
+    // expired, which is the one refusal the store has a recovery for. The
+    // claim is that a push after it still lands, so the assertion is the
+    // fake's object count and not anything the visor says.
+    name: "drive-refresh",
+    async run(ctx, origin, _browser, drive) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+      await launchTodoMvc(page);
+      await addTodo(page, "before the refusal");
+      const pushed = drive.objects().length;
+      await connectDrive(page);
+      await syncUntil(page, drive, pushed + 1, "the first push");
+
+      const revoked = await fetch(`${drive.url}/_fake/revoke-access`, {
+        method: "POST",
+      });
+      check(revoked.ok, `the fake refused to revoke: ${revoked.status}`);
+      await revoked.body?.cancel();
+
+      const afterFirst = drive.objects().length;
+      await addTodo(page, "after the refusal");
+      await syncUntil(
+        page,
+        drive,
+        afterFirst + 1,
+        "the push that had to refresh first",
+      );
+
+      // And the binding is still a binding: a 401 that was recovered from
+      // must not have left the device asking for re-authorization.
+      const said = await storageState(page);
+      check(
+        connectedCleanly(said),
+        `a recovered 401 left the binding reading "${said}"`,
+      );
+    },
+  },
+
+  {
     // Both realms on this side, named: the visor on the main thread and the
     // runtime in the SharedWorker. The worker is the exception that makes
     // the name worth spelling out — a page can see its own realm fail, but
@@ -1075,7 +1401,15 @@ async function main(): Promise<void> {
 
   const relay = await startRelay();
   console.log(`e2e: relay at ${relay.url}`);
-  const dist = await stageSite(relay.url);
+  // ONE fake for the whole run, deliberately: the store is the user's own
+  // Drive account, and two devices of one group reaching the same account
+  // is what the round-trip scenario turns on. Objects a previous scenario
+  // pushed stay visible — under names derived from THAT group's key, which
+  // is precisely the isolation the round-trip asserts, so a shared fake
+  // makes that assertion stronger rather than weaker.
+  const drive = startFakeDrive();
+  console.log(`e2e: fake drive at ${drive.url}`);
+  const dist = await stageSite(relay.url, drive.url);
   const server = serve(dist);
   console.log(`e2e: serving ${dist} at ${server.origin}`);
   let browser: Browser | undefined;
@@ -1088,7 +1422,7 @@ async function main(): Promise<void> {
       const ctx = await browser.newContext();
       const t0 = performance.now();
       try {
-        await scenario.run(ctx, server.origin, browser);
+        await scenario.run(ctx, server.origin, browser, drive);
         console.log(
           `ok   ${scenario.name} (${(performance.now() - t0).toFixed(0)}ms)`,
         );
@@ -1096,8 +1430,11 @@ async function main(): Promise<void> {
         failures++;
         console.error(`FAIL ${scenario.name}: ${(err as Error).message}`);
         // What the visor was showing when the wait gave up, per open page:
-        // the M3a flakes were diagnosed from exactly this line.
-        for (const page of ctx.pages()) {
+        // the M3a flakes were diagnosed from exactly this line. EVERY
+        // context, not just this scenario's own: a scenario with a second
+        // device fails at that device as often as at this one, and dumping
+        // only `ctx` prints nothing at all when the failure is over there.
+        for (const page of browser?.contexts().flatMap((c) => c.pages()) ?? []) {
           const dump = await page.evaluate(() => ({
             strip: document.querySelector("#visor-strip")?.textContent ??
               "<none>",
@@ -1113,6 +1450,7 @@ async function main(): Promise<void> {
   } finally {
     await browser?.close();
     await server.stop();
+    await drive.stop();
     await relay.stop();
     await Deno.remove(dist, { recursive: true }).catch(() => {});
   }

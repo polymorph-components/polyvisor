@@ -3,7 +3,8 @@ use std::rc::Rc;
 
 use futures::future::LocalBoxFuture;
 use polyvisor_kernel::{
-    BootConfig, Clock, Fetch, Files, Kernel, LocalFuture, Locks, Platform, Rng, Seams, Spawn,
+    BootConfig, Clock, Fetch, Files, HttpResponse, Kernel, LocalFuture, Locks, Platform, Rng,
+    Seams, Spawn,
 };
 
 use crate::net::IrohNet;
@@ -141,13 +142,33 @@ impl Rng for Random {
 struct Http;
 
 impl Fetch for Http {
-    fn get(&self, url: String) -> LocalFuture<'_, Result<Vec<u8>, String>> {
-        Box::pin(async move { http_get(&url).await })
+    fn request(
+        &self,
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> LocalFuture<'_, Result<HttpResponse, String>> {
+        Box::pin(async move { http_request(method, url, headers, body).await })
     }
 }
 
-async fn http_get(url: &str) -> Result<Vec<u8>, String> {
-    use wasi::http::types::{Method, Request, Response, Scheme};
+/// `wasi:http/client@0.3.1`, as the kernel's one HTTP seam
+/// (`polyvisor_kernel::Fetch`).
+///
+/// `Err` is reserved for "nothing was answered": a URL this host will not
+/// send, a transmission that failed. Every status the host DID answer with
+/// comes back as an `HttpResponse` — the store reads 401 to decide to
+/// refresh and 404 to decide a name is absent, so collapsing a status into
+/// an error here would take the decision away from the only code that can
+/// make it.
+async fn http_request(
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> Result<HttpResponse, String> {
+    use wasi::http::types::{Fields, Method, Request, Response, Scheme};
 
     let (scheme, rest) = url
         .split_once("://")
@@ -157,20 +178,52 @@ async fn http_get(url: &str) -> Result<Vec<u8>, String> {
         "http" => Scheme::Http,
         other => Scheme::Other(other.to_string()),
     };
+    // The path AND the query: `set-path-with-query` takes them together,
+    // and the store's every read is a query (`files.list`'s `q`, `alt=media`).
     let (authority, path) = match rest.split_once('/') {
         Some((authority, path)) => (authority.to_string(), format!("/{path}")),
         None => (rest.to_string(), "/".to_string()),
     };
 
-    // A GET has no body: the request's trailers future is completed with the
-    // empty answer its writer defaults to when dropped.
+    // Field VALUES are bytes in the 0.3 track, not strings: a header value
+    // is not required to be UTF-8. Everything this kernel sends is, so the
+    // conversion is one-way and lossless here.
+    let fields: Vec<(String, Vec<u8>)> = headers
+        .into_iter()
+        .map(|(name, value)| (name, value.into_bytes()))
+        .collect();
+    let headers = Fields::from_list(&fields)
+        .map_err(|e| format!("{url}: these request headers were refused: {e:?}"))?;
+
+    // The request's trailers future is completed with the empty answer its
+    // writer defaults to when dropped: nothing here sends trailers.
     let (trailers_tx, trailers) = wit_future::new(|| Ok(None));
     drop(trailers_tx);
-    let headers = wasi::http::types::Fields::new();
-    let (request, transmit) = Request::new(headers, None, trailers, None);
+
+    // A body is a STREAM the host reads while the request is in flight, so
+    // the writer cannot be filled before `send` is running — the write parks
+    // until the host reads, and awaiting it first would deadlock. An empty
+    // body is `none`, which is the contract's own spelling for a zero-length
+    // content stream rather than an empty stream nobody closes.
+    let (writer, contents) = if body.is_empty() {
+        (None, None)
+    } else {
+        let (writer, reader) = wit_stream::new();
+        (Some(writer), Some(reader))
+    };
+    let (request, transmit) = Request::new(headers, contents, trailers, None);
+    let method = match method.as_str() {
+        "GET" => Method::Get,
+        "HEAD" => Method::Head,
+        "POST" => Method::Post,
+        "PUT" => Method::Put,
+        "DELETE" => Method::Delete,
+        "PATCH" => Method::Patch,
+        other => Method::Other(other.to_string()),
+    };
     request
-        .set_method(&Method::Get)
-        .map_err(|()| "GET was refused as a method".to_string())?;
+        .set_method(&method)
+        .map_err(|()| format!("{url}: this host will not send that method"))?;
     request
         .set_scheme(Some(&scheme))
         .map_err(|()| format!("{url} has a scheme this host will not send"))?;
@@ -182,18 +235,48 @@ async fn http_get(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|()| format!("{url} has a path this host will not send"))?;
     drop(transmit);
 
-    let response: Response = wasi::http::client::send(request)
-        .await
-        .map_err(|e| format!("{url}: {e}"))?;
-    let status = response.get_status_code();
-    if !(200..300).contains(&status) {
-        return Err(format!("{url}: the host answered {status}"));
+    // Sent and filled together, for the reason above. `join` rather than two
+    // awaits: whichever the host wants first, it gets.
+    let send = wasi::http::client::send(request);
+    let fill = async move {
+        match writer {
+            None => Vec::new(),
+            Some(mut writer) => {
+                let unwritten = writer.write_all(body).await;
+                // The host sees the end of the body when the writer goes.
+                drop(writer);
+                unwritten
+            }
+        }
+    };
+    let (response, unwritten) = futures::join!(send, fill);
+    let response: Response = response.map_err(|e| format!("{url}: {e}"))?;
+    if !unwritten.is_empty() {
+        return Err(format!(
+            "{url}: the host stopped reading the request body with {} byte(s) left",
+            unwritten.len()
+        ));
     }
+
+    // Both read before `consume-body`, which moves the response.
+    let status = response.get_status_code();
+    let headers = response
+        .get_headers()
+        // `copy-all`, not a borrow: the response's headers are immutable
+        // and the kernel wants owned pairs.
+        .copy_all()
+        .into_iter()
+        .map(|(name, value)| (name, String::from_utf8_lossy(&value).into_owned()))
+        .collect();
 
     let (body_result_tx, body_result) = wit_future::new(|| Ok(()));
     drop(body_result_tx);
     let (body, _trailers) = Response::consume_body(response, body_result);
-    Ok(body.collect().await)
+    Ok(HttpResponse {
+        status,
+        headers,
+        body: body.collect().await,
+    })
 }
 
 // -- the state root ------------------------------------------------------------
@@ -345,6 +428,13 @@ impl guest::lifecycle::Guest for Component {
             BootConfig {
                 home_origin: config.home_origin,
                 device: config.device,
+                // The redirect the storage ceremony comes back to, and the
+                // two bases the e2e harness points at its fake: all three
+                // are the glue's knowledge, not the kernel's
+                // (internal.wit `lifecycle.boot-config`).
+                page_url: config.page_url,
+                drive_api: config.drive_api,
+                drive_oauth: config.drive_oauth,
             },
             Seams {
                 platform: Box::new(Kv),
@@ -485,6 +575,35 @@ impl guest::pairing::Guest for Component {
     }
     async fn status() -> Result<polyvisor::internal::types::Phase, Error> {
         kernel()?.pairing_status().map(phase).map_err(map_error)
+    }
+}
+
+impl guest::storage::Guest for Component {
+    async fn status() -> Result<guest::storage::Binding, Error> {
+        let binding = kernel()?.storage_status().map_err(map_error)?;
+        Ok(guest::storage::Binding {
+            provider: binding.provider,
+            state: binding.state,
+            last_pull: binding.last_pull,
+            last_push: binding.last_push,
+        })
+    }
+    async fn oauth_start(client: guest::storage::OauthClient) -> Result<String, Error> {
+        kernel()?
+            .oauth_start(client.client_id, client.client_secret)
+            .map_err(map_error)
+    }
+    async fn oauth_complete(code: String, state: String) -> Result<(), Error> {
+        kernel()?
+            .oauth_complete(code, state)
+            .await
+            .map_err(map_error)
+    }
+    async fn disconnect() -> Result<(), Error> {
+        kernel()?.storage_disconnect().await.map_err(map_error)
+    }
+    async fn sync_now() -> Result<(), Error> {
+        kernel()?.sync_now().await.map_err(map_error)
     }
 }
 

@@ -75,6 +75,16 @@ dioxus = { version = "=0.7.10", default-features = false, features = ["macro", "
 # time this skeleton was cut.
 stream-dom-dioxus = { git = "https://github.com/polymorph-components/polymorph-stream-dom", rev = "197492374936b3b4ce5af55f2bac50fa6b551597" }
 stream-dom-guest = { git = "https://github.com/polymorph-components/polymorph-stream-dom", rev = "197492374936b3b4ce5af55f2bac50fa6b551597" }
+# The store's name derivation (docs/design.md "Storage", internal.wit
+# `storage`): every object in the user's Drive is named
+# `hex(HMAC-SHA256(name-key, tree || commit))`, so two devices of a group
+# derive the same names and nobody else derives any of them. `default-features
+# = false` keeps it `no_std`; `sha2` is already a kernel dependency, and this
+# is the generic HMAC over it rather than a second hash.
+# Version 0.12 rather than the 0.13 release candidate: it is the one built
+# on `digest` 0.10, which is `sha2` 0.10's — a newer hmac would pull a second
+# `digest` into the graph and not accept this `Sha256` at all.
+hmac = { version = "0.12", default-features = false }
 # The pairing code's alphabet (PAIRING.md §1): `BASE32_NOPAD_VISUAL` is the
 # confusable-free base32 variant, which is what makes a 79-character code
 # something a person can read off one screen and type into another.

@@ -58,6 +58,12 @@ pub struct Snapshot {
     /// items per app. `None` for a device that has not run an engine yet —
     /// the anchor written at mint, before the engine is built.
     pub engine: Option<polyvisor_engine::Snapshot>,
+    /// The durable store's binding: the sealed OAuth tokens and how the last
+    /// sync went (`crate::drive`). Sealed like everything else here, which is
+    /// the whole reason a bearer never crosses the port. `#[serde(default)]`
+    /// because a checkpoint written before M4 has no such field.
+    #[serde(default)]
+    pub storage: Option<crate::drive::Sealed>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -232,12 +238,14 @@ impl Snapshot {
         device: Device,
         seed: [u8; 32],
         engine: Option<polyvisor_engine::Snapshot>,
+        storage: Option<crate::drive::Sealed>,
     ) -> Snapshot {
         Snapshot {
             v: SCHEMA,
             device,
             seed,
             engine,
+            storage,
         }
     }
 }

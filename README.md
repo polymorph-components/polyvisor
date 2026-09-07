@@ -35,10 +35,11 @@ read it before arguing with anything here.
 Run `just --list` for the available recipes; `just e2e` runs the Playwright
 suite against a local iroh relay.
 
-**Status (M0–M3b landed):** three realms with TodoMVC; devices with two
+**Status (M0–M4 landed):** three realms with TodoMVC; devices with two
 tiers of rest, sealed OPFS checkpoints and a swept index; `tasks` as an
 automerge document synced between devices over subduction and the iroh
-relay; pairing by code + SAS into a device group that is the sync policy.
-Next: keyhive/BeeKEM envelope encryption (M3c), storage providers (M4),
-passkey unseal and recovery (M5). The settings UI is deliberately minimal
+relay; pairing by code + SAS into a device group that is the sync policy;
+app content sealed as keyhive/BeeKEM envelopes; Google Drive as a dumb
+ciphertext store (OAuth split between kernel and shell; a fake Drive in
+e2e). Next: passkey unseal and recovery (M5). The settings UI is deliberately minimal
 pending a redesign.

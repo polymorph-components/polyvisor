@@ -51,6 +51,18 @@ pub struct Snapshot {
     /// of the checkpoint.
     #[serde(default)]
     pub vault: Option<crate::vault::VaultState>,
+    /// The group's store-name key (docs/design.md M4, the Drive record): the
+    /// 32 bytes every name in the user's own store is HMAC'd under, so two
+    /// devices of one group derive the same names and nobody else derives any
+    /// of them. Minted with the group and carried to a joiner inside ENROLL,
+    /// which is why it rests here rather than being derived from the seed:
+    /// it belongs to the *group*, and the seed is one device's.
+    ///
+    /// `Option` because a checkpoint written before M4 has no such field, and
+    /// because a device that has never opened its group document has no group
+    /// to have a key for.
+    #[serde(default)]
+    pub name_key: Option<[u8; 32]>,
 }
 
 /// One app's document and the tree behind it.
@@ -73,6 +85,21 @@ pub struct TreeState {
 /// A stored sedimentree item: its signed envelope and its payload blob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
+    pub signed: Vec<u8>,
+    pub blob: Vec<u8>,
+}
+
+/// One sedimentree item as the durable store carries it: the tree and commit
+/// that name it, and the bytes.
+///
+/// Ids are raw bytes rather than `SedimentreeId`/`CommitId` so the kernel can
+/// name, serialize and re-ingest an item without depending on sedimentree's
+/// types at all — the store is addressing plus opaque bytes to it, and that
+/// is the whole of what it should know.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreItem {
+    pub tree: [u8; 32],
+    pub commit: [u8; 32],
     pub signed: Vec<u8>,
     pub blob: Vec<u8>,
 }
@@ -104,6 +131,41 @@ impl SnapshotStorage {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Every stored commit of every tree, as the durable store carries them.
+    ///
+    /// What the durable store pushes (docs/design.md "Storage"): one object
+    /// per item, content-addressed by the pair that names it. Commits only —
+    /// this engine authors no fragments (nothing calls `add_fragments`, and
+    /// compaction is not implemented), so a fragment could only arrive from a
+    /// peer that had one, and there is none to have.
+    pub fn all_items(&self) -> Vec<StoreItem> {
+        self.trees
+            .borrow()
+            .iter()
+            .flat_map(|(tree, t)| {
+                t.commits
+                    .iter()
+                    .map(|(id, (signed, blob))| StoreItem {
+                        tree: *tree.as_bytes(),
+                        commit: *id.as_bytes(),
+                        signed: signed.as_bytes().to_vec(),
+                        blob: blob.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Whether `tree` already holds `commit`. What the push path asks before
+    /// uploading: the store is addressed by name, and a name it already has
+    /// is an object already written.
+    pub fn holds(&self, tree: SedimentreeId, commit: CommitId) -> bool {
+        self.trees
+            .borrow()
+            .get(&tree)
+            .is_some_and(|t| t.commits.contains_key(&commit))
     }
 
     /// The tree's decoded metadata, for `Handle::hydrate_tree` after a
@@ -166,6 +228,7 @@ impl SnapshotStorage {
         us: Option<(SedimentreeId, Vec<u8>)>,
         keyhive: Option<SedimentreeId>,
         vault: Option<crate::vault::VaultState>,
+        name_key: Option<[u8; 32]>,
     ) -> Snapshot {
         Snapshot {
             apps: apps
@@ -177,6 +240,7 @@ impl SnapshotStorage {
             us: us.map(|(tree, doc)| self.tree_state(tree, doc)),
             keyhive: keyhive.map(|tree| self.tree_state(tree, Vec::new())),
             vault,
+            name_key,
         }
     }
 

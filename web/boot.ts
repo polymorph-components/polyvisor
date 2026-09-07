@@ -10,7 +10,40 @@ import { artifactsFromEnvelope } from "@polyengine/runtime/embedder";
 import { ComponentException } from "@polyengine/protocol";
 
 import { mountProducer } from "./mount.ts";
+import { popupReturn } from "./oauth.ts";
 import { proxyInterfaces } from "./rpc.ts";
+
+// ---------------------------------------------------------------------------
+// The returning half of the storage ceremony (internal.wit
+// `shell.open-popup`)
+//
+// The provider redirects the popup back to THIS page's URL with `code` and
+// `state` on it, so the returning load is this same bundle — in a window
+// that has an opener and nothing else to do. It hands the two parameters to
+// the opener and closes.
+//
+// `location.origin` as the target, not `"*"`: the redirect landed on this
+// origin, so the opener is on it too, and naming it means a one-shot
+// authorization code is never posted into a window that turned out to be
+// somewhere else.
+//
+// Then the module PARKS. Everything below this block is the visor's boot —
+// a SharedWorker, a device, a mounted component — and none of it belongs in
+// a window that exists for one message. `window.close()` does not stop the
+// synchronous code that follows it, so the stop has to be explicit; a
+// top-level await that never settles is exactly that, and it leaves the
+// rest of the module unevaluated rather than merely unused.
+// ---------------------------------------------------------------------------
+
+const returned = popupReturn(location.search);
+if (returned !== undefined && globalThis.opener !== null) {
+  globalThis.opener.postMessage(
+    { t: "oauth", code: returned.code, state: returned.state },
+    location.origin,
+  );
+  globalThis.close();
+  await new Promise<never>(() => {});
+}
 
 const I = {
   device: "polyvisor:internal/device@0.1.0",
@@ -18,6 +51,7 @@ const I = {
   apps: "polyvisor:internal/apps@0.1.0",
   sync: "polyvisor:internal/sync@0.1.0",
   pairing: "polyvisor:internal/pairing@0.1.0",
+  storage: "polyvisor:internal/storage@0.1.0",
   events: "polyvisor:internal/events@0.1.0",
   shell: "polyvisor:internal/shell@0.1.0",
 } as const;
@@ -137,15 +171,34 @@ fetch(new URL("config.json", location.href), { cache: "no-store" })
     if (!res.ok) {
       throw new Error(`config.json: the origin answered ${res.status}`);
     }
-    const relay = (await res.json() as { relay?: unknown }).relay;
+    const config = await res.json() as {
+      relay?: unknown;
+      drive_api?: unknown;
+      drive_oauth?: unknown;
+    };
+    const relay = config.relay;
     if (typeof relay !== "string" || relay === "") {
       throw new Error("config.json names no relay");
     }
+    // Optional, unlike the relay: `none` is Google's own bases
+    // (`lifecycle.boot-config.drive-api`/`drive-oauth`), and a home origin
+    // that publishes neither is the ordinary deployment. Only a string is
+    // passed on — anything else in the file is a configuration this glue
+    // will not silently interpret.
+    const optional = (v: unknown): string | undefined =>
+      typeof v === "string" && v !== "" ? v : undefined;
     control.postMessage({
       t: "hello",
       device,
       homeOrigin: location.origin,
       relay,
+      // The OAuth redirect (`lifecycle.boot-config.page-url`): this page's
+      // URL without query or fragment, which is where the popup comes back
+      // to. The kernel needs it to build the authorization URL and again
+      // to exchange the code, and only the page knows it.
+      pageUrl: location.origin + location.pathname,
+      driveApi: optional(config.drive_api),
+      driveOauth: optional(config.drive_oauth),
     });
   })
   .catch((err: unknown) => {
@@ -186,6 +239,7 @@ const kernel = proxyInterfaces(control, [
   I.apps,
   I.sync,
   I.pairing,
+  I.storage,
   I.events,
 ]);
 const apps = kernel[I.apps] as {
@@ -399,6 +453,66 @@ async function main(): Promise<void> {
         return false;
       }
     },
+    // The ceremony's browser half (internal.wit `shell.open-popup`): a
+    // window is a page capability, so the kernel never sees one — it mints
+    // the URL, this opens it, and the two parameters that come back are all
+    // that crosses.
+    //
+    // Three ways this resolves, and `none` is two of them:
+    //
+    //   * the popup returned to this page's URL and the returning load
+    //     posted us the pair (the block at the top of this module) — the
+    //     only `some`;
+    //   * the user closed the window, which nothing notifies us of, so it
+    //     is polled: `popup.closed` every 500 ms, as internal.wit's "`none`
+    //     if the user closed it" requires something to notice;
+    //   * the browser refused to open a window at all — a popup blocker,
+    //     or a call not made from a user gesture. Indistinguishable from a
+    //     window closed at once, and `none` is the same honest answer: no
+    //     code came back.
+    openPopup: (url: string): Promise<[string, string] | undefined> =>
+      new Promise((resolve) => {
+        const popup = globalThis.open(
+          url,
+          "polyvisor-oauth",
+          "popup,width=520,height=640",
+        );
+        if (popup === null) {
+          resolve(undefined);
+          return;
+        }
+        let settled = false;
+        const finish = (answer: [string, string] | undefined) => {
+          if (settled) return;
+          settled = true;
+          clearInterval(poll);
+          globalThis.removeEventListener("message", onMessage);
+          // The returning page closes itself; this covers the paths where
+          // it did not get that far, so a ceremony that ended one way or
+          // another never leaves a window standing.
+          try {
+            popup.close();
+          } catch {
+            // Already gone.
+          }
+          resolve(answer);
+        };
+        const onMessage = (ev: MessageEvent) => {
+          // Same-origin only, and only from the window we opened: the
+          // message carries a one-shot authorization code, and any page may
+          // post to an opener.
+          if (ev.origin !== location.origin || ev.source !== popup) return;
+          const data = ev.data;
+          if (typeof data !== "object" || data === null) return;
+          if ((data as { t?: string }).t !== "oauth") return;
+          const { code, state } = data as { code: string; state: string };
+          finish([String(code), String(state)]);
+        };
+        globalThis.addEventListener("message", onMessage);
+        const poll = setInterval(() => {
+          if (popup.closed) finish(undefined);
+        }, 500);
+      }),
   };
 
   // A fatal that arrived while the artifacts were being fetched: the worker
