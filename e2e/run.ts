@@ -524,9 +524,10 @@ async function waitForConnectedPeer(page: Page, peer: string): Promise<void> {
 //
 // The ceremony runs headless. "Connect Google Drive" opens a popup at the
 // URL the kernel minted; the fake's `/auth` 302s straight back to this
-// page's URL with `code` and `state`, that returning load posts the pair to
-// its opener and closes itself (web/boot.ts), and the opener's
-// `shell.open-popup` resolves with it. No consent screen exists to click.
+// page's URL with `code` and `state`, that returning load broadcasts the
+// pair on the ceremony's BroadcastChannel and closes itself (web/boot.ts —
+// the popup is opened `noopener`, so there is no opener to post to), and the
+// waiting `shell.open-popup` resolves with it. No consent screen to click.
 // ---------------------------------------------------------------------------
 
 const storageSheet = (page: Page) => sheet(page, "Storage");
@@ -763,6 +764,94 @@ const scenarios: Scenario[] = [
       // The strip says "waking" until `device.status` answers over the
       // worker port; the placeholder is the first kernel-backed pixel.
       await strip.getByText("this device").waitFor({ timeout: 10_000 });
+    },
+  },
+
+  {
+    // docs/design.md "Windows and handles": a window a document holds a
+    // handle to can be navigated cross-origin by that document, so it gets
+    // no trusted pixels at all. Both holders are exercised — an opener and
+    // a parent — and both from a page on the HOME origin, because what the
+    // visor refuses is the handle, not the holder's origin.
+    name: "handled-window-refuses-to-boot",
+    async run(ctx, origin) {
+      const indexUrl = origin + "/";
+      const refusal = "not this visor's own";
+
+      const host = await open(ctx, origin);
+      await visorReady(host);
+
+      // (i) OPENED. Chromium under Playwright blocks no popups, so a bare
+      // `window.open` is enough; the window it hands back is exactly the
+      // handle the ruling is about.
+      const [opened] = await Promise.all([
+        host.waitForEvent("popup"),
+        host.evaluate((u: string) => {
+          globalThis.open(u);
+        }, indexUrl),
+      ]);
+      await opened.locator("#visor-reopen").waitFor({ timeout: 20_000 });
+      check(
+        (await opened.locator("#visor").textContent() ?? "").includes(refusal),
+        "the opened window did not paint the framework's refusal",
+      );
+      // Give the boot every chance to happen anyway before claiming it did
+      // not: the claim is that no strip and no worker ever appear, and a
+      // check made at once would pass against a visor still starting.
+      await opened.waitForTimeout(3_000);
+      eq(
+        await opened.locator("#visor-strip").count(),
+        0,
+        "the opened window painted trusted pixels",
+      );
+      // `__polyvisor` is not even installed in a refusing window — the
+      // tripwire parks above the line that installs it — so "no worker" is
+      // read as "nothing said a worker booted".
+      eq(
+        await opened.evaluate(() =>
+          ((globalThis as Record<string, unknown>).__polyvisor as
+            | { workerBooted?: boolean }
+            | undefined)?.workerBooted ?? false
+        ),
+        false,
+        "the refusing window booted a worker",
+      );
+
+      // The way out: a fresh browsing context nobody holds a handle to.
+      // Awaited on the CONTEXT rather than as the clicking page's `popup`,
+      // because `noopener` is precisely the case where the new window is
+      // not related to the one that asked for it.
+      const [reopened] = await Promise.all([
+        ctx.waitForEvent("page"),
+        opened.locator("#visor-reopen").click(),
+      ]);
+      await visorReady(reopened);
+      check(
+        await reopened.locator("#visor-strip").count() === 1,
+        "the reopened window did not boot the visor",
+      );
+      eq(
+        await reopened.evaluate(() => globalThis.opener === null),
+        true,
+        "the reopened window still has an opener",
+      );
+
+      // (ii) FRAMED, on the same origin as the frame's own document.
+      await host.setContent(
+        `<iframe id="framed" src="${indexUrl}" width="800" height="600"></iframe>`,
+      );
+      const framed = host.frameLocator("#framed");
+      await framed.locator("#visor-reopen").waitFor({ timeout: 20_000 });
+      check(
+        (await framed.locator("#visor").textContent() ?? "").includes(refusal),
+        "the framed visor did not paint the framework's refusal",
+      );
+      await host.waitForTimeout(3_000);
+      eq(
+        await framed.locator("#visor-strip").count(),
+        0,
+        "the framed visor painted trusted pixels",
+      );
     },
   },
 
@@ -1176,8 +1265,9 @@ const scenarios: Scenario[] = [
   {
     // The ceremony, end to end and headless: the kernel mints the URL, the
     // page opens the popup, the fake consents at once and redirects back,
-    // the returning load hands the pair to its opener, and the kernel
-    // exchanges and seals it (internal.wit `storage`, `shell.open-popup`).
+    // the returning load broadcasts the pair on the ceremony's channel, and
+    // the kernel exchanges and seals it (internal.wit `storage`,
+    // `shell.open-popup`).
     name: "drive-connect",
     async run(ctx, origin) {
       const page = await open(ctx, origin);

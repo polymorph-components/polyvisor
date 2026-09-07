@@ -471,8 +471,10 @@ interface shell {
     request-persistence: async func() -> bool;
     /// Open `url` in a popup and resolve with the `code` and `state` query
     /// parameters the popup returns to this page's URL with; `none` if the
-    /// user closed it. A window is a page capability, so the ceremony's
-    /// browser half lives here and the kernel never sees a window.
+    /// ceremony did not come back: consent was declined, or nothing
+    /// returned within the glue's bound. A window is a page capability, so
+    /// the ceremony's browser half lives here and the kernel never sees a
+    /// window.
     open-popup: async func(url: string) -> option<tuple<string, string>>;
 }
 
