@@ -270,7 +270,7 @@ native tests, so browser gates are mandatory for every visor change.
 |---|---|---|
 | Rust | 1.98.1 | current stable; satisfies stream-dom (1.98), subduction (1.91), keyhive (1.90) |
 | `wit-bindgen` | `=0.60.0`, workspace-wide | must equal stream-dom's pin: `StreamReader<u8>` (a wit-bindgen runtime type) crosses the delegation from our world's `run` into `stream_dom_dioxus::driver::run`. Different wit-bindgen versions *can* coexist in one component (the `wasip3_task_set` weak-symbol ABI exists for exactly that), but not across a shared runtime type. Bumps follow stream-dom's. `generate!` never sets `async: true`: that lowers sync WIT functions (resource constructors) async, which the canonical ABI forbids and only the translator catches; WIT's own `async func` annotations are the source of truth |
-| `@polyengine/*` | git rev `80ee6cb` (raw.githubusercontent) + `pre-80ee6cb` translator asset | carries the #289 driver fix; see "polyengine is consumed at a git revision" |
+| `@polyengine/*` | 0.6.4, one version across the graph | first release with the #289 driver fix; brand symbols are per-version, so a partial upgrade fails at `instanceof` |
 | `dioxus` | `=0.7.10` | dioxus-core state is shared with `stream-dom-dioxus`; skew breaks the build |
 | polymorph-stream-dom | git rev (see Cargo.toml / deno.json) | unpublished, moving; policy object and asset handles landed in #15 |
 | subduction | git `sansio` rev | above |
@@ -336,7 +336,7 @@ native tests, so browser gates are mandatory for every visor change.
 - **M5** passkey PRF rung, recovery kits, Drive provider.
 - Parked: app worker (above); native shell; JS producers.
 
-## polyengine is consumed at a git revision
+## polyengine is consumed from JSR
 
 Found in M1: an import awaited from a Dioxus event handler never resumed
 until the next event. Root cause (polyengine, fixed upstream in #289): a
@@ -346,12 +346,7 @@ fires no driver-arrival, so a host call registered during it is
 invisible to the parked race, and the settlement pump stands down while
 the parked driver counts. A stream-dom producer is the routine victim —
 its `readDirect` session keeps a driver parked whenever one long poll
-(`events.next`) is outstanding.
-
-The fix is in polyengine `main`; polyengine publishes to JSR only on cut
-releases, and a release is a human act. So this tree consumes polyengine
-by git revision: `deno.json` maps every `@polyengine/*` specifier to
-raw.githubusercontent at one sha, and `web/translate.ts` fetches the
-matching `pre-<sha>` release's translator wasm (digest-checked against its
-SHA256SUMS, cached under `target/`). The sha is spelled in `deno.json` and
-in `web/translate.ts`; the two must agree, and a bump is its own PR. Return to a caret JSR pin when a release carrying #289 exists.
+is outstanding. The fix shipped in polyengine 0.6.4; the tree consumes
+it at a caret JSR pin. `deno.json` sets `minimumDependencyAge` to zero:
+polyengine releases are cut minutes before this tree takes them, and
+Deno's 24 h age gate would otherwise refuse them.

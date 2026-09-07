@@ -2,53 +2,45 @@
   "version": "5",
   "specifiers": {
     "jsr:@polyengine/protocol@~0.3.1": "0.3.1",
-    "jsr:@polyengine/runtime@~0.6.3": "0.6.3",
-    "jsr:@polyengine/translator@~0.6.3": "0.6.3",
-    "jsr:@polyengine/wasi@~0.6.3": "0.6.3",
+    "jsr:@polyengine/runtime@~0.6.3": "0.6.4",
+    "jsr:@polyengine/runtime@~0.6.4": "0.6.4",
+    "jsr:@polyengine/translator@~0.6.3": "0.6.4",
+    "jsr:@polyengine/translator@~0.6.4": "0.6.4",
+    "jsr:@polyengine/wasi@~0.6.3": "0.6.4",
+    "jsr:@polyengine/wasi@~0.6.4": "0.6.4",
     "jsr:@polymorph/iroh@0.6": "0.6.0",
     "jsr:@polymorph/webcrypto@0.6": "0.6.0",
-    "jsr:@polymorph/webrtc-datachannels@0.6": "0.6.0",
+    "jsr:@polymorph/webrtc-datachannels@0.6": "0.6.2",
     "jsr:@polymorph/websocket@0.6": "0.6.0",
     "jsr:@std/assert@1": "1.0.19",
-    "jsr:@std/cli@^1.0.32": "1.0.32",
-    "jsr:@std/encoding@^1.0.11": "1.0.11",
-    "jsr:@std/fmt@^1.0.10": "1.0.10",
     "jsr:@std/fs@1": "1.0.24",
-    "jsr:@std/fs@^1.0.24": "1.0.24",
-    "jsr:@std/html@^1.0.7": "1.0.7",
-    "jsr:@std/http@*": "1.1.3",
     "jsr:@std/internal@^1.0.12": "1.0.14",
     "jsr:@std/internal@^1.0.14": "1.0.14",
     "jsr:@std/media-types@1": "1.1.0",
-    "jsr:@std/media-types@^1.1.0": "1.1.0",
-    "jsr:@std/net@^1.0.6": "1.0.6",
     "jsr:@std/path@1": "1.1.6",
     "jsr:@std/path@^1.1.5": "1.1.6",
-    "jsr:@std/path@^1.1.6": "1.1.6",
-    "jsr:@std/streams@^1.1.2": "1.1.2",
     "npm:@remote-dom/core@^1.11.1": "1.11.1",
-    "npm:node-datachannel@0.32.3": "0.32.3",
     "npm:playwright@1.62.1": "1.62.1",
-    "npm:werift@0.22.2": "0.22.2"
+    "npm:werift@0.24.4": "0.24.4"
   },
   "jsr": {
     "@polyengine/protocol@0.3.1": {
       "integrity": "3cba0ded857c5cc911fcf9c0782c7566c79af89ddc8e0ec4e48ece60c807a518"
     },
-    "@polyengine/runtime@0.6.3": {
-      "integrity": "8f1ffc1c547793bc4cb3c1dec6a62c8cf0eb5cdb135b70e6df1fd042c6ec58f0",
+    "@polyengine/runtime@0.6.4": {
+      "integrity": "e33a1bc82ffb128b0bfd2d0830b5d278396f96459b28ba49a07b8ed2669480fd",
       "dependencies": [
         "jsr:@polyengine/protocol"
       ]
     },
-    "@polyengine/translator@0.6.3": {
-      "integrity": "ccd0bb64ce3081d70b13e224c77e423faf7acf9953f62d4e0d2bab97c626c932",
+    "@polyengine/translator@0.6.4": {
+      "integrity": "87c667f254ae93738ed1cdad0e62295814d211df5be0cbfe30e8545b40156193",
       "dependencies": [
-        "jsr:@polyengine/runtime"
+        "jsr:@polyengine/runtime@~0.6.4"
       ]
     },
-    "@polyengine/wasi@0.6.3": {
-      "integrity": "5c738fe95101f22e469346618e79ce261dd636a5d44e89fdcdd40c33d8c92e17",
+    "@polyengine/wasi@0.6.4": {
+      "integrity": "3402d542ede9126ec62102f51f7c6463c52d3183fb0539a63e3b00c58eb30d22",
       "dependencies": [
         "jsr:@polyengine/protocol"
       ]
@@ -57,9 +49,9 @@
       "integrity": "66608ff41b7de97bf1659003f25a91c6ac06cd20e2511c7be13400cb3ba32143",
       "dependencies": [
         "jsr:@polyengine/protocol",
-        "jsr:@polyengine/runtime",
-        "jsr:@polyengine/translator",
-        "jsr:@polyengine/wasi",
+        "jsr:@polyengine/runtime@~0.6.3",
+        "jsr:@polyengine/translator@~0.6.3",
+        "jsr:@polyengine/wasi@~0.6.3",
         "jsr:@polymorph/webcrypto",
         "jsr:@polymorph/webrtc-datachannels",
         "jsr:@polymorph/websocket"
@@ -71,11 +63,10 @@
         "jsr:@polyengine/protocol"
       ]
     },
-    "@polymorph/webrtc-datachannels@0.6.0": {
-      "integrity": "3cac84fe625177154ebd5a792548963a7381710998bfe94acd5170680f7bd227",
+    "@polymorph/webrtc-datachannels@0.6.2": {
+      "integrity": "42f46aaf2f2d25f689b69210d8ddaf634835699fb4a3b67d981e20140aadaed4",
       "dependencies": [
         "jsr:@polyengine/protocol",
-        "npm:node-datachannel",
         "npm:werift"
       ]
     },
@@ -91,37 +82,11 @@
         "jsr:@std/internal@^1.0.12"
       ]
     },
-    "@std/cli@1.0.32": {
-      "integrity": "188b3a100d6202d64e3f5bd3d799c7fa4f6d77f92cc65eb7f641c1fa0aa92a66"
-    },
-    "@std/encoding@1.0.11": {
-      "integrity": "e7cef2f0b3153bccc17431e7c864a1de03a4b6d9647389c43e08aaa775d37385"
-    },
-    "@std/fmt@1.0.10": {
-      "integrity": "90dfba288802ac6de82fb31d0917eb9e4450b9925b954d5e51fc29ac07419db5"
-    },
     "@std/fs@1.0.24": {
       "integrity": "f3061b45b81673a2bece689da041df32d174be064c89eb6397fb5718d3fb7877",
       "dependencies": [
         "jsr:@std/internal@^1.0.14",
         "jsr:@std/path@^1.1.5"
-      ]
-    },
-    "@std/html@1.0.7": {
-      "integrity": "175c818905a6e75743c69c251395e273d82698e58cfe7dd76268d70e28b8d8fe"
-    },
-    "@std/http@1.1.3": {
-      "integrity": "73a98e05ff58aa18bea562d286172e6c815b1eddd4fcab194beda19e3683b88c",
-      "dependencies": [
-        "jsr:@std/cli",
-        "jsr:@std/encoding",
-        "jsr:@std/fmt",
-        "jsr:@std/fs@^1.0.24",
-        "jsr:@std/html",
-        "jsr:@std/media-types@^1.1.0",
-        "jsr:@std/net",
-        "jsr:@std/path@^1.1.6",
-        "jsr:@std/streams"
       ]
     },
     "@std/internal@1.0.14": {
@@ -130,17 +95,11 @@
     "@std/media-types@1.1.0": {
       "integrity": "c9d093f0c05c3512932b330e3cc1fe1d627b301db33a4c2c2185c02471d6eaa4"
     },
-    "@std/net@1.0.6": {
-      "integrity": "110735f93e95bb9feb95790a8b1d1bf69ec0dc74f3f97a00a76ea5efea25500c"
-    },
     "@std/path@1.1.6": {
       "integrity": "c68485c2a4dfbb5ae3cc74fae4e8c4e5d874cf8a8ed12927917235c758b46cbe",
       "dependencies": [
         "jsr:@std/internal@^1.0.14"
       ]
-    },
-    "@std/streams@1.1.2": {
-      "integrity": "0249bf9b78a999f57032ca4d8e7ccaa57579090242640b35ddc948fbb745d3af"
     }
   },
   "npm": {
@@ -156,9 +115,6 @@
     },
     "@leichtgewicht/ip-codec@2.0.5": {
       "integrity": "sha512-Vo+PSpZG2/fmgmiNzYK9qWRh8h/CHrwD0mo1h1DzL4yzHNSfWYujGTYsWGreD000gcgmZ7K4Ys6Tx9TxtsKdDw=="
-    },
-    "@minhducsun2002/leb128@1.0.0": {
-      "integrity": "sha512-eFrYUPDVHeuwWHluTG1kwNQUEUcFjVKYwPkU8z9DR1JH3AW7JtJsG9cRVGmwz809kKtGfwGJj58juCZxEvnI/g=="
     },
     "@noble/curves@1.9.7": {
       "integrity": "sha512-gbKGcRUYIjA3/zCCNaWDciTMFI0dCkvou3TL8Zmy5Nc7sJ47a0jtOeZoTaMxkuqRo9cRhjOdZJXegxYE5FN/xw==",
@@ -304,9 +260,6 @@
         "is-plain-object"
       ]
     },
-    "@shinyoshiaki/jspack@0.0.6": {
-      "integrity": "sha512-SdsNhLjQh4onBlyPrn4ia1Pdx5bXT88G/LIEpOYAjx2u4xeY/m/HB5yHqlkJB1uQR3Zw4R3hBWLj46STRAN0rg=="
-    },
     "@types/dom-mediacapture-transform@0.1.12": {
       "integrity": "sha512-d7/QsLRwF864A5mgIM/YrfiglHoYn7zgCcAoJgW404r+2DwnNr7EBbLnCWpmOMgH8y0te73L1AV6H1bmauaWFw==",
       "dependencies": [
@@ -315,9 +268,6 @@
     },
     "@types/dom-webcodecs@0.1.13": {
       "integrity": "sha512-O5hkiFIcjjszPIYyUSyvScyvrBoV3NOEEZx/pMlsu44TKzWNkLVBBxnxJz42in5n3QIolYOcBYFCPZZ0h8SkwQ=="
-    },
-    "aes-js@3.1.2": {
-      "integrity": "sha512-e5pEa2kBnBOgR4Y/p20pskXI74UEz7de8ZGVo58asOtvSVG5YAbJeELPZxOmt+Bnz3rX753YKhfIn4X4l1PPRQ=="
     },
     "asn1js@3.0.10": {
       "integrity": "sha512-S2s3aOytiKdFRdulw2qPE51MzjzVOisppcVv7jVFR+Kw0kxwvFrDcYA0h7Ndqbmj0HkMIXYWaoj7fli8kgx1eg==",
@@ -330,27 +280,6 @@
     "base64-js@1.5.1": {
       "integrity": "sha512-AKpaYlHn8t4SVbOHCy+b5+KKgvR4vrsD8vbvrbiQJps7fKDTkjkDry6ji0rUJjC0kzbNePLwzxq8iypo41qeWA=="
     },
-    "big-integer@1.6.52": {
-      "integrity": "sha512-QxD8cf2eVqJOOz63z6JIN9BzvVs/dlySa5HGSBH5xtR8dPteIRQnBxxKqkNTiT6jbDTF6jAfrd4oMcND9RGbQg=="
-    },
-    "bl@4.1.0": {
-      "integrity": "sha512-1W07cM9gS6DcLperZfFSj+bWLtaPGSOHWhPiGzXmvVJbRLdG82sH/Kn8EtW1VqWVA54AKf2h5k5BbnIbwF3h6w==",
-      "dependencies": [
-        "buffer@5.7.1",
-        "inherits",
-        "readable-stream"
-      ]
-    },
-    "buffer-crc32@1.0.0": {
-      "integrity": "sha512-Db1SbgBS/fg/392AblrMJk97KggmvYhr4pB5ZIMTWtaivCPMWLkmb7m21cJvpvgK+J3nsU2CmmixNBZx4vFj/w=="
-    },
-    "buffer@5.7.1": {
-      "integrity": "sha512-EHcyIPBQ4BSGlvjB16k5KgAJ27CIsHY/2JBmCRReo48y9rQ3MaUzWX3KVlBa4U7MyX02HdVj0K7C3WaB3ju7FQ==",
-      "dependencies": [
-        "base64-js",
-        "ieee754"
-      ]
-    },
     "buffer@6.0.3": {
       "integrity": "sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==",
       "dependencies": [
@@ -358,47 +287,17 @@
         "ieee754"
       ]
     },
-    "chownr@1.1.4": {
-      "integrity": "sha512-jJ0bqzaylmJtVnNgzTeSOs8DPavpbYgEr/b0YL8/2GO3xJEhInFmhKMUnEJQjZumK7KXGFhUy89PrsJWlakBVg=="
-    },
-    "date-fns@4.4.0": {
-      "integrity": "sha512-+1UMbeh68lH1SegH83CGWwpb6OHHbpSgr3+s5Eww5M4CAgswBpoWS0AjTOfEJ33HiYKz1hdj/KTFprzXHmq/6w=="
-    },
     "debug@4.4.0": {
       "integrity": "sha512-6WTZ/IxCY/T6BALoZHaE4ctp9xm+Z5kY/pzYaCHRFeyVhojxlrm+46y68HA6hr0TcwEssoxNiDEUJQjfPZ/RYA==",
       "dependencies": [
         "ms"
       ]
     },
-    "decompress-response@6.0.0": {
-      "integrity": "sha512-aW35yZM6Bb/4oJlZncMH2LCoZtJXTRxES17vE3hoRiowU2kWHaJKFkSBDnDR+cm9J+9QhXmREyIfv0pji9ejCQ==",
-      "dependencies": [
-        "mimic-response"
-      ]
-    },
-    "deep-extend@0.6.0": {
-      "integrity": "sha512-LOHxIOaPYdHlJRtCQfDIVZtfw/ufM8+rVj649RIHzcm/vGwQRXFt6OPqIFWsm2XEMrNIEtWR64sY1LEKD2vAOA=="
-    },
-    "detect-libc@2.1.2": {
-      "integrity": "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ=="
-    },
     "dns-packet@5.6.1": {
       "integrity": "sha512-l4gcSouhcgIKRvyy99RNVOgxXiicE+2jZoNmaNmZ6JXiGajBOJAesk1OBlJuM5k2c+eudGdLxDqXuPCKIj6kpw==",
       "dependencies": [
         "@leichtgewicht/ip-codec"
       ]
-    },
-    "end-of-stream@1.4.5": {
-      "integrity": "sha512-ooEGc6HP26xXq/N+GCGOT0JKCLDGrq2bQUZrQ7gyrJiZANJ/8YDTxTpQBXGMn+WbIQXNVpyWymm7KYVICQnyOg==",
-      "dependencies": [
-        "once"
-      ]
-    },
-    "expand-template@2.0.3": {
-      "integrity": "sha512-XYfuKMvj4O35f/pOXLObndIRvyQ+/+6AhODh+OKWj9S9498pHHn/IMszH+gt0fBCRWMNfk1ZSp5x3AifmnI2vg=="
-    },
-    "fs-constants@1.0.0": {
-      "integrity": "sha512-y6OAwoSIf7FyjMIv94u+b5rdheZEjzR63GTyZJm5qh4Bi+2YgwLCcI/fPFZkL5PSixOt6ZNKm+w+Hfp/Bciwow=="
     },
     "fsevents@2.3.2": {
       "integrity": "sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==",
@@ -411,26 +310,11 @@
         "is-property"
       ]
     },
-    "github-from-package@0.0.0": {
-      "integrity": "sha512-SyHy3T1v2NUXn29OsWdxmK6RwHD+vkj3v8en8AOBZ1wBQ/hCAQ5bAQTD02kW4W9tUp/3Qh6J8r9EvntiyCmOOw=="
-    },
     "htm@3.1.1": {
       "integrity": "sha512-983Vyg8NwUE7JkZ6NmOqpCZ+sh1bKv2iYTlUkzlWmA5JD2acKoxd4KVxbMmxX/85mtfdnDmTFoNKcg5DGAvxNQ=="
     },
     "ieee754@1.2.1": {
       "integrity": "sha512-dcyqhDvX1C46lXZcVqCpK+FtMRQVdIMN6/Df5js2zouUsqG7I6sFxitIC+7KYK29KdXOLHdu9zL4sFnoVQnqaA=="
-    },
-    "inherits@2.0.4": {
-      "integrity": "sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ=="
-    },
-    "ini@1.3.8": {
-      "integrity": "sha512-JV/yugV2uzW5iMRSiZAyDtQd+nxtUnjeLt0acNdw98kKLrvuRVyB80tsREOE7yvGVgalhZ6RNXCmEHkUKBKxew=="
-    },
-    "int64-buffer@1.1.0": {
-      "integrity": "sha512-94smTCQOvigN4d/2R/YDjz8YVG0Sufvv2aAh8P5m42gwhCsDAJqnbNOrxJsrADuAFAA69Q/ptGzxvNcNuIJcvw=="
-    },
-    "ip@2.0.1": {
-      "integrity": "sha512-lJUL9imLTNi1ZfXT+DU6rBBdbiKGBuay9B6xGSPVjUeQwaH1RIGqef8RZkUtHioLmSNpPR5M4HVKJGm1j8FWVQ=="
     },
     "is-plain-object@2.0.4": {
       "integrity": "sha512-h5PpgXkWitc38BBMYawTYMWJHFZJVnBquFE57xFpjB8pJFiF6gZ+bU+WyI/yqXiFR5mdLsgYNaPe8uao6Uv9Og==",
@@ -444,27 +328,12 @@
     "isobject@3.0.1": {
       "integrity": "sha512-WhB9zCku7EGTj/HQQRz5aUQEUeoQZH2bWcltRErOpymJ4boYE6wL9Tbr23krRPSZ+C5zqNSrSw+Cc7sZZ4b7vg=="
     },
-    "lodash@4.18.1": {
-      "integrity": "sha512-dMInicTPVE8d1e5otfwmmjlxkZoUpiVLwyeTdUsi/Caj/gfzzblBcCE5sRHV/AsjuCmxWrte2TNGSYuCeCq+0Q=="
-    },
     "mediabunny@1.55.2": {
       "integrity": "sha512-EEx4O6qYddAdCyWPMZNDwI7uc5hewNHrPAf9jLcVhIbXoPsiqNQ+D9i1pfadmGkjN2V318jSrZljkpoziYm6Lg==",
       "dependencies": [
         "@types/dom-mediacapture-transform",
         "@types/dom-webcodecs"
       ]
-    },
-    "mimic-response@3.1.0": {
-      "integrity": "sha512-z0yWI+4FDrrweS8Zmt4Ej5HdJmky15+L2e6Wgn3+iK5fWzb6T3fhNFq2+MeTRb064c6Wr4N/wv0DzQTjNzHNGQ=="
-    },
-    "minimist@1.2.8": {
-      "integrity": "sha512-2yyAR8qBkN3YuheJanUpWC5U3bb5osDywNB8RzDVlDwDHbocAJveqqj1u8+SVD7jkWT4yvsHCpWqqWqAxb0zCA=="
-    },
-    "mkdirp-classic@0.5.3": {
-      "integrity": "sha512-gKLcREMhtuZRwRAfqP3RFW+TK4JqApVBtOIftVgjuABpAtpxhPGaDcfvbhNvD0B8iD1oUr/txX35NjcaY6Ns/A=="
-    },
-    "mp4box@0.5.4": {
-      "integrity": "sha512-GcCH0fySxBurJtvr0dfhz0IxHZjc1RP+F+I8xw+LIwkU1a+7HJx8NCDiww1I5u4Hz6g4eR1JlGADEGJ9r4lSfA=="
     },
     "ms@2.1.3": {
       "integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA=="
@@ -476,34 +345,6 @@
         "thunky"
       ],
       "bin": true
-    },
-    "nano-time@1.0.0": {
-      "integrity": "sha512-flnngywOoQ0lLQOTRNexn2gGSNuM9bKj9RZAWSzhQ+UJYaAFG9bac4DW9VHjUAzrOaIcajHybCTHe/bkvozQqA==",
-      "dependencies": [
-        "big-integer"
-      ]
-    },
-    "napi-build-utils@2.0.0": {
-      "integrity": "sha512-GEbrYkbfF7MoNaoh2iGG84Mnf/WZfB0GdGEsM8wz7Expx/LlWf5U8t9nvJKXSp3qr5IsEbK04cBGhol/KwOsWA=="
-    },
-    "node-abi@3.94.0": {
-      "integrity": "sha512-W5ZNO5KRPB5TkYmGVD9F6YqhsglXJzE6etpbmT+f6EQElhiX/UTG551cnsRGvLG3fyZEg9HwaDmNmj5nwJ4z9g==",
-      "dependencies": [
-        "semver"
-      ]
-    },
-    "node-datachannel@0.32.3": {
-      "integrity": "sha512-Aok1ZhLsll472lRefgWYuWJ0070jh0ecHravTdRyZEmoESumebMEQV8Y+poBwSW2ZbEwAokAOGsK5Cu8pDDT2g==",
-      "dependencies": [
-        "prebuild-install"
-      ],
-      "scripts": true
-    },
-    "once@1.4.0": {
-      "integrity": "sha512-lNaJgI+2Q5URQBkccEKHTQOPaXdUxnZZElQTZY0MFUAuaEqe1E+Nyvgdz/aIyNi6Z9MzO5dv1H8n58/GELp3+w==",
-      "dependencies": [
-        "wrappy"
-      ]
     },
     "playwright-core@1.62.1": {
       "integrity": "sha512-wPYSwEBJY9GHraISXqyqtx0na0LpO3XEX7jNDhntbex7tzUS7kLnZsOlFruFJB4Hi/rhDMjXGqHewDZ68nYZVw==",
@@ -519,32 +360,6 @@
       ],
       "bin": true
     },
-    "prebuild-install@7.1.3": {
-      "integrity": "sha512-8Mf2cbV7x1cXPUILADGI3wuhfqWvtiLA1iclTDbFRZkgRQS0NqsPZphna9V+HyTEadheuPmjaJMsbzKQFOzLug==",
-      "dependencies": [
-        "detect-libc",
-        "expand-template",
-        "github-from-package",
-        "minimist",
-        "mkdirp-classic",
-        "napi-build-utils",
-        "node-abi",
-        "pump",
-        "rc",
-        "simple-get",
-        "tar-fs",
-        "tunnel-agent"
-      ],
-      "deprecated": true,
-      "bin": true
-    },
-    "pump@3.0.4": {
-      "integrity": "sha512-VS7sjc6KR7e1ukRFhQSY5LM2uBWAUPiOPa/A3mkKmiMwSmRFUITt0xuj+/lesgnCv+dPIEYlkzrcyXgquIHMcA==",
-      "dependencies": [
-        "end-of-stream",
-        "once"
-      ]
-    },
     "pvtsutils@1.3.6": {
       "integrity": "sha512-PLgQXQ6H2FWCaeRak8vvk1GW462lMxB5s3Jm673N82zI4vqtVUPuZdffdZbPDFRoU8kAhItWFtPCWiPpp4/EDg==",
       "dependencies": [
@@ -554,72 +369,8 @@
     "pvutils@1.2.0": {
       "integrity": "sha512-BbubeCEyTuQjVMakvJQ/Sxbc93F2pwmbsxONT/ZRrwU7Ua38d8unYTwXpTVLAKJ4BDuH9IGztCjQcd/N/39Dvg=="
     },
-    "rc@1.2.8": {
-      "integrity": "sha512-y3bGgqKj3QBdxLbLkomlohkvsA8gdAiUQlSBJnBhfn+BPxg4bc62d8TcBW15wavDfgexCgccckhcZvywyQYPOw==",
-      "dependencies": [
-        "deep-extend",
-        "ini",
-        "minimist",
-        "strip-json-comments"
-      ],
-      "bin": true
-    },
-    "readable-stream@3.6.2": {
-      "integrity": "sha512-9u/sniCrY3D5WdsERHzHE4G2YCXqoG5FTHUiCC4SIbr6XcLZBY05ya9EKjYek9O5xOAwjGq+1JdGBAS7Q9ScoA==",
-      "dependencies": [
-        "inherits",
-        "string_decoder",
-        "util-deprecate"
-      ]
-    },
     "reflect-metadata@0.2.2": {
       "integrity": "sha512-urBwgfrvVP/eAyXx4hluJivBKzuEbSQs9rKWCrCkbSxNv8mxPcUZKeuoF3Uy4mJl3Lwprp6yy5/39VWigZ4K6Q=="
-    },
-    "safe-buffer@5.2.1": {
-      "integrity": "sha512-rp3So07KcdmmKbGvgaNxQSJr7bGVSVk5S9Eq1F+ppbRo70+YeaDxkw5Dd8NPN+GD6bjnYm2VuPuCXmpuYvmCXQ=="
-    },
-    "semver@7.8.5": {
-      "integrity": "sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA==",
-      "bin": true
-    },
-    "simple-concat@1.0.1": {
-      "integrity": "sha512-cSFtAPtRhljv69IK0hTVZQ+OfE9nePi/rtJmw5UjHeVyVroEqJXP1sFztKUy1qU+xvz3u/sfYJLa947b7nAN2Q=="
-    },
-    "simple-get@4.0.1": {
-      "integrity": "sha512-brv7p5WgH0jmQJr1ZDDfKDOSeWWg+OVypG99A/5vYGPqJ6pxiaHLy8nxtFjBA7oMa01ebA9gfh1uMCFqOuXxvA==",
-      "dependencies": [
-        "decompress-response",
-        "once",
-        "simple-concat"
-      ]
-    },
-    "string_decoder@1.3.0": {
-      "integrity": "sha512-hkRX8U1WjJFd8LsDJ2yQ/wWWxaopEsABU1XfkM8A+j0+85JAGppt16cr1Whg6KIbb4okU6Mql6BOj+uup/wKeA==",
-      "dependencies": [
-        "safe-buffer"
-      ]
-    },
-    "strip-json-comments@2.0.1": {
-      "integrity": "sha512-4gB8na07fecVVkOI6Rs4e7T6NOTki5EmL7TUduTs6bu3EdnSycntVJ4re8kgZA+wx9IueI2Y11bfbgwtzuE0KQ=="
-    },
-    "tar-fs@2.1.5": {
-      "integrity": "sha512-OboTd8mmMhZDNPV+UjQcK9yKAatXu2aJ+r1w4im1Otd4M4fl2hwvdoXUxIYHFTHWK/3y3FarBP70v3vwmGlOxw==",
-      "dependencies": [
-        "chownr",
-        "mkdirp-classic",
-        "pump",
-        "tar-stream"
-      ]
-    },
-    "tar-stream@2.2.0": {
-      "integrity": "sha512-ujeqbceABgwMZxEJnk2HDY2DlnUZ+9oEcb1KzTVfYHio0UE6dG71n60d8D2I4qNvleWrrXpmjpt7vZeF1LnMZQ==",
-      "dependencies": [
-        "bl",
-        "end-of-stream",
-        "fs-constants",
-        "inherits",
-        "readable-stream"
-      ]
     },
     "thunky@1.1.0": {
       "integrity": "sha512-eHY7nBftgThBqOyHGVN+l8gF0BucP09fMo0oO/Lb0w1OF80dJv+lDVpXG60WMQvkcxAkNybKsrEIE3ZtKGmPrA=="
@@ -636,318 +387,25 @@
         "tslib@1.14.1"
       ]
     },
-    "tunnel-agent@0.6.0": {
-      "integrity": "sha512-McnNiV1l8RYeY8tBgEpuodCC1mLUdbSN+CYBL7kJsJNInOP8UjDDEwdk6Mw60vdLLrr5NHKZhMAOSrR2NZuQ+w==",
-      "dependencies": [
-        "safe-buffer"
-      ]
-    },
-    "turbo-crc32@1.0.1": {
-      "integrity": "sha512-8yyRd1ZdNp+AQLGqi3lTaA2k81JjlIZOyFQEsi7GQWBgirnQOxjqVtDEbYHM2Z4yFdJ5AQw0fxBLLnDCl6RXoQ=="
-    },
     "tweetnacl@1.0.3": {
       "integrity": "sha512-6rt+RN7aOi1nGMyC4Xa5DdYiukl2UWCbcJft7YhxReBGQD7OAM8Pbxw6YMo4r2diNEA8FEmu32YOn9rhaiE5yw=="
     },
-    "util-deprecate@1.0.2": {
-      "integrity": "sha512-EPD5q1uXyFxJpCrLnCc1nHnq3gOa6DZBocAIiI2TaSCA7VCJ1UJDMagCzIkXNsUYfD1daK//LTEQ8xiIbrHtcw=="
-    },
-    "uuid@11.1.1": {
-      "integrity": "sha512-vIYxrBCC/N/K+Js3qSN88go7kIfNPssr/hHCesKCQNAjmgvYS2oqr69kIufEG+O4+PfezOH4EbIeHCfFov8ZgQ==",
-      "bin": true
-    },
-    "werift-common@0.0.3": {
-      "integrity": "sha512-ma3E4BqKTyZVLhrdfTVs2T1tg9seeUtKMRn5e64LwgrogWa62+3LAUoLBUSl1yPWhgSkXId7GmcHuWDen9IJeQ==",
-      "dependencies": [
-        "@shinyoshiaki/jspack",
-        "debug"
-      ]
-    },
-    "werift-dtls@0.5.8": {
-      "integrity": "sha512-oH39cdCpVLqKcPZRMGQLcN+tIBixvMGqjCB9qCrH39Tu9Mmu8u2+zTzyl0Fod87EK6PNPgoNqMJt64xlSMfLnw==",
+    "werift@0.24.4": {
+      "integrity": "sha512-NoROZ11L/ZqAB5ombCB4VBuVNdIZfwI493zlxlIX7BlwfWRy55eDJdtWMC2VX35yBXFaWwA8NtYbmJ8qWtVk9Q==",
       "dependencies": [
         "@fidm/x509",
         "@noble/curves",
         "@peculiar/x509",
         "@shinyoshiaki/binary-data",
+        "buffer",
         "debug",
+        "mediabunny",
+        "multicast-dns",
         "tweetnacl"
       ]
-    },
-    "werift-ice@0.2.3": {
-      "integrity": "sha512-k000fIaw8w2D4Xv5EvW6b5h4faJx8p4D8HPuDzRiGTx6UrLv2BuvUkC60LNqxlDf9o3zh90Hx1WZoHbhuw9keA==",
-      "dependencies": [
-        "debug",
-        "multicast-dns"
-      ]
-    },
-    "werift-rtp@0.8.9": {
-      "integrity": "sha512-uLFOawIXw8FblIp1akfIVYFuRNtNo7csRxYypLz0t++sUNCN7sPeghVqET/c3Mq7Tg2QA3oAb15fXIIuJEp2AA==",
-      "dependencies": [
-        "buffer@6.0.3",
-        "debug",
-        "mediabunny"
-      ]
-    },
-    "werift-sctp@0.0.11": {
-      "integrity": "sha512-7109yuI5U7NTEHjqjn0A8VeynytkgVaxM6lRr1Ziv0D8bPcaB8A7U/P88M7WaCpWDoELHoXiRUjQycMWStIgjQ==",
-      "dependencies": [
-        "@shinyoshiaki/jspack"
-      ]
-    },
-    "werift@0.22.2": {
-      "integrity": "sha512-R+dfzOknUiGH8EcxGjWfN4404+Npj4tT1L5HpqZLjw0ARCO0B19i9gAQOo6ESzzTE+L8L1wxb1KIspOeoko+TQ==",
-      "dependencies": [
-        "@fidm/x509",
-        "@minhducsun2002/leb128",
-        "@noble/curves",
-        "@peculiar/x509",
-        "@shinyoshiaki/binary-data",
-        "@shinyoshiaki/jspack",
-        "aes-js",
-        "buffer@6.0.3",
-        "buffer-crc32",
-        "date-fns",
-        "debug",
-        "int64-buffer",
-        "ip",
-        "lodash",
-        "mp4box",
-        "multicast-dns",
-        "nano-time",
-        "turbo-crc32",
-        "tweetnacl",
-        "uuid",
-        "werift-common",
-        "werift-dtls",
-        "werift-ice",
-        "werift-rtp",
-        "werift-sctp"
-      ]
-    },
-    "wrappy@1.0.2": {
-      "integrity": "sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ=="
     }
   },
   "remote": {
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/protocol/src/abortable.ts": "c79c15c2d8714b1df9d4677a6a56251dd952e10eb701826105ebf96faf37416f",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/protocol/src/brands.ts": "efe1894d458a7189fd12965b77147ec366dee7c89c1dd8f7e6281acb8c2b10c1",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/protocol/src/cloneable.ts": "eb28aa41af0ea938f9cfa9535ef01daf390bbb6309a31616bce653a8e5974334",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/protocol/src/defer_cancel.ts": "d812c08adfa821f95803bcf4f88fba975c00a1dd4a6fb02a0184aa2faedd0d41",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/protocol/src/errors.ts": "3d23e2dce96b68050704fa915ce24e33fa75d31f98a15fa4ee7c9be03e14dcc7",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/protocol/src/handles.ts": "214c0d27876b7f32b893c71f3b3e011e463268db340224e0c2e1fb7c13784d19",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/protocol/src/mark_decorator.ts": "f20bae8bc40eff9dba0b4ba1b75a98178a328d3ef106adc2860dac32844b714e",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/protocol/src/mod.ts": "b9f3448185c7245f7cc496e6ab37074c4f7ccde0690a9253cba056e8dc1d80fd",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/protocol/src/registry.ts": "0d9bba71fa2d0d23e4fba1c54179546069da5fa179c9fcda32e645fb9b94f8d9",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/protocol/src/suspending.ts": "e7b4cf668972b9d50ac58ca88785849ef29771411332b5b48f61d881a07eaa1e",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/async_values.ts": "d3205823c92fd452e35a09d843a1d2b2302e5d015adb36155589eb4fd9f35498",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/bulk_lists.ts": "02590eaf28b1363e932582f131b0f362cd4f6e661a7d840271ba6f187fc2dc2c",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/context.ts": "3f22f282c8527775502e42f1604a6cf7dcc7984f19c769c61983f3c42a3f2e99",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/flatten.ts": "f1ecfa40c6c8c853445d79d0ff66386079737e205a5343189372c0779296ee06",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/float.ts": "0483e8c1aa8786eee4c6f6357fee6738555e4310650c474aba6cd811a80d7d36",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/handles.ts": "9a63847255758a484fcbd40eb123aacf6d4dda446ca9aa3a4fab998a1a7b2be2",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/layout.ts": "91c954e8786ddf7f7f6f6a145d00e003f8d7dc553e42f865ed51faf2b2e4a35f",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/lift.ts": "c80866245ddfec73554524dde4238f82c5421db34f36df9f6d26dccce5fbc02c",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/load.ts": "672d7946659a62c3b2f9559dadd1e29acba26d062509c1a640441bb2958a874d",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/lower.ts": "218228b203036fae827f6cea2e2dd229c44cd63712a8540336238092e6e7b3d1",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/memory.ts": "f671f27d573c0a7e58f45a969c64f2e356ba6106f243f14bf4445cca9d0ffa46",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/mod.ts": "aa26eb5f3d5f3237957ec5d507f24f0db9879427bbac8af81b2448d9b25aecb9",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/store.ts": "8e0f3044acb57726874cc221b1650c0cf92238bd5cbf39a7afec9843c0c55d1a",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/strings.ts": "96149ca6304d98b81afa79ddf1ca112e6de016c258ebce9abfa3ad685529d10c",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/trap.ts": "28285138bea16366e519755b246f17a17f7523e7882b3ed01c2ada5c1b52d4aa",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/types.ts": "0049aa272af2deefe3906f0a69c47de2e244d74f343e923dc5eac75ca26db618",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/cabi/values.ts": "bb63f1a60c590db7ca7f16cb09520368bbc27fbd4b7601dbac42a7392e3b4e86",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/embedder/casing.ts": "86969e529c1820e3a1b1a099310e005f03cc0160627e856b04aba5f0d5a45d35",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/embedder/copy.ts": "84331e5ac165ad76564486fa91a75ddd720611b3b762b557bb00a552bc43e4bd",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/embedder/errors.ts": "fb5c246ea22d84d3ee04272411b17f92253f475fa8fc078f268abbf1bcd9d1eb",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/embedder/imports.ts": "64243d592d6ee372e4f40eac9e73c602c95da6af1f89a17347302f31bc2af991",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/embedder/instantiate.ts": "99333a2cec56ad2f82ad8e95d7b3c5ea3a339899e0a0f29a2209b7d26e1b3d4c",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/embedder/mod.ts": "052a06429fd19f7daab2aef94af700a637d85f32d815c24d3d0c96989e5bbce4",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/embedder/resources.ts": "c36f190572db2e5b6cc3e42020c3fe36c98f4ae8d376be1a18290c94ead8d7aa",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/embedder/streams.ts": "52521a7e321f8f175c78f98ae0ef60feb52eb2306181767466dd5d3af4bf6aa7",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/embedder/sync.ts": "d7bd31b74a3b6c6c310f552c54a10b760f3387d668d719be93d8d77a2bd4bc58",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/embedder/values.ts": "3bcf6e88e4be54a60868d11a1b9fe7bc46c9ceefac2dd4bde2e12b3b0d8217c1",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/embedder/version.ts": "8266971ade1e1f7fd818377f3f4b22c0c7f376a30f8c53dfca78f7577262d7f6",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/exec/boundary.ts": "28e8726bc90936028cdd3b7bc242926f798b4b4d9a1a04272bbe296277f25b41",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/exec/executor.ts": "22355619720d26ca3dff640e0faa01dbca6988e56398457ae084fb48affe186d",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/exec/host_streams.ts": "544b5a2dba4eab6ef605a42f888aca0f9b8d4a2c7d9228f4d0289c55d1c5c049",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/exec/mod.ts": "a46320977ece14342bcb72c9c9e36d65a1cd09d789591d0909d7d1185264010b",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/intrinsics/async_builtins.ts": "6779758d72a678288dadd10cdcc5508b4fb434eb97c70cbb2694acb3e01b0c6f",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/intrinsics/context.ts": "89e6561f3310ee39a4d4ea7922d9a770597ee0218526e2d2b7c09a5dfa966de6",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/intrinsics/errors.ts": "97b3d295d58b53143056fa6e2d99d2a1968489ed67d2e8f7f4fe3a73031942a6",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/intrinsics/fact_calls.ts": "709d6131676c170081f67a31c45c795b0d51f4b75b677245837bb970185761ba",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/intrinsics/mod.ts": "47a7707eba9d78a1c0940e12c41a385c894ab31ac50e6686b089e664f0e925d7",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/intrinsics/stream_builtins.ts": "5c51beb3af53a5905179136f3bcc67b27104d1979fee280fb86c1c6ebed63e6d",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/intrinsics/transcode.ts": "8668c685be8f0cec4d26060cd2f6403dec2a96702c300c050ae648cb421a6449",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/jspi/bridge.ts": "d26ce2c0f51d5d17d0aa041aa718542bb46333ce7ad38899dcac7cd80a841dea",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/jspi/mechanics.ts": "35f02d5853a66de110ce632184ce91878081f6108311274a4841297e839d7601",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/jspi/mod.ts": "672aae180ad752ce07cfd83b006d24058f3aa4952a75d9a1fd256b7f804cd46a",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/jspi/suspending.ts": "d634d2895bca5e6cff135b705c9116cc1d6462cf126b52e02526c724d76b2376",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/jspi/types.ts": "102430fa9386026d0429d42a5365dcc2ed557af536138328325e4cd56f8ddce0",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/plan/loader.ts": "88abe1a80b7c2c49e1229d34d70c844b3edada8807e89f62ebe98d52eb5e94ac",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/shim/mod.ts": "34af2240dfd0be720def487db2db34eaad6ba9178003f20e2193d03a0632779b",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/shim/translator.ts": "e100cc1280afbec67f59da8ea8bc6c003e3dae9692eda81f80114b210c532c98",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/task/mod.ts": "6c3572a146eb5c34b2cd95353c5e162e1f6d603fb25d52ef0c49fb6120c24b82",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/task/scheduler.ts": "5c573e57c5e0f3791a298582c9368c000cd7476b9b86ca22865334017fbfc8c6",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/task/streams.ts": "4d6b343629e65d2d3cbb647c74fe80ebe40e794a6b558bb24390440f7bb5da83",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/task/subtask.ts": "c7fc724c409fe5b32dc944966cb3e090480eadb0024f79106e028b5d5ebc60ff",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/task/thread.ts": "e347d327cec5b165007e296382d3a67bf2e9e87d0ccaf674e0cef6ec44bed371",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/runtime/src/task/waitable.ts": "640fa8dc12fd5479db7ea70fa245e4990d457650096795bb164369412c90d23e",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/wasi/src/cli.ts": "1eb437bf69eefaa662509352804480fcca099a0fd47718d735b2d1e666b58b48",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/wasi/src/clocks.ts": "73f6f43a175d883e59c61133f1877605844d279275272ba1b30bcb4e66005068",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/wasi/src/filesystem.ts": "6dcead5346d78084c3923410e44875e678f3b58db0c2d59513339b428596ec25",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/wasi/src/http.ts": "bf1651c17634826d6bdcf2f496e595194eb024f6aa7ae71073a5873eb43d364d",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/wasi/src/internal/cli_shared.ts": "d844155e3b1904ff187d72af6ea7981c446977eb600db21afc596b9ad5f9377f",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/wasi/src/io.ts": "ef972bc4bdbd1fcf579a0f3c9a8ffd75122b2d001096c4b68dd376e11815421a",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/wasi/src/mod.ts": "f05cebacbc70dd2022bddd2df01f8bc712bc550508f2a6a45b1abe7db6ca66bb",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/0ab4a76571ea8db17903b566356473ca7b998df2/wasi/src/random.ts": "12a01c122cd20e76bff2805c9ad8472098e86d237503e3ed97e58382c5db48b2",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/protocol/src/abortable.ts": "c79c15c2d8714b1df9d4677a6a56251dd952e10eb701826105ebf96faf37416f",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/protocol/src/brands.ts": "efe1894d458a7189fd12965b77147ec366dee7c89c1dd8f7e6281acb8c2b10c1",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/protocol/src/cloneable.ts": "eb28aa41af0ea938f9cfa9535ef01daf390bbb6309a31616bce653a8e5974334",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/protocol/src/defer_cancel.ts": "d812c08adfa821f95803bcf4f88fba975c00a1dd4a6fb02a0184aa2faedd0d41",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/protocol/src/errors.ts": "3d23e2dce96b68050704fa915ce24e33fa75d31f98a15fa4ee7c9be03e14dcc7",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/protocol/src/handles.ts": "214c0d27876b7f32b893c71f3b3e011e463268db340224e0c2e1fb7c13784d19",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/protocol/src/mark_decorator.ts": "f20bae8bc40eff9dba0b4ba1b75a98178a328d3ef106adc2860dac32844b714e",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/protocol/src/mod.ts": "b9f3448185c7245f7cc496e6ab37074c4f7ccde0690a9253cba056e8dc1d80fd",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/protocol/src/registry.ts": "0d9bba71fa2d0d23e4fba1c54179546069da5fa179c9fcda32e645fb9b94f8d9",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/protocol/src/suspending.ts": "e7b4cf668972b9d50ac58ca88785849ef29771411332b5b48f61d881a07eaa1e",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/async_values.ts": "d3205823c92fd452e35a09d843a1d2b2302e5d015adb36155589eb4fd9f35498",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/bulk_lists.ts": "02590eaf28b1363e932582f131b0f362cd4f6e661a7d840271ba6f187fc2dc2c",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/context.ts": "3f22f282c8527775502e42f1604a6cf7dcc7984f19c769c61983f3c42a3f2e99",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/flatten.ts": "f1ecfa40c6c8c853445d79d0ff66386079737e205a5343189372c0779296ee06",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/float.ts": "0483e8c1aa8786eee4c6f6357fee6738555e4310650c474aba6cd811a80d7d36",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/handles.ts": "9a63847255758a484fcbd40eb123aacf6d4dda446ca9aa3a4fab998a1a7b2be2",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/layout.ts": "91c954e8786ddf7f7f6f6a145d00e003f8d7dc553e42f865ed51faf2b2e4a35f",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/lift.ts": "c80866245ddfec73554524dde4238f82c5421db34f36df9f6d26dccce5fbc02c",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/load.ts": "672d7946659a62c3b2f9559dadd1e29acba26d062509c1a640441bb2958a874d",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/lower.ts": "218228b203036fae827f6cea2e2dd229c44cd63712a8540336238092e6e7b3d1",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/memory.ts": "f671f27d573c0a7e58f45a969c64f2e356ba6106f243f14bf4445cca9d0ffa46",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/mod.ts": "aa26eb5f3d5f3237957ec5d507f24f0db9879427bbac8af81b2448d9b25aecb9",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/store.ts": "8e0f3044acb57726874cc221b1650c0cf92238bd5cbf39a7afec9843c0c55d1a",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/strings.ts": "96149ca6304d98b81afa79ddf1ca112e6de016c258ebce9abfa3ad685529d10c",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/trap.ts": "28285138bea16366e519755b246f17a17f7523e7882b3ed01c2ada5c1b52d4aa",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/types.ts": "0049aa272af2deefe3906f0a69c47de2e244d74f343e923dc5eac75ca26db618",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/cabi/values.ts": "bb63f1a60c590db7ca7f16cb09520368bbc27fbd4b7601dbac42a7392e3b4e86",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/embedder/casing.ts": "86969e529c1820e3a1b1a099310e005f03cc0160627e856b04aba5f0d5a45d35",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/embedder/copy.ts": "84331e5ac165ad76564486fa91a75ddd720611b3b762b557bb00a552bc43e4bd",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/embedder/errors.ts": "fb5c246ea22d84d3ee04272411b17f92253f475fa8fc078f268abbf1bcd9d1eb",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/embedder/imports.ts": "64243d592d6ee372e4f40eac9e73c602c95da6af1f89a17347302f31bc2af991",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/embedder/instantiate.ts": "99333a2cec56ad2f82ad8e95d7b3c5ea3a339899e0a0f29a2209b7d26e1b3d4c",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/embedder/mod.ts": "052a06429fd19f7daab2aef94af700a637d85f32d815c24d3d0c96989e5bbce4",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/embedder/resources.ts": "c36f190572db2e5b6cc3e42020c3fe36c98f4ae8d376be1a18290c94ead8d7aa",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/embedder/streams.ts": "52521a7e321f8f175c78f98ae0ef60feb52eb2306181767466dd5d3af4bf6aa7",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/embedder/sync.ts": "d7bd31b74a3b6c6c310f552c54a10b760f3387d668d719be93d8d77a2bd4bc58",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/embedder/values.ts": "3bcf6e88e4be54a60868d11a1b9fe7bc46c9ceefac2dd4bde2e12b3b0d8217c1",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/embedder/version.ts": "8266971ade1e1f7fd818377f3f4b22c0c7f376a30f8c53dfca78f7577262d7f6",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/exec/boundary.ts": "d0c77744d22336d874f4f0978384a42e5b546df6c865200246a3bfc0ea499899",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/exec/executor.ts": "22355619720d26ca3dff640e0faa01dbca6988e56398457ae084fb48affe186d",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/exec/host_streams.ts": "544b5a2dba4eab6ef605a42f888aca0f9b8d4a2c7d9228f4d0289c55d1c5c049",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/exec/mod.ts": "a46320977ece14342bcb72c9c9e36d65a1cd09d789591d0909d7d1185264010b",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/intrinsics/async_builtins.ts": "6779758d72a678288dadd10cdcc5508b4fb434eb97c70cbb2694acb3e01b0c6f",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/intrinsics/context.ts": "89e6561f3310ee39a4d4ea7922d9a770597ee0218526e2d2b7c09a5dfa966de6",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/intrinsics/errors.ts": "97b3d295d58b53143056fa6e2d99d2a1968489ed67d2e8f7f4fe3a73031942a6",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/intrinsics/fact_calls.ts": "709d6131676c170081f67a31c45c795b0d51f4b75b677245837bb970185761ba",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/intrinsics/mod.ts": "47a7707eba9d78a1c0940e12c41a385c894ab31ac50e6686b089e664f0e925d7",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/intrinsics/stream_builtins.ts": "5c51beb3af53a5905179136f3bcc67b27104d1979fee280fb86c1c6ebed63e6d",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/intrinsics/transcode.ts": "8668c685be8f0cec4d26060cd2f6403dec2a96702c300c050ae648cb421a6449",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/jspi/bridge.ts": "d26ce2c0f51d5d17d0aa041aa718542bb46333ce7ad38899dcac7cd80a841dea",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/jspi/mechanics.ts": "35f02d5853a66de110ce632184ce91878081f6108311274a4841297e839d7601",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/jspi/mod.ts": "672aae180ad752ce07cfd83b006d24058f3aa4952a75d9a1fd256b7f804cd46a",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/jspi/suspending.ts": "d634d2895bca5e6cff135b705c9116cc1d6462cf126b52e02526c724d76b2376",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/jspi/types.ts": "102430fa9386026d0429d42a5365dcc2ed557af536138328325e4cd56f8ddce0",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/plan/format.ts": "d704936f7e4de6fe5d33d2b54d8787cdc92a9808aa393da6986d8d25e27f88e2",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/plan/loader.ts": "88abe1a80b7c2c49e1229d34d70c844b3edada8807e89f62ebe98d52eb5e94ac",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/shim/mod.ts": "34af2240dfd0be720def487db2db34eaad6ba9178003f20e2193d03a0632779b",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/shim/translator.ts": "e100cc1280afbec67f59da8ea8bc6c003e3dae9692eda81f80114b210c532c98",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/task/mod.ts": "6c3572a146eb5c34b2cd95353c5e162e1f6d603fb25d52ef0c49fb6120c24b82",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/task/scheduler.ts": "5c573e57c5e0f3791a298582c9368c000cd7476b9b86ca22865334017fbfc8c6",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/task/streams.ts": "4d6b343629e65d2d3cbb647c74fe80ebe40e794a6b558bb24390440f7bb5da83",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/task/subtask.ts": "c7fc724c409fe5b32dc944966cb3e090480eadb0024f79106e028b5d5ebc60ff",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/task/thread.ts": "e347d327cec5b165007e296382d3a67bf2e9e87d0ccaf674e0cef6ec44bed371",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/task/waitable.ts": "640fa8dc12fd5479db7ea70fa245e4990d457650096795bb164369412c90d23e",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/wasi/src/cli.ts": "1eb437bf69eefaa662509352804480fcca099a0fd47718d735b2d1e666b58b48",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/wasi/src/clocks.ts": "73f6f43a175d883e59c61133f1877605844d279275272ba1b30bcb4e66005068",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/wasi/src/filesystem.ts": "6dcead5346d78084c3923410e44875e678f3b58db0c2d59513339b428596ec25",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/wasi/src/filesystem_web.ts": "16a91f59e37d494f3beb5279388c901a5d498d90d6931017b16202f36da993d1",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/wasi/src/http.ts": "bf1651c17634826d6bdcf2f496e595194eb024f6aa7ae71073a5873eb43d364d",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/wasi/src/internal/cli_shared.ts": "d844155e3b1904ff187d72af6ea7981c446977eb600db21afc596b9ad5f9377f",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/wasi/src/internal/fs_provider.ts": "49e81f0bd283fb6fcc475cb5da865e6e9656608f53f7afb6eb53db303a79a31b",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/wasi/src/io.ts": "ef972bc4bdbd1fcf579a0f3c9a8ffd75122b2d001096c4b68dd376e11815421a",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/wasi/src/mod.ts": "f05cebacbc70dd2022bddd2df01f8bc712bc550508f2a6a45b1abe7db6ca66bb",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/wasi/src/random.ts": "12a01c122cd20e76bff2805c9ad8472098e86d237503e3ed97e58382c5db48b2",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/protocol/src/abortable.ts": "c79c15c2d8714b1df9d4677a6a56251dd952e10eb701826105ebf96faf37416f",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/protocol/src/brands.ts": "efe1894d458a7189fd12965b77147ec366dee7c89c1dd8f7e6281acb8c2b10c1",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/protocol/src/cloneable.ts": "eb28aa41af0ea938f9cfa9535ef01daf390bbb6309a31616bce653a8e5974334",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/protocol/src/defer_cancel.ts": "d812c08adfa821f95803bcf4f88fba975c00a1dd4a6fb02a0184aa2faedd0d41",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/protocol/src/errors.ts": "3d23e2dce96b68050704fa915ce24e33fa75d31f98a15fa4ee7c9be03e14dcc7",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/protocol/src/handles.ts": "214c0d27876b7f32b893c71f3b3e011e463268db340224e0c2e1fb7c13784d19",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/protocol/src/mark_decorator.ts": "f20bae8bc40eff9dba0b4ba1b75a98178a328d3ef106adc2860dac32844b714e",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/protocol/src/mod.ts": "b9f3448185c7245f7cc496e6ab37074c4f7ccde0690a9253cba056e8dc1d80fd",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/protocol/src/registry.ts": "0d9bba71fa2d0d23e4fba1c54179546069da5fa179c9fcda32e645fb9b94f8d9",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/protocol/src/suspending.ts": "e7b4cf668972b9d50ac58ca88785849ef29771411332b5b48f61d881a07eaa1e",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/async_values.ts": "d3205823c92fd452e35a09d843a1d2b2302e5d015adb36155589eb4fd9f35498",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/bulk_lists.ts": "02590eaf28b1363e932582f131b0f362cd4f6e661a7d840271ba6f187fc2dc2c",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/context.ts": "3f22f282c8527775502e42f1604a6cf7dcc7984f19c769c61983f3c42a3f2e99",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/flatten.ts": "f1ecfa40c6c8c853445d79d0ff66386079737e205a5343189372c0779296ee06",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/float.ts": "0483e8c1aa8786eee4c6f6357fee6738555e4310650c474aba6cd811a80d7d36",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/handles.ts": "9a63847255758a484fcbd40eb123aacf6d4dda446ca9aa3a4fab998a1a7b2be2",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/layout.ts": "91c954e8786ddf7f7f6f6a145d00e003f8d7dc553e42f865ed51faf2b2e4a35f",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/lift.ts": "c80866245ddfec73554524dde4238f82c5421db34f36df9f6d26dccce5fbc02c",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/load.ts": "672d7946659a62c3b2f9559dadd1e29acba26d062509c1a640441bb2958a874d",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/lower.ts": "218228b203036fae827f6cea2e2dd229c44cd63712a8540336238092e6e7b3d1",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/memory.ts": "f671f27d573c0a7e58f45a969c64f2e356ba6106f243f14bf4445cca9d0ffa46",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/mod.ts": "aa26eb5f3d5f3237957ec5d507f24f0db9879427bbac8af81b2448d9b25aecb9",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/store.ts": "8e0f3044acb57726874cc221b1650c0cf92238bd5cbf39a7afec9843c0c55d1a",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/strings.ts": "96149ca6304d98b81afa79ddf1ca112e6de016c258ebce9abfa3ad685529d10c",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/trap.ts": "28285138bea16366e519755b246f17a17f7523e7882b3ed01c2ada5c1b52d4aa",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/types.ts": "0049aa272af2deefe3906f0a69c47de2e244d74f343e923dc5eac75ca26db618",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/cabi/values.ts": "bb63f1a60c590db7ca7f16cb09520368bbc27fbd4b7601dbac42a7392e3b4e86",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/embedder/casing.ts": "86969e529c1820e3a1b1a099310e005f03cc0160627e856b04aba5f0d5a45d35",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/embedder/copy.ts": "84331e5ac165ad76564486fa91a75ddd720611b3b762b557bb00a552bc43e4bd",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/embedder/errors.ts": "fb5c246ea22d84d3ee04272411b17f92253f475fa8fc078f268abbf1bcd9d1eb",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/embedder/imports.ts": "64243d592d6ee372e4f40eac9e73c602c95da6af1f89a17347302f31bc2af991",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/embedder/instantiate.ts": "99333a2cec56ad2f82ad8e95d7b3c5ea3a339899e0a0f29a2209b7d26e1b3d4c",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/embedder/mod.ts": "052a06429fd19f7daab2aef94af700a637d85f32d815c24d3d0c96989e5bbce4",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/embedder/resources.ts": "c36f190572db2e5b6cc3e42020c3fe36c98f4ae8d376be1a18290c94ead8d7aa",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/embedder/streams.ts": "52521a7e321f8f175c78f98ae0ef60feb52eb2306181767466dd5d3af4bf6aa7",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/embedder/sync.ts": "d7bd31b74a3b6c6c310f552c54a10b760f3387d668d719be93d8d77a2bd4bc58",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/embedder/values.ts": "3bcf6e88e4be54a60868d11a1b9fe7bc46c9ceefac2dd4bde2e12b3b0d8217c1",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/embedder/version.ts": "8266971ade1e1f7fd818377f3f4b22c0c7f376a30f8c53dfca78f7577262d7f6",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/exec/boundary.ts": "d0c77744d22336d874f4f0978384a42e5b546df6c865200246a3bfc0ea499899",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/exec/executor.ts": "22355619720d26ca3dff640e0faa01dbca6988e56398457ae084fb48affe186d",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/exec/host_streams.ts": "544b5a2dba4eab6ef605a42f888aca0f9b8d4a2c7d9228f4d0289c55d1c5c049",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/exec/mod.ts": "a46320977ece14342bcb72c9c9e36d65a1cd09d789591d0909d7d1185264010b",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/intrinsics/async_builtins.ts": "6779758d72a678288dadd10cdcc5508b4fb434eb97c70cbb2694acb3e01b0c6f",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/intrinsics/context.ts": "89e6561f3310ee39a4d4ea7922d9a770597ee0218526e2d2b7c09a5dfa966de6",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/intrinsics/errors.ts": "97b3d295d58b53143056fa6e2d99d2a1968489ed67d2e8f7f4fe3a73031942a6",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/intrinsics/fact_calls.ts": "709d6131676c170081f67a31c45c795b0d51f4b75b677245837bb970185761ba",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/intrinsics/mod.ts": "47a7707eba9d78a1c0940e12c41a385c894ab31ac50e6686b089e664f0e925d7",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/intrinsics/stream_builtins.ts": "5c51beb3af53a5905179136f3bcc67b27104d1979fee280fb86c1c6ebed63e6d",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/intrinsics/transcode.ts": "8668c685be8f0cec4d26060cd2f6403dec2a96702c300c050ae648cb421a6449",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/jspi/bridge.ts": "d26ce2c0f51d5d17d0aa041aa718542bb46333ce7ad38899dcac7cd80a841dea",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/jspi/mechanics.ts": "35f02d5853a66de110ce632184ce91878081f6108311274a4841297e839d7601",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/jspi/mod.ts": "672aae180ad752ce07cfd83b006d24058f3aa4952a75d9a1fd256b7f804cd46a",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/jspi/suspending.ts": "d634d2895bca5e6cff135b705c9116cc1d6462cf126b52e02526c724d76b2376",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/jspi/types.ts": "102430fa9386026d0429d42a5365dcc2ed557af536138328325e4cd56f8ddce0",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/plan/format.ts": "d704936f7e4de6fe5d33d2b54d8787cdc92a9808aa393da6986d8d25e27f88e2",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/plan/loader.ts": "88abe1a80b7c2c49e1229d34d70c844b3edada8807e89f62ebe98d52eb5e94ac",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/shim/mod.ts": "34af2240dfd0be720def487db2db34eaad6ba9178003f20e2193d03a0632779b",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/shim/translator.ts": "e100cc1280afbec67f59da8ea8bc6c003e3dae9692eda81f80114b210c532c98",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/task/mod.ts": "6c3572a146eb5c34b2cd95353c5e162e1f6d603fb25d52ef0c49fb6120c24b82",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/task/scheduler.ts": "5c573e57c5e0f3791a298582c9368c000cd7476b9b86ca22865334017fbfc8c6",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/task/streams.ts": "4d6b343629e65d2d3cbb647c74fe80ebe40e794a6b558bb24390440f7bb5da83",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/task/subtask.ts": "c7fc724c409fe5b32dc944966cb3e090480eadb0024f79106e028b5d5ebc60ff",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/task/thread.ts": "e347d327cec5b165007e296382d3a67bf2e9e87d0ccaf674e0cef6ec44bed371",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/runtime/src/task/waitable.ts": "640fa8dc12fd5479db7ea70fa245e4990d457650096795bb164369412c90d23e",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/translator/mod.ts": "3d47a087107a7a2a72a00eea7c6df6a1986062f2244a13f0575d5773f19b47e7",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/translator/shim_asset_deno.ts": "62d66a938d29b9a69c5bbc6e8a0883d439aab18695d0d4da8e14a63bac350beb",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/wasi/src/cli.ts": "1eb437bf69eefaa662509352804480fcca099a0fd47718d735b2d1e666b58b48",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/wasi/src/clocks.ts": "73f6f43a175d883e59c61133f1877605844d279275272ba1b30bcb4e66005068",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/wasi/src/filesystem.ts": "6dcead5346d78084c3923410e44875e678f3b58db0c2d59513339b428596ec25",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/wasi/src/http.ts": "bf1651c17634826d6bdcf2f496e595194eb024f6aa7ae71073a5873eb43d364d",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/wasi/src/internal/cli_shared.ts": "d844155e3b1904ff187d72af6ea7981c446977eb600db21afc596b9ad5f9377f",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/wasi/src/io.ts": "ef972bc4bdbd1fcf579a0f3c9a8ffd75122b2d001096c4b68dd376e11815421a",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/wasi/src/mod.ts": "f05cebacbc70dd2022bddd2df01f8bc712bc550508f2a6a45b1abe7db6ca66bb",
-    "https://raw.githubusercontent.com/polymorph-components/polyengine/d547583c5014c56c2691e57d9bfa616638593746/wasi/src/random.ts": "12a01c122cd20e76bff2805c9ad8472098e86d237503e3ed97e58382c5db48b2",
     "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/dispatch.ts": "114107ed7fbd3d535cd194ae5cb425956c6591062eb1ddd6f42f6f0ea0a0c0cf",
     "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/driver.ts": "9f99c10ad9979035c6630d146696fe5fb5528c30377585639b450396bb94097a",
     "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/events.ts": "9f7d431393a2ba300059cf2aa9c32698d19ea8b1115944896a2af8f5564ac9cb",
@@ -963,6 +421,10 @@
   },
   "workspace": {
     "dependencies": [
+      "jsr:@polyengine/protocol@~0.3.1",
+      "jsr:@polyengine/runtime@~0.6.4",
+      "jsr:@polyengine/translator@~0.6.4",
+      "jsr:@polyengine/wasi@~0.6.4",
       "jsr:@polymorph/iroh@0.6",
       "jsr:@polymorph/webcrypto@0.6",
       "jsr:@polymorph/webrtc-datachannels@0.6",

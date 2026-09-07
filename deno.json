@@ -1,14 +1,14 @@
 {
   "nodeModulesDir": "auto",
   "imports": {
-    "@polyengine/runtime/embedder": "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/embedder/mod.ts",
-    "@polyengine/runtime/shim": "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/shim/mod.ts",
-    "@polyengine/runtime/plan": "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/runtime/src/plan/mod.ts",
-    "@polyengine/translator": "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/translator/mod.ts",
-    "@polyengine/protocol": "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/protocol/src/mod.ts",
-    "@polyengine/wasi": "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/wasi/src/mod.ts",
-    "@polyengine/wasi/filesystem-web": "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/wasi/src/filesystem_web.ts",
-    "@polyengine/wasi/http": "https://raw.githubusercontent.com/polymorph-components/polyengine/80ee6cb8a3471c4e136b0b061b4f8f75fef85c8b/wasi/src/http.ts",
+    "@polyengine/runtime/embedder": "jsr:@polyengine/runtime@^0.6.4/embedder",
+    "@polyengine/runtime/shim": "jsr:@polyengine/runtime@^0.6.4/shim",
+    "@polyengine/runtime/plan": "jsr:@polyengine/runtime@^0.6.4/plan",
+    "@polyengine/translator": "jsr:@polyengine/translator@^0.6.4",
+    "@polyengine/protocol": "jsr:@polyengine/protocol@^0.3.1",
+    "@polyengine/wasi": "jsr:@polyengine/wasi@^0.6.4",
+    "@polyengine/wasi/filesystem-web": "jsr:@polyengine/wasi@^0.6.4/filesystem-web",
+    "@polyengine/wasi/http": "jsr:@polyengine/wasi@^0.6.4/http",
     "@polymorph/webcrypto": "jsr:@polymorph/webcrypto@^0.6.0",
     "@polymorph/websocket": "jsr:@polymorph/websocket@^0.6.0",
     "@polymorph/webrtc-datachannels": "jsr:@polymorph/webrtc-datachannels@^0.6.0",
@@ -39,5 +39,6 @@
       "dom.asynciterable",
       "deno.ns"
     ]
-  }
+  },
+  "minimumDependencyAge": "0"
 }
