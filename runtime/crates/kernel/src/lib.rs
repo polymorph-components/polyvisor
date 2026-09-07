@@ -748,8 +748,19 @@ impl Kernel {
     /// One generation, sealed and committed, then the lease.
     async fn write_checkpoint(&self) -> Result<(), Error> {
         // Taken before the state borrow: `Engine::snapshot` borrows the
-        // engine's own cells, and nothing may hold two of ours at once.
-        let engine = self.engine.borrow().as_ref().map(|e| e.snapshot());
+        // engine's own cells, and nothing may hold two of ours at once. It is
+        // also async since M3c (it carries the device's keyhive), so the
+        // engine handle is cloned out and the borrow released before awaiting.
+        let engine = self.engine.borrow().clone();
+        let engine = match engine {
+            Some(engine) => Some(
+                engine
+                    .snapshot()
+                    .await
+                    .map_err(|why| Error::new(ErrorCode::Failed, why))?,
+            ),
+            None => None,
+        };
         let (dek, generation, snapshot) = {
             let state = self.state.borrow();
             let dek = state.dek.clone().expect("open implies a data key");

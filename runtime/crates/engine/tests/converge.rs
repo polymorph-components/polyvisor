@@ -11,7 +11,8 @@ use future_form::Local;
 use futures::future::LocalBoxFuture;
 use futures::{executor::LocalPool, task::LocalSpawnExt as _};
 use polyvisor_engine::{
-    Engine, EngineClock, EngineEvent, EngineNotify, LocalFuture, Snapshot, Spawner, TaskSnapshot,
+    AppState, Engine, EngineClock, EngineEvent, EngineNotify, LocalFuture, Snapshot, Spawner,
+    TaskSnapshot, TreeState,
 };
 use subduction_protocol::event::Direction;
 use subduction_runtime::memory::transport::MemoryTransport;
@@ -150,12 +151,7 @@ async fn wire(a: &TestEngine, b: &TestEngine) {
     // the two devices are in one first — `a` enrolling `b` exactly as an
     // adder does at the end of pairing, and `b` adopting the document rather
     // than merging its own group of one into it.
-    a.add_member(b.verifying_key().to_bytes(), String::new(), 0)
-        .await
-        .unwrap();
-    b.adopt_us(&a.us_save().await.unwrap(), a.verifying_key().to_bytes())
-        .await
-        .unwrap();
+    enroll(a, b).await;
 
     let (ta, tb) = MemoryTransport::pair();
     let b_key = b.verifying_key();
@@ -177,6 +173,30 @@ async fn wire(a: &TestEngine, b: &TestEngine) {
             .expect("b authenticates a"),
         a.peer_id(),
     );
+}
+
+/// The enrollment half of pairing, driven through the engine API exactly as
+/// `kernel::pairing` drives it: the joiner's keyhive contact card goes to the
+/// adder, the adder writes the joiner into the group document and into the
+/// keyhive group, and the joiner adopts both.
+async fn enroll(adder: &TestEngine, joiner: &TestEngine) {
+    let card = joiner.keyhive_card().await.unwrap();
+    adder
+        .add_member(joiner.verifying_key().to_bytes(), String::new(), 0)
+        .await
+        .unwrap();
+    let (keyhive, read_back) = adder
+        .enroll_keyhive(&card, joiner.verifying_key().to_bytes())
+        .await
+        .unwrap();
+    joiner
+        .adopt_us(
+            &adder.us_save().await.unwrap(),
+            adder.verifying_key().to_bytes(),
+        )
+        .await
+        .unwrap();
+    joiner.adopt_keyhive(&keyhive, &read_back).await.unwrap();
 }
 
 fn titles(snapshot: &TaskSnapshot) -> Vec<String> {
@@ -236,7 +256,10 @@ fn a_snapshot_restores_the_same_items() {
         ea.tasks_add(APP, "kept".into()).await.unwrap();
         let id = ea.tasks_add(APP, "toggled".into()).await.unwrap();
         ea.tasks_set_completed(APP, &id, true).await.unwrap();
-        (ea.snapshot(), ea.tasks_items(APP).await.unwrap())
+        (
+            ea.snapshot().await.unwrap(),
+            ea.tasks_items(APP).await.unwrap(),
+        )
     });
     let (snapshot, before) = snapshot;
 
@@ -254,13 +277,10 @@ fn a_restored_device_still_converges() {
     let mut pool = LocalPool::new();
     let a = device(&pool, 4, None);
     let ea = Rc::clone(&a.engine);
-    let snapshot = pool
-        .run_until(async move {
-            ea.tasks_add(APP, "survives".into())
-                .await
-                .map(|_| ea.snapshot())
-        })
-        .unwrap();
+    let snapshot = pool.run_until(async move {
+        ea.tasks_add(APP, "survives".into()).await.unwrap();
+        ea.snapshot().await.unwrap()
+    });
 
     let mut pool = LocalPool::new();
     let a = device(&pool, 4, Some(snapshot));
@@ -325,7 +345,7 @@ fn a_restored_engine_does_not_re_mint_the_id_it_last_used() {
     let ea = Rc::clone(&a.engine);
     let (snapshot, first) = pool.run_until(async move {
         let first = ea.tasks_add(APP, "before the reboot".into()).await.unwrap();
-        (ea.snapshot(), first)
+        (ea.snapshot().await.unwrap(), first)
     });
 
     let mut pool = LocalPool::new();
@@ -462,5 +482,240 @@ fn a_group_this_device_is_not_in_is_not_adopted() {
         assert!(why.contains("not in itself"), "{why}");
 
         assert_eq!(members(&eb).await.len(), 1, "B is still its own group");
+    });
+}
+
+/// M3c's whole claim, from the outside: what rests in storage — and so what
+/// crosses the wire and sits on a relay — is a keyhive envelope, and a party
+/// holding those bytes without being in the group gets nothing from them.
+#[test]
+fn commits_at_rest_are_envelopes_a_stranger_cannot_open() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 12, None);
+    let ea = Rc::clone(&a.engine);
+    let sealed = pool.run_until(async move {
+        ea.tasks_add(APP, "buy milk".into()).await.unwrap();
+        ea.snapshot().await.unwrap()
+    });
+
+    let blobs: Vec<Vec<u8>> = sealed
+        .apps
+        .iter()
+        .flat_map(|app| app.state.commits.iter().map(|item| item.blob.clone()))
+        .collect();
+    assert!(!blobs.is_empty(), "the task produced no commit");
+    for blob in &blobs {
+        assert!(
+            !blob.windows(8).any(|w| w == b"buy milk"),
+            "a commit blob carries the plaintext title"
+        );
+    }
+
+    // A store or relay that ended up with the blobs and nothing else: the
+    // sedimentree items, without the saved automerge document (which is the
+    // kernel's sealed checkpoint, not anything that crosses a wire), without
+    // this group's user-system document, and without its keyhive.
+    let stranger = Snapshot {
+        apps: sealed
+            .apps
+            .iter()
+            .map(|app| AppState {
+                app: app.app.clone(),
+                state: TreeState {
+                    doc: Vec::new(),
+                    ..app.state.clone()
+                },
+            })
+            .collect(),
+        us: None,
+        keyhive: None,
+        vault: None,
+    };
+    let mut pool = LocalPool::new();
+    let outsider = device(&pool, 13, Some(stranger));
+    let engine = Rc::clone(&outsider.engine);
+    let items = pool.run_until(async move { engine.tasks_items(APP).await.unwrap() });
+    assert!(
+        items.items.is_empty(),
+        "a non-member opened the group's envelopes: {:?}",
+        titles(&items)
+    );
+}
+
+/// The causal walk, pinned: a joiner given the content key of the *newest*
+/// commit only — not the whole read-back set — still materializes the entire
+/// ancestry behind it.
+///
+/// This is the mechanism PAIRING.md §4b calls causal-key read-back, and it is
+/// the reason the sealed plaintext is keyhive's own `Envelope` rather than a
+/// look-alike: the walk deserializes an `Envelope` out of every plaintext it
+/// opens, so a parallel format would fail here and nowhere else.
+#[test]
+fn a_joiner_walks_the_ancestry_from_a_single_key() {
+    use sedimentree_core::loose_commit::LooseCommit;
+    use subduction_crypto::signed::Signed;
+
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 14, None);
+    let ea = Rc::clone(&a.engine);
+    let sealed = pool.run_until(async move {
+        for title in ["first", "second", "third"] {
+            ea.tasks_add(APP, title.into()).await.unwrap();
+        }
+        ea.snapshot().await.unwrap()
+    });
+
+    // The newest commit is the one no other commit names as a parent. Read
+    // structurally out of the sedimentree rather than assumed from write
+    // order, so the test pins the walk and not the engine's bookkeeping.
+    let commits: Vec<LooseCommit> = sealed
+        .apps
+        .iter()
+        .flat_map(|app| app.state.commits.iter())
+        .map(|item| {
+            Signed::<LooseCommit>::try_decode(&item.signed)
+                .expect("a stored commit envelope decodes")
+                .try_decode_trusted_payload()
+                .expect("a stored commit decodes")
+        })
+        .collect();
+    assert_eq!(commits.len(), 3, "three tasks, three commits");
+    let newest = commits
+        .iter()
+        .find(|commit| {
+            !commits
+                .iter()
+                .any(|other| other.parents().contains(&commit.head()))
+        })
+        .expect("the history has a head")
+        .head();
+
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 14, Some(sealed));
+    let b = device(&pool, 15, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        let card = eb.keyhive_card().await.unwrap();
+        ea.add_member(eb.verifying_key().to_bytes(), String::new(), 0)
+            .await
+            .unwrap();
+        let (keyhive, read_back) = ea
+            .enroll_keyhive(&card, eb.verifying_key().to_bytes())
+            .await
+            .unwrap();
+
+        // Everything the adder would normally hand over, cut down to the one
+        // key the newest commit was sealed under.
+        let all: Vec<([u8; 32], [u8; 32])> = bincode::deserialize(&read_back).unwrap();
+        let only_newest: Vec<([u8; 32], [u8; 32])> = all
+            .into_iter()
+            .filter(|(cref, _)| cref == newest.as_bytes())
+            .collect();
+        assert_eq!(
+            only_newest.len(),
+            1,
+            "the head's own key is in the hand-over"
+        );
+        let trimmed = bincode::serialize(&only_newest).unwrap();
+
+        eb.adopt_us(&ea.us_save().await.unwrap(), ea.verifying_key().to_bytes())
+            .await
+            .unwrap();
+        eb.adopt_keyhive(&keyhive, &trimmed).await.unwrap();
+
+        let (ta, tb) = MemoryTransport::pair();
+        let b_key = eb.verifying_key();
+        let inbound = RefCell::new(None);
+        let _ = futures::future::join(ea.connect(ta, Direction::Outbound, Some(b_key)), async {
+            *inbound.borrow_mut() = Some(eb.connect(tb, Direction::Inbound, None).await);
+        })
+        .await;
+
+        let items = until(|| async {
+            let items = eb.tasks_items(APP).await.unwrap();
+            (items.items.len() == 3).then_some(items)
+        })
+        .await;
+        let mut seen = titles(&items);
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec!["first", "second", "third"],
+            "the walk did not reach the whole ancestry"
+        );
+    });
+}
+
+/// ENROLL hands over the group's *operations*, never the adder's keyhive
+/// archive: an archive carries `active.prekey_pairs`, which are the adder's
+/// own secrets. The strong form of the check is the round-trip — re-encoding
+/// the decoded operation list reproduces the payload byte for byte, so there
+/// is nothing else in it.
+#[test]
+fn the_enrollment_payload_is_an_operation_list_and_nothing_else() {
+    use keyhive_core::archive::Archive;
+    use keyhive_core::event::static_event::StaticEvent;
+
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 16, None);
+    let b = device(&pool, 17, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+
+    pool.run_until(async move {
+        ea.tasks_add(APP, "already here".into()).await.unwrap();
+        let card = eb.keyhive_card().await.unwrap();
+        ea.add_member(eb.verifying_key().to_bytes(), String::new(), 0)
+            .await
+            .unwrap();
+        let (keyhive, _read_back) = ea
+            .enroll_keyhive(&card, eb.verifying_key().to_bytes())
+            .await
+            .unwrap();
+
+        let events: Vec<StaticEvent<[u8; 32]>> = bincode::deserialize(&keyhive)
+            .expect("the enrollment payload is a list of keyhive operations");
+        assert!(!events.is_empty(), "an enrollment with no operations");
+        assert_eq!(
+            bincode::serialize(&events).unwrap(),
+            keyhive,
+            "the payload carries something besides the operation list"
+        );
+        assert!(
+            bincode::deserialize::<Archive<[u8; 32]>>(&keyhive).is_err(),
+            "the enrollment payload is a keyhive archive, which carries the adder's prekey secrets"
+        );
+    });
+}
+
+/// The keyhive card is bound to the key the SAS ceremony authenticated. A card
+/// naming any other identity is refused, so the membership grant cannot land
+/// on a device other than the one the two users compared digits for.
+#[test]
+fn a_card_for_another_key_is_not_enrolled() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 18, None);
+    let b = device(&pool, 19, None);
+    let c = device(&pool, 20, None);
+    let (ea, eb, ec) = (
+        Rc::clone(&a.engine),
+        Rc::clone(&b.engine),
+        Rc::clone(&c.engine),
+    );
+
+    pool.run_until(async move {
+        // C's card offered under B's key: the ceremony authenticated B.
+        let elsewhere = ec.keyhive_card().await.unwrap();
+        let refused = ea
+            .enroll_keyhive(&elsewhere, eb.verifying_key().to_bytes())
+            .await;
+        assert!(
+            refused.is_err(),
+            "a card for another key was enrolled: {refused:?}"
+        );
+        // And the honest card still works, so the check is not simply refusing.
+        let card = eb.keyhive_card().await.unwrap();
+        ea.enroll_keyhive(&card, eb.verifying_key().to_bytes())
+            .await
+            .unwrap();
     });
 }

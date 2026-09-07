@@ -41,6 +41,16 @@ pub struct Snapshot {
     /// a device must still boot from one.
     #[serde(default)]
     pub us: Option<TreeState>,
+    /// The keyhive-events tree (`crate::keyhive_tree`): the membership and
+    /// CGKA operations that let this device's peers open its envelopes. It has
+    /// no automerge document — `TreeState::doc` is empty — because its commits
+    /// *are* the state.
+    #[serde(default)]
+    pub keyhive: Option<TreeState>,
+    /// This device's keyhive itself, including secrets. Sealed with the rest
+    /// of the checkpoint.
+    #[serde(default)]
+    pub vault: Option<crate::vault::VaultState>,
 }
 
 /// One app's document and the tree behind it.
@@ -154,6 +164,8 @@ impl SnapshotStorage {
         &self,
         apps: impl Iterator<Item = (String, SedimentreeId, Vec<u8>)>,
         us: Option<(SedimentreeId, Vec<u8>)>,
+        keyhive: Option<SedimentreeId>,
+        vault: Option<crate::vault::VaultState>,
     ) -> Snapshot {
         Snapshot {
             apps: apps
@@ -163,6 +175,8 @@ impl SnapshotStorage {
                 })
                 .collect(),
             us: us.map(|(tree, doc)| self.tree_state(tree, doc)),
+            keyhive: keyhive.map(|tree| self.tree_state(tree, Vec::new())),
+            vault,
         }
     }
 

@@ -183,7 +183,7 @@ form. Polyvisor owns five implementations:
 |---|---|
 | `Transport` | one per connection over `polymorph:iroh` streams, relay-only: WebRTC is off in the worker because a SharedWorker has no `RTCPeerConnection` (the host backend never resolves there). Framing per `subduction_iroh` (u32 BE length prefix) so native subduction peers interoperate |
 | `Storage` | M3a: an in-memory item store serialized into the sealed checkpoint with the automerge docs. Items in their own files under the state root is the follow-up once checkpoint size matters |
-| `Policy` | group membership, read off the user-system document (`polyvisor:us`): a remote peer may read/write exactly while its key is a member. Envelope encryption via keyhive's own gate is M3c |
+| `Policy` | group membership, read off the user-system document (`polyvisor:us`): a remote peer may read/write exactly while its key is a member. App-tree envelopes are keyhive's (M3c, `engine/src/vault.rs`) |
 | `Signer` / `NodeEffect::Sign` | M3a: `ed25519-dalek` over a seed held in the sealed checkpoint (the seed posture; the same seed, imported through `polymorph:webcrypto`, builds the iroh identity). Later: a non-extractable platform key — signing is an effect with external custody, which is exactly what that needs |
 | `Clock` | `wasi:clocks@0.3` |
 
@@ -274,7 +274,7 @@ native tests, so browser gates are mandatory for every visor change.
 | `dioxus` | `=0.7.10` | dioxus-core state is shared with `stream-dom-dioxus`; skew breaks the build |
 | polymorph-stream-dom | git rev (see Cargo.toml / deno.json) | unpublished, moving; policy object and asset handles landed in #15 |
 | subduction | git `sansio` rev | above |
-| keyhive | git `main` rev | above |
+| keyhive | git rev `a509a2d` | `keyhive_core` / `keyhive_crypto` / `beekem`, unreleased and moving. The sealed plaintext is keyhive's own `Envelope` and the read-back walk is keyhive's own `try_causal_decrypt`, so a rev bump is a wire-format change for every stored blob: its own PR |
 | `@polymorph/*` | 0.6.0 | the 2026-09-05 cut matching polyengine 0.6.3 |
 | polymorph:iroh WIT | provisional | being upgraded upstream in parallel; re-checked before M3a, the first milestone that exercises it |
 | `wasi:*` WIT | 0.3.1 (consolidated WASI release) | what `@polyengine/wasi` serves on the `@0.3` track |
@@ -316,8 +316,17 @@ native tests, so browser gates are mandatory for every visor change.
   (headless, parked). **M3b** pairing (code + commit/reveal SAS + dual
   confirm), the device group as the user-system document, sync policy =
   group membership, reconnect at boot. **M3c** keyhive/BeeKEM: envelope
-  encryption of every tree so relays and stores hold ciphertext only;
-  the group's keyhive membership derived from the user-system document.
+  encryption of every *app* tree, so relays and stores hold app content
+  as ciphertext only; the group's keyhive membership derived from the
+  user-system document. Two trees stay plaintext by ruling:
+  `polyvisor:us`, because it is what tells a device which group — and so
+  which keyhive document — it belongs to, and it carries only endpoint
+  public keys and petnames a relay already sees; and the keyhive-events
+  tree, keyhive's own signed, content-free operation log. Enrollment is
+  total read-back: the adder hands the joiner every content key it holds
+  over the SAS-authenticated pairing connection, so a new device reads
+  the group's entire history; the read-back window for shared documents
+  is an open policy item, and shared documents do not exist yet.
   Sequenced after M3b because device↔device sync already runs inside
   authenticated QUIC — content encryption is what untrusted *storage*
   (M4) needs, and building the group first gives keyhive a membership
