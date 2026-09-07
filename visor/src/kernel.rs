@@ -297,6 +297,94 @@ pub(crate) async fn request_persistence() -> bool {
     api::shell::request_persistence().await
 }
 
+/// One store binding, as the Storage section shows it (internal.wit
+/// `storage.binding`).
+///
+/// `state` is the kernel's own framework voice — "not connected",
+/// "connected", "connected; the last sync did not finish: <why>", "needs
+/// re-authorization: <why>" — and is rendered exactly as it arrived, like a
+/// peer's state. The visor composes no sentence of its own about a store.
+#[derive(Clone, PartialEq)]
+pub(crate) struct Binding {
+    pub(crate) provider: String,
+    pub(crate) state: String,
+    /// Epoch milliseconds, 0 if never.
+    pub(crate) last_pull: u64,
+    pub(crate) last_push: u64,
+}
+
+impl Binding {
+    /// Is there a store to sync with?
+    ///
+    // CONTRACT: internal.wit `storage.binding` carries no boolean — the
+    // connectedness of a binding is only in `state`, whose four spellings
+    // the contract enumerates. So the visor matches the two that mean "the
+    // ceremony has to be run": "not connected", and the
+    // "needs re-authorization: <why>" prefix. Anything else is a binding
+    // that has tokens, which is the conservative reading: a state this
+    // visor does not recognise still shows the store's own words, and
+    // still offers "Disconnect", so nothing is stranded by a vocabulary
+    // that grew.
+    pub(crate) fn connected(&self) -> bool {
+        self.state != "not connected"
+    }
+
+    /// Does the user have to run the ceremony (again)?
+    pub(crate) fn needs_ceremony(&self) -> bool {
+        !self.connected() || self.state.starts_with("needs re-authorization")
+    }
+}
+
+pub(crate) async fn storage_status() -> Result<Binding, String> {
+    api::storage::status()
+        .await
+        .map_err(message)
+        .map(|b| Binding {
+            provider: b.provider,
+            state: b.state,
+            last_pull: b.last_pull,
+            last_push: b.last_push,
+        })
+}
+
+/// Mint a PKCE ceremony; the answer is the authorization URL for the
+/// popup. The redirect is the kernel's own (`boot-config.page-url`), which
+/// is why the visor supplies only the client pair.
+pub(crate) async fn oauth_start(
+    client_id: String,
+    client_secret: String,
+) -> Result<String, String> {
+    api::storage::oauth_start(api::storage::OauthClient {
+        client_id,
+        client_secret,
+    })
+    .await
+    .map_err(message)
+}
+
+/// The popup landed back: hand the kernel the pair and let it exchange and
+/// seal. The one-shot code crosses here; no token ever does.
+pub(crate) async fn oauth_complete(code: String, state: String) -> Result<(), String> {
+    api::storage::oauth_complete(code, state)
+        .await
+        .map_err(message)
+}
+
+pub(crate) async fn storage_disconnect() -> Result<(), String> {
+    api::storage::disconnect().await.map_err(message)
+}
+
+pub(crate) async fn sync_now() -> Result<(), String> {
+    api::storage::sync_now().await.map_err(message)
+}
+
+/// Open the authorization URL in a popup and wait for the `code`/`state`
+/// it comes back with. `None` is a window the user closed — not a failure,
+/// and nothing for the kernel to hear about.
+pub(crate) async fn open_popup(url: String) -> Option<(String, String)> {
+    api::shell::open_popup(url).await
+}
+
 /// Wall-clock now, epoch milliseconds, for [`crate::voice::coarse_age`].
 ///
 /// `std`'s clock, not an import of our own: the visor world declares no

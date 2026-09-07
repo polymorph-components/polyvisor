@@ -398,12 +398,21 @@ impl Kernel {
         // operations first would have nothing to attach them to.
         let (keyhive, read_back) = engine.enroll_keyhive(&card, joiner_key).await?;
         let us = engine.us_save().await?;
+        // The group's store-name key travels here and nowhere else: it is a
+        // group secret, and this connection is the one the two users have
+        // just compared six digits over. Without it the joiner would be a
+        // member of the group that writes to a *different* set of names in
+        // the same Drive folder — two stores, neither converging.
+        let name_key = engine
+            .name_key()
+            .ok_or_else(|| "this device has no group to enroll into".to_string())?;
         send_frame(
             transport.as_ref(),
             &Frame::Enroll {
                 us,
                 keyhive,
                 read_back,
+                name_key: name_key.to_vec(),
             },
         )
         .await?;
@@ -566,18 +575,23 @@ impl Kernel {
         send_frame(transport.as_ref(), &Frame::ConfirmJoin).await?;
         self.set_phase(Phase::AwaitingPeer);
 
-        let (us, keyhive, read_back) = match frames.next().await {
+        let (us, keyhive, read_back, name_key) = match frames.next().await {
             Some(Frame::Enroll {
                 us,
                 keyhive,
                 read_back,
-            }) => (us, keyhive, read_back),
+                name_key,
+            }) => (us, keyhive, read_back, name_key),
             Some(Frame::Cancel) => return Err(cancelled()),
             Some(_) => return Err(out_of_order()),
             None => return Err(gone()),
         };
+        let name_key: [u8; 32] = name_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| "that device sent a malformed store key".to_string())?;
         let engine = self.engine().map_err(|e| e.message)?;
-        engine.adopt_us(&us, adder_key).await?;
+        engine.adopt_us(&us, adder_key, name_key).await?;
         engine.adopt_keyhive(&keyhive, &read_back).await?;
         self.checkpoint().await.map_err(|e| e.message)?;
         Ok(())
@@ -721,6 +735,12 @@ enum Frame {
         /// this connection is the one the two users just compared six digits
         /// over.
         read_back: Vec<u8>,
+        /// The group's store-name key (`polyvisor_engine::Engine::name_key`):
+        /// what every object in the user's durable store is named under. A
+        /// group secret, on the same connection and for the same reason as
+        /// `read_back` — a joiner that minted its own would write a second,
+        /// invisible store beside the group's.
+        name_key: Vec<u8>,
     },
     Refused,
     Cancel,

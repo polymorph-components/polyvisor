@@ -211,7 +211,9 @@ signed commits, keyhive's signed ops) — so a device that pulls from the
 store converges the same way it would from a peer, and the store needs no
 schema of its own. Object names are `hex(HMAC(name-key, tree-id ‖ item
 id))` under one folder per group in the user's Drive `appDataFolder`;
-the name key is derived from the device seed's group secret so every
+the name key is minted by the group's founding device (from its seed
+mixed with boot entropy), rests in the sealed engine snapshot, and
+reaches joiners inside the SAS-authenticated ENROLL frame, so every
 device in the group derives the same names and a store operator learns
 only that N objects exist. Tokens rest sealed beside the device seed;
 the OAuth code is the one artifact that crosses the port, bound to a PKCE
@@ -349,7 +351,7 @@ native tests, so browser gates are mandatory for every visor change.
 - **M4** storage: Google Drive as the first (and, for now, only) dumb
   store — user-only, keyed object names, the OAuth ceremony split
   between kernel (PKCE, exchange, sealed tokens) and shell (the popup),
-  push after every local change and pull at boot and on demand; a fake
+  push and pull after every local change, at boot, and on demand; a fake
   Drive in e2e. Provider-as-component (the `provider` world, per-
   destination egress, the picker) waits for a second provider: one
   backend does not justify a boundary. S3 is deferred; Drive is what a

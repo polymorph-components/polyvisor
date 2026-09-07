@@ -20,7 +20,7 @@
 
 use dioxus::prelude::*;
 
-use crate::kernel::{self, App, Entry, Event, Member, Peer, SessionId, Status};
+use crate::kernel::{self, App, Binding, Entry, Event, Member, Peer, SessionId, Status};
 use crate::state::{
     Action, Drawer, Gate, Phase, Rest, Tenant, Tier, boot_drawer, claim_code, grouped,
 };
@@ -146,6 +146,24 @@ async fn read_members(mut members: Signal<Vec<Member>>, mut notice: Signal<Optio
     }
 }
 
+/// The store binding (internal.wit `storage.status`). Read alongside the
+/// peers and the group: this world has no timer, so a store's state is
+/// only ever as fresh as the last press that read it.
+async fn read_storage(mut binding: Signal<Option<Binding>>, mut notice: Signal<Option<Notice>>) {
+    match kernel::storage_status().await {
+        // Guarded like `read_status`: `Signal::set` marks the scope dirty
+        // whether or not the value moved, and this is re-read on every
+        // Settings press and every storage act.
+        Ok(b) => {
+            let changed = binding.read().as_ref() != Some(&b);
+            if changed {
+                binding.set(Some(b));
+            }
+        }
+        Err(e) => notice.set(Some(Notice::Plain(e))),
+    }
+}
+
 /// Where the ceremony stands, from the kernel.
 ///
 /// `pairing.status` is the ceremony's one authority: the visor never
@@ -206,6 +224,7 @@ pub(crate) fn Visor() -> Element {
     let peers = use_signal(Vec::<Peer>::new);
     let members = use_signal(Vec::<Member>::new);
     let pairing_phase = use_signal(Phase::default);
+    let binding = use_signal(|| None::<Binding>);
 
     // Two orderings, both between a spawned read and a user's write. They
     // are `CopyValue` rather than `Signal` on purpose: a generation is
@@ -371,11 +390,21 @@ pub(crate) fn Visor() -> Element {
         });
     });
 
+    // The Storage section's own re-read: the press that opens Settings,
+    // and every act in the section (connect, sync, disconnect), each of
+    // which changes what `storage.status` answers.
+    let refresh_storage = use_callback(move |()| {
+        spawn(async move {
+            read_storage(binding, notice).await;
+        });
+    });
+
     let show_settings = use_callback(move |t: Tenant| {
         let next = drawer().reduce(Action::Toggle(t));
         set_drawer(next);
         if next == Drawer::Open(Tenant::Settings) {
             refresh_devices.call(());
+            refresh_storage.call(());
         }
     });
 
@@ -583,6 +612,11 @@ pub(crate) fn Visor() -> Element {
                             KeptNote { petname: petname.clone(), rest }
                         } else {
                             KeepSheet { on_kept }
+                        }
+
+                        StorageSection {
+                            binding: binding.read().clone(),
+                            on_refresh: refresh_storage,
                         }
 
                         DevicesSection {
@@ -853,6 +887,159 @@ fn KeepSheet(on_kept: EventHandler<bool>) -> Element {
                     on_kept.call(kernel::request_persistence().await);
                 },
                 "Keep"
+            }
+            if let Some(message) = error() {
+                div { class: "{Voice::Framework.class()} sheet-error", "{message}" }
+            }
+        }
+    }
+}
+
+/// Durable storage on a dumb store the user owns (internal.wit `storage`).
+///
+/// The section is arranged around one fact: the kernel is the only
+/// authority on what a binding is doing. `binding.state` is the kernel's
+/// own framework voice and is rendered unparaphrased, exactly as a peer's
+/// state is; the visor adds no sentence about a store beyond the ones it
+/// composes about its own acts (a window the user closed, a field left
+/// empty).
+///
+/// The client pair is typed here and goes straight through to
+/// `oauth-start`. Nothing about it is kept: the kernel seals what it needs
+/// and the fields are cleared, so the trusted pixels are not a second home
+/// for the user's credentials.
+///
+/// The ceremony's shape is fixed by the split in internal.wit `storage`:
+/// the kernel mints the URL (`oauth-start`), the *page* opens the window
+/// (`shell.open-popup`, which is why the visor can run this at all), and
+/// the kernel exchanges the pair the window brought back
+/// (`oauth-complete`). The visor never sees a token and never sees a
+/// window.
+#[component]
+fn StorageSection(binding: Option<Binding>, on_refresh: EventHandler<()>) -> Element {
+    let now = kernel::now_ms();
+    let mut client_id = use_signal(String::new);
+    let mut client_secret = use_signal(String::new);
+    let mut error = use_signal(|| None::<String>);
+
+    // Same shape as the Devices section's `acted`: show the kernel's
+    // refusal if it refused, then re-read, because what the binding is now
+    // is the kernel's answer and never this button's assumption about it.
+    let mut acted = move |result: Result<(), String>| {
+        match result {
+            Ok(()) => error.set(None),
+            Err(e) => error.set(Some(e)),
+        }
+        on_refresh.call(());
+    };
+
+    let connect = move |_| async move {
+        // An empty client id is refused by the kernel, in the kernel's own
+        // words (`storage.oauth-start`). The visor does not compose a
+        // second sentence for it.
+        let url = match kernel::oauth_start(client_id(), client_secret()).await {
+            Ok(url) => url,
+            Err(e) => {
+                error.set(Some(e));
+                return;
+            }
+        };
+        match kernel::open_popup(url).await {
+            // `none` is a window the user closed, or one the browser
+            // refused to open (internal.wit `shell.open-popup`). Neither is
+            // a failure the kernel has to hear about: the ceremony it
+            // minted is simply not completed, and pressing Connect again
+            // mints another.
+            None => {
+                error.set(Some(
+                    "the authorization window closed before it came back".into(),
+                ));
+                on_refresh.call(());
+            }
+            Some((code, state)) => {
+                client_id.set(String::new());
+                client_secret.set(String::new());
+                acted(kernel::oauth_complete(code, state).await);
+            }
+        }
+    };
+
+    rsx! {
+        div { class: "sheet",
+            div { class: "sheet-head",
+                span { class: "{Voice::Framework.class()}", "Storage" }
+            }
+            match binding.as_ref() {
+                // Before the first `storage.status` answers. Not "not
+                // connected": that is a state the kernel says, and saying
+                // it here would be the visor guessing.
+                None => rsx! {
+                    span { class: "{Voice::Framework.class()} placeholder", "reading the store…" }
+                },
+                Some(b) => rsx! {
+                    // The kernel's own words, whichever of the four they
+                    // are — including "needs re-authorization: <why>",
+                    // whose reason the visor neither shortens nor rewrites.
+                    div { id: "visor-storage-state", class: "{Voice::Framework.class()}", "{b.state}" }
+
+                    if b.connected() {
+                        div { class: "{Voice::Framework.class()}",
+                            if b.last_pull == 0 {
+                                "nothing pulled yet"
+                            } else {
+                                "last pull {coarse_age(now, b.last_pull)} ago"
+                            }
+                        }
+                        div { class: "{Voice::Framework.class()}",
+                            if b.last_push == 0 {
+                                "nothing pushed yet"
+                            } else {
+                                "last push {coarse_age(now, b.last_push)} ago"
+                            }
+                        }
+                        button {
+                            onclick: move |_| async move { acted(kernel::sync_now().await) },
+                            "Sync now"
+                        }
+                        button {
+                            // Forgets the tokens; internal.wit `storage`:
+                            // "does not touch the store". So the sentence
+                            // says what happens and does not imply the
+                            // user's own objects went anywhere.
+                            onclick: move |_| async move { acted(kernel::storage_disconnect().await) },
+                            "Disconnect"
+                        }
+                    }
+
+                    if b.needs_ceremony() {
+                        label {
+                            span { class: "{Voice::Framework.class()}", "client id" }
+                            input {
+                                r#type: "text",
+                                value: "{client_id}",
+                                oninput: move |e| client_id.set(e.value()),
+                            }
+                        }
+                        label {
+                            span { class: "{Voice::Framework.class()}", "client secret" }
+                            input {
+                                r#type: "text",
+                                value: "{client_secret}",
+                                oninput: move |e| client_secret.set(e.value()),
+                            }
+                        }
+                        // internal.wit `storage.oauth-client`, said once and
+                        // plainly: Google documents the installed-app secret
+                        // as not treated as a secret, and this framework
+                        // bakes none in. A `type=password` field above would
+                        // contradict exactly that, which is why neither is
+                        // one.
+                        div { class: "{Voice::Framework.class()}",
+                            "an installed-app client pair — the secret gates nothing without your consent, and nothing is built in"
+                        }
+                        button { onclick: connect, "Connect Google Drive" }
+                    }
+                },
             }
             if let Some(message) = error() {
                 div { class: "{Voice::Framework.class()} sheet-error", "{message}" }

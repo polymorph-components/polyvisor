@@ -289,8 +289,11 @@ interface storage {
     record binding {
         /// "gdrive" is the only provider in M4.
         provider: string,
-        /// Framework voice: "not connected", "connected as <email>",
-        /// "connected", "needs re-authorization: <why>".
+        /// Framework voice: "not connected", "connected",
+        /// "connected; the last sync did not finish: <why>" (a transient
+        /// failure; the next mutation or "sync now" retries), or
+        /// "needs re-authorization: <why>" (the token was refused and a
+        /// refresh did not help; the ceremony must run again).
         state: string,
         /// Epoch milliseconds of the last successful pull and push, 0 if
         /// never.

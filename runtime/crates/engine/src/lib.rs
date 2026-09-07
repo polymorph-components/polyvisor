@@ -29,7 +29,7 @@ mod vault;
 pub use clock::EngineClock;
 pub use doc::{TaskSnapshot, TodoItem};
 pub use ed25519_dalek::VerifyingKey;
-pub use storage::{AppState, Snapshot, TreeState};
+pub use storage::{AppState, Item, Snapshot, StoreItem, TreeState};
 pub use subduction_protocol::peer_id::PeerId;
 pub use transport::{DynTransport, EngineTransport};
 pub use us::{Member, us_tree};
@@ -45,7 +45,11 @@ use vault::Vault;
 use ed25519_dalek::SigningKey;
 use future_form::Local;
 use futures::future::LocalBoxFuture;
-use sedimentree_core::{blob::Blob, id::SedimentreeId, loose_commit::id::CommitId};
+use sedimentree_core::{
+    blob::{Blob, BlobMeta},
+    id::SedimentreeId,
+    loose_commit::id::CommitId,
+};
 use sha2::{Digest as _, Sha256};
 use subduction_crypto::signer::memory::MemorySigner;
 use subduction_protocol::{
@@ -151,6 +155,16 @@ pub struct Engine<T: Transport<Local> + 'static> {
     /// The seed the vault's CSPRNG is built from: the device seed mixed with
     /// this boot's entropy.
     vault_rng_seed: [u8; 32],
+    /// The group's store-name key (`storage::Snapshot::name_key`). `None`
+    /// until the group document is opened, which mints one for a founder and
+    /// [`Engine::adopt_us`] replaces for a joiner.
+    name_key: RefCell<Option<[u8; 32]>>,
+    /// What a founder mints its name key from: the device seed mixed with
+    /// this boot's fresh entropy, domain-separated. The engine has no
+    /// randomness seam of its own — `entropy` is drawn from the kernel's
+    /// `Rng` at every start (see [`Engine::new`]) — and this is that draw,
+    /// kept until the group document is first opened.
+    name_key_seed: [u8; 32],
     /// Restored-but-not-yet-hydrated state. `Engine::new` cannot talk to its
     /// own driver — the caller has not spawned it yet — so a restored
     /// snapshot's trees are handed to the driver on the first async call.
@@ -186,7 +200,9 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         let mut hydrate = Vec::new();
         let mut us: Option<UsDoc> = None;
         let mut pending_vault: Option<VaultState> = None;
+        let mut name_key: Option<[u8; 32]> = None;
         if let Some(state) = storage_state {
+            name_key = state.name_key;
             for app in state.apps {
                 let tree = tasks_tree(&app.app);
                 storage.restore(tree, app.state.commits, app.state.fragments);
@@ -247,6 +263,8 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             pending_vault: RefCell::new(pending_vault),
             vault_rng_seed: mix(b"polyvisor:keyhive-rng", &seed, &entropy),
             us: RefCell::new(us),
+            name_key: RefCell::new(name_key),
+            name_key_seed: mix(b"polyvisor:name-key", &seed, &entropy),
             members,
             conns: RefCell::new(Vec::new()),
             pending_hydration: RefCell::new((!hydrate.is_empty()).then_some(hydrate)),
@@ -405,7 +423,17 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     /// commits are removed from the driver and from storage before the new
     /// document takes its place. Left behind they would be absorbed straight
     /// back in on the next turn — and pushed to the group on the first sync.
-    pub async fn adopt_us(&self, bytes: &[u8], adder: [u8; 32]) -> Result<(), String> {
+    /// `name_key` is the group's store-name key, from the same ENROLL frame:
+    /// adopting a group means writing to — and reading from — the store that
+    /// group already uses, and the names there are derived under this key.
+    /// It replaces the group-of-one's key for the same reason the document
+    /// does; the objects the old key named were this device's alone.
+    pub async fn adopt_us(
+        &self,
+        bytes: &[u8],
+        adder: [u8; 32],
+        name_key: [u8; 32],
+    ) -> Result<(), String> {
         self.hydrate().await?;
         // Parsed and checked *before* a byte of local state is touched: a
         // document that does not open, or that does not hold both this
@@ -429,6 +457,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         self.storage.forget_tree(tree);
 
         *self.us.borrow_mut() = Some(adopted);
+        *self.name_key.borrow_mut() = Some(name_key);
         self.refresh_members();
 
         // Resubscribe: `remove_tree` took the tree out of the driver's
@@ -539,6 +568,145 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         }
     }
 
+    // -- the durable store ---------------------------------------------------
+
+    /// The group's store-name key, or `None` for a device with no group yet.
+    ///
+    /// The kernel derives every name it writes to the user's store from this
+    /// (docs/design.md "Storage"), so `None` is also the answer to "is there
+    /// anything to store": a device with no group document has nothing a
+    /// second device of the group could want.
+    #[must_use]
+    pub fn name_key(&self) -> Option<[u8; 32]> {
+        *self.name_key.borrow()
+    }
+
+    /// Every item this device holds, across every tree: what the durable
+    /// store's push walks.
+    ///
+    /// The signed envelope is carried verbatim, exactly as the checkpoint
+    /// carries it (`crate::storage`): re-signing another device's commit on
+    /// the way to the store would relabel its authorship as ours.
+    #[must_use]
+    pub fn items(&self) -> Vec<StoreItem> {
+        self.storage.all_items()
+    }
+
+    /// Install items a *store* handed back — another device of this group
+    /// pushed them — and apply whatever they unlock. Answers whether anything
+    /// was new, which is the kernel's cue to checkpoint.
+    ///
+    /// This is the restore path, not the authoring path: the items go into
+    /// storage as the signed envelopes they arrived as and the driver is told
+    /// about them with `hydrate_tree`, exactly as `Engine::new` +
+    /// [`Engine::hydrate`] do for a checkpoint's items. `add_commits` would
+    /// have been wrong twice over — it re-signs the commit as this device's,
+    /// and it re-seals an app blob that is already an envelope.
+    ///
+    /// Trees are ingested keyhive-first and then the group document, for the
+    /// reason [`Engine::hydrate`] gives: the keyhive events are the material
+    /// that turns a blob this device cannot open into one it can.
+    pub async fn ingest_items(&self, items: Vec<StoreItem>) -> Result<bool, String> {
+        self.hydrate().await?;
+        self.open_us().await?;
+        let mut by_tree: BTreeMap<SedimentreeId, Vec<Item>> = BTreeMap::new();
+        let mut fresh = false;
+        // The member keys, read once: the store is not a peer, so nothing
+        // else has checked who authored what it hands back.
+        let members: std::collections::BTreeSet<[u8; 32]> = self.members.borrow().clone();
+        for item in items {
+            if self.accept(&members, &item) {
+                fresh = true;
+                by_tree
+                    .entry(SedimentreeId::new(item.tree))
+                    .or_default()
+                    .push(Item {
+                        signed: item.signed,
+                        blob: item.blob,
+                    });
+            }
+        }
+        if !fresh {
+            return Ok(false);
+        }
+        let mut order: Vec<SedimentreeId> = by_tree.keys().copied().collect();
+        order.sort_by_key(|tree| {
+            if *tree == keyhive_tree() {
+                0
+            } else if *tree == us_tree() {
+                1
+            } else {
+                2
+            }
+        });
+        for tree in order {
+            let items = by_tree.remove(&tree).unwrap_or_default();
+            self.storage.restore(tree, items, Vec::new());
+            let (commits, fragments) = self.storage.metadata(tree);
+            // Merged, not replaced: `Command::HydrateTree` adds each commit to
+            // the resident tree (subduction_protocol/src/core_machine.rs:284),
+            // so handing it the whole tree again is idempotent.
+            self.handle
+                .hydrate_tree(tree, commits, fragments)
+                .await
+                .map_err(|e| e.to_string())?;
+            let _landed = self.absorb(tree).await;
+        }
+        Ok(true)
+    }
+
+    /// Whether one item a store handed back may be installed, and is news.
+    ///
+    /// **A store is not a peer.** Everything arriving over a connection has
+    /// been through the handshake (the peer proved its key), the kernel's
+    /// membership check and `GroupPolicy`; an object read out of Drive has
+    /// been through none of those, and the bytes are whatever was under that
+    /// name. So every claim the object makes is checked here against the
+    /// envelope itself, and the envelope against the group:
+    ///
+    /// - the **signature** verifies (`try_verify`, not the trusted-storage
+    ///   decode: the trusted decode reads the fields of an envelope nobody
+    ///   has checked, which is exactly the situation it documents itself as
+    ///   being wrong for);
+    /// - the **issuer is a member** — the same set `GroupPolicy` consults for
+    ///   a remote peer's operations, and with no exception for the group
+    ///   document, because the live path has none either. What that costs is
+    ///   stated: a commit authored by a device this one has not yet learned
+    ///   of is skipped, and lands on a later pass once the enrollment that
+    ///   names it has been absorbed (the keyhive and `us` trees are ingested
+    ///   before the app trees, so that pass is usually the same one);
+    /// - the **tree** the object was filed under is the one the commit names
+    ///   (`sedimentree_id`), so an item cannot be moved between trees;
+    /// - the **commit id** the object was named by is the commit's own head;
+    /// - the **blob** is the one the commit committed to (`BlobMeta`), so the
+    ///   signed metadata and the bytes beside it cannot be from two different
+    ///   items.
+    ///
+    /// A failing item is skipped, not fatal: the folder is the user's own
+    /// Drive and one bad object must not stop the rest from landing.
+    fn accept(&self, members: &std::collections::BTreeSet<[u8; 32]>, item: &StoreItem) -> bool {
+        let Ok(signed) = subduction_crypto::signed::Signed::<
+            sedimentree_core::loose_commit::LooseCommit,
+        >::try_decode(&item.signed) else {
+            return false;
+        };
+        let Ok(verified) = signed.try_verify() else {
+            return false;
+        };
+        if !members.contains(&verified.issuer().to_bytes()) {
+            return false;
+        }
+        let payload = verified.payload();
+        let tree = SedimentreeId::new(item.tree);
+        if payload.sedimentree_id() != tree
+            || payload.head() != CommitId::new(item.commit)
+            || *payload.blob_meta() != BlobMeta::new(&Blob::new(item.blob.clone()))
+        {
+            return false;
+        }
+        !self.storage.holds(tree, payload.head())
+    }
+
     // -- checkpointing -------------------------------------------------------
 
     /// Everything needed to reconstruct this engine: each app's automerge
@@ -563,12 +731,14 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             .as_ref()
             .map(|doc| (doc.tree(), doc.save()));
         let keyhive = vault.is_some().then(keyhive_tree);
+        let name_key = *self.name_key.borrow();
         Ok(self.storage.snapshot(
             apps.iter()
                 .map(|(app, doc)| (app.clone(), doc.tree(), doc.save())),
             us,
             keyhive,
             vault,
+            name_key,
         ))
     }
 
@@ -602,6 +772,18 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         // already and would otherwise never build the keyhive that document
         // names.
         self.open_vault().await?;
+        // Also before the early return, and for a second reason: a checkpoint
+        // written before the store existed restores a group document with no
+        // name key beside it, and that device would otherwise never mint one
+        // — it has a group already, so it never takes the founding branch
+        // below, and `storage` would sit there with nothing to name.
+        //
+        // Minting here is safe for a joiner too: `adopt_us` replaces the key
+        // along with the document, because the names it must derive are the
+        // ones the group already writes under.
+        if self.name_key.borrow().is_none() {
+            *self.name_key.borrow_mut() = Some(self.name_key_seed);
+        }
         if self.us.borrow().is_some() {
             return Ok(());
         }

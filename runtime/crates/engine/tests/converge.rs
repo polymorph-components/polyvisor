@@ -12,7 +12,7 @@ use futures::future::LocalBoxFuture;
 use futures::{executor::LocalPool, task::LocalSpawnExt as _};
 use polyvisor_engine::{
     AppState, Engine, EngineClock, EngineEvent, EngineNotify, LocalFuture, Snapshot, Spawner,
-    TaskSnapshot, TreeState,
+    StoreItem, TaskSnapshot, TreeState,
 };
 use subduction_protocol::event::Direction;
 use subduction_runtime::memory::transport::MemoryTransport;
@@ -193,6 +193,7 @@ async fn enroll(adder: &TestEngine, joiner: &TestEngine) {
         .adopt_us(
             &adder.us_save().await.unwrap(),
             adder.verifying_key().to_bytes(),
+            adder.name_key().expect("the adder founded a group"),
         )
         .await
         .unwrap();
@@ -462,11 +463,11 @@ fn a_group_this_device_is_not_in_is_not_adopted() {
         // A's group of one, which B was never enrolled into.
         let orphan = ea.us_save().await.unwrap();
         let adder = ea.verifying_key().to_bytes();
-        let why = eb.adopt_us(&orphan, adder).await.unwrap_err();
+        let why = eb.adopt_us(&orphan, adder, [7u8; 32]).await.unwrap_err();
         assert!(why.contains("this one is not in"), "{why}");
 
         let why = eb
-            .adopt_us(b"not a document at all", adder)
+            .adopt_us(b"not a document at all", adder, [7u8; 32])
             .await
             .unwrap_err();
         assert!(why.contains("cannot read"), "{why}");
@@ -478,7 +479,7 @@ fn a_group_this_device_is_not_in_is_not_adopted() {
             .await
             .unwrap();
         let stranger = ec.us_save().await.unwrap();
-        let why = eb.adopt_us(&stranger, adder).await.unwrap_err();
+        let why = eb.adopt_us(&stranger, adder, [7u8; 32]).await.unwrap_err();
         assert!(why.contains("not in itself"), "{why}");
 
         assert_eq!(members(&eb).await.len(), 1, "B is still its own group");
@@ -528,6 +529,7 @@ fn commits_at_rest_are_envelopes_a_stranger_cannot_open() {
             })
             .collect(),
         us: None,
+        name_key: None,
         keyhive: None,
         vault: None,
     };
@@ -618,9 +620,13 @@ fn a_joiner_walks_the_ancestry_from_a_single_key() {
         );
         let trimmed = bincode::serialize(&only_newest).unwrap();
 
-        eb.adopt_us(&ea.us_save().await.unwrap(), ea.verifying_key().to_bytes())
-            .await
-            .unwrap();
+        eb.adopt_us(
+            &ea.us_save().await.unwrap(),
+            ea.verifying_key().to_bytes(),
+            ea.name_key().expect("A founded a group"),
+        )
+        .await
+        .unwrap();
         eb.adopt_keyhive(&keyhive, &trimmed).await.unwrap();
 
         let (ta, tb) = MemoryTransport::pair();
@@ -717,5 +723,149 @@ fn a_card_for_another_key_is_not_enrolled() {
         ea.enroll_keyhive(&card, eb.verifying_key().to_bytes())
             .await
             .unwrap();
+    });
+}
+
+// -- what a store hands back -------------------------------------------------
+
+/// The app-tree item A authored for its one task, as the store carries it.
+fn app_item(engine: &TestEngine) -> StoreItem {
+    let tree = *polyvisor_engine::tasks_tree(APP).as_bytes();
+    engine
+        .items()
+        .into_iter()
+        .find(|item| item.tree == tree)
+        .expect("the task's commit is in the app tree")
+}
+
+#[test]
+fn a_store_does_not_get_to_decide_what_an_item_is() {
+    // A store is not a peer: nothing has checked a signature, a membership or
+    // a name on the way in, so `ingest_items` checks all of them. Each case
+    // here is one of those checks, and the pristine item at the end is the
+    // control that says the rejections were the tampering and not the harness.
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 1, None);
+    let b = device(&pool, 2, None);
+    // A third device, in nobody's group: what an item authored by a stranger
+    // and filed under the group's own name looks like.
+    let outsider = device(&pool, 3, None);
+    let (ea, eb, eo) = (
+        Rc::clone(&a.engine),
+        Rc::clone(&b.engine),
+        Rc::clone(&outsider.engine),
+    );
+
+    pool.run_until(async move {
+        enroll(&ea, &eb).await;
+        ea.tasks_add(APP, "buy milk".into()).await.unwrap();
+        eo.tasks_add(APP, "not from the group".into())
+            .await
+            .unwrap();
+        let good = app_item(&ea);
+        let stranger = app_item(&eo);
+
+        // B holds A's group and A's keyhive, and nothing of the task yet.
+        assert!(eb.tasks_items(APP).await.unwrap().items.is_empty());
+
+        let forged = StoreItem {
+            signed: {
+                let mut bytes = good.signed.clone();
+                // The last bytes are the signature (subduction_crypto's
+                // envelope is schema ‖ issuer ‖ fields ‖ signature).
+                let last = bytes.len() - 1;
+                bytes[last] ^= 0x01;
+                bytes
+            },
+            ..good.clone()
+        };
+        let unsigned = StoreItem {
+            signed: b"not an envelope at all".to_vec(),
+            ..good.clone()
+        };
+        let relabelled_tree = StoreItem {
+            tree: *polyvisor_engine::us_tree().as_bytes(),
+            ..good.clone()
+        };
+        let relabelled_commit = StoreItem {
+            commit: [9u8; 32],
+            ..good.clone()
+        };
+        let swapped_blob = StoreItem {
+            blob: {
+                let mut blob = good.blob.clone();
+                blob.push(0);
+                blob
+            },
+            ..good.clone()
+        };
+
+        for (what, item) in [
+            ("a signature that does not verify", forged),
+            ("bytes that are not an envelope", unsigned),
+            ("an item filed under another tree", relabelled_tree),
+            ("an item named by another commit id", relabelled_commit),
+            ("a blob the commit did not commit to", swapped_blob),
+            ("an item authored outside the group", stranger),
+        ] {
+            assert!(
+                !eb.ingest_items(vec![item]).await.unwrap(),
+                "{what} was installed"
+            );
+            assert!(
+                eb.tasks_items(APP).await.unwrap().items.is_empty(),
+                "{what} reached the document"
+            );
+        }
+
+        // The control: the same item, untouched, does land — and the
+        // document it lands in is the one the group is sharing.
+        assert!(eb.ingest_items(vec![good.clone()]).await.unwrap());
+        assert_eq!(
+            titles(&eb.tasks_items(APP).await.unwrap()),
+            vec!["buy milk"]
+        );
+        // And again is not news: the store re-offering what this device holds
+        // must not read as a change to checkpoint.
+        assert!(!eb.ingest_items(vec![good]).await.unwrap());
+    });
+}
+
+#[test]
+fn a_checkpoint_written_before_the_store_existed_still_mints_a_name_key() {
+    // The pre-M4 shape: a device with a group document and no name key. It
+    // never takes the founding branch again, so a mint that only ran there
+    // would leave it with a store it cannot name a single object in.
+    let mut pool = LocalPool::new();
+    let sealed = {
+        let a = device(&pool, 1, None);
+        let ea = Rc::clone(&a.engine);
+        pool.run_until(async move {
+            ea.tasks_add(APP, "buy milk".into()).await.unwrap();
+            ea.snapshot().await.unwrap()
+        })
+    };
+    assert!(sealed.us.is_some(), "the device founded its group");
+    let pre_m4 = Snapshot {
+        name_key: None,
+        ..sealed
+    };
+
+    let restored = device(&pool, 1, Some(pre_m4));
+    let engine = Rc::clone(&restored.engine);
+    pool.run_until(async move {
+        assert_eq!(engine.name_key(), None, "nothing was restored");
+        // The first touch of the group document is what mints it.
+        let _members = engine.members().await.unwrap();
+        assert!(
+            engine.name_key().is_some(),
+            "a restored device can name its store's objects"
+        );
+        // And it is carried from then on.
+        assert_eq!(
+            engine.snapshot().await.unwrap().name_key,
+            engine.name_key(),
+            "the mint rides the next checkpoint"
+        );
     });
 }

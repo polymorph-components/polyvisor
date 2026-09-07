@@ -50,6 +50,7 @@ const I = {
   apps: "polyvisor:internal/apps@0.1.0",
   sync: "polyvisor:internal/sync@0.1.0",
   pairing: "polyvisor:internal/pairing@0.1.0",
+  storage: "polyvisor:internal/storage@0.1.0",
   events: "polyvisor:internal/events@0.1.0",
   eventSource: "polyvisor:internal/event-source@0.1.0",
   appServices: "polyvisor:internal/app-services@0.1.0",
@@ -100,6 +101,17 @@ interface Hello {
    * the tab read and passed on. Like the device id, it is deployment
    * configuration that exists before the kernel does. */
   relay: string;
+  /** This page's URL without query or fragment
+   * (`lifecycle.boot-config.page-url`): the OAuth redirect the storage
+   * ceremony comes back to. Only a window knows its own URL, so like the
+   * device id and the relay it arrives from the tab. */
+  pageUrl: string;
+  /** Google Drive's API and OAuth bases, when the home origin publishes
+   * its own (`config.json`'s `drive_api`/`drive_oauth`; the e2e harness
+   * points both at a fake). `undefined` is Google's, which is the kernel's
+   * default and not this glue's business to spell. */
+  driveApi?: string;
+  driveOauth?: string;
   /** Resolves when this worker actually HOLDS `pm-device-<device>`. */
   lock: Promise<void>;
 }
@@ -232,7 +244,8 @@ async function loadRuntime(device: string): Promise<Exports> {
  * the first tab says which device this worker is: the id exists before the
  * kernel does and only a tab can supply it. */
 const ready: Promise<Exports> = (async () => {
-  const { device, homeOrigin, relay, lock } = await helloed;
+  const { device, homeOrigin, relay, pageUrl, driveApi, driveOauth, lock } =
+    await helloed;
   // Before the kernel exists: `lifecycle.boot` runs the sweep, and a sweep
   // that ran while a sibling worker's lock was merely REQUESTED would read
   // that device as dead and collect a live namespace. Held first, booted
@@ -240,12 +253,22 @@ const ready: Promise<Exports> = (async () => {
   await lock;
   const exports_ = await loadRuntime(device);
   const boot = exports_[I.lifecycle].boot as (
-    c: { homeOrigin: string; device: string; relay: string },
+    c: {
+      homeOrigin: string;
+      device: string;
+      relay: string;
+      pageUrl: string;
+      driveApi: string | undefined;
+      driveOauth: string | undefined;
+    },
   ) => Promise<void>;
   // The home origin without a trailing slash, per `lifecycle.boot-config`.
   // `location.origin` is spelled that way, and every tab that can reach this
   // worker is on the home origin by construction.
-  await boot({ homeOrigin, device, relay });
+  // `option<string>` lowers as `T | undefined` (m1-context.md "Value
+  // mapping"), so an absent base is passed as the absence itself rather
+  // than as an empty string the kernel would have to re-interpret.
+  await boot({ homeOrigin, device, relay, pageUrl, driveApi, driveOauth });
   return exports_;
 })();
 
@@ -388,8 +411,19 @@ self.onconnect = (ev: MessageEvent) => {
       const device = String((data as { device: string }).device);
       const homeOrigin = String((data as { homeOrigin: string }).homeOrigin);
       const relay = String((data as { relay: string }).relay);
+      const pageUrl = String((data as { pageUrl: string }).pageUrl);
+      const optional = (v: unknown) =>
+        typeof v === "string" && v !== "" ? v : undefined;
       if (hello === undefined) {
-        hello = { device, homeOrigin, relay, lock: holdDeviceLock(device) };
+        hello = {
+          device,
+          homeOrigin,
+          relay,
+          pageUrl,
+          driveApi: optional((data as { driveApi?: unknown }).driveApi),
+          driveOauth: optional((data as { driveOauth?: unknown }).driveOauth),
+          lock: holdDeviceLock(device),
+        };
         announce(hello);
       } else if (hello.device !== device) {
         // One worker, one device (docs/design.md "Devices"). Two ids on one
@@ -458,6 +492,21 @@ self.onconnect = (ev: MessageEvent) => {
       confirm: async () => (await ready)[I.pairing].confirm(),
       cancel: async () => (await ready)[I.pairing].cancel(),
       status: async () => (await ready)[I.pairing].status(),
+    }),
+    // Control port only, like `pairing`: connecting a store is a ceremony
+    // in the trusted pixels, and an app session has no business naming a
+    // provider — still less holding the one-shot code that crosses here.
+    // The tokens themselves never cross this port: `oauth-complete` hands
+    // the kernel a code, and what comes back the kernel seals for itself
+    // (internal.wit `storage`).
+    [I.storage]: draining({
+      status: async () => (await ready)[I.storage].status(),
+      oauthStart: async (client: unknown) =>
+        (await ready)[I.storage].oauthStart(client),
+      oauthComplete: async (code: string, state: string) =>
+        (await ready)[I.storage].oauthComplete(code, state),
+      disconnect: async () => (await ready)[I.storage].disconnect(),
+      syncNow: async () => (await ready)[I.storage].syncNow(),
     }),
     [I.apps]: draining({
       installed: async () => (await ready)[I.apps].installed(),

@@ -11,11 +11,12 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 mod apps;
 mod checkpoint;
 mod device;
+mod drive;
 mod events;
 mod pairing;
 mod seal;
@@ -24,6 +25,7 @@ mod sync;
 
 pub use apps::{AppInfo, AssetInfo, ComponentArtifacts};
 pub use device::{DeviceStatus, IndexRow, Rest, State, Tier};
+pub use drive::{Binding, HttpResponse};
 pub use events::Event;
 pub use pairing::Phase;
 /// The task types are the engine's: the kernel no longer holds a list of its
@@ -193,10 +195,37 @@ pub trait NetHandle {
     fn accept(&self) -> LocalFuture<'_, Result<Accepted, String>>;
 }
 
-/// HTTP GET. `Err` carries a framework-voice reason (transport failure or a
-/// non-2xx status); the kernel never inspects it beyond passing it on.
+/// HTTP. One method, because the store needs every verb and every status:
+/// the Drive client reads 401 to decide to refresh and 404 to decide a name
+/// is absent (`crate::drive`), so a seam that collapsed status into `Err`
+/// could not carry it.
+///
+/// `Err` is a *transport* failure — nothing was answered — and carries a
+/// framework-voice reason the kernel passes on unread. A status the caller
+/// dislikes is an answer, not an error.
 pub trait Fetch {
-    fn get(&self, url: String) -> LocalFuture<'_, Result<Vec<u8>, String>>;
+    fn request(
+        &self,
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> LocalFuture<'_, Result<HttpResponse, String>>;
+
+    /// The app registry's read (`crate::apps`): a GET whose non-2xx answer is
+    /// the same nothing as a failed one. Provided in terms of
+    /// [`Fetch::request`] so there is one implementation to write.
+    fn get(&self, url: String) -> LocalFuture<'_, Result<Vec<u8>, String>> {
+        Box::pin(async move {
+            let response = self
+                .request("GET".to_string(), url.clone(), Vec::new(), Vec::new())
+                .await?;
+            if !(200..300).contains(&response.status) {
+                return Err(format!("{url}: the host answered {}", response.status));
+            }
+            Ok(response.body)
+        })
+    }
 }
 
 /// Cryptographic randomness (`wasi:random/random`). Synchronous: the WIT
@@ -255,6 +284,17 @@ pub struct BootConfig {
     /// The device this worker is. The glue owns the id because the worker is
     /// named after it (docs/design.md "Devices"); everything else is here.
     pub device: String,
+    /// This page's URL without query or fragment: the OAuth redirect
+    /// (internal.wit `lifecycle.boot-config.page-url`). The kernel never sees
+    /// a window, so it cannot know its own page; the glue does, and the
+    /// exchange needs the same redirect the authorization carried.
+    pub page_url: String,
+    /// Drive's API and OAuth bases; `None` is Google's
+    /// ([`drive::DRIVE_API`], [`drive::DRIVE_AUTH`]/[`drive::DRIVE_TOKEN`]).
+    /// An override is one base with `/auth` and `/token` under it; the e2e
+    /// harness points both at its fake.
+    pub drive_api: Option<String>,
+    pub drive_oauth: Option<String>,
 }
 
 pub type SessionId = u32;
@@ -283,6 +323,10 @@ struct DeviceState {
     /// would be keeping a stale one: from that moment the engine is the only
     /// authority on its own state.
     engine_state: Option<polyvisor_engine::Snapshot>,
+    /// The store binding the checkpoint carried, until [`Kernel::boot`] takes
+    /// it. Like `engine_state`, keeping a copy afterwards would be keeping a
+    /// stale one.
+    storage: Option<drive::Sealed>,
     /// The pointed generation in `kv`; the next checkpoint is this + 1,
     /// whether or not it was the one that loaded (see `checkpoint`).
     generation: u64,
@@ -294,6 +338,13 @@ pub struct Kernel {
     seams: Seams,
     home_origin: String,
     id: String,
+    /// This kernel, weakly, so a `&self` method can hand a spawned task a
+    /// handle. Set once, immediately after the `Rc` exists (see
+    /// [`Kernel::boot`]); the store's sync is scheduled from
+    /// [`Kernel::checkpoint`], which has only `&self`.
+    me: RefCell<Weak<Kernel>>,
+    /// The OAuth redirect and the two Drive bases, from `boot-config`.
+    drive_config: drive::Config,
     state: RefCell<DeviceState>,
     registry: Registry,
     /// Live sessions, session id -> app id.
@@ -320,6 +371,13 @@ pub struct Kernel {
     pairing: RefCell<pairing::Pairing>,
     /// Serialises checkpoints — see [`Kernel::checkpoint`].
     checkpointing: RefCell<Checkpointing>,
+    /// The durable store: tokens, the pending consent ceremony, and how the
+    /// last sync went (internal.wit `storage`).
+    drive: RefCell<drive::Drive>,
+    /// The store sync's gate. The checkpoint gate's twin, and for the same
+    /// reason: one push/pull in flight, and a request made during one is
+    /// coalesced into a single further pass.
+    syncing: RefCell<Checkpointing>,
 }
 
 /// The checkpoint gate: at most one writer, and one bit of "someone asked
@@ -350,7 +408,7 @@ impl Kernel {
         )
         .await?;
 
-        let state = match seams.platform.get(store::index_key(&id)).await {
+        let mut state = match seams.platform.get(store::index_key(&id)).await {
             None => mint(&seams, &id, now).await?,
             Some(bytes) => resume(&seams, &id, IndexRow::decode(&bytes)?, now).await?,
         };
@@ -363,10 +421,17 @@ impl Kernel {
             .await;
 
         let registry = Registry::fetch(seams.fetch.as_ref(), &home_origin).await?;
+        let drive = drive::Drive::restore(state.storage.take());
         let kernel = Rc::new(Kernel {
             seams,
             home_origin,
             id,
+            me: RefCell::new(Weak::new()),
+            drive_config: drive::Config {
+                page_url: config.page_url,
+                api: config.drive_api,
+                oauth: config.drive_oauth,
+            },
             state: RefCell::new(state),
             registry,
             sessions: RefCell::new(BTreeMap::new()),
@@ -379,11 +444,18 @@ impl Kernel {
             peers: RefCell::new(Vec::new()),
             pairing: RefCell::new(pairing::Pairing::default()),
             checkpointing: RefCell::new(Checkpointing::default()),
+            drive: RefCell::new(drive),
+            syncing: RefCell::new(Checkpointing::default()),
         });
+        *kernel.me.borrow_mut() = Rc::downgrade(&kernel);
         // A sealed device has no seed in memory, so it has no engine and no
         // endpoint until `unseal` (internal.wit `device`).
         if kernel.state() != State::Sealed {
             kernel.start_sync();
+            // At boot, after `open`: a device that was off while its group
+            // wrote catches up without anyone asking (internal.wit
+            // `storage.sync-now`). Bound or not is the schedule's question.
+            kernel.schedule_store_sync();
         }
         Ok(kernel)
     }
@@ -622,12 +694,18 @@ impl Kernel {
             let mut state = self.state.borrow_mut();
             state.seed = restored.seed;
             state.engine_state = restored.engine;
+            *self.drive.borrow_mut() = drive::Drive::restore(restored.storage);
             state.device = Some(restored.device);
             state.generation = generation;
             state.dek = Some(dek);
             state.wrapped = None;
         }
         self.start_sync();
+        // The boot trigger's other half: a device that rested under a
+        // passphrase has been off, and unsealing is the moment it can catch
+        // up with what its group wrote meanwhile (`Kernel::boot` does the
+        // same for a device that opens without one).
+        self.schedule_store_sync();
         self.touch_lease().await
     }
 
@@ -654,6 +732,7 @@ impl Kernel {
         state.seed = [0u8; 32];
         state.engine_state = None;
         drop(state);
+        *self.drive.borrow_mut() = drive::Drive::default();
         // The engine and the endpoint go with the device: a torn-down device
         // must not keep syncing what it no longer has.
         let _engine = self.engine.borrow_mut().take();
@@ -724,6 +803,17 @@ impl Kernel {
         // Unconditionally, including on the error path: a gate left latched
         // would silently stop every later checkpoint.
         *self.checkpointing.borrow_mut() = Checkpointing::default();
+        // The store's trigger, chained off this gate rather than off each
+        // mutation site: every local change already ends here, and so does
+        // every remote one (the engine's pump checkpoints). One place to
+        // schedule from, and it is behind the same coalescing the writes are.
+        //
+        // Only on a write that landed: a checkpoint that failed did not
+        // change what is on disk, and pushing state the device could not
+        // record itself would put the store ahead of its own author.
+        if result.is_ok() {
+            self.schedule_store_sync();
+        }
         result
     }
 
@@ -768,7 +858,7 @@ impl Kernel {
             (
                 dek,
                 state.generation + 1,
-                checkpoint::Snapshot::new(device, state.seed, engine),
+                checkpoint::Snapshot::new(device, state.seed, engine, self.drive.borrow().sealed()),
             )
         };
         checkpoint::write(
@@ -1013,6 +1103,7 @@ async fn mint(seams: &Seams, id: &str, now: u64) -> Result<DeviceState, Error> {
         device: Some(snapshot.device),
         seed: snapshot.seed,
         engine_state: snapshot.engine,
+        storage: snapshot.storage,
         generation,
         erased: false,
     })
@@ -1034,7 +1125,7 @@ async fn mint_anchor(seams: &Seams, id: &str, dek: &Dek) -> (checkpoint::Snapsho
     // knows this device by.
     let mut seed = [0u8; 32];
     seams.rng.fill(&mut seed);
-    let snapshot = checkpoint::Snapshot::new(device, seed, None);
+    let snapshot = checkpoint::Snapshot::new(device, seed, None, None);
     let committed = checkpoint::write(
         seams.files.as_ref(),
         seams.platform.as_ref(),
@@ -1081,6 +1172,7 @@ async fn resume(seams: &Seams, id: &str, row: IndexRow, now: u64) -> Result<Devi
                 device: None,
                 seed: [0u8; 32],
                 engine_state: None,
+                storage: None,
                 generation: 0,
                 erased: false,
             })
@@ -1105,6 +1197,7 @@ async fn resume(seams: &Seams, id: &str, row: IndexRow, now: u64) -> Result<Devi
                 device: Some(snapshot.device),
                 seed: snapshot.seed,
                 engine_state: snapshot.engine,
+                storage: snapshot.storage,
                 generation,
                 erased: false,
             })
