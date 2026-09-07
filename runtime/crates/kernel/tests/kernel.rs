@@ -775,6 +775,22 @@ impl FakeDrive {
         self.refresh.borrow_mut().clear();
     }
 
+    /// How many objects in the store are sedimentree *fragments*. Decoded
+    /// rather than matched by name: an object's name is an HMAC of the item
+    /// id, and a fragment's id is whatever automerge's change hash happened
+    /// to be.
+    fn fragments_in_store(&self) -> usize {
+        self.files
+            .borrow()
+            .values()
+            .filter(|file| !file.folder)
+            .filter(|file| {
+                serde_json::from_slice::<polyvisor_engine::StoreItem>(&file.body)
+                    .is_ok_and(|item| item.kind == polyvisor_engine::ItemKind::Fragment)
+            })
+            .count()
+    }
+
     /// The names of every object in the one folder this group writes to.
     fn objects(&self) -> Vec<String> {
         self.files
@@ -3624,7 +3640,7 @@ fn a_compacted_range_reaches_the_store_as_one_object() {
     for n in 1..=4096 {
         block_on(a.tasks_add(sa, format!("task {n}"))).unwrap();
         written = n;
-        if a.holds_a_fragment() {
+        if a.fragments_held(Some("todomvc")) > 0 {
             break;
         }
     }
@@ -3649,4 +3665,53 @@ fn a_compacted_range_reaches_the_store_as_one_object() {
         written,
         "B read the whole range out of the store"
     );
+}
+
+#[test]
+fn the_joiner_publishes_the_history_it_adopted() {
+    // Pairing hands the joiner the group document whole and leaves its tree
+    // empty, so the era before the joiner existed is history it can read
+    // and — until it rolls that history into a fragment of its own — cannot
+    // hand to anybody. Both "anybodies" are here: the adder, which takes the
+    // fragment over the wire, and the store, where the joiner's push is what
+    // puts the group's first era into Drive under a name the joiner derived.
+    let drive = FakeDrive::shared();
+    let here = World::default().with_drive(&drive);
+    let there = here.peer().with_drive(&drive);
+    let a = here.boot();
+    let b = there.boot();
+    let (_sa, _sb) = (session(&a), session(&b));
+    settle();
+
+    let _sas = pair(&b, &a);
+    settle();
+    assert_eq!(
+        b.fragments_held(None),
+        1,
+        "the joiner rolled the history it adopted into one fragment",
+    );
+    // The other half of the problem: it is an *item*, so it syncs. The adder
+    // — which built nothing, having adopted nothing — ends up holding the
+    // joiner's fragment beside its own loose commits.
+    assert_eq!(
+        a.fragments_held(None),
+        1,
+        "and it reached the adder as an item, over the wire",
+    );
+
+    connect_store(&b);
+    settle();
+    // Found by decoding rather than by name: an object's name is an HMAC of
+    // the item id, and a fragment's id is whatever automerge's change hash
+    // happened to be.
+    assert_eq!(
+        drive.fragments_in_store(),
+        1,
+        "and the joiner published it, so the store holds that era too",
+    );
+
+    // Both devices still see the same two-device group, which is the thing
+    // all of this is carrying.
+    assert_eq!(block_on(a.sync_members()).unwrap().len(), 2);
+    assert_eq!(block_on(b.sync_members()).unwrap().len(), 2);
 }

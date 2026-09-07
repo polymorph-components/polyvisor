@@ -270,20 +270,30 @@ impl Drive {
 // -- the exports -------------------------------------------------------------
 
 impl Kernel {
-    /// Whether this device holds a sedimentree fragment yet — a commit range
-    /// rolled up into one item (`docs/design.md` §"Read-back and partitions").
+    /// How many sedimentree fragments this device holds over one tree — the
+    /// app's, or (`None`) the group document's. A fragment is a commit range
+    /// carried as one item (`docs/design.md` §"Read-back and partitions").
     ///
-    /// Test introspection, in the shape of `Engine::live_connections`: which
-    /// commit closes a fragment is the hash's decision, so a test that wants
-    /// the compacted case has to write until one appears and cannot predict
-    /// the number. Nothing in the WIT world reads this.
+    /// Test introspection, in the shape of `Engine::live_connections`:
+    /// which commit closes a fragment is the hash's decision, so a test that
+    /// wants the compacted case has to write until one appears and cannot
+    /// predict the number. Nothing in the WIT world reads this.
+    ///
+    /// Per-tree because the two have nothing to do with each other: an app's
+    /// fragments arrive on the hash's schedule, while the group document gets
+    /// exactly one the moment a device adopts it (`Engine::adopt_fragment`).
     #[must_use]
-    pub fn holds_a_fragment(&self) -> bool {
-        self.engine().is_ok_and(|engine| {
+    pub fn fragments_held(&self, app: Option<&str>) -> usize {
+        let tree = match app {
+            Some(app) => *polyvisor_engine::tasks_tree(app).as_bytes(),
+            None => *polyvisor_engine::us_tree().as_bytes(),
+        };
+        self.engine().map_or(0, |engine| {
             engine
                 .items()
                 .iter()
-                .any(|item| item.kind == ItemKind::Fragment)
+                .filter(|item| item.tree == tree && item.kind == ItemKind::Fragment)
+                .count()
         })
     }
 

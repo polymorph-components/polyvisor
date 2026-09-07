@@ -1392,13 +1392,106 @@ fn a_chain_of_fragments_is_still_one_entry_point() {
             written,
             "the joiner read both ranges, walking from the newest fragment down",
         );
+        // Scoped to the app tree: B also holds a fragment over the group
+        // document it adopted at enrollment (`Engine::adopt_fragment`).
+        let app = *tasks_tree(APP).as_bytes();
         assert_eq!(
             eb.items()
                 .iter()
-                .filter(|item| item.kind == ItemKind::Fragment)
+                .filter(|item| item.tree == app && item.kind == ItemKind::Fragment)
                 .count(),
             2,
             "and holds them as fragments, not as the ranges unrolled",
+        );
+    });
+}
+
+// -- the adopted group document, as an item -----------------------------------
+
+/// The `us` tree's items, as (loose commits, fragments).
+fn us_items(engine: &TestEngine) -> (usize, usize) {
+    let tree = *polyvisor_engine::us_tree().as_bytes();
+    let mut commits = 0;
+    let mut fragments = 0;
+    for item in engine.items().iter().filter(|item| item.tree == tree) {
+        match item.kind {
+            ItemKind::Commit => commits += 1,
+            ItemKind::Fragment => fragments += 1,
+        }
+    }
+    (commits, fragments)
+}
+
+#[test]
+fn a_joiner_can_serve_the_history_it_adopted() {
+    // `adopt_us` installs the adder's document whole and empties the tree
+    // that used to back it, so without this the joiner would hold the
+    // group's whole past as something it can read and cannot hand to anyone
+    // — no item of that era is in its tree, and the pull will not fetch the
+    // objects back because the changes are already in its document.
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 30, None);
+    let b = device(&pool, 31, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+
+    let (snapshot, before) = pool.run_until(async move {
+        // Some group history to adopt: a second member, and the keyhive
+        // pointer the founder writes.
+        wire(&ea, &eb).await;
+        let (_commits, fragments) = us_items(&eb);
+        assert_eq!(fragments, 1, "the joiner rolled the adopted history up");
+        (eb.snapshot().await.unwrap(), members(&eb).await)
+    });
+    assert_eq!(before.len(), 2, "the adopted group is the adder's, plus us");
+
+    // The document blanked, the tree kept: what a device holds if it has the
+    // items and nothing else. If the fragment's bundle is a real automerge
+    // bundle of the adopted history, the group comes back from it alone.
+    let mut naked = snapshot;
+    if let Some(us) = naked.us.as_mut() {
+        us.doc.clear();
+    }
+    let mut pool = LocalPool::new();
+    let restored = device(&pool, 31, Some(naked));
+    let engine = Rc::clone(&restored.engine);
+    let after = pool.run_until(async move { members(&engine).await });
+    assert_eq!(
+        after, before,
+        "the group came back out of the fragment, with no document to help",
+    );
+}
+
+#[test]
+fn a_third_device_learns_the_first_era_from_the_second() {
+    // A enrols B; B enrols C; C never meets A. Everything C learns of the
+    // group's first era — the era before B existed — comes from B, and B
+    // holds it as the one fragment it built when it adopted.
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 32, None);
+    let b = device(&pool, 33, None);
+    let c = device(&pool, 34, None);
+    let (ea, eb, ec) = (
+        Rc::clone(&a.engine),
+        Rc::clone(&b.engine),
+        Rc::clone(&c.engine),
+    );
+
+    pool.run_until(async move {
+        wire(&ea, &eb).await;
+        // B is now a member and has A's history as a fragment. C pairs with
+        // B, and B — not A — is the only device it is ever wired to.
+        wire(&eb, &ec).await;
+
+        let seen = until(|| async {
+            let seen = members(&ec).await;
+            (seen.len() == 3).then_some(seen)
+        })
+        .await;
+        assert_eq!(seen.len(), 3, "C sees the whole group, A included");
+        let (_commits, fragments) = us_items(&ec);
+        assert!(
+            fragments >= 1,
+            "and holds that history as a fragment of its own",
         );
     });
 }

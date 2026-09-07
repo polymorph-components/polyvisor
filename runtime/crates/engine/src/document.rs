@@ -232,6 +232,23 @@ impl Document {
         self.doc.fragments(1..)
     }
 
+    /// The document's current heads, and every change hash in its history.
+    ///
+    /// For the one caller that has to describe a whole document as a single
+    /// sedimentree fragment rather than take automerge's own partition of it
+    /// (`crate::Engine::adopt_fragment`).
+    pub fn heads(&self) -> Vec<automerge::ChangeHash> {
+        self.doc.get_heads()
+    }
+
+    pub fn change_hashes(&self) -> Vec<automerge::ChangeHash> {
+        self.doc
+            .get_changes(&[])
+            .iter()
+            .map(automerge::Change::hash)
+            .collect()
+    }
+
     /// The bundle bytes for each fragment, in the order given. Separate from
     /// [`Document::fragments`] because bundling re-encodes every member of
     /// every fragment handed to it, and the caller drops all but the ones it

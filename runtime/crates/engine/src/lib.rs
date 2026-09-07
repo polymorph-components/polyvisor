@@ -477,7 +477,90 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        Ok(())
+        self.adopt_fragment().await
+    }
+
+    /// Make the adopted group document servable: one sedimentree fragment
+    /// over the whole of it.
+    ///
+    /// [`Engine::adopt_us`] installs an automerge *snapshot* — the adder's
+    /// document, whole — and empties the tree that used to back it. That
+    /// leaves this device holding history it can read and cannot hand to
+    /// anyone: no loose commit of the group's past is in its tree, so a third
+    /// device that syncs only with this one, or a store this one pushes to,
+    /// gets nothing of the era before the pairing. The pull will not fetch
+    /// those objects back either, and should not — the changes are already in
+    /// the document (`Engine::read_not_held`).
+    ///
+    /// A fragment is exactly the item sedimentree has for this: a range of
+    /// history carried as one blob by a member that can read the whole range.
+    /// This device can — it just adopted it — so it builds one, with an empty
+    /// boundary because the range reaches the root, and every change as a
+    /// checkpoint because the fragment covers all of them
+    /// (`Fragment::supports_block` answers coverage from head, checkpoints
+    /// and boundary; `Fragment::new` truncates the checkpoints to 12 bytes).
+    ///
+    /// Identity is head plus boundary, so the adder — holding the same graph
+    /// — builds the same fragment if it ever takes this path, and a deeper
+    /// one automerge draws later subsumes neither: both are correct items
+    /// over the same changes.
+    async fn adopt_fragment(&self) -> Result<(), String> {
+        let tree = us_tree();
+        // A sedimentree fragment has one head; an automerge document may
+        // have several. Where it does, the document is given one the way the
+        // absorb path gives a partitioned app tree one: an empty change
+        // depending on every current head. It goes in as a real signed `us`
+        // commit rather than a bare automerge change, because that is what
+        // every other device will read it as.
+        if self.with_us(UsDoc::heads).len() > 1 {
+            let anchor = {
+                let mut cell = self.us.borrow_mut();
+                let doc = cell
+                    .as_mut()
+                    .ok_or_else(|| "this device has no group document".to_string())?;
+                doc.merge_anchor()
+            };
+            self.push_us_commit(anchor).await?;
+        }
+        let (heads, members) = self.with_us(|doc| (doc.heads(), doc.change_hashes()));
+        // One head, or none at all: a document with no changes has no
+        // history to serve, which is not this function's problem to report.
+        let (Some(head), 1) = (heads.first().copied(), heads.len()) else {
+            return Ok(());
+        };
+        if self.storage.holds_fragment(tree, CommitId::new(head.0)) {
+            return Ok(());
+        }
+        let fragment = automerge::Fragment {
+            head,
+            // What `ChangeHash::fragment_level` would say — leading zero
+            // bytes, the same metric sedimentree's `CountLeadingZeroBytes`
+            // uses (automerge types.rs:680). It is not the *stratum* this
+            // fragment sits at, which sedimentree computes from the head
+            // itself; the one thing automerge reads it for is whether a
+            // one-member fragment may be encoded as a bare change rather
+            // than a bundle, and both decode through `load_incremental`.
+            level: head.0.iter().take_while(|byte| **byte == 0).count(),
+            boundary: Vec::new(),
+            checkpoints: members
+                .iter()
+                .filter(|hash| **hash != head)
+                .copied()
+                .collect(),
+            members: members.clone(),
+        };
+        let Some(bundle) = self
+            .with_us(|doc| doc.bundle(vec![fragment.clone()]))
+            .into_iter()
+            .next()
+        else {
+            return Ok(());
+        };
+        // Plaintext, like every other item of this tree (`crate::vault`
+        // module docs: the group document is what tells a device who its
+        // group is, and it cannot be sealed to a key that knowledge is
+        // needed to derive).
+        self.install_fragment(tree, &fragment, bundle, false).await
     }
 
     // -- connections ---------------------------------------------------------
@@ -1202,80 +1285,101 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             fresh.into_iter().zip(bundles).collect()
         };
         for (fragment, bundle) in candidates {
-            let head = CommitId::new(fragment.head.0);
-            let boundary: BTreeSet<CommitId> = fragment
-                .boundary
-                .iter()
-                .map(|hash| CommitId::new(hash.0))
-                .collect();
-            let checkpoints: Vec<CommitId> = fragment
-                .checkpoints
-                .iter()
-                .map(|hash| CommitId::new(hash.0))
-                .collect();
-            let (blob, sealed) = if enveloped {
-                let vault = self.require_vault()?;
-                // What keeps the causal walk going below the fragment. The
-                // boundary names the commits just under it, and for each one
-                // the *carrier* is what has to be named: if we hold a
-                // fragment headed at that commit, the thing a later reader
-                // must be able to open is that fragment, under its own cref —
-                // the boundary commit's own envelope was pruned along with
-                // its range, and its content key left the frontier when it
-                // was covered, so naming the commit would embed nothing at
-                // all. `Vault::seal` embeds exactly those preds whose keys
-                // this device still holds, and `Vault::confirm` then drops
-                // them from the frontier, which is what keeps the head set
-                // at one entry point per branch instead of one per fragment.
-                let preds: Vec<[u8; 32]> = boundary
-                    .iter()
-                    .map(|id| {
-                        if self.storage.holds_fragment(tree, *id) {
-                            fragment_cref(tree, *id)
-                        } else {
-                            *id.as_bytes()
-                        }
-                    })
-                    .collect();
-                let sealed = vault
-                    .seal(fragment_cref(tree, head), &preds, bundle)
-                    .await?;
-                (Blob::new(sealed.blob.clone()), Some(sealed))
-            } else {
-                (Blob::new(bundle), None)
-            };
-            self.handle
-                .add_fragments(
-                    tree,
-                    vec![subduction_protocol::command::NewFragment {
-                        head,
-                        boundary,
-                        checkpoints,
-                        blob,
-                    }],
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-            // The durability barrier `mutate` documents: the fragment must be
-            // in storage before anything is dropped on the strength of it.
-            let _heads = self
-                .handle
-                .tree_heads(tree)
-                .await
-                .map_err(|e| e.to_string())?;
-            if let Some(sealed) = sealed {
-                let vault = self.require_vault()?;
-                // `confirm` makes the fragment an entry point and drops the
-                // preds it embedded — which is where the *previous* fragment
-                // stops being one, since this envelope now carries its key.
-                vault.confirm(&sealed);
-                // And the members it carries stop being entry points too:
-                // their changes are in the bundle (`Vault::cover`).
-                vault.cover(fragment.members.iter().map(|hash| hash.0));
-                self.publish_keyhive().await?;
-            }
-            let _pruned = self.storage.prune(tree);
+            self.install_fragment(tree, &fragment, bundle, enveloped)
+                .await?;
         }
+        Ok(())
+    }
+
+    /// Put one fragment into the tree: seal it if the tree is enveloped, hand
+    /// it to the driver, wait for it to be durable, move the frontier, and
+    /// drop the loose commits it now carries.
+    ///
+    /// Shared by [`Engine::compact`], which builds fragments over ranges
+    /// automerge closed on their own, and by [`Engine::adopt_fragment`],
+    /// which builds one over a whole adopted history. The two differ only in
+    /// where the `automerge::Fragment` came from; everything after that —
+    /// including the ordering, which is what makes the drop safe — is this.
+    async fn install_fragment(
+        &self,
+        tree: SedimentreeId,
+        fragment: &automerge::Fragment,
+        bundle: Vec<u8>,
+        enveloped: bool,
+    ) -> Result<(), String> {
+        let head = CommitId::new(fragment.head.0);
+        let boundary: BTreeSet<CommitId> = fragment
+            .boundary
+            .iter()
+            .map(|hash| CommitId::new(hash.0))
+            .collect();
+        let checkpoints: Vec<CommitId> = fragment
+            .checkpoints
+            .iter()
+            .map(|hash| CommitId::new(hash.0))
+            .collect();
+        let (blob, sealed) = if enveloped {
+            let vault = self.require_vault()?;
+            // What keeps the causal walk going below the fragment. The
+            // boundary names the commits just under it, and for each one
+            // the *carrier* is what has to be named: if we hold a
+            // fragment headed at that commit, the thing a later reader
+            // must be able to open is that fragment, under its own cref —
+            // the boundary commit's own envelope was pruned along with
+            // its range, and its content key left the frontier when it
+            // was covered, so naming the commit would embed nothing at
+            // all. `Vault::seal` embeds exactly those preds whose keys
+            // this device still holds, and `Vault::confirm` then drops
+            // them from the frontier, which is what keeps the head set
+            // at one entry point per branch instead of one per fragment.
+            let preds: Vec<[u8; 32]> = boundary
+                .iter()
+                .map(|id| {
+                    if self.storage.holds_fragment(tree, *id) {
+                        fragment_cref(tree, *id)
+                    } else {
+                        *id.as_bytes()
+                    }
+                })
+                .collect();
+            let sealed = vault
+                .seal(fragment_cref(tree, head), &preds, bundle)
+                .await?;
+            (Blob::new(sealed.blob.clone()), Some(sealed))
+        } else {
+            (Blob::new(bundle), None)
+        };
+        self.handle
+            .add_fragments(
+                tree,
+                vec![subduction_protocol::command::NewFragment {
+                    head,
+                    boundary,
+                    checkpoints,
+                    blob,
+                }],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        // The durability barrier `mutate` documents: the fragment must be
+        // in storage before anything is dropped on the strength of it.
+        let _heads = self
+            .handle
+            .tree_heads(tree)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(sealed) = sealed {
+            let vault = self.require_vault()?;
+            // `confirm` makes the fragment an entry point and drops the
+            // preds it embedded — which is where the *previous* fragment
+            // stops being one, since this envelope now carries its key.
+            vault.confirm(&sealed);
+            // And the members it carries stop being entry points too:
+            // their changes are in the bundle (`Vault::cover`).
+            vault.cover(fragment.members.iter().map(|hash| hash.0));
+            self.publish_keyhive().await?;
+        }
+        let _pruned = self.storage.prune(tree);
         Ok(())
     }
 

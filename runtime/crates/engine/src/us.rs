@@ -134,6 +134,22 @@ impl UsDoc {
         self.core.applied_ids()
     }
 
+    /// This document's heads, and every change hash in its history. See
+    /// `crate::document::Document::heads`.
+    pub fn heads(&self) -> Vec<automerge::ChangeHash> {
+        self.core.heads()
+    }
+
+    pub fn change_hashes(&self) -> Vec<automerge::ChangeHash> {
+        self.core.change_hashes()
+    }
+
+    /// An empty change depending on every current head — automerge's own
+    /// merge commit. See `crate::document::Document::merge_anchor`.
+    pub fn merge_anchor(&mut self) -> Option<NewCommit> {
+        self.core.merge_anchor()
+    }
+
     /// The bundle bytes for those fragments. See
     /// `crate::document::Document::bundle`.
     pub fn bundle(&self, fragments: Vec<automerge::Fragment>) -> Vec<Vec<u8>> {
