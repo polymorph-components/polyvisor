@@ -52,6 +52,10 @@
 //! one person's own devices — which is the entire membership model here — that
 //! is the intent. It would be a policy decision to revisit for shared
 //! documents, which do not exist yet.
+//!
+//! Because the ancestry rides in the envelopes, the state a device keeps is a
+//! *set of heads* — one `⟨pointer, key⟩` pair per readable branch — and not a
+//! key per commit. See [`Vault::advance`].
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -105,10 +109,31 @@ pub struct VaultState {
     pub archive: Vec<u8>,
     pub group: [u8; 32],
     pub doc: [u8; 32],
-    /// The content keys this device has learned, which is what lets it seal a
-    /// commit whose parents it did not author. Secret, and sealed with the
-    /// rest of the checkpoint.
-    pub chunk_keys: Vec<(Cref, [u8; 32])>,
+    /// This device's entry points into the group's document: one
+    /// `(commit, content key)` pair per head of the readable frontier
+    /// (`design/causal_encryption.md` §"Decryption Head"). Secret, and sealed
+    /// with the rest of the checkpoint.
+    ///
+    /// `alias`: an M3c checkpoint wrote the whole key map under `chunk_keys`.
+    /// Loading one is harmless — the full map is a superset of the head set,
+    /// and the extra entries are pruned the first time their descendants are
+    /// opened or sealed.
+    #[serde(alias = "chunk_keys", default)]
+    pub heads: Vec<(Cref, [u8; 32])>,
+}
+
+/// A sealed commit, and what the frontier owes it once it has landed.
+///
+/// Separate from [`Vault::seal`] because the frontier must not move until
+/// the commit is in storage: `advance` prunes the parents whose keys went
+/// into this envelope, and if the write then failed those keys would be
+/// gone with nothing carrying them — the device would hold a head naming a
+/// commit no storage has.
+pub struct Sealed {
+    pub blob: Vec<u8>,
+    cref: Cref,
+    key: SymmetricKey,
+    embedded: Vec<Cref>,
 }
 
 /// This device's keyhive: its own identity, the device group, and the one
@@ -121,8 +146,9 @@ pub struct Vault {
     /// engine holds the vault behind an `Rc` it clones before every await.
     group: Cell<GroupId>,
     doc: Cell<DocumentId>,
-    /// Content keys, by commit id. See [`VaultState::chunk_keys`].
-    chunk_keys: RefCell<HashMap<Cref, SymmetricKey>>,
+    /// The readable frontier: a content key per head commit, and nothing
+    /// below them. See [`VaultState::heads`] and [`Vault::advance`].
+    heads: RefCell<HashMap<Cref, SymmetricKey>>,
     /// Digests of the static events already carried into the keyhive-events
     /// tree, so republishing is a no-op rather than a re-commit of the whole
     /// op graph on every turn.
@@ -162,7 +188,7 @@ impl Vault {
             kh,
             group: Cell::new(group_id),
             doc: Cell::new(doc_id),
-            chunk_keys: RefCell::new(HashMap::new()),
+            heads: RefCell::new(HashMap::new()),
             published: RefCell::new(HashSet::new()),
         })
     }
@@ -190,9 +216,9 @@ impl Vault {
             store,
             group: Cell::new(GroupId::new(identifier(state.group)?)),
             doc: Cell::new(DocumentId::from(identifier(state.doc)?)),
-            chunk_keys: RefCell::new(
+            heads: RefCell::new(
                 state
-                    .chunk_keys
+                    .heads
                     .iter()
                     .map(|(cref, key)| (*cref, SymmetricKey::from(*key)))
                     .collect(),
@@ -208,8 +234,8 @@ impl Vault {
             archive: bincode::serialize(&archive).map_err(|e| format!("keyhive archive: {e}"))?,
             group: self.group.get().to_bytes(),
             doc: self.doc.get().to_bytes(),
-            chunk_keys: self
-                .chunk_keys
+            heads: self
+                .heads
                 .borrow()
                 .iter()
                 .map(|(cref, key)| {
@@ -299,7 +325,8 @@ impl Vault {
         self.static_events().await
     }
 
-    /// The content keys this device holds, for the device it is enrolling.
+    /// This device's entry points into the group's document, for the device it
+    /// is enrolling.
     ///
     /// BeeKEM hands a new member the *current* epoch key and nothing earlier,
     /// so a freshly paired device sees the group's whole history as noise. The
@@ -319,14 +346,17 @@ impl Vault {
     /// and it is what the e2e pairing ceremony expects. It would be a policy
     /// question for shared documents, which do not exist.
     ///
-    /// The map only grows, and it grows with every commit anyone in the group
-    /// ever writes. That is the standing cost of total read-back: it is
-    /// checkpointed on every device and copied to every device enrolled after
-    /// it. Bounding it *is* the chain-cut policy decision, which this milestone
-    /// does not make.
+    /// What is handed over is the *frontier*, not a key per commit: one
+    /// `⟨pointer, key⟩` pair per readable branch, from which everything
+    /// causally prior is discovered by following the ancestor keys inside each
+    /// envelope. `design/causal_encryption.md` §"Key Management" is explicit
+    /// that keeping them all is "possible, but fragile and unwieldy", and
+    /// §"Decryption Head" gives this shape instead. So this grows with live
+    /// concurrency and out-of-order delivery, not with history: a linear
+    /// history delivered in order hands over one pair however long it is.
     pub fn export_content_keys(&self) -> Result<Vec<u8>, String> {
         let keys: Vec<(Cref, [u8; 32])> = self
-            .chunk_keys
+            .heads
             .borrow()
             .iter()
             .map(|(cref, key)| {
@@ -341,7 +371,7 @@ impl Vault {
     fn import_content_keys(&self, bytes: &[u8]) -> Result<(), String> {
         let keys: Vec<(Cref, [u8; 32])> =
             bincode::deserialize(bytes).map_err(|e| format!("bad content keys: {e}"))?;
-        self.chunk_keys.borrow_mut().extend(
+        self.heads.borrow_mut().extend(
             keys.into_iter()
                 .map(|(cref, key)| (cref, SymmetricKey::from(key))),
         );
@@ -355,7 +385,9 @@ impl Vault {
     /// its contact card is what the adder just enrolled. What is replaced is
     /// which group and document it seals to; the group of one it generated at
     /// first boot stays in the op graph, unreferenced, which is what keeps its
-    /// own pre-pairing content readable *to itself*.
+    /// own pre-pairing content readable *to itself* — and readable to the group
+    /// as soon as this device writes once, since that write's envelope names
+    /// its old frontier as ancestors.
     pub async fn adopt(
         &self,
         events: &[u8],
@@ -423,6 +455,16 @@ impl Vault {
         Ok(out)
     }
 
+    /// How many entry points into the document this device holds: one per
+    /// branch of the readable frontier it cannot reach from another
+    /// (`design/causal_encryption.md` §"Multiple Heads"). This is the size of
+    /// what the checkpoint carries and what the next device enrolled is
+    /// handed, so it is the number this milestone exists to keep small.
+    #[must_use]
+    pub fn entry_points(&self) -> usize {
+        self.heads.borrow().len()
+    }
+
     // -- content -------------------------------------------------------------
 
     /// Seal one automerge change as the sedimentree blob that carries it.
@@ -431,7 +473,7 @@ impl Vault {
         cref: Cref,
         preds: &[Cref],
         change: Vec<u8>,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Sealed, String> {
         let doc = self
             .kh
             .get_document(self.doc.get())
@@ -443,12 +485,13 @@ impl Vault {
         // authoring on top of it merely means the chain is cut there — for
         // everyone, equally, which is what we would want if it happened.
         let ancestors: HashMap<Cref, SymmetricKey> = {
-            let keys = self.chunk_keys.borrow();
+            let keys = self.heads.borrow();
             preds
                 .iter()
                 .filter_map(|parent| keys.get(parent).map(|key| (*parent, *key)))
                 .collect()
         };
+        let embedded: Vec<Cref> = ancestors.keys().copied().collect();
         let plaintext = bincode::serialize(&Envelope {
             plaintext: change,
             ancestors,
@@ -460,11 +503,28 @@ impl Vault {
             .try_encrypt_content_keyed(doc, &cref, &preds.to_vec(), &plaintext)
             .await
             .map_err(|e| format!("encrypt: {e:?}"))?;
-        let _replaced = self.chunk_keys.borrow_mut().insert(cref, key);
         self.store
             .insert(Arc::new(sealed.encrypted_content().clone()))
             .await;
-        bincode::serialize(sealed.encrypted_content()).map_err(|e| format!("envelope: {e}"))
+        let blob =
+            bincode::serialize(sealed.encrypted_content()).map_err(|e| format!("envelope: {e}"))?;
+        Ok(Sealed {
+            blob,
+            cref,
+            key,
+            embedded,
+        })
+    }
+
+    /// The sealed commit is in storage. The frontier moves forward: it becomes
+    /// a head, and the parents whose keys went INTO its envelope stop being
+    /// ones. They are not lost — they are one hop below a head, which is where
+    /// `design/causal_encryption.md` says a key belongs.
+    pub fn confirm(&self, sealed: &Sealed) {
+        self.advance(
+            &[(sealed.cref, sealed.key)],
+            sealed.embedded.iter().copied(),
+        );
     }
 
     /// Open as many of `blobs` as this device can.
@@ -480,7 +540,16 @@ impl Vault {
     /// Undecryptable commits are dropped rather than reported: a device that
     /// has not yet ingested the epoch material sees them again on the next
     /// absorb, which is what the keyhive-events tree exists to fix.
-    pub async fn open(&self, blobs: Vec<(Cref, Vec<u8>)>) -> Result<Vec<(Cref, Vec<u8>)>, String> {
+    /// `known` is the set of commits the caller has already applied. It is
+    /// what makes an ancestor key droppable: a key for a commit this device has
+    /// read is carried by the descendant that named it, while a key for a
+    /// commit that has *not* arrived is the only way that commit will ever be
+    /// opened, so it is kept.
+    pub async fn open(
+        &self,
+        blobs: Vec<(Cref, Vec<u8>)>,
+        known: &HashSet<Cref>,
+    ) -> Result<Vec<(Cref, Vec<u8>)>, String> {
         let Some(doc) = self.kh.get_document(self.doc.get()).await else {
             // Commits are here but the document's keyhive state is not. Not an
             // error — the keyhive-events tree has not caught up.
@@ -498,6 +567,13 @@ impl Vault {
 
         let mut opened: Vec<(Cref, Vec<u8>)> = Vec::new();
         let mut dark: Vec<&(Cref, Ciphertext)> = Vec::new();
+        // Commits that become heads, and commits whose key now rides inside
+        // one — collected across the whole batch, applied once at the end.
+        let mut reached: Vec<(Cref, SymmetricKey)> = Vec::new();
+        let mut covered: HashSet<Cref> = HashSet::new();
+        // Ancestor keys read out of the envelopes this batch opened, decided on
+        // once at the end.
+        let mut ancestors: HashMap<Cref, SymmetricKey> = HashMap::new();
         for item in &wanted {
             let (cref, encrypted) = item;
             match self
@@ -508,7 +584,15 @@ impl Vault {
                 Ok((plain, key)) => {
                     let envelope: Envelope<Cref, Vec<u8>> =
                         bincode::deserialize(&plain).map_err(|e| format!("chunk envelope: {e}"))?;
-                    self.remember(*cref, key, &envelope);
+                    // Deferred to one `advance` at the end of the batch:
+                    // applying insert-then-prune commit by commit would let a
+                    // parent opened later in the same batch re-enter the
+                    // frontier after its child had already pruned it.
+                    reached.push((*cref, key));
+                    // Not covered yet: whether an ancestor's key can be dropped
+                    // depends on whether that ancestor is reachable, which is
+                    // not known until the walk below has run.
+                    ancestors.extend(envelope.ancestors.iter().map(|(a, k)| (*a, *k)));
                     opened.push((*cref, envelope.plaintext));
                 }
                 Err(_) => dark.push(item),
@@ -521,15 +605,33 @@ impl Vault {
             // which is what the keys handed over at enrollment are for. This is
             // the same walk `Keyhive::try_causal_decrypt_content` runs, entered
             // one level down so the seed can be a key rather than an epoch.
+            // Seeded from every entry point that can reach into the dark: a
+            // held key for a dark commit itself, and — the case that actually
+            // carries a partition — a commit just opened under the current
+            // epoch whose envelope names dark ancestors. The second is the
+            // whole of `design/causal_encryption.md` §"Multiple Heads": a new
+            // head supplied for a branch is what connects it, and here the new
+            // head arrived as ordinary content.
+            let by_cref: HashMap<Cref, &Ciphertext> =
+                wanted.iter().map(|(cref, enc)| (*cref, enc)).collect();
             let mut seeds: Vec<(Arc<Ciphertext>, SymmetricKey)> = {
-                let held = self.chunk_keys.borrow();
+                let held = self.heads.borrow();
                 dark.iter()
                     .filter_map(|(cref, encrypted)| {
                         held.get(cref)
                             .map(|key| (Arc::new(encrypted.clone()), *key))
                     })
+                    .chain(reached.iter().filter_map(|(cref, key)| {
+                        by_cref
+                            .get(cref)
+                            .map(|enc| (Arc::new((*enc).clone()), *key))
+                    }))
                     .collect()
             };
+            let seeded: HashSet<Cref> = seeds
+                .iter()
+                .map(|(encrypted, _)| encrypted.content_ref)
+                .collect();
             if !seeds.is_empty() {
                 let walked: CausalDecryptionState<Cref, Vec<u8>> =
                     match CiphertextStoreExt::<Local, Cref, Vec<u8>>::try_causal_decrypt(
@@ -545,39 +647,102 @@ impl Vault {
                 // `complete` is already the envelopes' payloads: the walk
                 // unwraps each `Envelope` itself (keyhive_core
                 // store/ciphertext.rs:222).
-                let reached: HashMap<Cref, Vec<u8>> = walked.complete.into_iter().collect();
-                let mut learned: Vec<(Cref, SymmetricKey)> = walked.next.into_iter().collect();
+                let plaintexts: HashMap<Cref, Vec<u8>> = walked.complete.into_iter().collect();
+                // Everything the walk touched below its seeds is covered by
+                // definition: it got there by reading a seed's envelope, and so
+                // will anyone else who holds that seed. `next` — ancestors whose
+                // ciphertext has not arrived yet — is covered for the same
+                // reason, which is why a key for a commit we do not hold is not
+                // worth keeping either. The seeds themselves stay: they are the
+                // frontier the walk descended from.
+                // Only what actually opened. `walked.keys` also records the key
+                // of a ciphertext whose decrypt FAILED — a corrupt or
+                // wrongly-sealed blob — and pruning on one of those would drop a
+                // key nothing carries.
+                covered.extend(
+                    plaintexts
+                        .keys()
+                        .filter(|cref| !seeded.contains(*cref))
+                        .copied(),
+                );
+                // Ancestors the walk could not reach because their ciphertext is
+                // not here yet. Same decision as the envelopes' own ancestors,
+                // below.
+                ancestors.extend(walked.next.iter().map(|(cref, key)| (*cref, *key)));
                 for (cref, _) in &dark {
-                    if let Some(plain) = reached.get(cref) {
-                        // Keys only for chunks that actually opened: `keys` also
-                        // records the key of a ciphertext whose decrypt FAILED,
-                        // and keeping one of those would let a later seal name a
-                        // parent key that opens nothing.
-                        if let Some(key) = walked.keys.get(cref) {
-                            learned.push((*cref, *key));
-                        }
+                    if let Some(plain) = plaintexts.get(cref) {
                         opened.push((*cref, plain.clone()));
                     }
                 }
-                self.chunk_keys.borrow_mut().extend(learned);
             }
         }
+        // The ancestor keys, decided. An ancestor this device can already reach
+        // — because it opened in this batch, because it is on the frontier, or
+        // because the caller has long since applied it — is covered: its key
+        // rides inside the descendant that just named it. An ancestor that has
+        // simply not arrived is none of those, and dropping its key would strand
+        // it: when its ciphertext turns up in a later batch there would be
+        // nothing to seed a walk with, and every descendant already applied
+        // would sit in automerge's buffer behind it forever.
+        //
+        // Keeping it costs one frontier entry per out-of-order arrival, and
+        // that entry outlives the arrival: once the commit opens as a seed it
+        // stays a head, because the descendant that would cover it was read
+        // before it existed here. Bounded by how often delivery runs backwards,
+        // not by history.
+        {
+            let held: HashSet<Cref> = self.heads.borrow().keys().copied().collect();
+            let opened_now: HashSet<Cref> = opened.iter().map(|(cref, _)| *cref).collect();
+            for (cref, key) in ancestors {
+                if opened_now.contains(&cref) || held.contains(&cref) || known.contains(&cref) {
+                    let _covered = covered.insert(cref);
+                } else {
+                    reached.push((cref, key));
+                }
+            }
+        }
+        self.advance(&reached, covered.into_iter());
         Ok(opened)
     }
 
     // -- internals -----------------------------------------------------------
 
-    /// Record a commit's own content key and the ancestor keys its envelope
-    /// carried. This map is the read-back state: it only grows, one entry per
-    /// commit this device has ever opened, and it is both checkpointed and
-    /// handed to the next device enrolled. That growth is the standing cost of
-    /// total read-back (see `export_content_keys`) — 64 bytes per commit, and
-    /// nothing prunes it, because pruning it is the chain-cut policy decision
-    /// this milestone does not make.
-    fn remember(&self, cref: Cref, key: SymmetricKey, envelope: &Envelope<Cref, Vec<u8>>) {
-        let mut keys = self.chunk_keys.borrow_mut();
-        let _replaced = keys.insert(cref, key);
-        keys.extend(envelope.ancestors.iter().map(|(a, k)| (*a, *k)));
+    /// Move the readable frontier: `arrived` become heads, `covered` stop
+    /// being ones.
+    ///
+    /// This is what keeps the entry point a *set of heads* rather than a key
+    /// per commit ever seen. `design/causal_encryption.md` §"Key Management"
+    /// is blunt that the latter is "possible, but fragile and unwieldy", and
+    /// §"Decryption Head" gives the shape that replaces it: a
+    /// `⟨pointer, key⟩` pair is an entry point, and everything causally prior
+    /// is discovered by following the ancestor keys inside each envelope.
+    ///
+    /// Pruning is only sound because a covered commit's key demonstrably rides
+    /// inside a head's envelope: `seal` prunes exactly the parents it wrote
+    /// into `ancestors`, and `open` prunes exactly the crefs it read back out
+    /// of one. A parent whose key this device did not hold is therefore never
+    /// pruned — there is nothing carrying it.
+    ///
+    /// Inserts run before removals so that a batch containing both a parent
+    /// and its child leaves the child, whatever order they were opened in.
+    ///
+    /// The frontier is therefore exact for in-order delivery and slightly
+    /// conservative for out-of-order delivery: a commit whose key was kept
+    /// because it had not arrived stays a head once it does, since the
+    /// descendant that would have covered it was read before it got here. One
+    /// extra entry per out-of-order arrival, and nothing that is not a
+    /// legitimate entry point.
+    fn advance(&self, arrived: &[(Cref, SymmetricKey)], covered: impl Iterator<Item = Cref>) {
+        let mut heads = self.heads.borrow_mut();
+        for (cref, key) in arrived {
+            let _replaced = heads.insert(*cref, *key);
+        }
+        let fresh: HashSet<Cref> = arrived.iter().map(|(cref, _)| *cref).collect();
+        for cref in covered {
+            if !fresh.contains(&cref) {
+                let _dropped = heads.remove(&cref);
+            }
+        }
     }
 
     async fn all_events(&self) -> Vec<StaticEvent<Cref>> {

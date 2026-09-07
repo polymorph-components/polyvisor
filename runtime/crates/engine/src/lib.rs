@@ -403,6 +403,14 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         Ok(())
     }
 
+    /// How many entry points into the group's document this device holds —
+    /// the size of the head set it checkpoints and hands to the next device it
+    /// enrols. One per unmerged readable branch; a linear history is one.
+    pub async fn entry_points(&self) -> Result<usize, String> {
+        self.open_us().await?;
+        Ok(self.require_vault()?.entry_points())
+    }
+
     /// The user-system document's bytes, for the adder to put in ENROLL.
     pub async fn us_save(&self) -> Result<Vec<u8>, String> {
         self.open_us().await?;
@@ -1004,11 +1012,14 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             Ok((answer, doc.tree(), doc.last_local_commit()))
         })?;
         if let Some(commit) = commit {
-            let commit = self.seal(commit).await?;
+            let (commit, sealed) = self.seal(commit).await?;
             self.handle
                 .add_commits(tree, vec![commit])
                 .await
                 .map_err(|e| e.to_string())?;
+            // Only now: until the driver has taken the commit, the parents
+            // whose keys are inside it must stay on the frontier.
+            self.require_vault()?.confirm(&sealed);
             // A durability barrier, and the reason the kernel may checkpoint
             // the moment this returns. `add_commits` only queues a command;
             // the driver signs and persists it inside `drain_effects`, which
@@ -1034,7 +1045,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     async fn seal(
         &self,
         commit: subduction_protocol::command::NewCommit,
-    ) -> Result<subduction_protocol::command::NewCommit, String> {
+    ) -> Result<(subduction_protocol::command::NewCommit, vault::Sealed), String> {
         let vault = self.require_vault()?;
         let preds: Vec<[u8; 32]> = commit.parents.iter().map(|id| *id.as_bytes()).collect();
         let sealed = vault
@@ -1044,10 +1055,13 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 commit.blob.as_slice().to_vec(),
             )
             .await?;
-        Ok(subduction_protocol::command::NewCommit {
-            blob: Blob::new(sealed),
-            ..commit
-        })
+        Ok((
+            subduction_protocol::command::NewCommit {
+                blob: Blob::new(sealed.blob.clone()),
+                ..commit
+            },
+            sealed,
+        ))
     }
 
     /// Make sure this device holds a document for `app`, and that every live
@@ -1139,12 +1153,18 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             // stay in storage and are tried again on the next event.
             return false;
         };
-        let wanted = {
+        let (wanted, known) = {
             let apps = self.apps.borrow();
             let Some(doc) = apps.get(app) else {
                 return false;
             };
-            doc.unapplied(&self.storage)
+            (
+                doc.unapplied(&self.storage),
+                doc.applied_ids()
+                    .into_iter()
+                    .map(|id| *id.as_bytes())
+                    .collect(),
+            )
         };
         if wanted.is_empty() {
             return false;
@@ -1155,21 +1175,52 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                     .into_iter()
                     .map(|(id, blob)| (*id.as_bytes(), blob))
                     .collect(),
+                &known,
             )
             .await
         else {
             return false;
         };
-        let mut apps = self.apps.borrow_mut();
-        let Some(doc) = apps.get_mut(app) else {
-            return false;
+        let (absorbed, tree, anchor) = {
+            let mut apps = self.apps.borrow_mut();
+            let Some(doc) = apps.get_mut(app) else {
+                return false;
+            };
+            let absorbed = doc.apply(
+                opened
+                    .into_iter()
+                    .map(|(id, change)| (CommitId::new(id), change))
+                    .collect(),
+            );
+            // The partition case (`design/causal_encryption.md` §"Multiple
+            // Heads"): what just landed was concurrent with what this device
+            // already had, so it was sealed under an epoch some *other* member
+            // may not hold — a device enrolled after that branch was written
+            // can decrypt neither it nor anything automerge buffers behind it.
+            // A merge anchor republishes the branch: its envelope names both
+            // heads' content keys and is sealed under the current epoch, so
+            // every current member walks in from it.
+            //
+            // Only for content, and only on divergence. A batch that is itself
+            // nothing but somebody else's anchor is not a reason to author
+            // one, which is what stops two devices anchoring each other
+            // forever.
+            let anchor = (absorbed.content && doc.diverged())
+                .then(|| doc.merge_anchor())
+                .flatten();
+            (absorbed, doc.tree(), anchor)
         };
-        doc.apply(
-            opened
-                .into_iter()
-                .map(|(id, change)| (CommitId::new(id), change))
-                .collect(),
-        )
+        if let Some(anchor) = anchor
+            && let Ok((anchor, sealed)) = self.seal(anchor).await
+        {
+            let pushed = self.handle.add_commits(tree, vec![anchor]).await;
+            if pushed.is_ok() {
+                let _heads = self.handle.tree_heads(tree).await;
+                vault.confirm(&sealed);
+                let _published = self.publish_keyhive().await;
+            }
+        }
+        absorbed.landed
     }
 
     /// Ingest the group's keyhive operations, then retry every app document:

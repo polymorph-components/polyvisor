@@ -12,7 +12,7 @@ use futures::future::LocalBoxFuture;
 use futures::{executor::LocalPool, task::LocalSpawnExt as _};
 use polyvisor_engine::{
     AppState, Engine, EngineClock, EngineEvent, EngineNotify, LocalFuture, Snapshot, Spawner,
-    StoreItem, TaskSnapshot, TreeState,
+    StoreItem, TaskSnapshot, TreeState, tasks_tree,
 };
 use subduction_protocol::event::Direction;
 use subduction_runtime::memory::transport::MemoryTransport;
@@ -198,6 +198,17 @@ async fn enroll(adder: &TestEngine, joiner: &TestEngine) {
         .await
         .unwrap();
     joiner.adopt_keyhive(&keyhive, &read_back).await.unwrap();
+}
+
+/// Wire two engines together without enrolling: the group is already shared.
+async fn wire_only(a: &TestEngine, b: &TestEngine) {
+    let (ta, tb) = MemoryTransport::pair();
+    let b_key = b.verifying_key();
+    let inbound = RefCell::new(None);
+    let _ = futures::future::join(a.connect(ta, Direction::Outbound, Some(b_key)), async {
+        *inbound.borrow_mut() = Some(b.connect(tb, Direction::Inbound, None).await);
+    })
+    .await;
 }
 
 fn titles(snapshot: &TaskSnapshot) -> Vec<String> {
@@ -866,6 +877,230 @@ fn a_checkpoint_written_before_the_store_existed_still_mints_a_name_key() {
             engine.snapshot().await.unwrap().name_key,
             engine.name_key(),
             "the mint rides the next checkpoint"
+        );
+    });
+}
+
+/// The frontier is a set, and divergence is what makes it bigger than one.
+///
+/// Two devices write while apart, so the document has two branches off one
+/// root; each device then holds an entry point per branch it cannot reach from
+/// the other (`design/causal_encryption.md` §"Multiple Heads"). What it does
+/// *not* hold is a key per commit: the root's key rides inside its children's
+/// envelopes and is dropped from the frontier as soon as one of them is read.
+#[test]
+fn concurrent_branches_leave_one_entry_point_each() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 40, None);
+    let b = device(&pool, 41, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+
+    pool.run_until(async move {
+        ea.tasks_add(APP, "root".into()).await.unwrap();
+        enroll(&ea, &eb).await;
+        assert_eq!(
+            ea.entry_points().await.unwrap(),
+            1,
+            "a linear history is one entry point"
+        );
+
+        // Apart: B has never synced, so its write branches from nothing while
+        // A's extends the root.
+        ea.tasks_add(APP, "branch a".into()).await.unwrap();
+        eb.tasks_add(APP, "branch b".into()).await.unwrap();
+        assert_eq!(
+            ea.entry_points().await.unwrap(),
+            1,
+            "A extended its own history and stayed at one entry point"
+        );
+        assert_eq!(
+            eb.entry_points().await.unwrap(),
+            2,
+            "B holds the root it was enrolled with and its own concurrent branch"
+        );
+
+        wire_only(&ea, &eb).await;
+        let merged = until(|| async {
+            let items = ea.tasks_items(APP).await.unwrap();
+            (items.items.len() == 3).then_some(items)
+        })
+        .await;
+        let mut seen = titles(&merged);
+        seen.sort();
+        assert_eq!(seen, vec!["branch a", "branch b", "root"]);
+        for _ in 0..500 {
+            yield_now().await;
+        }
+
+        // Both anchored the merge, and those two anchors are themselves
+        // concurrent — two branches, two entry points, and no third anchor:
+        // an anchor is not content, and only content is worth anchoring for.
+        // Bounded by concurrency, not by history length, which is the whole
+        // claim.
+        for engine in [&ea, &eb] {
+            assert_eq!(
+                engine.entry_points().await.unwrap(),
+                2,
+                "the frontier grew past the number of live branches"
+            );
+        }
+    });
+}
+
+/// A device enrolled while another was offline still reads that device's
+/// branch, without waiting for anyone to write again.
+///
+/// This is the partition case: B's writes were sealed under an epoch that
+/// predates C's enrolment, so C can decrypt neither them nor anything automerge
+/// buffers behind them. The device that *can* read both — A — republishes the
+/// branch by anchoring the merge, and C walks in from there
+/// (`design/causal_encryption.md` §"Multiple Heads": a branch is connected "by
+/// supplying a new head for it").
+#[test]
+fn a_branch_written_before_a_joiner_existed_reaches_it_through_the_anchor() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 30, None);
+    let b = device(&pool, 31, None);
+    let c = device(&pool, 32, None);
+    let (ea, eb, ec) = (
+        Rc::clone(&a.engine),
+        Rc::clone(&b.engine),
+        Rc::clone(&c.engine),
+    );
+
+    pool.run_until(async move {
+        ea.tasks_add(APP, "from a".into()).await.unwrap();
+        enroll(&ea, &eb).await;
+        // B never connects: it writes into a partition. It has never synced,
+        // so its app tree holds exactly this one commit.
+        eb.tasks_add(APP, "from b offline".into()).await.unwrap();
+        let b_commit = {
+            let mut own: Vec<[u8; 32]> = eb
+                .items()
+                .iter()
+                .filter(|item| item.tree == *tasks_tree(APP).as_bytes())
+                .map(|item| item.commit)
+                .collect();
+            assert_eq!(own.len(), 1, "B wrote more than the one commit");
+            own.pop().expect("B's own commit")
+        };
+        // C is enrolled meanwhile, so its epoch begins after B's write.
+        enroll(&ea, &ec).await;
+
+        wire_only(&ea, &eb).await;
+        let _merged = until(|| async {
+            let items = ea.tasks_items(APP).await.unwrap();
+            (items.items.len() == 2).then_some(items)
+        })
+        .await;
+
+        // Delivered to C through the store, in two batches with the anchor
+        // first — so the claim "without anyone writing again" is pinned across
+        // separate deliveries and not just within one sync.
+        assert!(ec.tasks_items(APP).await.unwrap().items.is_empty());
+        let (branch, rest): (Vec<_>, Vec<_>) = ea
+            .items()
+            .into_iter()
+            .partition(|item| item.commit == b_commit);
+        assert_eq!(branch.len(), 1, "B's offline commit is not in what A holds");
+
+        let _landed = ec.ingest_items(rest).await.unwrap();
+        for _ in 0..200 {
+            yield_now().await;
+        }
+        let _landed = ec.ingest_items(branch).await.unwrap();
+        let seen = until(|| async {
+            let items = ec.tasks_items(APP).await.unwrap();
+            (items.items.len() == 2).then_some(items)
+        })
+        .await;
+        let mut seen = titles(&seen);
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec!["from a", "from b offline"],
+            "the joiner never reached the branch written before it existed"
+        );
+    });
+}
+
+/// Out-of-order delivery: the child arrives in one batch and its parents in
+/// the next, and the parents still open.
+///
+/// This is the store path rather than the peer path, because a store hands back
+/// whatever it happened to list — there is no causal order in a bucket (keyhive
+/// `design/causal_encryption.md` §"Crypt Store": "there is no dependency on
+/// ordering between encrypted blobs").
+///
+/// The joiner holds one entry point, the head. Batch one gives it that head and
+/// nothing below; the walk opens it and reads out the keys of ancestors whose
+/// ciphertext has not arrived (`CausalDecryptionState::next`). Those keys are
+/// the only way those commits will ever be opened: they predate the joiner's
+/// enrolment, so no epoch of its own reaches them, and once the head is applied
+/// no later batch can re-derive them. Batch two delivers them and nothing else,
+/// with nobody writing anything.
+#[test]
+fn parents_delivered_after_their_child_still_open() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 50, None);
+    let c = device(&pool, 52, None);
+    let (ea, ec) = (Rc::clone(&a.engine), Rc::clone(&c.engine));
+
+    pool.run_until(async move {
+        let app_tree = *tasks_tree(APP).as_bytes();
+        let app_commits = |engine: &TestEngine| -> Vec<[u8; 32]> {
+            engine
+                .items()
+                .iter()
+                .filter(|item| item.tree == app_tree)
+                .map(|item| item.commit)
+                .collect()
+        };
+
+        ea.tasks_add(APP, "first".into()).await.unwrap();
+        ea.tasks_add(APP, "second".into()).await.unwrap();
+        let older = app_commits(&ea);
+        assert_eq!(older.len(), 2, "two commits so far");
+        ea.tasks_add(APP, "third".into()).await.unwrap();
+
+        // C is enrolled now, so every one of those three commits predates its
+        // epoch: the head's key, handed over at enrolment, is its only way in.
+        enroll(&ea, &ec).await;
+
+        let (parents, first): (Vec<_>, Vec<_>) = ea
+            .items()
+            .into_iter()
+            .partition(|item| item.tree == app_tree && older.contains(&item.commit));
+        assert_eq!(
+            parents.len(),
+            2,
+            "exactly the two older commits are held back"
+        );
+
+        // C opens the app before either delivery: without a document the
+        // items would just sit in storage and both batches would be opened
+        // together on the first read, which is not what this is testing.
+        assert!(ec.tasks_items(APP).await.unwrap().items.is_empty());
+
+        let _landed = ec.ingest_items(first).await.unwrap();
+        for _ in 0..200 {
+            yield_now().await;
+        }
+        assert!(
+            ec.tasks_items(APP).await.unwrap().items.is_empty(),
+            "the head alone should materialize nothing: its parents are missing"
+        );
+        // Batch two: the parents, alone. Nothing writes.
+        let _landed = ec.ingest_items(parents).await.unwrap();
+        let seen = until(|| async {
+            let items = ec.tasks_items(APP).await.unwrap();
+            (items.items.len() == 3).then_some(items)
+        })
+        .await;
+        assert_eq!(
+            titles(&seen),
+            vec!["first", "second", "third"],
+            "the parents delivered after their child were never opened"
         );
     });
 }
