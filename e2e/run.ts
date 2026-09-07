@@ -10,15 +10,16 @@
 import { chromium } from "playwright";
 import type { Browser, BrowserContext, Page } from "playwright";
 import { contentType } from "@std/media-types";
+import { copy } from "@std/fs";
 import { extname, join, normalize } from "@std/path";
 
-const DIST = new URL("../web/dist", import.meta.url).pathname;
+const BUILT = new URL("../web/dist", import.meta.url).pathname;
 
 // ---------------------------------------------------------------------------
 // Static server
 // ---------------------------------------------------------------------------
 
-function serve(): { origin: string; stop(): Promise<void> } {
+function serve(dist: string): { origin: string; stop(): Promise<void> } {
   const server = Deno.serve({
     port: 0, // The kernel picks; parallel checkouts must not collide.
     hostname: "127.0.0.1",
@@ -29,8 +30,8 @@ function serve(): { origin: string; stop(): Promise<void> } {
     if (path.endsWith("/")) path += "index.html";
     // `normalize` collapses `..` before the join, so a request cannot climb
     // out of dist.
-    const file = join(DIST, normalize(path));
-    if (!file.startsWith(DIST)) return new Response("no", { status: 403 });
+    const file = join(dist, normalize(path));
+    if (!file.startsWith(dist)) return new Response("no", { status: 403 });
     try {
       const body = await Deno.readFile(file);
       return new Response(body, {
@@ -47,6 +48,101 @@ function serve(): { origin: string; stop(): Promise<void> } {
     origin: `http://127.0.0.1:${server.addr.port}`,
     stop: () => server.shutdown(),
   };
+}
+
+// ---------------------------------------------------------------------------
+// The relay
+//
+// Two devices in two browser contexts have no way to reach each other
+// without one: `polymorph:iroh` dials through a relay over WebSocket, and
+// the home origin names it in `config.json`. This harness runs its own — a
+// local `iroh-relay --dev` — so the gate never depends on the public n0
+// relays being up, or on this machine having any internet at all.
+// ---------------------------------------------------------------------------
+
+/** A port nothing is listening on, right now.
+ *
+ * `iroh-relay` takes a fixed `http_bind_addr` and has no port-0 mode, so
+ * the port has to be chosen before the relay starts: bind it, read it, drop
+ * it. The window between the close and the relay's bind is a race, and a
+ * lost one shows up as the relay failing to start rather than as a silent
+ * wrong-relay probe (which is why the readiness wait below is against the
+ * port we picked, not against whatever answered). */
+function freePort(): number {
+  const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+  const port = (listener.addr as Deno.NetAddr).port;
+  listener.close();
+  return port;
+}
+
+interface Relay {
+  url: string;
+  /** Kill the relay and take its config directory with it, the way
+   * `stageSite`'s copy is removed: a gate that leaves temp trees behind
+   * fills `/tmp` one run at a time. */
+  stop(): Promise<void>;
+}
+
+async function startRelay(): Promise<Relay> {
+  const port = freePort();
+  const dir = await Deno.makeTempDir({ prefix: "polyvisor-relay-" });
+  const config = join(dir, "relay.toml");
+  await Deno.writeTextFile(
+    config,
+    `http_bind_addr = "127.0.0.1:${port}"\nenable_metrics = false\n`,
+  );
+  const child = new Deno.Command("iroh-relay", {
+    args: ["--dev", "--config-path", config],
+    stdout: "inherit",
+    stderr: "inherit",
+  }).spawn();
+
+  const url = `http://127.0.0.1:${port}`;
+  const deadline = performance.now() + 30_000;
+  for (;;) {
+    try {
+      // Any answer at all means the HTTP server is up; the relay's own
+      // paths are the client's business, not the harness's.
+      const res = await fetch(url, { signal: AbortSignal.timeout(2_000) });
+      await res.body?.cancel();
+      break;
+    } catch {
+      if (performance.now() > deadline) {
+        child.kill("SIGKILL");
+        await Deno.remove(dir, { recursive: true }).catch(() => {});
+        throw new Error(`iroh-relay did not answer at ${url} within 30s`);
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+  return {
+    url,
+    async stop() {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // Already gone; nothing owed.
+      }
+      await Deno.remove(dir, { recursive: true }).catch(() => {});
+    },
+  };
+}
+
+/**
+ * A copy of the built site with this run's relay in its `config.json`.
+ *
+ * The copy is the point: `web/dist` is what a home origin serves, and a
+ * gate that edited it in place would leave a checkout whose site points at
+ * a relay that stopped existing when the run ended.
+ */
+async function stageSite(relay: string): Promise<string> {
+  const dist = await Deno.makeTempDir({ prefix: "polyvisor-dist-" });
+  await copy(BUILT, dist, { overwrite: true });
+  await Deno.writeTextFile(
+    join(dist, "config.json"),
+    JSON.stringify({ relay }),
+  );
+  return dist;
 }
 
 // ---------------------------------------------------------------------------
@@ -67,7 +163,11 @@ function eq(actual: unknown, expected: unknown, what: string): void {
 
 interface Scenario {
   name: string;
-  run(ctx: BrowserContext, origin: string): Promise<void>;
+  /** `ctx` is this scenario's own fresh context — one browser context is
+   * one device (separate sessionStorage, separate SharedWorker). A
+   * scenario that needs a *second* device makes its own context from
+   * `browser` and closes it itself. */
+  run(ctx: BrowserContext, origin: string, browser: Browser): Promise<void>;
 }
 
 /** Wait for the visor to have painted its strip, and fail loudly on the
@@ -207,6 +307,207 @@ async function claimed(page: Page): Promise<boolean> {
     );
   }
   return !cls.includes("unclaimed");
+}
+
+// ---------------------------------------------------------------------------
+// Sync, as these scenarios drive it
+//
+// Everything here is shaped by one fact about the visor: it holds no state
+// of its own and no timer exists in its world (visor/src/ui.rs), so nothing
+// on screen refreshes on its own. `device.status` and `sync.peers` are read
+// on every press that *opens* the Settings tenant — so toggling Settings
+// shut and open again is how this harness re-reads an endpoint id or a
+// peer's state. That is not a workaround for a missing feature; polling
+// chrome is a thing the milestone deliberately does not have.
+// ---------------------------------------------------------------------------
+
+const syncSheet = (page: Page) => sheet(page, "Sync");
+
+const settingsButton = (page: Page) =>
+  strip(page).getByRole("button", { name: "Settings", exact: true });
+
+/** Settings open, showing the sync section. */
+async function openSettings(page: Page): Promise<void> {
+  if (await syncSheet(page).count() > 0) return;
+  await settingsButton(page).click();
+  await syncSheet(page).waitFor({ timeout: 10_000 });
+}
+
+/** Close Settings and open it again: the press that opens it is the
+ * `device.status` and `sync.peers` read, so this is the only way to see
+ * either of them change. */
+async function refreshSettings(page: Page): Promise<void> {
+  if (await syncSheet(page).count() > 0) {
+    await settingsButton(page).click();
+    await drawer(page).waitFor({ state: "detached", timeout: 10_000 });
+  }
+  await openSettings(page);
+}
+
+/**
+ * This device's endpoint id, as another device would read it off the
+ * screen.
+ *
+ * Empty until the endpoint is bound (internal.wit
+ * `device-status.endpoint-id`): the bind is spawned and lands after first
+ * paint, so the sheet says "binding…" for a while. The re-read is a
+ * Settings toggle, not a reload — the visor re-reads `device.status` on the
+ * press that opens the tenant (visor/src/ui.rs `show_settings`), and a
+ * reload would burn a fresh wasm instance per realm (~124 memories per
+ * renderer) to learn one string that a second press already tells us.
+ */
+async function endpointId(page: Page): Promise<string> {
+  const deadline = performance.now() + 60_000;
+  for (;;) {
+    await openSettings(page);
+    const shown = syncSheet(page).locator("#visor-endpoint-id");
+    try {
+      await shown.waitFor({ timeout: 3_000 });
+      const id = (await shown.textContent() ?? "").trim();
+      if (id.length > 0) return id;
+    } catch {
+      // Still "binding…"; fall through to another press.
+    }
+    if (performance.now() > deadline) {
+      throw new Failure("this device never bound an iroh endpoint");
+    }
+    await refreshSettings(page);
+  }
+}
+
+/** Paste a peer's endpoint id into the sync form and dial it. */
+async function dial(page: Page, peer: string): Promise<void> {
+  await openSettings(page);
+  const sync = syncSheet(page);
+  await sync.locator("input[type=text]").fill(peer);
+  await sync.getByRole("button", { name: "Connect", exact: true }).click();
+}
+
+/** Wait for the peer row to say `connected`. Generous, because what it is
+ * waiting for is a relay handshake — a WebSocket to the relay, a QUIC
+ * handshake through it and subduction's own handshake on top — none of which
+ * is fast. There is no direct path to wait for: the browser profile has no
+ * UDP, and WebRTC is off in the worker (runtime/component/src/net.rs), so
+ * every dial and accept stays on the relay. */
+async function waitForConnectedPeer(page: Page, peer: string): Promise<void> {
+  const deadline = performance.now() + 30_000;
+  let said = "no row at all";
+  for (;;) {
+    const row = syncSheet(page).locator(".peer-row").filter({ hasText: peer })
+      .first();
+    if (await row.count() > 0) {
+      said = (await row.locator(".framework").first().textContent() ?? "")
+        .trim();
+      // "connecting" is not "connected", and the kernel's own vocabulary
+      // (internal.wit `sync.peer`) is what is matched here, unparaphrased.
+      if (said === "connected") return;
+    }
+    // A refused dial is the kernel's own message in the sync sheet, and it
+    // is worth more than a 30s timeout — but only until the next refresh
+    // closes the sheet and takes the message with it, which is why it is
+    // read here rather than at the moment of the click.
+    const refused = syncSheet(page).locator(".sheet-error");
+    if (await refused.count() > 0) {
+      throw new Failure(`the dial was refused: ${await refused.textContent()}`);
+    }
+    if (performance.now() > deadline) {
+      throw new Failure(`the peer never reached "connected"; it read ${said}`);
+    }
+    await new Promise((r) => setTimeout(r, 1_000));
+    await refreshSettings(page);
+  }
+}
+
+const todoFrame = (page: Page) => page.frameLocator("#app-zone iframe");
+
+async function addTodo(page: Page, title: string): Promise<void> {
+  const input = todoFrame(page).locator("input.new-todo, input").first();
+  await input.waitFor({ timeout: 30_000 });
+  await input.fill(title);
+  await input.press("Enter");
+  await todoFrame(page).getByText(title).first().waitFor({ timeout: 15_000 });
+}
+
+/** Reload the page and put TodoMVC back on screen: a fresh mount, which is
+ * a fresh `tasks.items` read. */
+async function remountTodoMvc(page: Page): Promise<void> {
+  await page.reload();
+  await visorReady(page);
+  await launchTodoMvc(page);
+}
+
+/**
+ * Wait for a todo that was written on the *other* device.
+ *
+ * Nothing pushes into a mounted app: `polyvisor:app/tasks` is pull-only and
+ * the TodoMVC guest re-reads after its own mutations and at mount
+ * (apps/todomvc/src/lib.rs). So a remote change is on this device's disk
+ * long before it is on this device's screen, and the only honest way to
+ * observe it is to make the app read again — which is what the remount
+ * between attempts does.
+ */
+async function waitForRemoteTodo(page: Page, title: string): Promise<void> {
+  // The app re-reads `tasks.items` only on mount and after its own
+  // mutations (wit/app.wit `tasks`: a change feed is the additive next
+  // step), so a remote change shows up on the next mount. Remounting costs
+  // a wasm instance per realm; a few seconds between attempts keeps the
+  // whole wait inside a handful of them.
+  const deadline = performance.now() + 60_000;
+  for (;;) {
+    try {
+      await todoFrame(page).getByText(title).first().waitFor({
+        timeout: 5_000,
+      });
+      return;
+    } catch {
+      if (performance.now() > deadline) {
+        throw new Failure(`"${title}" never arrived from the other device`);
+      }
+    }
+    await page.waitForTimeout(3_000);
+    await remountTodoMvc(page);
+  }
+}
+
+/**
+ * Two devices, dialed and converged: A holds "from A", B has dialed A and
+ * holds both todos. Returns both pages and both endpoint ids; the caller
+ * owns B's context.
+ *
+ * Two browser contexts really are two devices — separate sessionStorage, so
+ * separate device anchors, so separately-named SharedWorkers and separate
+ * OPFS — and the two endpoint ids differing is the assertion that says so.
+ */
+async function converge(
+  ctxA: BrowserContext,
+  ctxB: BrowserContext,
+  origin: string,
+): Promise<{ a: Page; b: Page; idA: string; idB: string }> {
+  const a = await open(ctxA, origin);
+  await visorReady(a);
+  await launchTodoMvc(a);
+  await addTodo(a, "from A");
+  const idA = await endpointId(a);
+
+  const b = await open(ctxB, origin);
+  await visorReady(b);
+  const idB = await endpointId(b);
+  check(
+    idA !== idB,
+    "the two contexts are the same device: they share an endpoint id",
+  );
+
+  await dial(b, idA);
+  await waitForConnectedPeer(b, idA);
+
+  // B's app only re-reads after B's own mutations, so adding "from B" is
+  // both the second half of the convergence claim and the thing that makes
+  // A's todo appear.
+  await launchTodoMvc(b);
+  await addTodo(b, "from B");
+  await waitForRemoteTodo(b, "from A");
+
+  return { a, b, idA, idB };
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +793,55 @@ const scenarios: Scenario[] = [
   },
 
   {
+    name: "two-devices-sync",
+    async run(ctx, origin, browser) {
+      const ctxB = await browser.newContext();
+      try {
+        const { a } = await converge(ctx, ctxB, origin);
+
+        // A is not asked to do anything of its own: no mutation, no dial.
+        // The claim is that the change B made arrived on A and went into
+        // A's checkpoint, so A's *next boot* — a cold read off disk — has
+        // it. Nothing in worker memory can be doing this work.
+        await remountTodoMvc(a);
+        await waitForRemoteTodo(a, "from B");
+        await todoFrame(a).getByText("from A").first().waitFor({
+          timeout: 15_000,
+        });
+      } finally {
+        await ctxB.close();
+      }
+    },
+  },
+
+  {
+    name: "sync-merged-doc-survives-reload",
+    async run(ctx, origin, browser) {
+      const ctxB = await browser.newContext();
+      try {
+        const { b } = await converge(ctx, ctxB, origin);
+
+        // No re-dial: what is being tested is B's checkpoint holding the
+        // merged document, so convergence is state and not a live session.
+        // Whether B still has a peer row afterwards is deliberately not
+        // asserted — peers are not persisted, and the claim of this
+        // scenario is about the todos; asserting the other thing would
+        // fail for a reason it is not about.
+        await b.reload();
+        await visorReady(b);
+        await launchTodoMvc(b);
+        for (const title of ["from A", "from B"]) {
+          await todoFrame(b).getByText(title).first().waitFor({
+            timeout: 30_000,
+          });
+        }
+      } finally {
+        await ctxB.close();
+      }
+    },
+  },
+
+  {
     name: "frame-network-dead",
     async run(ctx, origin) {
       const page = await open(ctx, origin);
@@ -516,7 +866,12 @@ const scenarios: Scenario[] = [
   },
 
   {
-    name: "instantiates-without-jspi",
+    // Both realms on this side, named: the visor on the main thread and the
+    // runtime in the SharedWorker. The worker is the exception that makes
+    // the name worth spelling out — a page can see its own realm fail, but
+    // a worker that throws while instantiating does so out of sight, and
+    // `workerBooted` is the only evidence on this side that it did not.
+    name: "visor-and-frame-without-jspi",
     async run(ctx, origin) {
       const page = await open(ctx, origin);
       await visorReady(page);
@@ -553,14 +908,17 @@ const scenarios: Scenario[] = [
 
 async function main(): Promise<void> {
   try {
-    await Deno.stat(join(DIST, "index.html"));
+    await Deno.stat(join(BUILT, "index.html"));
   } catch {
     console.error("e2e: web/dist is not built — run `just site` first");
     Deno.exit(1);
   }
 
-  const server = serve();
-  console.log(`e2e: serving web/dist at ${server.origin}`);
+  const relay = await startRelay();
+  console.log(`e2e: relay at ${relay.url}`);
+  const dist = await stageSite(relay.url);
+  const server = serve(dist);
+  console.log(`e2e: serving ${dist} at ${server.origin}`);
   let browser: Browser | undefined;
   let failures = 0;
   try {
@@ -571,13 +929,24 @@ async function main(): Promise<void> {
       const ctx = await browser.newContext();
       const t0 = performance.now();
       try {
-        await scenario.run(ctx, server.origin);
+        await scenario.run(ctx, server.origin, browser);
         console.log(
           `ok   ${scenario.name} (${(performance.now() - t0).toFixed(0)}ms)`,
         );
       } catch (err) {
         failures++;
         console.error(`FAIL ${scenario.name}: ${(err as Error).message}`);
+        // What the visor was showing when the wait gave up, per open page:
+        // the M3a flakes were diagnosed from exactly this line.
+        for (const page of ctx.pages()) {
+          const dump = await page.evaluate(() => ({
+            strip: document.querySelector("#visor-strip")?.textContent ??
+              "<none>",
+            drawer: document.querySelector("#visor-drawer")?.textContent ??
+              "<none>",
+          })).catch((e) => ({ error: String(e) }));
+          console.error(`  page ${page.url()}: ${JSON.stringify(dump)}`);
+        }
       } finally {
         await ctx.close();
       }
@@ -585,6 +954,8 @@ async function main(): Promise<void> {
   } finally {
     await browser?.close();
     await server.stop();
+    await relay.stop();
+    await Deno.remove(dist, { recursive: true }).catch(() => {});
   }
   if (failures > 0) {
     console.error(`e2e: ${failures} scenario(s) failed`);

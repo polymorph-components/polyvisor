@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::Rc;
 
 mod apps;
 mod checkpoint;
@@ -18,22 +19,30 @@ mod device;
 mod events;
 mod seal;
 mod store;
-mod tasks;
+mod sync;
 
 pub use apps::{AppInfo, AssetInfo, ComponentArtifacts};
 pub use device::{DeviceStatus, IndexRow, Rest, State, Tier};
 pub use events::Event;
+/// The task types are the engine's: the kernel no longer holds a list of its
+/// own, it holds an automerge document per app inside the engine.
+pub use polyvisor_engine::{EngineTransport, TaskSnapshot as Snapshot, TodoItem};
 pub use store::LEASE_TTL_MS;
-pub use tasks::{Snapshot, TodoItem};
+pub use sync::Peer;
 
 use apps::Registry;
 use device::Device;
 use events::Events;
 use seal::{Dek, WrappedDek};
-use tasks::TaskList;
+
+use futures::future::LocalBoxFuture;
+use polyvisor_engine::{DynTransport, Engine};
 
 /// A future that borrows its owner and is never sent between threads.
 pub type LocalFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+
+/// The engine, at the transport the kernel gives it.
+type SyncEngine = Engine<DynTransport>;
 
 /// The unsealed key/value store (`polyvisor:internal/kv`). Arguments are
 /// owned so the returned future borrows only the store.
@@ -87,11 +96,71 @@ pub trait Locks {
     fn is_held(&self, name: String) -> LocalFuture<'_, bool>;
 }
 
-/// The system clock (`wasi:clocks/system-clock`), in epoch milliseconds.
-/// Synchronous: `now` is a plain `func`. Not monotonic — every comparison
-/// against it saturates.
+/// The system clock (`wasi:clocks/system-clock`), in epoch milliseconds, and
+/// the monotonic clock's sleep (`wasi:clocks/monotonic-clock`).
+///
+/// `now_ms` is synchronous: `now` is a plain `func`. Not monotonic — every
+/// comparison against it saturates. `sleep` is what the sync engine's driver
+/// arms its protocol deadlines with; nothing else in the kernel sleeps.
 pub trait Clock {
     fn now_ms(&self) -> u64;
+    fn sleep(&self, ms: u64) -> LocalFuture<'_, ()>;
+}
+
+/// Where the kernel's long-lived futures run: the sync driver, the engine's
+/// event pump, each connection's read loop, and the endpoint's accept loop.
+///
+/// The component implements this with wit-bindgen's
+/// `rt::async_support::spawn_local`; tests implement it over a `LocalPool`
+/// spawner. Nothing here joins or cancels: these futures live as long as the
+/// worker does.
+pub trait Spawn {
+    fn spawn(&self, future: LocalBoxFuture<'static, ()>);
+}
+
+/// The device's iroh endpoint (`polymorph:iroh`).
+///
+/// The seed is the device's Ed25519 seed: the same seed the engine signs with,
+/// imported through `polymorph:webcrypto` to build the iroh identity, so a
+/// device's endpoint id and its subduction peer id are one key (internal.wit
+/// `world runtime`).
+pub trait Net {
+    /// Bind the endpoint, answering its id (z-base-32, iroh's spelling) and
+    /// the handle that dials and accepts on it.
+    fn bind(&self, seed: [u8; 32]) -> LocalFuture<'_, Result<Bound, String>>;
+}
+
+/// A bound endpoint: its id, and the handle that dials and accepts on it.
+pub type Bound = (String, Box<dyn NetHandle>);
+
+/// An accepted connection: the endpoint id that opened it, that id's raw
+/// Ed25519 public key, and its transport.
+///
+/// The key travels with the id for the same reason it does in [`Dialed`] —
+/// the z-base-32 spelling belongs to the endpoint component — and the kernel
+/// needs it here to check that the peer subduction authenticates is the one
+/// the endpoint id named (see `Kernel::sync_connect`'s inbound twin).
+pub type Accepted = (String, [u8; 32], Box<dyn EngineTransport>);
+
+/// A dialed connection: the peer's raw Ed25519 public key, and its transport.
+///
+/// The key comes back with the connection because an iroh endpoint id *is*
+/// that key, in iroh's z-base-32 spelling — and that spelling belongs to the
+/// endpoint component, not to the kernel. The engine needs the key because
+/// subduction requires an outbound connection to name who it believes it is
+/// dialing (subduction_protocol/src/conn_machine.rs:96); an inbound one
+/// learns its peer from the handshake, which is why [`NetHandle::accept`]
+/// answers only an endpoint id.
+pub type Dialed = ([u8; 32], Box<dyn EngineTransport>);
+
+/// A bound endpoint. Arguments are owned so the returned future borrows only
+/// the handle.
+pub trait NetHandle {
+    /// Dial `endpoint_id` and open the connection's stream.
+    fn connect(&self, endpoint_id: String) -> LocalFuture<'_, Result<Dialed, String>>;
+
+    /// The next inbound connection, with the endpoint id that opened it.
+    fn accept(&self) -> LocalFuture<'_, Result<Accepted, String>>;
 }
 
 /// HTTP GET. `Err` carries a framework-voice reason (transport failure or a
@@ -113,9 +182,13 @@ pub struct Seams {
     pub platform: Box<dyn Platform>,
     pub files: Box<dyn Files>,
     pub locks: Box<dyn Locks>,
-    pub clock: Box<dyn Clock>,
+    /// `Rc` rather than `Box`: the engine's clock adapter outlives the call
+    /// that builds it and is held by the driver task.
+    pub clock: Rc<dyn Clock>,
     pub fetch: Box<dyn Fetch>,
     pub rng: Box<dyn Rng>,
+    pub spawn: Rc<dyn Spawn>,
+    pub net: Box<dyn Net>,
 }
 
 /// Mirrors `polyvisor:internal/types.error-code` one for one.
@@ -170,7 +243,16 @@ struct DeviceState {
     /// readable — or renderable — before the seal opens (internal.wit
     /// `device`), so it is not in memory either.
     device: Option<Device>,
-    tasks: BTreeMap<String, TaskList>,
+    /// The device's Ed25519 seed: its subduction identity and, imported
+    /// through `polymorph:webcrypto`, its iroh identity (docs/design.md
+    /// "Sync engine", the `Signer` row: "a seed held in the sealed
+    /// checkpoint"). Zero while sealed, like everything else personal.
+    seed: [u8; 32],
+    /// The engine state the checkpoint carried, until the engine is built
+    /// from it — [`Kernel::start_sync`] takes it. Keeping a copy afterwards
+    /// would be keeping a stale one: from that moment the engine is the only
+    /// authority on its own state.
+    engine_state: Option<polyvisor_engine::Snapshot>,
     /// The pointed generation in `kv`; the next checkpoint is this + 1,
     /// whether or not it was the one that loaded (see `checkpoint`).
     generation: u64,
@@ -190,13 +272,37 @@ pub struct Kernel {
     /// (internal.wit `types.session-id`).
     next_session: RefCell<SessionId>,
     events: Events,
+    /// `Some` exactly while the device is open: the engine holds the tasks.
+    engine: RefCell<Option<Rc<SyncEngine>>>,
+    /// The bound endpoint, and what `sync.connect` dials through. `None`
+    /// while sealed, and while the endpoint has not come up.
+    endpoint: RefCell<Option<Rc<dyn NetHandle>>>,
+    /// This device's endpoint id; `""` until the endpoint is bound
+    /// (internal.wit `device.device-status.endpoint-id`).
+    endpoint_id: RefCell<String>,
+    /// Why the endpoint did not bind, once it is known to have failed.
+    /// `None` both before the bind finishes and after it succeeds — the two
+    /// are told apart by [`Kernel::endpoint`] being `Some`.
+    bind_error: RefCell<Option<String>>,
+    /// What `sync.peers` reports, in the order peers were first seen.
+    peers: RefCell<Vec<sync::PeerRecord>>,
+    /// Serialises checkpoints — see [`Kernel::checkpoint`].
+    checkpointing: RefCell<Checkpointing>,
+}
+
+/// The checkpoint gate: at most one writer, and one bit of "someone asked
+/// again while I was writing".
+#[derive(Default)]
+struct Checkpointing {
+    running: bool,
+    dirty: bool,
 }
 
 impl Kernel {
     /// Sweep, then bring this device up, then build the app registry from the
     /// home origin. All three must succeed for the runtime to be usable, so
     /// this is the constructor rather than a method on a half-built kernel.
-    pub async fn boot(config: BootConfig, seams: Seams) -> Result<Kernel, Error> {
+    pub async fn boot(config: BootConfig, seams: Seams) -> Result<Rc<Kernel>, Error> {
         let home_origin = config.home_origin.trim_end_matches('/').to_string();
         let id = config.device;
         let now = seams.clock.now_ms();
@@ -225,7 +331,7 @@ impl Kernel {
             .await;
 
         let registry = Registry::fetch(seams.fetch.as_ref(), &home_origin).await?;
-        Ok(Kernel {
+        let kernel = Rc::new(Kernel {
             seams,
             home_origin,
             id,
@@ -234,7 +340,19 @@ impl Kernel {
             sessions: RefCell::new(BTreeMap::new()),
             next_session: RefCell::new(1),
             events: Events::default(),
-        })
+            engine: RefCell::new(None),
+            endpoint: RefCell::new(None),
+            endpoint_id: RefCell::new(String::new()),
+            bind_error: RefCell::new(None),
+            peers: RefCell::new(Vec::new()),
+            checkpointing: RefCell::new(Checkpointing::default()),
+        });
+        // A sealed device has no seed in memory, so it has no engine and no
+        // endpoint until `unseal` (internal.wit `device`).
+        if kernel.state() != State::Sealed {
+            kernel.start_sync();
+        }
+        Ok(kernel)
     }
 
     // -- state gates ---------------------------------------------------------
@@ -292,6 +410,7 @@ impl Kernel {
     pub fn device_status(&self) -> Result<DeviceStatus, Error> {
         self.not_erased()?;
         let state = self.state();
+        let endpoint_id = self.endpoint_id();
         let inner = self.state.borrow();
         let device = inner.device.clone();
         Ok(DeviceStatus {
@@ -303,6 +422,7 @@ impl Kernel {
             name: device.as_ref().map(|d| d.name.clone()).unwrap_or_default(),
             hue: device.as_ref().map(|d| d.hue).unwrap_or(0),
             word: device.map(|d| d.word).unwrap_or_default(),
+            endpoint_id,
         })
     }
 
@@ -425,7 +545,7 @@ impl Kernel {
     /// The login. A wrong passphrase is `refused` and the device stays
     /// sealed; there is no counter and no lockout, because the cost of a
     /// guess is the Argon2id derivation itself.
-    pub async fn unseal(&self, passphrase: String) -> Result<(), Error> {
+    pub async fn unseal(self: &Rc<Self>, passphrase: String) -> Result<(), Error> {
         self.not_erased()?;
         if self.state() != State::Sealed {
             return Err(Error::new(
@@ -467,12 +587,14 @@ impl Kernel {
         .await?;
         {
             let mut state = self.state.borrow_mut();
+            state.seed = restored.seed;
+            state.engine_state = restored.engine;
             state.device = Some(restored.device);
-            state.tasks = restored.tasks;
             state.generation = generation;
             state.dek = Some(dek);
             state.wrapped = None;
         }
+        self.start_sync();
         self.touch_lease().await
     }
 
@@ -496,7 +618,16 @@ impl Kernel {
         state.dek = None;
         state.wrapped = None;
         state.device = None;
-        state.tasks.clear();
+        state.seed = [0u8; 32];
+        state.engine_state = None;
+        drop(state);
+        // The engine and the endpoint go with the device: a torn-down device
+        // must not keep syncing what it no longer has.
+        let _engine = self.engine.borrow_mut().take();
+        let _endpoint = self.endpoint.borrow_mut().take();
+        self.endpoint_id.borrow_mut().clear();
+        *self.bind_error.borrow_mut() = None;
+        self.peers.borrow_mut().clear();
         Ok(())
     }
 
@@ -526,10 +657,65 @@ impl Kernel {
     }
 
     /// Seal the whole of the kernel's serializable state into a new
-    /// generation, then refresh the lease. Called after every successful
-    /// mutation; state is small until the engine lands, so there is no
-    /// debounce (docs/design.md "Devices").
+    /// generation, then refresh the lease.
+    ///
+    /// **At most one checkpoint is ever in flight, and requests made during
+    /// one are coalesced into a single further write.** Since the engine
+    /// landed there are two callers — the export path after a local mutation,
+    /// and the engine's event pump after a remote change — and they are not
+    /// ordered with respect to each other. Two overlapping writers would be
+    /// wrong twice over: the OPFS host refuses concurrent access handles
+    /// outright ("too many calls are being made on file resources"), and even
+    /// if it did not, two runs of `checkpoint::write` racing would advance
+    /// `dev/<id>/gen` out of order and could leave the pointer naming the
+    /// *older* of two generations.
+    ///
+    /// A caller that arrives mid-write is told `Ok` and its data is written
+    /// by the running loop, not by it. That is not a lie: the kernel's
+    /// in-memory state is authoritative and is what every iteration
+    /// serializes, so the loop's next pass carries the coalesced caller's
+    /// change — it simply is not the one that wrote it. Only the caller that
+    /// *started* the loop learns of a write failure, which is the caller that
+    /// can still refuse to claim the mutation landed.
     async fn checkpoint(&self) -> Result<(), Error> {
+        {
+            let mut gate = self.checkpointing.borrow_mut();
+            if gate.running {
+                gate.dirty = true;
+                return Ok(());
+            }
+            gate.running = true;
+        }
+        let result = self.checkpoint_loop().await;
+        // Unconditionally, including on the error path: a gate left latched
+        // would silently stop every later checkpoint.
+        *self.checkpointing.borrow_mut() = Checkpointing::default();
+        result
+    }
+
+    /// Write until nobody has asked again. `dirty` is cleared *before* the
+    /// write, so a request that arrives while it is in flight is seen.
+    async fn checkpoint_loop(&self) -> Result<(), Error> {
+        loop {
+            // An erased device has no data key and nothing left to seal. The
+            // pump can still be running — its engine outlives `erase` by a
+            // turn — and a checkpoint here would panic reaching for the key.
+            if self.state.borrow().erased {
+                return Ok(());
+            }
+            self.checkpointing.borrow_mut().dirty = false;
+            self.write_checkpoint().await?;
+            if !self.checkpointing.borrow().dirty {
+                return Ok(());
+            }
+        }
+    }
+
+    /// One generation, sealed and committed, then the lease.
+    async fn write_checkpoint(&self) -> Result<(), Error> {
+        // Taken before the state borrow: `Engine::snapshot` borrows the
+        // engine's own cells, and nothing may hold two of ours at once.
+        let engine = self.engine.borrow().as_ref().map(|e| e.snapshot());
         let (dek, generation, snapshot) = {
             let state = self.state.borrow();
             let dek = state.dek.clone().expect("open implies a data key");
@@ -537,7 +723,7 @@ impl Kernel {
             (
                 dek,
                 state.generation + 1,
-                checkpoint::Snapshot::new(device, state.tasks.clone()),
+                checkpoint::Snapshot::new(device, state.seed, engine),
             )
         };
         checkpoint::write(
@@ -668,16 +854,19 @@ impl Kernel {
 
     // -- app services --------------------------------------------------------
 
-    pub fn tasks_revision(&self, session: SessionId) -> Result<u64, String> {
-        self.with_tasks(session, |list| Ok(list.revision))
+    pub async fn tasks_revision(&self, session: SessionId) -> Result<u64, String> {
+        let (app, engine) = self.app_engine(session)?;
+        engine.tasks_revision(&app).await
     }
 
-    pub fn tasks_items(&self, session: SessionId) -> Result<Snapshot, String> {
-        self.with_tasks(session, |list| Ok(list.snapshot()))
+    pub async fn tasks_items(&self, session: SessionId) -> Result<Snapshot, String> {
+        let (app, engine) = self.app_engine(session)?;
+        engine.tasks_items(&app).await
     }
 
     pub async fn tasks_add(&self, session: SessionId, title: String) -> Result<String, String> {
-        let id = self.with_tasks(session, |list| Ok(list.add(title)))?;
+        let (app, engine) = self.app_engine(session)?;
+        let id = engine.tasks_add(&app, title).await?;
         self.checkpoint_service().await?;
         Ok(id)
     }
@@ -688,7 +877,8 @@ impl Kernel {
         id: &str,
         completed: bool,
     ) -> Result<(), String> {
-        self.with_tasks(session, |list| list.set_completed(id, completed))?;
+        let (app, engine) = self.app_engine(session)?;
+        engine.tasks_set_completed(&app, id, completed).await?;
         self.checkpoint_service().await
     }
 
@@ -698,20 +888,21 @@ impl Kernel {
         id: &str,
         title: String,
     ) -> Result<(), String> {
-        self.with_tasks(session, |list| list.set_title(id, title))?;
+        let (app, engine) = self.app_engine(session)?;
+        engine.tasks_set_title(&app, id, title).await?;
         self.checkpoint_service().await
     }
 
     pub async fn tasks_remove(&self, session: SessionId, id: &str) -> Result<(), String> {
-        self.with_tasks(session, |list| list.remove(id))?;
+        let (app, engine) = self.app_engine(session)?;
+        engine.tasks_remove(&app, id).await?;
         self.checkpoint_service().await
     }
 
-    fn with_tasks<T>(
-        &self,
-        session: SessionId,
-        f: impl FnOnce(&mut TaskList) -> Result<T, String>,
-    ) -> Result<T, String> {
+    /// The gate every `app-services` call passes: the device is open, the
+    /// session is live, and the engine is running. One list per app id, so
+    /// every session of an app sees the same document.
+    fn app_engine(&self, session: SessionId) -> Result<(String, Rc<SyncEngine>), String> {
         // `app-services` answers `result<_, string>`: an app never learns the
         // device's state beyond "this did not work".
         self.open().map_err(|e| e.message)?;
@@ -721,8 +912,8 @@ impl Kernel {
         let app = self
             .session_app_id(session)
             .map_err(|_| "unknown session".to_string())?;
-        let mut state = self.state.borrow_mut();
-        f(state.tasks.entry(app).or_default())
+        let engine = self.engine().map_err(|e| e.message)?;
+        Ok((app, engine))
     }
 
     async fn checkpoint_service(&self) -> Result<(), String> {
@@ -775,7 +966,8 @@ async fn mint(seams: &Seams, id: &str, now: u64) -> Result<DeviceState, Error> {
         dek: Some(dek),
         wrapped: None,
         device: Some(snapshot.device),
-        tasks: snapshot.tasks,
+        seed: snapshot.seed,
+        engine_state: snapshot.engine,
         generation,
         erased: false,
     })
@@ -785,8 +977,19 @@ async fn mint(seams: &Seams, id: &str, now: u64) -> Result<DeviceState, Error> {
 /// that actually landed. A failure here is not fatal — the device is usable
 /// and its anchor is in memory — but it leaves the pointer at 0, which is
 /// what makes the *next* boot's re-mint legal (see [`open_or_mint`]).
+///
+/// Outside [`Kernel::checkpoint`]'s gate, and safe to be: this runs inside
+/// `boot`, before the `Kernel` exists at all. There is no engine, no event
+/// pump and no export the glue could have dispatched, so there is nothing for
+/// it to overlap with — the gate would be a lock with one possible holder.
 async fn mint_anchor(seams: &Seams, id: &str, dek: &Dek) -> (checkpoint::Snapshot, u64) {
-    let snapshot = checkpoint::Snapshot::new(Device::mint(seams.rng.as_ref()), BTreeMap::new());
+    let device = Device::mint(seams.rng.as_ref());
+    // The device's signing seed, drawn with the anchor and, like it, never
+    // drawn again once a checkpoint carries it: it is the identity every peer
+    // knows this device by.
+    let mut seed = [0u8; 32];
+    seams.rng.fill(&mut seed);
+    let snapshot = checkpoint::Snapshot::new(device, seed, None);
     let committed = checkpoint::write(
         seams.files.as_ref(),
         seams.platform.as_ref(),
@@ -831,7 +1034,8 @@ async fn resume(seams: &Seams, id: &str, row: IndexRow, now: u64) -> Result<Devi
                 dek: None,
                 wrapped: Some(WrappedDek::decode(&bytes)?),
                 device: None,
-                tasks: BTreeMap::new(),
+                seed: [0u8; 32],
+                engine_state: None,
                 generation: 0,
                 erased: false,
             })
@@ -854,7 +1058,8 @@ async fn resume(seams: &Seams, id: &str, row: IndexRow, now: u64) -> Result<Devi
                 dek: Some(dek),
                 wrapped: None,
                 device: Some(snapshot.device),
-                tasks: snapshot.tasks,
+                seed: snapshot.seed,
+                engine_state: snapshot.engine,
                 generation,
                 erased: false,
             })

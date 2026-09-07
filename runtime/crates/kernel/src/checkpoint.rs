@@ -37,14 +37,11 @@
 //! write is `n + 1` while the torn `n` and the loaded `n - 1` are both still
 //! on disk, and only removing both collects them.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::device::{Device, SCHEMA};
 use crate::seal::Dek;
-use crate::tasks::TaskList;
 use crate::{Error, ErrorCode, Files, Platform, Rng};
 
 /// Everything a reload must restore. Sessions are deliberately absent: a
@@ -54,8 +51,13 @@ use crate::{Error, ErrorCode, Files, Platform, Rng};
 pub struct Snapshot {
     v: u32,
     pub device: Device,
-    /// One task list per app id, as `Kernel::tasks` holds them.
-    pub tasks: BTreeMap<String, TaskList>,
+    /// The device's Ed25519 seed. Sealed like everything else here: it is the
+    /// whole of the device's identity to its peers, and to iroh.
+    pub seed: [u8; 32],
+    /// The sync engine's state: an automerge document and its sedimentree
+    /// items per app. `None` for a device that has not run an engine yet —
+    /// the anchor written at mint, before the engine is built.
+    pub engine: Option<polyvisor_engine::Snapshot>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -226,11 +228,16 @@ async fn read_generation(
 }
 
 impl Snapshot {
-    pub fn new(device: Device, tasks: BTreeMap<String, TaskList>) -> Snapshot {
+    pub fn new(
+        device: Device,
+        seed: [u8; 32],
+        engine: Option<polyvisor_engine::Snapshot>,
+    ) -> Snapshot {
         Snapshot {
             v: SCHEMA,
             device,
-            tasks,
+            seed,
+            engine,
         }
     }
 }

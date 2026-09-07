@@ -24,6 +24,13 @@ import { wasi } from "@polyengine/wasi";
 import { filesystemWeb } from "@polyengine/wasi/filesystem-web";
 import type { OpfsDirectoryHandle } from "@polyengine/wasi/filesystem-web";
 import { http } from "@polyengine/wasi/http";
+import { webcryptoImports } from "@polymorph/webcrypto";
+import { websocketImports } from "@polymorph/websocket";
+import { webrtcImports } from "@polymorph/webrtc-datachannels";
+
+// Vendored, not `@polymorph/iroh`: that package's only export is its root,
+// whose graph statically pulls @polyengine/translator into this bundle.
+import { socketsImports } from "./platform/sockets.ts";
 
 import { serveInterfaces } from "./rpc.ts";
 import { kv } from "./platform/kv.ts";
@@ -41,6 +48,7 @@ const I = {
   device: "polyvisor:internal/device@0.1.0",
   store: "polyvisor:internal/store@0.1.0",
   apps: "polyvisor:internal/apps@0.1.0",
+  sync: "polyvisor:internal/sync@0.1.0",
   events: "polyvisor:internal/events@0.1.0",
   eventSource: "polyvisor:internal/event-source@0.1.0",
   appServices: "polyvisor:internal/app-services@0.1.0",
@@ -86,6 +94,11 @@ const tabs = new Set<Tab>();
 interface Hello {
   device: string;
   homeOrigin: string;
+  /** The iroh relay this device binds its endpoint through
+   * (`lifecycle.boot-config.relay`): the home origin's `config.json`, which
+   * the tab read and passed on. Like the device id, it is deployment
+   * configuration that exists before the kernel does. */
+  relay: string;
   /** Resolves when this worker actually HOLDS `pm-device-<device>`. */
   lock: Promise<void>;
 }
@@ -177,10 +190,39 @@ async function loadRuntime(device: string): Promise<Exports> {
       // one that must win.
       ...fs.imports,
       ...http().imports,
+      // The endpoint component's own imports, which is what the runtime's
+      // are once `wac plug` has composed it in (justfile `compose`): the
+      // relay wire (websocket), the direct browser wire (webrtc data
+      // channels), the identity keys (webcrypto — the kernel imports the
+      // ed25519 halves directly too, and both sides resolve to this one
+      // provider), and a `wasi:sockets` UDP surface that answers
+      // `not-supported`, which is the browser profile's honest answer: the
+      // endpoint binds no socket.
+      ...webcryptoImports(),
+      ...websocketImports(),
+      ...webrtcImports(),
+      ...socketsImports(),
       "polyvisor:internal/kv@0.1.0": kv,
       [I.locks]: locks,
     },
-    { jspi: false },
+    // THE ONE REALM WITH JSPI (docs/design.md "No JSPI", "The worker is the
+    // one exception, for now"). Nothing polyvisor writes needs it: every
+    // glue-implemented import is `async func` and the callback ABI
+    // wit-bindgen emits never blocks a frame. The composed iroh endpoint
+    // does. It authenticates QUIC with rustls, whose `Signer::sign` is
+    // synchronous, and polymorph-iroh implements that as `block_on` over the
+    // async `polymorph:webcrypto` sign import — a sync lower of an async
+    // import, which is precisely what JSPI is for. With `jspi: false` the
+    // ACCEPTING side of every connection stalls in `CertificateVerify` and
+    // polyengine raises `NeedsJspi` (found in M3a; dialling out survives,
+    // which is why it presents as a peer stuck at "connecting").
+    //
+    // This reverts to `jspi: false` when the transport's signer is in-guest
+    // — an identity built from a seed, the posture the kernel already holds
+    // — and web/jspi_test.ts asserts `true` here explicitly, so that flip
+    // back has to be a deliberate edit of the test too. The visor and frame
+    // realms never needed it and stay without it.
+    { jspi: true },
   );
   return instance.exports as unknown as Exports;
 }
@@ -189,7 +231,7 @@ async function loadRuntime(device: string): Promise<Exports> {
  * the first tab says which device this worker is: the id exists before the
  * kernel does and only a tab can supply it. */
 const ready: Promise<Exports> = (async () => {
-  const { device, homeOrigin, lock } = await helloed;
+  const { device, homeOrigin, relay, lock } = await helloed;
   // Before the kernel exists: `lifecycle.boot` runs the sweep, and a sweep
   // that ran while a sibling worker's lock was merely REQUESTED would read
   // that device as dead and collect a live namespace. Held first, booted
@@ -197,12 +239,12 @@ const ready: Promise<Exports> = (async () => {
   await lock;
   const exports_ = await loadRuntime(device);
   const boot = exports_[I.lifecycle].boot as (
-    c: { homeOrigin: string; device: string },
+    c: { homeOrigin: string; device: string; relay: string },
   ) => Promise<void>;
   // The home origin without a trailing slash, per `lifecycle.boot-config`.
   // `location.origin` is spelled that way, and every tab that can reach this
   // worker is on the home origin by construction.
-  await boot({ homeOrigin, device });
+  await boot({ homeOrigin, device, relay });
   return exports_;
 })();
 
@@ -221,10 +263,14 @@ ready.catch((err: unknown) => {
 // stay pending. So the runtime's side is `event-source.drain`, which never
 // parks, and the glue calls it after every export activation it made.
 //
-// That misses nothing while the kernel is the only producer: every event is
-// born inside an export call the glue itself dispatched. When the engine
-// starts producing events from host-call completions, this is the site that
-// has to change (and the WIT doc says so).
+// That misses nothing, and no longer only for now. The kernel's one event is
+// `session-ended`, and it is born inside an export activation the glue itself
+// dispatched (`apps.abort`, `apps.close`). The engine has landed and adds
+// none: a remote change reaches an app through `tasks.revision`, which the
+// app polls, and the visor re-reads `sync.peers` when Settings opens. Nothing
+// in the kernel produces an event from a host-call completion, so there is
+// nothing for a drain sited here to miss. An event with no export activation
+// behind it is what would change that, and it would change this site.
 // ---------------------------------------------------------------------------
 
 function fanOut(events: KernelEvent[]): void {
@@ -340,8 +386,9 @@ self.onconnect = (ev: MessageEvent) => {
     if (t === "hello") {
       const device = String((data as { device: string }).device);
       const homeOrigin = String((data as { homeOrigin: string }).homeOrigin);
+      const relay = String((data as { relay: string }).relay);
       if (hello === undefined) {
-        hello = { device, homeOrigin, lock: holdDeviceLock(device) };
+        hello = { device, homeOrigin, relay, lock: holdDeviceLock(device) };
         announce(hello);
       } else if (hello.device !== device) {
         // One worker, one device (docs/design.md "Devices"). Two ids on one
@@ -390,6 +437,13 @@ self.onconnect = (ev: MessageEvent) => {
     }),
     [I.store]: draining({
       devices: async () => (await ready)[I.store].devices(),
+    }),
+    // Control port only, like `device`: dialing another device is the
+    // visor's act, and an app session has no business naming a peer.
+    [I.sync]: draining({
+      connect: async (endpointId: string) =>
+        (await ready)[I.sync].connect(endpointId),
+      peers: async () => (await ready)[I.sync].peers(),
     }),
     [I.apps]: draining({
       installed: async () => (await ready)[I.apps].installed(),

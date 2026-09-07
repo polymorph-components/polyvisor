@@ -26,6 +26,12 @@ pub(crate) struct App {
 /// `device`), which is exactly why the strip keys its dress off `state`
 /// and never off "is the name empty": an unpainted anchor must be
 /// unpaintable while the seal is shut, not merely usually blank.
+///
+/// `PartialEq` so a re-read can be compared against what is on screen and
+/// dropped when it says the same thing: `Signal::set` marks its scope dirty
+/// unconditionally, so an unguarded re-read on every Settings press would
+/// re-render the whole visor to produce the identical DOM.
+#[derive(PartialEq)]
 pub(crate) struct Status {
     pub(crate) id: String,
     pub(crate) state: DeviceState,
@@ -35,6 +41,10 @@ pub(crate) struct Status {
     pub(crate) name: String,
     pub(crate) hue: u16,
     pub(crate) word: String,
+    /// This device's iroh endpoint id, z-base-32 (internal.wit `device`).
+    /// "" while sealed, and until the endpoint is bound — so the sync
+    /// section has to have something to say about an empty one.
+    pub(crate) endpoint_id: String,
 }
 
 impl Status {
@@ -98,7 +108,36 @@ pub(crate) async fn status() -> Result<Status, String> {
             name: s.name,
             hue: s.hue,
             word: s.word,
+            endpoint_id: s.endpoint_id,
         })
+}
+
+/// One dialed device, as the sync section lists it (internal.wit `sync`).
+/// `state` is the kernel's own framework voice ("connecting", "connected",
+/// "closed: <why>") and is rendered unplated for exactly that reason.
+#[derive(Clone, PartialEq)]
+pub(crate) struct Peer {
+    pub(crate) endpoint_id: String,
+    pub(crate) state: String,
+}
+
+/// Dial another device. Returning is not converging: the contract only
+/// promises the dial was accepted, so the sync section re-reads `peers`
+/// afterwards rather than inventing a row of its own.
+pub(crate) async fn connect(endpoint_id: String) -> Result<(), String> {
+    api::sync::connect(endpoint_id).await.map_err(message)
+}
+
+pub(crate) async fn peers() -> Result<Vec<Peer>, String> {
+    Ok(api::sync::peers()
+        .await
+        .map_err(message)?
+        .into_iter()
+        .map(|p| Peer {
+            endpoint_id: p.endpoint_id,
+            state: p.state,
+        })
+        .collect())
 }
 
 /// The device index: every device on this origin, petname and tier only.

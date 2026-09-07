@@ -5,24 +5,333 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
+use std::task::Poll;
 
+use futures::channel::mpsc;
+use futures::future::LocalBoxFuture;
+use futures::stream::StreamExt as _;
+use futures::{executor::LocalPool, task::LocalSpawnExt as _};
 use polyvisor_kernel::{
-    BootConfig, Clock, Error, ErrorCode, Event, Fetch, Files, IndexRow, Kernel, LEASE_TTL_MS,
-    LocalFuture, Locks, Platform, Rest, Rng, Seams, State, Tier,
+    Accepted, BootConfig, Bound, Clock, Dialed, EngineTransport, Error, ErrorCode, Event, Fetch,
+    Files, IndexRow, Kernel, LEASE_TTL_MS, LocalFuture, Locks, Net, NetHandle, Platform, Rest, Rng,
+    Seams, Spawn, State, Tier,
 };
 
 // -- harness -----------------------------------------------------------------
 
-/// Every fake resolves immediately, so a `Pending` here means the kernel
-/// awaited something that cannot complete — a bug, not a stall.
+/// One executor per test thread. The kernel's sync engine is a driver task,
+/// an event pump and a read loop per connection, all spawned rather than
+/// awaited; every `block_on` here therefore has to drive the whole pool, not
+/// just the future it was handed.
+///
+/// The spawner is held beside the pool rather than taken from it on demand:
+/// the kernel spawns *while* a `run_until` is in flight, and the pool's cell
+/// is mutably borrowed for the whole of that.
+struct TestPool {
+    pool: RefCell<LocalPool>,
+    spawner: futures::executor::LocalSpawner,
+}
+
+thread_local! {
+    static POOL: TestPool = {
+        let pool = LocalPool::new();
+        let spawner = pool.spawner();
+        TestPool { pool: RefCell::new(pool), spawner }
+    };
+}
+
+/// Run `fut` to completion, giving every spawned task its turns.
 fn block_on<F: Future>(fut: F) -> F::Output {
-    let waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    let mut fut = std::pin::pin!(fut);
-    match fut.as_mut().poll(&mut cx) {
-        Poll::Ready(v) => v,
-        Poll::Pending => panic!("the kernel parked on a fake that answers immediately"),
+    POOL.with(|pool| pool.pool.borrow_mut().run_until(fut))
+}
+
+/// The `Spawn` seam over the test's pool.
+struct PoolSpawn;
+
+impl Spawn for PoolSpawn {
+    fn spawn(&self, future: LocalBoxFuture<'static, ()>) {
+        POOL.with(|pool| {
+            pool.spawner
+                .spawn_local(future)
+                .expect("the local pool accepts tasks")
+        });
+    }
+}
+
+/// Let every spawned task make progress until `check` answers `Some`.
+/// Bounded, so a wedged engine fails the test instead of hanging it.
+fn settle_until<F, Fut, T>(mut check: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    block_on(async {
+        for _ in 0..8192 {
+            if let Some(found) = check().await {
+                return found;
+            }
+            yield_now().await;
+        }
+        panic!("the kernels never converged");
+    })
+}
+
+/// Hand the pool back one turn, so spawned tasks run.
+async fn yield_now() {
+    let mut yielded = false;
+    futures::future::poll_fn(move |cx| {
+        if yielded {
+            return Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await;
+}
+
+/// Run every spawned task until it has nothing left to do this instant.
+fn settle() {
+    block_on(async {
+        for _ in 0..64 {
+            yield_now().await;
+        }
+    });
+}
+
+// -- the network fake --------------------------------------------------------
+
+/// One end of an in-memory connection, as the kernel's transport seam.
+struct Pipe {
+    tx: RefCell<mpsc::UnboundedSender<Vec<u8>>>,
+    rx: RefCell<mpsc::UnboundedReceiver<Vec<u8>>>,
+}
+
+/// One end of a connection, and the sending half it talks through — kept
+/// beside it so a test can cut that end's wire (see [`FakeNet::unplug`]).
+struct End {
+    transport: Box<dyn EngineTransport>,
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl Pipe {
+    fn pair() -> (End, End) {
+        let (a_tx, a_rx) = mpsc::unbounded();
+        let (b_tx, b_rx) = mpsc::unbounded();
+        (
+            End {
+                transport: Box::new(Pipe {
+                    tx: RefCell::new(a_tx.clone()),
+                    rx: RefCell::new(b_rx),
+                }),
+                tx: a_tx,
+            },
+            End {
+                transport: Box::new(Pipe {
+                    tx: RefCell::new(b_tx.clone()),
+                    rx: RefCell::new(a_rx),
+                }),
+                tx: b_tx,
+            },
+        )
+    }
+}
+
+impl EngineTransport for Pipe {
+    fn send(&self, bytes: Vec<u8>) -> LocalFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            self.tx
+                .borrow()
+                .unbounded_send(bytes)
+                .map_err(|_| "the peer is gone".to_string())
+        })
+    }
+
+    fn recv(&self) -> LocalFuture<'_, Option<Vec<u8>>> {
+        // Polled rather than awaited on a held borrow: the receiver's cell is
+        // borrowed for the poll only.
+        Box::pin(futures::future::poll_fn(move |cx| {
+            self.rx.borrow_mut().poll_next_unpin(cx)
+        }))
+    }
+
+    fn close(&self) -> LocalFuture<'_, ()> {
+        Box::pin(async move {
+            self.tx.borrow_mut().close_channel();
+            self.rx.borrow_mut().close();
+        })
+    }
+}
+
+/// Every endpoint on the fake network, by endpoint id.
+type Switchboard = Rc<RefCell<BTreeMap<String, mpsc::UnboundedSender<Accepted>>>>;
+
+/// Every end each endpoint owns, by endpoint id, so a test can cut them.
+type Wires = Rc<RefCell<BTreeMap<String, Vec<mpsc::UnboundedSender<Vec<u8>>>>>>;
+
+/// Endpoint ids that announce a key other than their own.
+type Liars = Rc<RefCell<BTreeMap<String, [u8; 32]>>>;
+
+/// Distinct `World`s share one [`FakeNet`] when a test wants two devices that
+/// can see each other.
+/// The `Net` seam: endpoints on a shared switchboard, each connection a
+/// [`Pipe`] pair.
+///
+/// `gate` stands in for the relay handshake a real bind waits on: `bind` does
+/// not resolve until it is open. A gate that is never opened is a relay that
+/// never answers, which is the case the kernel must not boot behind.
+#[derive(Clone)]
+struct FakeNet {
+    switchboard: Switchboard,
+    gate: Rc<Cell<bool>>,
+    /// Every end each endpoint owns, so [`FakeNet::unplug`] can cut them all
+    /// at once.
+    wires: Wires,
+    /// Endpoint ids that announce a key other than the one they hold — a
+    /// dialer claiming to be a device it is not. Real iroh cannot produce
+    /// this (the id *is* the key), but the kernel does not get to assume the
+    /// endpoint component is the only thing on the other side of the seam.
+    liars: Liars,
+}
+
+impl Default for FakeNet {
+    fn default() -> Self {
+        FakeNet {
+            switchboard: Switchboard::default(),
+            gate: Rc::new(Cell::new(true)),
+            wires: Rc::default(),
+            liars: Rc::default(),
+        }
+    }
+}
+
+impl FakeNet {
+    /// A network whose bind waits until [`FakeNet::open_gate`].
+    fn gated() -> FakeNet {
+        FakeNet {
+            gate: Rc::new(Cell::new(false)),
+            ..FakeNet::default()
+        }
+    }
+
+    fn open_gate(&self) {
+        self.gate.set(true);
+    }
+
+    /// Pull an endpoint off the network: it stops answering dials, and every
+    /// pipe it handed out closes — a worker that died, from its peers' side.
+    /// Make `endpoint_id` announce `key` when it dials, instead of its own.
+    fn impersonate(&self, endpoint_id: &str, key: [u8; 32]) {
+        let _previous = self.liars.borrow_mut().insert(endpoint_id.to_string(), key);
+    }
+
+    fn unplug(&self, endpoint_id: &str) {
+        let _sender = self.switchboard.borrow_mut().remove(endpoint_id);
+        for wire in self
+            .wires
+            .borrow_mut()
+            .remove(endpoint_id)
+            .unwrap_or_default()
+        {
+            wire.close_channel();
+        }
+    }
+}
+
+/// The endpoint id a seed binds as, and its inverse.
+///
+/// The real spelling is z-base-32 of the device's Ed25519 public key; the
+/// property the kernel depends on is only that the id determines the key, so
+/// the fake spells the *seed* in hex and derives the key from it.
+fn endpoint_id_of(seed: [u8; 32]) -> String {
+    seed.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn key_of(endpoint_id: &str) -> Option<[u8; 32]> {
+    if endpoint_id.len() != 64 {
+        return None;
+    }
+    let mut seed = [0u8; 32];
+    for (i, slot) in seed.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(endpoint_id.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes(),
+    )
+}
+
+impl Net for FakeNet {
+    fn bind(&self, seed: [u8; 32]) -> LocalFuture<'_, Result<Bound, String>> {
+        Box::pin(async move {
+            while !self.gate.get() {
+                yield_now().await;
+            }
+            let id = endpoint_id_of(seed);
+            let (tx, rx) = mpsc::unbounded();
+            let _previous = self.switchboard.borrow_mut().insert(id.clone(), tx);
+            let handle: Box<dyn NetHandle> = Box::new(FakeEndpoint {
+                id: id.clone(),
+                key: key_of(&id).expect("a bound endpoint id spells a key"),
+                wires: Rc::clone(&self.wires),
+                liars: Rc::clone(&self.liars),
+                switchboard: Rc::clone(&self.switchboard),
+                inbound: RefCell::new(rx),
+            });
+            Ok((id, handle))
+        })
+    }
+}
+
+struct FakeEndpoint {
+    id: String,
+    wires: Wires,
+    liars: Liars,
+    /// The key this endpoint id spells — what a dialer's side of the wire
+    /// tells the accepting kernel, so it can check who authenticates.
+    key: [u8; 32],
+    switchboard: Switchboard,
+    inbound: RefCell<mpsc::UnboundedReceiver<Accepted>>,
+}
+
+impl NetHandle for FakeEndpoint {
+    fn connect(&self, endpoint_id: String) -> LocalFuture<'_, Result<Dialed, String>> {
+        Box::pin(async move {
+            let key = key_of(&endpoint_id)
+                .ok_or_else(|| format!("{endpoint_id} is not an endpoint id"))?;
+            let peer = self
+                .switchboard
+                .borrow()
+                .get(&endpoint_id)
+                .cloned()
+                .ok_or_else(|| format!("no device answers at {endpoint_id}"))?;
+            let (here, there) = Pipe::pair();
+            {
+                // Each end is owned by the device at its own side of the
+                // wire, which is what makes `unplug` cut the right ones.
+                let mut wires = self.wires.borrow_mut();
+                wires.entry(self.id.clone()).or_default().push(here.tx);
+                wires.entry(endpoint_id.clone()).or_default().push(there.tx);
+            }
+            let announced = self
+                .liars
+                .borrow()
+                .get(&self.id)
+                .copied()
+                .unwrap_or(self.key);
+            peer.unbounded_send((self.id.clone(), announced, there.transport))
+                .map_err(|_| "the peer is gone".to_string())?;
+            Ok((key, here.transport))
+        })
+    }
+
+    fn accept(&self) -> LocalFuture<'_, Result<Accepted, String>> {
+        Box::pin(async move {
+            futures::future::poll_fn(|cx| self.inbound.borrow_mut().poll_next_unpin(cx))
+                .await
+                .ok_or_else(|| "this endpoint is closed".to_string())
+        })
     }
 }
 
@@ -83,6 +392,17 @@ struct FakeFiles {
     store: Store,
     /// How many of the next writes report failure without storing anything.
     failures: Rc<Cell<u32>>,
+    /// Writes in flight now, and the most there have ever been at once.
+    ///
+    /// The OPFS host refuses concurrent access handles, so "two writes
+    /// overlapping" is not a performance question here — it is the error the
+    /// glue reported. A write therefore yields between taking the count up
+    /// and putting it down, which is where a second writer would slot in if
+    /// the kernel let one.
+    in_flight: Rc<Cell<u32>>,
+    peak_in_flight: Rc<Cell<u32>>,
+    /// Paths written, in order, for counting checkpoints.
+    written: Rc<RefCell<Vec<String>>>,
 }
 
 impl FakeFiles {
@@ -115,8 +435,22 @@ impl Files for FakeFiles {
             self.failures.set(self.failures.get() - 1);
             return Box::pin(async { Err(()) });
         }
-        self.store.borrow_mut().insert(path, bytes);
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            let depth = self.in_flight.get() + 1;
+            self.in_flight.set(depth);
+            self.peak_in_flight
+                .set(self.peak_in_flight.get().max(depth));
+            // Several turns, not one: the window a second writer would have
+            // to slip into has to be wide enough for the engine's driver and
+            // event pump to get their turns inside it.
+            for _ in 0..8 {
+                yield_now().await;
+            }
+            self.written.borrow_mut().push(path.clone());
+            self.store.borrow_mut().insert(path, bytes);
+            self.in_flight.set(self.in_flight.get() - 1);
+            Ok(())
+        })
     }
     fn remove_file(&self, path: String) -> LocalFuture<'_, ()> {
         self.store.borrow_mut().remove(&path);
@@ -154,6 +488,13 @@ impl Default for FakeClock {
 impl Clock for FakeClock {
     fn now_ms(&self) -> u64 {
         self.0.get()
+    }
+
+    /// Never resolves: no protocol deadline should fire on a happy path, and
+    /// one that did would make a test hang rather than fail
+    /// (subduction_runtime/tests/common/mod.rs:36).
+    fn sleep(&self, _ms: u64) -> LocalFuture<'_, ()> {
+        Box::pin(futures::future::pending())
     }
 }
 
@@ -196,6 +537,16 @@ impl Default for FakeRng {
 }
 
 impl FakeRng {
+    /// A generator that draws differently from [`FakeRng::default`] — what a
+    /// second browser profile needs, so the two devices do not mint the same
+    /// signing seed and therefore the same identity.
+    fn seeded(state: u64) -> FakeRng {
+        FakeRng {
+            state: Rc::new(Cell::new(state)),
+            ..FakeRng::default()
+        }
+    }
+
     /// Each value is one four-byte little-endian draw, handed out before the
     /// generator takes over.
     fn draws(values: &[u32]) -> FakeRng {
@@ -273,6 +624,7 @@ struct World {
     clock: FakeClock,
     rng: FakeRng,
     fetch: FakeFetch,
+    net: FakeNet,
 }
 
 impl Default for World {
@@ -284,6 +636,7 @@ impl Default for World {
             clock: FakeClock::default(),
             rng: FakeRng::default(),
             fetch: fetch_with(CSS_HANDLE_HEX),
+            net: FakeNet::default(),
         }
     }
 }
@@ -296,6 +649,13 @@ impl World {
         }
     }
 
+    fn with_net(net: FakeNet) -> World {
+        World {
+            net,
+            ..World::default()
+        }
+    }
+
     fn with_fetch(fetch: FakeFetch) -> World {
         World {
             fetch,
@@ -303,7 +663,17 @@ impl World {
         }
     }
 
-    fn try_boot_as(&self, id: &str) -> Result<Kernel, Error> {
+    /// A second browser profile on the same fake network: separate storage,
+    /// shared switchboard, so the two devices can dial each other.
+    fn peer(&self) -> World {
+        World {
+            net: self.net.clone(),
+            rng: FakeRng::seeded(0x1234_5678_9abc_def0),
+            ..World::default()
+        }
+    }
+
+    fn try_boot_as(&self, id: &str) -> Result<Rc<Kernel>, Error> {
         block_on(Kernel::boot(
             BootConfig {
                 home_origin: ORIGIN.to_string(),
@@ -313,18 +683,20 @@ impl World {
                 platform: Box::new(self.kv.clone()),
                 files: Box::new(self.files.clone()),
                 locks: Box::new(self.locks.clone()),
-                clock: Box::new(self.clock.clone()),
+                clock: Rc::new(self.clock.clone()),
                 fetch: Box::new(self.fetch.clone()),
                 rng: Box::new(self.rng.clone()),
+                spawn: Rc::new(PoolSpawn),
+                net: Box::new(self.net.clone()),
             },
         ))
     }
 
-    fn try_boot(&self) -> Result<Kernel, Error> {
+    fn try_boot(&self) -> Result<Rc<Kernel>, Error> {
         self.try_boot_as(ID)
     }
 
-    fn boot(&self) -> Kernel {
+    fn boot(&self) -> Rc<Kernel> {
         self.try_boot().unwrap()
     }
 
@@ -380,7 +752,7 @@ impl World {
 }
 
 /// The default world booted once: the shape most app/session tests want.
-fn boot() -> Kernel {
+fn boot() -> Rc<Kernel> {
     World::default().boot()
 }
 
@@ -511,12 +883,12 @@ fn tasks_survive_a_reload_but_sessions_do_not() {
     let kernel = world.boot();
     // The old session id is gone with the worker that minted it.
     assert_eq!(
-        kernel.tasks_revision(1),
+        block_on(kernel.tasks_revision(1)),
         Err("unknown session".into()),
         "sessions are not persisted: a reload ends them"
     );
     let s = session(&kernel);
-    let items = kernel.tasks_items(s).unwrap();
+    let items = block_on(kernel.tasks_items(s)).unwrap();
     assert_eq!(items.items.len(), 1);
     assert_eq!(items.items[0].title, "water the plants");
 }
@@ -1144,7 +1516,10 @@ fn unknown_sessions_are_rejected_everywhere() {
         block_on(kernel.asset(99, b"x")).unwrap_err().code,
         ErrorCode::UnknownSession
     );
-    assert_eq!(kernel.tasks_revision(99), Err("unknown session".into()));
+    assert_eq!(
+        block_on(kernel.tasks_revision(99)),
+        Err("unknown session".into())
+    );
 }
 
 #[test]
@@ -1168,23 +1543,26 @@ fn tasks_are_shared_by_every_session_of_one_app() {
     let a = session(&kernel);
     let b = session(&kernel);
     let id = block_on(kernel.tasks_add(a, "milk".into())).unwrap();
-    assert_eq!(kernel.tasks_items(b).unwrap().items[0].id, id);
+    assert_eq!(block_on(kernel.tasks_items(b)).unwrap().items[0].id, id);
 }
 
 #[test]
 fn every_mutation_advances_the_revision_and_ids_order_the_items() {
     let kernel = boot();
     let s = session(&kernel);
-    assert_eq!(kernel.tasks_revision(s).unwrap(), 0);
+    assert_eq!(block_on(kernel.tasks_revision(s)).unwrap(), 0);
 
     let first = block_on(kernel.tasks_add(s, "milk".into())).unwrap();
     let second = block_on(kernel.tasks_add(s, "bread".into())).unwrap();
-    assert!(first < second, "ids sort in creation order");
-    assert_eq!(kernel.tasks_revision(s).unwrap(), 2);
+    // Ids no longer carry order: they are per-device and opaque, because a
+    // shared counter is not safe across two authors. The document records
+    // each item's place instead, and `items` comes back in that order.
+    assert_ne!(first, second);
+    assert_eq!(block_on(kernel.tasks_revision(s)).unwrap(), 2);
 
     block_on(kernel.tasks_set_completed(s, &first, true)).unwrap();
     block_on(kernel.tasks_set_title(s, &second, "rye".into())).unwrap();
-    let snapshot = kernel.tasks_items(s).unwrap();
+    let snapshot = block_on(kernel.tasks_items(s)).unwrap();
     assert_eq!(snapshot.revision, 4);
     assert_eq!(
         snapshot
@@ -1198,13 +1576,13 @@ fn every_mutation_advances_the_revision_and_ids_order_the_items() {
     assert_eq!(snapshot.items[1].title, "rye");
 
     block_on(kernel.tasks_remove(s, &first)).unwrap();
-    assert_eq!(kernel.tasks_revision(s).unwrap(), 5);
-    assert_eq!(kernel.tasks_items(s).unwrap().items.len(), 1);
+    assert_eq!(block_on(kernel.tasks_revision(s)).unwrap(), 5);
+    assert_eq!(block_on(kernel.tasks_items(s)).unwrap().items.len(), 1);
 
     // A failed mutation is not a mutation.
     assert!(block_on(kernel.tasks_remove(s, &first)).is_err());
     assert!(block_on(kernel.tasks_set_title(s, "nope", "x".into())).is_err());
-    assert_eq!(kernel.tasks_revision(s).unwrap(), 5);
+    assert_eq!(block_on(kernel.tasks_revision(s)).unwrap(), 5);
 }
 
 // -- events ------------------------------------------------------------------
@@ -1278,4 +1656,310 @@ fn close_then_abort_announces_nothing() {
     kernel.close(s);
     kernel.abort(s, "the app's frame was closed: gone".into());
     assert!(quiet(&kernel));
+}
+
+// -- sync --------------------------------------------------------------------
+
+/// The todo list one session of `APP` sees.
+async fn titles(kernel: &Kernel, session: u32) -> Vec<String> {
+    kernel
+        .tasks_items(session)
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|item| item.title)
+        .collect()
+}
+
+#[test]
+fn two_devices_on_one_network_converge_on_tasks() {
+    let here = World::default();
+    let there = here.peer();
+    let a = here.boot();
+    let b = there.boot();
+    let (sa, sb) = (session(&a), session(&b));
+    // The endpoints bind on spawned tasks; give them their turns.
+    settle();
+
+    block_on(a.tasks_add(sa, "buy milk".into())).unwrap();
+    // Opening the list on B is what makes it ask for the tree.
+    assert!(block_on(titles(&b, sb)).is_empty());
+
+    let endpoint = b.device_status().unwrap().endpoint_id;
+    assert!(!endpoint.is_empty(), "an open device binds an endpoint");
+    block_on(a.sync_connect(endpoint.clone())).unwrap();
+    assert_eq!(
+        a.sync_peers().unwrap(),
+        vec![polyvisor_kernel::Peer {
+            endpoint_id: endpoint,
+            state: "connected".into()
+        }]
+    );
+
+    let seen = settle_until(|| async {
+        let items = titles(&b, sb).await;
+        (!items.is_empty()).then_some(items)
+    });
+    assert_eq!(seen, vec!["buy milk"]);
+
+    // And back the other way.
+    let id = block_on(b.tasks_items(sb)).unwrap().items[0].id.clone();
+    block_on(b.tasks_set_completed(sb, &id, true)).unwrap();
+    settle_until(|| async {
+        a.tasks_items(sa).await.unwrap().items[0]
+            .completed
+            .then_some(())
+    });
+}
+
+#[test]
+fn a_remote_change_is_checkpointed_so_a_reboot_still_has_it() {
+    // The engine's event pump checkpoints what no export call witnessed: a
+    // change that arrived from a peer. Without that, B's reload would forget
+    // A's todo — the device would have shown it and then lost it.
+    let here = World::default();
+    let there = here.peer();
+    let a = here.boot();
+    {
+        let b = there.boot();
+        let sb = session(&b);
+        let sa = session(&a);
+        settle();
+        assert!(block_on(titles(&b, sb)).is_empty());
+        block_on(a.sync_connect(b.device_status().unwrap().endpoint_id)).unwrap();
+        block_on(a.tasks_add(sa, "from a".into())).unwrap();
+        settle_until(|| async {
+            let items = titles(&b, sb).await;
+            (!items.is_empty()).then_some(items)
+        });
+    }
+
+    // B reboots: a fresh worker over the same storage. A is still up, but the
+    // reboot must not need it — what B shows comes off its own disk.
+    let rebooted = there.boot();
+    let session = session(&rebooted);
+    assert_eq!(block_on(titles(&rebooted, session)), vec!["from a"]);
+}
+
+#[test]
+fn a_relay_that_never_answers_does_not_hold_up_the_device() {
+    // The bind is a relay handshake, and a relay that never answers must cost
+    // the device nothing but its ability to dial: booting behind one froze
+    // `device.status`, and with it every visor on the origin.
+    let world = World::with_net(FakeNet::gated());
+    let kernel = world.boot();
+    settle();
+
+    let status = kernel.device_status().unwrap();
+    assert_eq!(
+        status.state,
+        State::Fresh,
+        "the device is open for business"
+    );
+    assert_eq!(status.endpoint_id, "", "and has no endpoint id yet");
+
+    // Tasks, the whole point of the device, work regardless.
+    let s = session(&kernel);
+    block_on(kernel.tasks_add(s, "works offline".into())).unwrap();
+    assert_eq!(block_on(titles(&kernel, s)), vec!["works offline"]);
+
+    let refused = block_on(kernel.sync_connect("whoever".into())).unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Unavailable);
+    assert!(
+        refused.message.contains("still binding"),
+        "the reason names the bind, not the peer: {}",
+        refused.message
+    );
+}
+
+#[test]
+fn an_endpoint_that_binds_late_shows_up_in_status_when_it_does() {
+    let net = FakeNet::gated();
+    let world = World::with_net(net.clone());
+    let kernel = world.boot();
+    settle();
+    assert_eq!(kernel.device_status().unwrap().endpoint_id, "");
+
+    net.open_gate();
+    settle();
+    assert!(
+        !kernel.device_status().unwrap().endpoint_id.is_empty(),
+        "status reports the endpoint id from the moment the bind lands"
+    );
+    // And dialing stops answering "still binding": a well-formed id nobody
+    // holds now fails as the peer's absence, not as our own endpoint's.
+    let nobody = "ab".repeat(32);
+    let refused = block_on(kernel.sync_connect(nobody)).unwrap_err();
+    assert!(
+        refused.message.contains("no device answers"),
+        "the endpoint is up, so the failure is the peer's: {}",
+        refused.message
+    );
+}
+
+// -- checkpoint serialisation ------------------------------------------------
+
+impl World {
+    /// The most writes this world ever had in flight at once.
+    fn peak_writes(&self) -> u32 {
+        self.files.peak_in_flight.get()
+    }
+
+    /// How many generations were sealed: one `state` file per checkpoint.
+    fn checkpoints(&self) -> usize {
+        self.files
+            .written
+            .borrow()
+            .iter()
+            .filter(|path| path.ends_with("/state"))
+            .count()
+    }
+
+    fn forget_writes(&self) {
+        self.files.written.borrow_mut().clear();
+        self.files.peak_in_flight.set(0);
+    }
+}
+
+#[test]
+fn two_export_calls_at_once_do_not_write_two_checkpoints_at_once() {
+    // The OPFS host refuses concurrent access handles, and two runs of
+    // `checkpoint::write` racing would also advance `dev/<id>/gen` out of
+    // order. The glue dispatches exports concurrently, so this is the plain
+    // case: two mutations in flight together.
+    let world = World::default();
+    let kernel = world.boot();
+    let s = session(&kernel);
+    world.forget_writes();
+
+    block_on(async {
+        let (first, second) = futures::future::join(
+            kernel.tasks_add(s, "milk".into()),
+            kernel.tasks_add(s, "bread".into()),
+        )
+        .await;
+        first.unwrap();
+        second.unwrap();
+    });
+
+    assert_eq!(world.peak_writes(), 1, "checkpoints never overlap");
+    // Two mutations, but the second arrives while the first is writing and is
+    // coalesced into one further pass: one checkpoint per loop iteration.
+    assert!(
+        world.checkpoints() <= 2,
+        "two rapid mutations coalesce; wrote {} checkpoints",
+        world.checkpoints()
+    );
+
+    // And nothing was lost by coalescing: the last generation written holds
+    // both todos, which a reload proves.
+    let rebooted = world.boot();
+    let s = session(&rebooted);
+    let mut titles = block_on(titles(&rebooted, s));
+    titles.sort();
+    assert_eq!(titles, vec!["bread", "milk"]);
+}
+
+#[test]
+fn a_remote_change_checkpointing_does_not_overlap_a_local_one() {
+    // The two callers that are not ordered with respect to each other: the
+    // export path, and the engine's event pump.
+    let here = World::default();
+    let there = here.peer();
+    let a = here.boot();
+    let b = there.boot();
+    let (sa, sb) = (session(&a), session(&b));
+    settle();
+    assert!(block_on(titles(&b, sb)).is_empty());
+    block_on(a.sync_connect(b.device_status().unwrap().endpoint_id)).unwrap();
+
+    there.forget_writes();
+
+    // Both devices mutate in the same turn of the pool: A's change reaches B
+    // while B is already writing its own. B's pump checkpoints the remote
+    // one, B's export path the local one, and neither knows about the other.
+    block_on(async {
+        let (from_a, from_b) = futures::future::join(
+            a.tasks_add(sa, "from a".into()),
+            b.tasks_add(sb, "from b".into()),
+        )
+        .await;
+        from_a.unwrap();
+        from_b.unwrap();
+    });
+    settle();
+
+    assert_eq!(
+        there.peak_writes(),
+        1,
+        "B never wrote two checkpoints at once"
+    );
+    let mut seen = block_on(titles(&b, sb));
+    seen.sort();
+    assert_eq!(seen, vec!["from a", "from b"]);
+
+    // Both survive B's reload, so the coalesced checkpoint carried both.
+    let rebooted = there.boot();
+    let s = session(&rebooted);
+    let mut titles = block_on(titles(&rebooted, s));
+    titles.sort();
+    assert_eq!(titles, vec!["from a", "from b"]);
+}
+
+#[test]
+fn a_peer_that_goes_away_stops_being_reported_as_connected() {
+    // The engine's connection registry shrinks on `ConnectionClosed`, and the
+    // kernel's peer list has to follow it: a row stuck at "connected" is the
+    // visor telling the user they are syncing with a device that is gone.
+    let here = World::default();
+    let there = here.peer();
+    let a = here.boot();
+    let b = there.boot();
+    settle();
+
+    let endpoint = b.device_status().unwrap().endpoint_id;
+    block_on(a.sync_connect(endpoint.clone())).unwrap();
+    assert_eq!(
+        a.sync_peers().unwrap(),
+        vec![polyvisor_kernel::Peer {
+            endpoint_id: endpoint.clone(),
+            state: "connected".into()
+        }]
+    );
+
+    // B's worker dies: every pipe it held closes.
+    there.net.unplug(&endpoint);
+    let state = settle_until(|| async {
+        let peers = a.sync_peers().unwrap();
+        let state = peers.first().map(|p| p.state.clone()).unwrap_or_default();
+        (state != "connected").then_some(state)
+    });
+    assert_eq!(state, "closed: the peer went away");
+}
+
+#[test]
+fn an_inbound_peer_that_authenticates_as_someone_else_is_dropped() {
+    // An inbound connection cannot pin its audience — it learns who dialed it
+    // from the handshake — so the check the outbound path gets for free has
+    // to happen after: the peer subduction authenticated must be the key the
+    // endpoint id spelled. Otherwise anyone could arrive wearing a trusted
+    // device's endpoint id and take its row in the peer list.
+    let here = World::default();
+    let there = here.peer();
+    let a = here.boot();
+    let b = there.boot();
+    settle();
+
+    let a_endpoint = a.device_status().unwrap().endpoint_id;
+    // A dials B announcing a key that is not A's.
+    here.net.impersonate(&a_endpoint, [7u8; 32]);
+    let _attempt = block_on(a.sync_connect(b.device_status().unwrap().endpoint_id));
+
+    let state = settle_until(|| async {
+        let peers = b.sync_peers().unwrap();
+        let row = peers.first()?;
+        (row.state != "connecting").then(|| row.state.clone())
+    });
+    assert_eq!(state, "closed: it authenticated as a different device");
 }

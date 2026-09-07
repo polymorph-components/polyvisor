@@ -10,7 +10,7 @@ use crate::{Error, ErrorCode};
 
 /// Bumped when a stored shape changes; a record from the future is an error
 /// rather than a silent partial read.
-pub const SCHEMA: u32 = 2;
+pub const SCHEMA: u32 = 3;
 
 const WORDS: &str = include_str!("../eff_short_wordlist.txt");
 
@@ -53,6 +53,9 @@ pub struct DeviceStatus {
     pub name: String,
     pub hue: u16,
     pub word: String,
+    /// This device's iroh endpoint id; `""` while sealed and until the
+    /// endpoint is bound.
+    pub endpoint_id: String,
 }
 
 /// `polyvisor:internal/store.entry` — the one unsealed record (docs/design.md

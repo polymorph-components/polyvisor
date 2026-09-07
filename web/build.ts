@@ -11,6 +11,10 @@
 // A missing artifact is an error, never an empty file: a site that boots
 // into a blank page because a component silently was not there is worse
 // than one that failed to build.
+//
+// The site also carries `config.json` — the home origin's one piece of
+// deployment configuration, the iroh relay its devices bind through
+// (`lifecycle.boot-config.relay`). boot.ts fetches it before the hello.
 
 import { copy, ensureDir } from "@std/fs";
 import { dirname, join } from "@std/path";
@@ -18,6 +22,24 @@ import { dirname, join } from "@std/path";
 const ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const DIST = join(ROOT, "web", "dist");
 const WASM_DIR = join(ROOT, "target", "wasm32-wasip2", "release");
+
+/** What the worker actually instantiates: the runtime with polymorph-iroh's
+ * endpoint component plugged in (justfile `compose`). The cargo artifact on
+ * its own has unimplemented `polymorph:iroh` imports, so shipping it would
+ * be a site whose worker cannot instantiate. */
+const COMPOSED_RUNTIME = join(
+  ROOT,
+  "target",
+  "polyvisor_runtime.composed.wasm",
+);
+
+/** The iroh relay a device binds its endpoint through, as the home origin
+ * publishes it (`dist/config.json`; `lifecycle.boot-config.relay`). It is
+ * live and untrusted — it carries ciphertext and endpoint ids — so a public
+ * one is the honest default; n0's `use1-1` is what polymorph-iroh's own
+ * production interop script dials (scripts/interop-prod.sh). The e2e
+ * harness overwrites this file with its own local relay. */
+const DEFAULT_RELAY = "https://use1-1.relay.n0.iroh.link";
 
 function fail(message: string): never {
   console.error(`build: ${message}`);
@@ -51,6 +73,11 @@ async function run(cmd: string[]): Promise<void> {
  * with nothing left to fetch — which is what a no-code-splitting bundle is.
  */
 async function bundle(entry: string, out: string): Promise<void> {
+  // No `--external` here on purpose: the one npm fallback these bundles
+  // would otherwise drag in (`@polymorph/webrtc-datachannels`' Deno/Node
+  // `RTCPeerConnection` polyfill) is aliased away in deno.json — see
+  // web/platform/no-node-datachannel.ts for why an external left a bare
+  // `npm:` specifier that stalled the SharedWorker.
   await run([
     Deno.execPath(),
     "bundle",
@@ -63,13 +90,24 @@ async function bundle(entry: string, out: string): Promise<void> {
   ]);
 }
 
-/** Component bytes + translation envelope, under `dest` in dist. */
-async function component(cargoName: string, dest: string): Promise<void> {
-  const wasm = join(WASM_DIR, `${cargoName}.wasm`);
+/** Component bytes + translation envelope, under `dest` in dist.
+ *
+ * `source` overrides where the bytes come from; it exists for the runtime,
+ * which ships as the `wac plug` composition of the cargo artifact with
+ * polymorph-iroh's endpoint component rather than as the cargo artifact
+ * itself (justfile `compose`). */
+async function component(
+  cargoName: string,
+  dest: string,
+  source?: string,
+): Promise<void> {
+  const wasm = source ?? join(WASM_DIR, `${cargoName}.wasm`);
   if (!await exists(wasm)) {
     fail(
-      `${wasm} is missing — run \`cargo build --workspace ` +
-        `--target wasm32-wasip2 --release\` first`,
+      source === undefined
+        ? `${wasm} is missing — run \`cargo build --workspace ` +
+          `--target wasm32-wasip2 --release\` first`
+        : `${wasm} is missing — run \`just compose\` first`,
     );
   }
   await ensureDir(dirname(join(DIST, dest)));
@@ -153,12 +191,20 @@ await bundle("worker.ts", "worker.js");
 await bundle("frame.ts", "frame.js");
 await copy(join(ROOT, "web", "index.html"), join(DIST, "index.html"));
 
-await component("polyvisor_runtime", "runtime.component");
+await component(
+  "polyvisor_runtime",
+  "runtime.component",
+  COMPOSED_RUNTIME,
+);
 await component("polyvisor_visor", "visor.component");
 for (const id of apps) await app(id);
 await Deno.writeTextFile(
   join(DIST, "apps", "index.json"),
   JSON.stringify(apps) + "\n",
+);
+await Deno.writeTextFile(
+  join(DIST, "config.json"),
+  JSON.stringify({ relay: DEFAULT_RELAY }) + "\n",
 );
 
 console.log(`build: web/dist ready (${apps.length} app(s))`);

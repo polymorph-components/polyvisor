@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "runtime/component",
+    "runtime/crates/engine",
     "runtime/crates/kernel",
     "visor",
     "apps/todomvc",
@@ -25,6 +26,40 @@ publish = false
 # parameter record.
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+# docs/design.md "Sync engine: subduction sans-IO": the engine drives
+# `subduction_protocol`'s sans-IO node through `subduction_runtime`'s
+# capability traits in their single-threaded `Local` form. Pinned to the
+# `sansio` branch by full sha — unreleased and moving, so a rev bump is its
+# own PR. `default-features = false` + `std`: the crates are `no_std`-first
+# and gate `thiserror`/`ed25519-dalek` std behind that one feature.
+#
+# `sedimentree_core` and `subduction_crypto` live under `legacy/` in that
+# workspace but are *not* legacy code: they are the shared data model and
+# signature envelope the sans-IO crates are built on, and the sansio crates
+# depend on them by path. The legacy crates we must not touch are the old
+# runtime ones (`subduction_core`, `subduction_iroh`, ...).
+subduction_protocol = { git = "https://github.com/inkandswitch/subduction", rev = "8b5aa2e43557a56a121b9748a10512aed5ca4f90", default-features = false, features = ["std"] }
+subduction_runtime = { git = "https://github.com/inkandswitch/subduction", rev = "8b5aa2e43557a56a121b9748a10512aed5ca4f90", default-features = false }
+subduction_crypto = { git = "https://github.com/inkandswitch/subduction", rev = "8b5aa2e43557a56a121b9748a10512aed5ca4f90", default-features = false, features = ["std"] }
+sedimentree_core = { git = "https://github.com/inkandswitch/subduction", rev = "8b5aa2e43557a56a121b9748a10512aed5ca4f90", default-features = false, features = ["std"] }
+# The tagless-final future kind subduction's traits are generic in. The
+# engine is `Local` everywhere: one SharedWorker, nothing is `Send`.
+# Version must match subduction's own pin or the trait is a different trait.
+future_form = "0.3.0"
+# docs/design.md "Sync engine": `tasks` is an automerge document from the
+# start — one local mutation is one automerge change, carried as one
+# sedimentree commit. Version matches subduction's own automerge pin so the
+# ChangeHash/CommitId correspondence stays byte-identical across peers.
+automerge = "0.11.0"
+# The engine's signing identity (internal.wit `world runtime`: the seed
+# posture). Same major as subduction's, so `Signature`/`VerifyingKey` unify
+# across the trait boundary. `default-features = false` keeps `getrandom`
+# and `rand_core` out: the seed comes from the kernel's `Rng` seam.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+# `LocalBoxFuture` (the shape of every seam future the kernel and engine
+# exchange) and, in tests, `LocalPool` — the single-threaded executor
+# subduction's own e2e tests drive their drivers with.
+futures = { version = "0.3.31", default-features = false, features = ["alloc", "async-await"] }
 # docs/design.md "Pins, with reasons": must equal stream-dom's pin —
 # StreamReader<u8> (a wit-bindgen runtime type) crosses the delegation from
 # our world's `run` into `stream_dom_dioxus::driver::run`; different

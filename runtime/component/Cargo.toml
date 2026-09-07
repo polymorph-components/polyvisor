@@ -13,3 +13,10 @@ crate-type = ["cdylib"]
 [dependencies]
 polyvisor-kernel = { path = "../crates/kernel" }
 wit-bindgen.workspace = true
+# `Net::bind` is handed the device's Ed25519 SEED, and `polymorph:webcrypto`
+# deliberately offers no way to derive a public key from a private import
+# (webcrypto.wit `interface signature`) while `identity-from-keys` requires
+# both halves. So the public half is derived here, from the same crate the
+# engine signs with.
+ed25519-dalek.workspace = true
+futures.workspace = true

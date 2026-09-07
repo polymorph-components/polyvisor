@@ -1,9 +1,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use futures::future::LocalBoxFuture;
 use polyvisor_kernel::{
-    BootConfig, Clock, Fetch, Files, Kernel, LocalFuture, Locks, Platform, Rng, Seams,
+    BootConfig, Clock, Fetch, Files, Kernel, LocalFuture, Locks, Platform, Rng, Seams, Spawn,
 };
+
+use crate::net::IrohNet;
 
 // No `async:` option on purpose. With it, wit-bindgen applies one blanket
 // mode to every function; `async: true` then lowers WIT-sync functions (the
@@ -85,6 +88,16 @@ impl Locks for WebLocks {
 struct SystemClock;
 
 impl Clock for SystemClock {
+    /// The sync driver's deadlines (`Clock::sleep`) come off the MONOTONIC
+    /// clock, not the one `now_ms` reads: a duration measured against a
+    /// clock that can be stepped backwards is a deadline that can be armed
+    /// for never.
+    fn sleep(&self, ms: u64) -> LocalFuture<'_, ()> {
+        Box::pin(async move {
+            wasi::clocks0_3_1::monotonic_clock::wait_for(ms.saturating_mul(1_000_000)).await;
+        })
+    }
+
     fn now_ms(&self) -> u64 {
         // Two `wasi:clocks` versions are in `wit/deps`, so the generated
         // module carries the version in its name.
@@ -93,6 +106,21 @@ impl Clock for SystemClock {
         // the lease arithmetic saturates anyway.
         let seconds = now.seconds.max(0) as u64;
         seconds * 1_000 + u64::from(now.nanoseconds) / 1_000_000
+    }
+}
+
+/// Where the kernel's long-lived futures run: the sync driver, the accept
+/// loop and each connection's read loop.
+///
+/// wit-bindgen's `spawn_local` puts the future on the component's own task
+/// set, so it is polled by the same async ABI machinery that resumes an
+/// export's activation — no second executor, and no host call outstanding
+/// that the host would have to keep alive.
+struct WitSpawn;
+
+impl Spawn for WitSpawn {
+    fn spawn(&self, future: LocalBoxFuture<'static, ()>) {
+        wit_bindgen::rt::async_support::spawn_local(future);
     }
 }
 
@@ -322,14 +350,19 @@ impl guest::lifecycle::Guest for Component {
                 platform: Box::new(Kv),
                 files: Box::new(StateRoot),
                 locks: Box::new(WebLocks),
-                clock: Box::new(SystemClock),
+                clock: Rc::new(SystemClock),
                 fetch: Box::new(Http),
                 rng: Box::new(Random),
+                spawn: Rc::new(WitSpawn),
+                // `boot-config.relay` stops here: the kernel asks for an
+                // endpoint, not for a relay, and the only things that need
+                // the URL are the bind and the dial addresses.
+                net: Box::new(IrohNet::new(config.relay)),
             },
         )
         .await
         .map_err(map_error)?;
-        KERNEL.with(|k| *k.borrow_mut() = Some(Rc::new(kernel)));
+        KERNEL.with(|k| *k.borrow_mut() = Some(kernel));
         Ok(())
     }
 }
@@ -367,6 +400,7 @@ impl guest::device::Guest for Component {
             name: status.name,
             hue: status.hue,
             word: status.word,
+            endpoint_id: status.endpoint_id,
         })
     }
     async fn set_name(name: String) -> Result<(), Error> {
@@ -386,6 +420,23 @@ impl guest::device::Guest for Component {
     }
     async fn erase() -> Result<(), Error> {
         kernel()?.erase().await.map_err(map_error)
+    }
+}
+
+impl guest::sync::Guest for Component {
+    async fn connect(endpoint_id: String) -> Result<(), Error> {
+        kernel()?.sync_connect(endpoint_id).await.map_err(map_error)
+    }
+    async fn peers() -> Result<Vec<guest::sync::Peer>, Error> {
+        Ok(kernel()?
+            .sync_peers()
+            .map_err(map_error)?
+            .into_iter()
+            .map(|p| guest::sync::Peer {
+                endpoint_id: p.endpoint_id,
+                state: p.state,
+            })
+            .collect())
     }
 }
 
@@ -493,11 +544,13 @@ impl guest::app_services::Guest for Component {
         kernel()
             .map_err(|_| unavailable_service())?
             .tasks_revision(session)
+            .await
     }
     async fn tasks_items(session: u32) -> Result<guest::app_services::Snapshot, String> {
         let snapshot = kernel()
             .map_err(|_| unavailable_service())?
-            .tasks_items(session)?;
+            .tasks_items(session)
+            .await?;
         Ok(guest::app_services::Snapshot {
             revision: snapshot.revision,
             items: snapshot
