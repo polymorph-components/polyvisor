@@ -484,8 +484,9 @@ native tests, so browser gates are mandatory for every visor change.
   destination egress, the picker) waits for a second provider: one
   backend does not justify a boundary. S3 is deferred; Drive is what a
   person has.
-- **M5** passkey PRF rung, recovery kits, Drive provider.
-- Parked: app worker (above); native shell; JS producers.
+- Parked, as issues: the passkey PRF unseal rung (#166), recovery kits
+  (#167); app worker (above); native shell; JS producers; S3 and the
+  provider component boundary (a second provider).
 
 ## polyengine is consumed from JSR
 
