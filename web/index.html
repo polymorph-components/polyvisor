@@ -21,7 +21,15 @@
       flex-direction: column;
       font: 16px/1.4 system-ui, sans-serif;
     }
-    /* The app zone fills everything above the visor. Frames are the only
+    /* The visor sits at the top, where browsers put their own trusted UI,
+       and out of thumb range on a handheld — app interactions are the
+       common case. Its geometry must not move when an app mounts
+       (docs/design.md "M1": "strip geometry immobile with the app
+       mounted"). */
+    #visor {
+      flex: 0 0 auto;
+    }
+    /* The app zone fills everything below the visor. Frames are the only
        thing that ever goes in it. */
     #app-zone {
       flex: 1 1 auto;
@@ -34,17 +42,11 @@
       height: 100%;
       display: block;
     }
-    /* The visor is fixed to the bottom: its geometry must not move when an
-       app mounts (docs/design.md "M1": "strip geometry immobile with the
-       app mounted"). */
-    #visor {
-      flex: 0 0 auto;
-    }
     </style>
   </head>
   <body>
-    <div id="app-zone"></div>
     <div id="visor"></div>
+    <div id="app-zone"></div>
     <script type="module" src="./boot.js"></script>
   </body>
 </html>

@@ -16,7 +16,7 @@ pub(crate) const CSS: &str = r#"
   display: flex; align-items: center; gap: 12px;
   padding: 0 12px;
   background: #18181b;
-  border-top: 1px solid #3f3f46;
+  border-bottom: 1px solid #3f3f46;
 }
 
 /* Content-sized, capped, and scrolling past the cap: growth is bounded so
@@ -26,7 +26,7 @@ pub(crate) const CSS: &str = r#"
   max-height: 60vh; overflow-y: auto;
   padding: 12px;
   background: #27272a;
-  border-top: 1px solid #3f3f46;
+  border-bottom: 1px solid #3f3f46;
 }
 
 #visor-identity { display: flex; align-items: center; gap: 8px; }
