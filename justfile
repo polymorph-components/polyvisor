@@ -32,15 +32,17 @@ compose:
         -o target/polyvisor_runtime.composed.wasm
 
 # web/dist: exactly what a home origin serves.
-site:
+# The site ships the composed runtime, so `compose` is a prerequisite here
+# and not only of `e2e`; pages.yml runs this recipe.
+site: compose
     deno task build
 
 # web/dist plus the test fixtures the e2e scenarios need (apps/hostile). NOT
 # what a home origin serves: the production Pages build runs `site`.
-site-fixtures:
+site-fixtures: compose
     deno task build:fixtures
 
-e2e: build-wasm compose site-fixtures
+e2e: build-wasm site-fixtures
     deno task e2e
 
 # Everything CI runs, in order (docs/design.md "Delivery": cargo test,
