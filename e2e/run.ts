@@ -310,38 +310,40 @@ async function claimed(page: Page): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
-// Sync, as these scenarios drive it
+// Devices, as these scenarios drive it
 //
 // Everything here is shaped by one fact about the visor: it holds no state
 // of its own and no timer exists in its world (visor/src/ui.rs), so nothing
-// on screen refreshes on its own. `device.status` and `sync.peers` are read
-// on every press that *opens* the Settings tenant — so toggling Settings
-// shut and open again is how this harness re-reads an endpoint id or a
-// peer's state. That is not a workaround for a missing feature; polling
-// chrome is a thing the milestone deliberately does not have.
+// on screen refreshes on its own. `device.status`, `sync.peers`,
+// `sync.members` and `pairing.status` are read on the press that opens the
+// Settings tenant and on the Devices section's own "Refresh" button — so
+// pressing Refresh is how this harness re-reads any of them. That is not a
+// workaround for a missing feature; polling chrome is a thing the milestone
+// deliberately does not have.
+//
+// Refresh is also what carries the kernel's `events.pairing-changed`
+// across: the worker drains the runtime after every export call it
+// dispatches (internal.wit `event-source`), and a phase the OTHER device
+// caused has no export activation of ours behind it until we make one.
 // ---------------------------------------------------------------------------
 
-const syncSheet = (page: Page) => sheet(page, "Sync");
+const devicesSheet = (page: Page) => sheet(page, "Devices");
 
 const settingsButton = (page: Page) =>
   strip(page).getByRole("button", { name: "Settings", exact: true });
 
-/** Settings open, showing the sync section. */
+/** Settings open, showing the Devices section. */
 async function openSettings(page: Page): Promise<void> {
-  if (await syncSheet(page).count() > 0) return;
+  if (await devicesSheet(page).count() > 0) return;
   await settingsButton(page).click();
-  await syncSheet(page).waitFor({ timeout: 10_000 });
+  await devicesSheet(page).waitFor({ timeout: 10_000 });
 }
 
-/** Close Settings and open it again: the press that opens it is the
- * `device.status` and `sync.peers` read, so this is the only way to see
- * either of them change. */
+/** Re-read everything the Devices section shows. */
 async function refreshSettings(page: Page): Promise<void> {
-  if (await syncSheet(page).count() > 0) {
-    await settingsButton(page).click();
-    await drawer(page).waitFor({ state: "detached", timeout: 10_000 });
-  }
   await openSettings(page);
+  await devicesSheet(page).getByRole("button", { name: "Refresh", exact: true })
+    .click();
 }
 
 /**
@@ -350,23 +352,20 @@ async function refreshSettings(page: Page): Promise<void> {
  *
  * Empty until the endpoint is bound (internal.wit
  * `device-status.endpoint-id`): the bind is spawned and lands after first
- * paint, so the sheet says "binding…" for a while. The re-read is a
- * Settings toggle, not a reload — the visor re-reads `device.status` on the
- * press that opens the tenant (visor/src/ui.rs `show_settings`), and a
- * reload would burn a fresh wasm instance per realm (~124 memories per
- * renderer) to learn one string that a second press already tells us.
+ * paint, so the sheet says "binding…" for a while, and "Refresh" is the
+ * re-read (visor/src/ui.rs `refresh_devices`).
  */
 async function endpointId(page: Page): Promise<string> {
   const deadline = performance.now() + 60_000;
   for (;;) {
     await openSettings(page);
-    const shown = syncSheet(page).locator("#visor-endpoint-id");
+    const shown = devicesSheet(page).locator("#visor-endpoint-id");
     try {
       await shown.waitFor({ timeout: 3_000 });
       const id = (await shown.textContent() ?? "").trim();
       if (id.length > 0) return id;
     } catch {
-      // Still "binding…"; fall through to another press.
+      // Still "binding…"; fall through to another refresh.
     }
     if (performance.now() > deadline) {
       throw new Failure("this device never bound an iroh endpoint");
@@ -375,12 +374,100 @@ async function endpointId(page: Page): Promise<string> {
   }
 }
 
-/** Paste a peer's endpoint id into the sync form and dial it. */
-async function dial(page: Page, peer: string): Promise<void> {
+/** Wait for something in the Devices section, pressing Refresh between
+ * attempts — the only way a phase the other device caused reaches this
+ * screen. A pairing failure is worth more than a timeout, so it ends the
+ * wait with the kernel's own words. */
+async function waitInDevices(
+  page: Page,
+  what: string,
+  ready: () => Promise<boolean>,
+  ms = 60_000,
+): Promise<void> {
+  const deadline = performance.now() + ms;
+  for (;;) {
+    await openSettings(page);
+    if (await ready()) return;
+    const failed = devicesSheet(page).locator(".sheet-error");
+    if (await failed.count() > 0) {
+      throw new Failure(
+        `${what}: the visor showed ${await failed.textContent()}`,
+      );
+    }
+    if (performance.now() > deadline) throw new Failure(`never saw ${what}`);
+    await new Promise((r) => setTimeout(r, 500));
+    await refreshSettings(page);
+  }
+}
+
+/** Joiner: show a pairing code. Returned exactly as displayed — in groups
+ * of four — because that is what a person retypes, and the visor's own
+ * `claim_code` is what has to undo the grouping. */
+async function offerPairing(page: Page): Promise<string> {
   await openSettings(page);
-  const sync = syncSheet(page);
-  await sync.locator("input[type=text]").fill(peer);
-  await sync.getByRole("button", { name: "Connect", exact: true }).click();
+  await devicesSheet(page)
+    .getByRole("button", { name: "Pair this device with another" }).click();
+  const code = devicesSheet(page).locator("#visor-pairing-code");
+  await waitInDevices(
+    page,
+    "a pairing code",
+    async () => await code.count() > 0,
+  );
+  return (await code.textContent() ?? "").trim();
+}
+
+/** Adder: claim the code the other device is showing. */
+async function claimPairing(page: Page, code: string): Promise<void> {
+  await openSettings(page);
+  const devices = devicesSheet(page);
+  await devices.getByRole("button", { name: "Add a device", exact: true })
+    .click();
+  await devices.locator("input[type=text]").fill(code);
+  await devices.getByRole("button", { name: "Claim", exact: true }).click();
+}
+
+/** The six digits this device is showing for comparison. */
+async function sasDigits(page: Page): Promise<string> {
+  const sas = devicesSheet(page).locator("#visor-pairing-sas");
+  await waitInDevices(
+    page,
+    "the pairing digits",
+    async () => await sas.count() > 0,
+  );
+  return (await sas.textContent() ?? "").trim();
+}
+
+/** Wait for a device to appear in this one's group. */
+async function waitForMember(page: Page, peer: string): Promise<void> {
+  await waitInDevices(
+    page,
+    `${peer} in the group`,
+    async () =>
+      await devicesSheet(page).locator(".member-row").filter({ hasText: peer })
+        .count() > 0,
+  );
+}
+
+/**
+ * Pair two devices: `joiner` shows a code, `adder` claims it, both compare
+ * the same six digits and both confirm. The claim of the ceremony is that
+ * the digits MATCH — a pair that went through with two different numbers
+ * would be the failure the whole commit-and-reveal exchange exists to
+ * prevent — so that is asserted rather than assumed.
+ */
+async function pair(adder: Page, joiner: Page): Promise<void> {
+  const code = await offerPairing(joiner);
+  await claimPairing(adder, code);
+  const onAdder = await sasDigits(adder);
+  const onJoiner = await sasDigits(joiner);
+  eq(onAdder, onJoiner, "the two devices showed different pairing digits");
+  for (const page of [adder, joiner]) {
+    await devicesSheet(page).getByRole("button", {
+      name: "Yes, pair",
+      exact: true,
+    })
+      .click();
+  }
 }
 
 /** Wait for the peer row to say `connected`. Generous, because what it is
@@ -390,10 +477,12 @@ async function dial(page: Page, peer: string): Promise<void> {
  * UDP, and WebRTC is off in the worker (runtime/component/src/net.rs), so
  * every dial and accept stays on the relay. */
 async function waitForConnectedPeer(page: Page, peer: string): Promise<void> {
-  const deadline = performance.now() + 30_000;
+  const deadline = performance.now() + 60_000;
   let said = "no row at all";
   for (;;) {
-    const row = syncSheet(page).locator(".peer-row").filter({ hasText: peer })
+    const row = devicesSheet(page).locator(".peer-row").filter({
+      hasText: peer,
+    })
       .first();
     if (await row.count() > 0) {
       said = (await row.locator(".framework").first().textContent() ?? "")
@@ -401,14 +490,6 @@ async function waitForConnectedPeer(page: Page, peer: string): Promise<void> {
       // "connecting" is not "connected", and the kernel's own vocabulary
       // (internal.wit `sync.peer`) is what is matched here, unparaphrased.
       if (said === "connected") return;
-    }
-    // A refused dial is the kernel's own message in the sync sheet, and it
-    // is worth more than a 30s timeout — but only until the next refresh
-    // closes the sheet and takes the message with it, which is why it is
-    // read here rather than at the moment of the click.
-    const refused = syncSheet(page).locator(".sheet-error");
-    if (await refused.count() > 0) {
-      throw new Failure(`the dial was refused: ${await refused.textContent()}`);
     }
     if (performance.now() > deadline) {
       throw new Failure(`the peer never reached "connected"; it read ${said}`);
@@ -497,7 +578,13 @@ async function converge(
     "the two contexts are the same device: they share an endpoint id",
   );
 
-  await dial(b, idA);
+  // A adds B: B shows the code, A claims it, both confirm the same six
+  // digits. Enrollment is what makes the connection legal at all — sync
+  // policy is group membership (internal.wit `sync`), so there is no
+  // dialling a stranger any more.
+  await pair(a, b);
+  await waitForMember(a, idB);
+  await waitForMember(b, idA);
   await waitForConnectedPeer(b, idA);
 
   // B's app only re-reads after B's own mutations, so adding "from B" is
@@ -862,6 +949,78 @@ const scenarios: Scenario[] = [
           fromFrame.join(", ")
         }`,
       );
+    },
+  },
+
+  {
+    name: "pairing-declined-aborts-both",
+    async run(ctx, origin, browser) {
+      const ctxB = await browser.newContext();
+      try {
+        const a = await open(ctx, origin);
+        await visorReady(a);
+        const b = await open(ctxB, origin);
+        await visorReady(b);
+
+        const code = await offerPairing(b);
+        await claimPairing(a, code);
+        const onA = await sasDigits(a);
+        const onB = await sasDigits(b);
+        eq(onA, onB, "the two devices showed different pairing digits");
+
+        // B presses "No" — `pairing.cancel` (runtime/crates/kernel/src/
+        // pairing.rs `pairing_cancel`). The canceller's own phase goes
+        // straight to `Idle` (pairing.rs:220 `set_phase(Phase::Idle)`); it
+        // is the OTHER side that lands on a `Failed` phase, from whichever
+        // race it sees first: the Cancel frame itself (`cancelled()`,
+        // pairing.rs:664, "the other device cancelled") or the transport
+        // closing ahead of it (pairing.rs:668, "the other device went
+        // away") — both are the kernel's own words for "the other side is
+        // gone", so both count.
+        await devicesSheet(b).getByRole("button", { name: "No", exact: true })
+          .click();
+
+        await waitInDevices(
+          a,
+          'the "other device" failure',
+          async () => {
+            const err = devicesSheet(a).locator(".sheet-error");
+            if (await err.count() === 0) return false;
+            return (await err.textContent() ?? "").includes("other device");
+          },
+          15_000,
+        );
+
+        // Neither device is in the other's group: a declined ceremony never
+        // reached enrollment.
+        for (const page of [a, b]) {
+          await refreshSettings(page);
+          eq(
+            await devicesSheet(page).locator(".member-row").count(),
+            1,
+            "a declined pairing still added a member",
+          );
+        }
+
+        // The canceller (B) lands on `Idle` too, same as pairing.rs:220 —
+        // its offer/claim controls are back, not stuck mid-ceremony.
+        await refreshSettings(b);
+        check(
+          await devicesSheet(b).getByRole("button", {
+            name: "Pair this device with another",
+          }).count() === 1,
+          "B did not return to Idle after cancelling",
+        );
+        check(
+          await devicesSheet(b).getByRole("button", {
+            name: "Add a device",
+            exact: true,
+          }).count() === 1,
+          "B did not return to Idle after cancelling",
+        );
+      } finally {
+        await ctxB.close();
+      }
     },
   },
 

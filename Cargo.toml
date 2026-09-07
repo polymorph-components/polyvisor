@@ -75,6 +75,18 @@ dioxus = { version = "=0.7.10", default-features = false, features = ["macro", "
 # time this skeleton was cut.
 stream-dom-dioxus = { git = "https://github.com/polymorph-components/polymorph-stream-dom", rev = "197492374936b3b4ce5af55f2bac50fa6b551597" }
 stream-dom-guest = { git = "https://github.com/polymorph-components/polymorph-stream-dom", rev = "197492374936b3b4ce5af55f2bac50fa6b551597" }
+# The pairing code's alphabet (PAIRING.md §1): `BASE32_NOPAD_VISUAL` is the
+# confusable-free base32 variant, which is what makes a 79-character code
+# something a person can read off one screen and type into another.
+# `default-features = false` + `alloc`: the `std` default buys only `Error`
+# impls this never surfaces.
+data-encoding = { version = "2.11", default-features = false, features = ["alloc"] }
+# The pairing ceremony's hash (PAIRING.md §2): BLAKE3 for the nonce
+# commitment and for the SAS transcript, byte-for-byte as the contract
+# spells it. Not sha2 — the contract names BLAKE3 and two devices must
+# derive the same six digits. `default-features = false` keeps it `no_std`
+# and portable-Rust, so the wasm32-wasip2 build needs no C toolchain.
+blake3 = { version = "1.8", default-features = false }
 
 [profile.release]
 opt-level = "s"

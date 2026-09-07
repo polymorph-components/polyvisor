@@ -438,6 +438,54 @@ impl guest::sync::Guest for Component {
             })
             .collect())
     }
+    async fn members() -> Result<Vec<guest::sync::Member>, Error> {
+        Ok(kernel()?
+            .sync_members()
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .map(|m| guest::sync::Member {
+                endpoint_id: m.endpoint_id,
+                petname: m.petname,
+                enrolled: m.enrolled,
+                me: m.me,
+            })
+            .collect())
+    }
+}
+
+/// The kernel's ceremony phase as the WIT spells it. One arm per case and
+/// no default: a phase the kernel grows must be given words here rather
+/// than quietly rendered as some neighbouring state.
+fn phase(p: polyvisor_kernel::Phase) -> polyvisor::internal::types::Phase {
+    use polyvisor::internal::types::Phase as Wit;
+    match p {
+        polyvisor_kernel::Phase::Idle => Wit::Idle,
+        polyvisor_kernel::Phase::Offering(code) => Wit::Offering(code),
+        polyvisor_kernel::Phase::Claiming => Wit::Claiming,
+        polyvisor_kernel::Phase::AwaitingConfirm(sas) => Wit::AwaitingConfirm(sas),
+        polyvisor_kernel::Phase::AwaitingPeer => Wit::AwaitingPeer,
+        polyvisor_kernel::Phase::Done => Wit::Done,
+        polyvisor_kernel::Phase::Failed(why) => Wit::Failed(why),
+    }
+}
+
+impl guest::pairing::Guest for Component {
+    async fn offer() -> Result<String, Error> {
+        kernel()?.pairing_offer().await.map_err(map_error)
+    }
+    async fn claim(code: String) -> Result<(), Error> {
+        kernel()?.pairing_claim(code).await.map_err(map_error)
+    }
+    async fn confirm() -> Result<(), Error> {
+        kernel()?.pairing_confirm().map_err(map_error)
+    }
+    async fn cancel() -> Result<(), Error> {
+        kernel()?.pairing_cancel().await.map_err(map_error)
+    }
+    async fn status() -> Result<polyvisor::internal::types::Phase, Error> {
+        kernel()?.pairing_status().map(phase).map_err(map_error)
+    }
 }
 
 impl guest::store::Guest for Component {
@@ -529,6 +577,9 @@ impl guest::event_source::Guest for Component {
             .map(|event| match event {
                 polyvisor_kernel::Event::SessionEnded(session, why) => {
                     guest::event_source::Event::SessionEnded((session, why))
+                }
+                polyvisor_kernel::Event::PairingChanged(p) => {
+                    guest::event_source::Event::PairingChanged(phase(p))
                 }
             })
             .collect()

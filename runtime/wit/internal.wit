@@ -59,6 +59,28 @@ interface types {
         /// Framework voice, for the visor to show or log as-is.
         message: string,
     }
+
+    /// Where a pairing ceremony stands. Declared here rather than in
+    /// `pairing` because two interfaces need it — `pairing.status` answers
+    /// it and `events.event` pushes it — and the runtime world *exports*
+    /// `pairing`, so an interface that `use`d it would need it imported and
+    /// exported at once (`wasm-tools component wit` refuses exactly that).
+    /// `types` is the package's shared vocabulary; this is now part of it.
+    variant phase {
+        idle,
+        /// Joiner: showing the code.
+        offering(string),
+        /// Adder: dialing and claiming.
+        claiming,
+        /// Both: the SAS to compare; confirm or cancel.
+        awaiting-confirm(string),
+        /// Confirmed here, waiting for the other side.
+        awaiting-peer,
+        /// Enrolled (joiner) or enrolled the peer (adder).
+        done,
+        /// Framework voice.
+        failed(string),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,23 +240,7 @@ interface sync {
 /// interactively on both devices. A fresh device with no group is its own
 /// group of one; joining replaces that group with the adder's.
 interface pairing {
-    use types.{error};
-
-    variant phase {
-        idle,
-        /// Joiner: showing the code.
-        offering(string),
-        /// Adder: dialing and claiming.
-        claiming,
-        /// Both: the SAS to compare; confirm or cancel.
-        awaiting-confirm(string),
-        /// Confirmed here, waiting for the other side.
-        awaiting-peer,
-        /// Enrolled (joiner) or enrolled the peer (adder).
-        done,
-        /// Framework voice.
-        failed(string),
-    }
+    use types.{error, phase};
 
     /// Joiner: mint an offer; returns the code. Replaces any open offer.
     offer: async func() -> result<string, error>;
@@ -320,13 +326,24 @@ interface apps {
 /// Kernel-originated events, as the visor consumes them: a long poll the
 /// visor's glue serves from a per-tab queue.
 interface events {
-    use types.{session-id};
+    use types.{session-id, phase};
 
     variant event {
         /// A session ended other than through `apps.close`. The string is
         /// the reason, framework voice: the kernel or the glue composed it,
         /// so the visor renders it unplated and plates only the app title.
         session-ended(tuple<session-id, string>),
+        /// The pairing ceremony moved: the kernel emits this on every phase
+        /// transition, including the ones the visor did not cause (the peer
+        /// confirming, an offer expiring, the enrollment landing).
+        ///
+        /// The visor has no timer and `pairing.status` may not park
+        /// (polyengine#292 — see `event-source`), so a ceremony that
+        /// advances because the *other* device acted has no other way to
+        /// reach the screen. `status` remains the authority and the visor
+        /// re-reads it after every act of its own; this is the push that
+        /// makes waiting cost nothing.
+        pairing-changed(phase),
     }
 
     /// Resolves with the next event; parks while there is none.

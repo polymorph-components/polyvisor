@@ -49,6 +49,7 @@ const I = {
   store: "polyvisor:internal/store@0.1.0",
   apps: "polyvisor:internal/apps@0.1.0",
   sync: "polyvisor:internal/sync@0.1.0",
+  pairing: "polyvisor:internal/pairing@0.1.0",
   events: "polyvisor:internal/events@0.1.0",
   eventSource: "polyvisor:internal/event-source@0.1.0",
   appServices: "polyvisor:internal/app-services@0.1.0",
@@ -444,6 +445,19 @@ self.onconnect = (ev: MessageEvent) => {
       connect: async (endpointId: string) =>
         (await ready)[I.sync].connect(endpointId),
       peers: async () => (await ready)[I.sync].peers(),
+      members: async () => (await ready)[I.sync].members(),
+    }),
+    // Control port only, like `sync`: pairing is a ceremony in the trusted
+    // pixels, and an app session has no business starting or confirming
+    // one. `draining` matters more here than anywhere else — the kernel
+    // pushes `pairing-changed` on transitions the *other* device caused,
+    // and this drain is what carries them to the tabs.
+    [I.pairing]: draining({
+      offer: async () => (await ready)[I.pairing].offer(),
+      claim: async (code: string) => (await ready)[I.pairing].claim(code),
+      confirm: async () => (await ready)[I.pairing].confirm(),
+      cancel: async () => (await ready)[I.pairing].cancel(),
+      status: async () => (await ready)[I.pairing].status(),
     }),
     [I.apps]: draining({
       installed: async () => (await ready)[I.apps].installed(),

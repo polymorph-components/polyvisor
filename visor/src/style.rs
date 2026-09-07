@@ -73,6 +73,31 @@ label { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
   overflow-x: auto;
 }
 .peer-row { display: flex; align-items: center; gap: 8px; align-self: stretch; }
+.member-row { display: flex; align-items: center; gap: 8px; align-self: stretch; }
+.member-row-name { flex: 1; min-width: 0; }
+
+/* Pairing. The code is 79 characters shown in groups of four: monospace so
+   the groups line up, selectable as a whole, and wrapped at the spaces
+   between groups (the only place it may break — a group broken mid-way is
+   a group read wrong). */
+.pairing-code {
+  font-family: ui-monospace, monospace;
+  user-select: all;
+  align-self: stretch;
+  line-height: 1.6;
+}
+
+/* The six digits both users compare. The largest thing in the drawer on
+   purpose: the entire security of the ceremony is one person reading them
+   off this screen and another agreeing they match, so they are sized to be
+   read across a desk, spaced so no two digits run together, and selectable
+   like every other machine text here. */
+.pairing-sas {
+  font-family: ui-monospace, monospace;
+  font-size: 40px;
+  letter-spacing: 6px;
+  user-select: all;
+}
 
 /* Unclaimed: before `device.status` reports `open` there is no identity to
    show, so the strip wears zero chroma — no hue, no name, no word. The
@@ -131,6 +156,24 @@ mod tests {
         // reaches the DOM only through the inline style the open branch of
         // `Identity` emits.
         assert!(!CSS.contains("hsl("));
+    }
+
+    /// The six digits are the ceremony: two people compare them across two
+    /// screens, so they are sized to be read at a distance rather than
+    /// styled like the framework's own prose.
+    #[test]
+    fn stylesheet_shows_the_sas_large() {
+        assert!(CSS.contains(".pairing-sas"));
+        let rule = CSS.split(".pairing-sas").nth(1).unwrap();
+        let rule = &rule[..rule.find('}').unwrap()];
+        assert!(
+            rule.contains("font-size: 40px"),
+            "the SAS must be far larger than the 14px base: {rule}"
+        );
+        assert!(
+            rule.contains("letter-spacing"),
+            "digits must not run together"
+        );
     }
 
     /// An endpoint id lands in an already-open Settings sheet: the bind

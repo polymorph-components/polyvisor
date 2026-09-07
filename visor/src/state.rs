@@ -116,25 +116,70 @@ impl Gate {
     }
 }
 
-/// What the sync form should dial, given what is in its box and which
-/// device this is.
+/// `types.phase` from internal.wit, as a plain value: what a pairing
+/// ceremony is doing right now. A copy rather than the generated type for
+/// the same reason [`DeviceState`] is one — the bindings exist only on the
+/// wasm target, and the rendering decisions this drives have to be
+/// testable natively.
 ///
-/// Endpoint ids travel by hand — read off one device's screen, typed or
-/// pasted into another's — so surrounding whitespace is an artefact of the
-/// carrying, not of the id, and is dropped. Two inputs are refused here
-/// rather than sent: an empty box (nothing was pasted) and this device's
-/// own id (a dial to oneself has no meaning and the kernel's refusal would
-/// read as a failure of sync rather than of the paste).
+/// The kernel is the only authority on it. The visor never advances it on
+/// its own guess about what a button did: every act re-reads
+/// `pairing.status`, and the kernel additionally pushes
+/// `events.pairing-changed` on every transition (including the ones the
+/// *other* device caused, which is the only way they could arrive — this
+/// world has no timer, and `pairing.status` may not park; internal.wit
+/// `event-source`, polyengine#292).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub(crate) enum Phase {
+    #[default]
+    Idle,
+    /// Joiner: showing this code.
+    Offering(String),
+    /// Adder: dialing and claiming.
+    Claiming,
+    /// Both: the six digits to compare.
+    AwaitingConfirm(String),
+    /// Confirmed here; the other side has not.
+    AwaitingPeer,
+    Done,
+    /// Framework voice.
+    Failed(String),
+}
+
+/// A pairing code as it is shown: groups of four, separated by spaces.
 ///
-// CONTRACT: internal.wit `sync.connect` says nothing about self-dialling;
-// refusing it in the visor is the conservative reading — the kernel stays
-// free to refuse it too, and this only means the call is never made.
-pub(crate) fn dial_target(typed: &str, self_endpoint_id: &str) -> Option<String> {
-    let id = typed.trim();
-    if id.is_empty() || id == self_endpoint_id.trim() {
-        return None;
+/// The code is 79 characters of visual base32 (the M3b pairing contract
+/// §1) and is read aloud or typed across from one screen to another, so
+/// the grouping is what makes losing one's place recoverable. It is
+/// display only — [`claim_code`] undoes it, and the kernel never sees a
+/// space.
+pub(crate) fn grouped(code: &str) -> String {
+    let mut out = String::with_capacity(code.len() + code.len() / 4);
+    for (i, c) in code.chars().enumerate() {
+        if i > 0 && i % 4 == 0 {
+            out.push(' ');
+        }
+        out.push(c);
     }
-    Some(id.to_string())
+    out
+}
+
+/// What to claim, given what is in the box.
+///
+/// All whitespace is dropped, not merely trimmed: the code is *shown* in
+/// groups of four, so a user who typed what they saw typed spaces, and a
+/// user who copied it copied them. An empty box is refused here rather
+/// than sent, so the kernel's "that is not a code" is never the answer to
+/// a press on an empty field.
+///
+// CONTRACT: internal.wit `pairing.claim` says nothing about the code's
+// spelling beyond what the pairing contract fixes (visual base32, no
+// padding). Stripping whitespace is the conservative normalisation — it
+// removes only what this visor itself inserted; case and every other
+// character are left for the kernel to judge.
+pub(crate) fn claim_code(typed: &str) -> Option<String> {
+    let code: String = typed.chars().filter(|c| !c.is_whitespace()).collect();
+    (!code.is_empty()).then_some(code)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -277,31 +322,35 @@ mod tests {
         );
     }
 
-    /// A pasted id carries whatever whitespace the carrying added.
+    /// The code is shown in groups of four so a person can keep their place
+    /// while reading it across to another device.
     #[test]
-    fn dial_target_trims_what_was_pasted() {
+    fn grouped_breaks_the_code_into_fours() {
+        assert_eq!(grouped("ABCDEFGHIJ"), "ABCD EFGH IJ");
+        assert_eq!(grouped("ABCD"), "ABCD");
+        assert_eq!(grouped(""), "");
+    }
+
+    /// What the grouping put in, the claim takes out — including whatever
+    /// a copy-paste or a typist added.
+    #[test]
+    fn claim_code_undoes_the_grouping() {
         assert_eq!(
-            dial_target("  abcd \n", "mine"),
-            Some("abcd".to_string()),
-            "a pasted id should dial without its whitespace"
+            claim_code(" ABCD EFGH\n IJ "),
+            Some("ABCDEFGHIJ".to_string())
+        );
+        assert_eq!(
+            claim_code(&grouped("ABCDEFGHIJ")),
+            Some("ABCDEFGHIJ".into())
         );
     }
 
-    /// The two refusals: nothing typed, and this device itself.
+    /// An empty box is not a claim: the press does nothing the kernel has
+    /// to compose a refusal for.
     #[test]
-    fn dial_target_refuses_the_empty_box_and_this_device() {
-        assert_eq!(dial_target("", "mine"), None);
-        assert_eq!(dial_target("   ", "mine"), None);
-        assert_eq!(dial_target("mine", "mine"), None);
-        assert_eq!(dial_target(" mine ", "mine"), None);
-    }
-
-    /// A device whose endpoint is not bound yet has an empty id, and that
-    /// must not turn every dial into a self-dial.
-    #[test]
-    fn dial_target_survives_an_unbound_endpoint() {
-        assert_eq!(dial_target("theirs", ""), Some("theirs".to_string()));
-        assert_eq!(dial_target("", ""), None);
+    fn claim_code_refuses_an_empty_box() {
+        assert_eq!(claim_code(""), None);
+        assert_eq!(claim_code("  \t\n "), None);
     }
 
     /// The quiet case: nothing was written while the read was out, so the

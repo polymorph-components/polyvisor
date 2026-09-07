@@ -13,8 +13,8 @@ use futures::stream::StreamExt as _;
 use futures::{executor::LocalPool, task::LocalSpawnExt as _};
 use polyvisor_kernel::{
     Accepted, BootConfig, Bound, Clock, Dialed, EngineTransport, Error, ErrorCode, Event, Fetch,
-    Files, IndexRow, Kernel, LEASE_TTL_MS, LocalFuture, Locks, Net, NetHandle, Platform, Rest, Rng,
-    Seams, Spawn, State, Tier,
+    Files, IndexRow, Kernel, LEASE_TTL_MS, LocalFuture, Locks, Net, NetHandle, Phase, Platform,
+    Rest, Rng, Seams, Spawn, State, Tier,
 };
 
 // -- harness -----------------------------------------------------------------
@@ -172,6 +172,34 @@ type Wires = Rc<RefCell<BTreeMap<String, Vec<mpsc::UnboundedSender<Vec<u8>>>>>>;
 /// Endpoint ids that announce a key other than their own.
 type Liars = Rc<RefCell<BTreeMap<String, [u8; 32]>>>;
 
+/// Endpoints whose inbound connections are queued rather than delivered, and
+/// the queue. What a test needs to put two dials in flight at once: without
+/// it the first dial is answered before the second is made, and the race the
+/// single-claim rule exists for cannot be staged at all.
+type Held = Rc<RefCell<BTreeMap<String, Vec<Accepted>>>>;
+
+/// A rewrite applied to everything an endpoint sends.
+type Mangler = Rc<dyn Fn(Vec<u8>) -> Vec<u8>>;
+type Manglers = Rc<RefCell<BTreeMap<String, Mangler>>>;
+
+/// One end of a connection whose outgoing messages are rewritten in flight.
+struct Mangled {
+    inner: Box<dyn EngineTransport>,
+    mangle: Mangler,
+}
+
+impl EngineTransport for Mangled {
+    fn send(&self, bytes: Vec<u8>) -> LocalFuture<'_, Result<(), String>> {
+        self.inner.send((self.mangle)(bytes))
+    }
+    fn recv(&self) -> LocalFuture<'_, Option<Vec<u8>>> {
+        self.inner.recv()
+    }
+    fn close(&self) -> LocalFuture<'_, ()> {
+        self.inner.close()
+    }
+}
+
 /// Distinct `World`s share one [`FakeNet`] when a test wants two devices that
 /// can see each other.
 /// The `Net` seam: endpoints on a shared switchboard, each connection a
@@ -192,6 +220,11 @@ struct FakeNet {
     /// this (the id *is* the key), but the kernel does not get to assume the
     /// endpoint component is the only thing on the other side of the seam.
     liars: Liars,
+    /// Endpoint ids whose outgoing frames are rewritten (see
+    /// [`FakeNet::tamper`]).
+    manglers: Manglers,
+    /// Endpoint ids not answering their door yet (see [`FakeNet::hold`]).
+    held: Held,
 }
 
 impl Default for FakeNet {
@@ -201,6 +234,8 @@ impl Default for FakeNet {
             gate: Rc::new(Cell::new(true)),
             wires: Rc::default(),
             liars: Rc::default(),
+            manglers: Rc::default(),
+            held: Rc::default(),
         }
     }
 }
@@ -227,6 +262,13 @@ impl FakeNet {
 
     fn unplug(&self, endpoint_id: &str) {
         let _sender = self.switchboard.borrow_mut().remove(endpoint_id);
+        self.cut(endpoint_id);
+    }
+
+    /// Cut every wire an endpoint holds while leaving it on the network: the
+    /// connections drop, and the device still answers new dials. A relay
+    /// hiccup, rather than a worker that died.
+    fn cut(&self, endpoint_id: &str) {
         for wire in self
             .wires
             .borrow_mut()
@@ -236,30 +278,70 @@ impl FakeNet {
             wire.close_channel();
         }
     }
+
+    /// Rewrite what `endpoint_id` puts on the wire. The only way to put a
+    /// *misbehaving* peer on the other side of a ceremony: both kernels here
+    /// are honest, so the frame has to be tampered with in flight.
+    fn tamper(&self, endpoint_id: &str, f: Mangler) {
+        let _previous = self
+            .manglers
+            .borrow_mut()
+            .insert(endpoint_id.to_string(), f);
+    }
+
+    /// Queue every connection dialed to `endpoint_id` instead of delivering
+    /// it, until [`FakeNet::release`].
+    fn hold(&self, endpoint_id: &str) {
+        let _previous = self
+            .held
+            .borrow_mut()
+            .insert(endpoint_id.to_string(), Vec::new());
+    }
+
+    /// Deliver everything that piled up, in one go.
+    fn release(&self, endpoint_id: &str) {
+        let waiting = self
+            .held
+            .borrow_mut()
+            .remove(endpoint_id)
+            .unwrap_or_default();
+        let switchboard = self.switchboard.borrow();
+        let Some(peer) = switchboard.get(endpoint_id) else {
+            return;
+        };
+        for accepted in waiting {
+            peer.unbounded_send(accepted)
+                .expect("the held endpoint is still listening");
+        }
+    }
 }
 
-/// The endpoint id a seed binds as, and its inverse.
+/// The endpoint id a key spells, and its inverse.
 ///
 /// The real spelling is z-base-32 of the device's Ed25519 public key; the
-/// property the kernel depends on is only that the id determines the key, so
-/// the fake spells the *seed* in hex and derives the key from it.
+/// property everything here depends on is that the id and the key determine
+/// each other, so the fake spells the key in hex.
+fn id_of_key(key: [u8; 32]) -> String {
+    key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn endpoint_id_of(seed: [u8; 32]) -> String {
-    seed.iter().map(|b| format!("{b:02x}")).collect()
+    id_of_key(
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes(),
+    )
 }
 
 fn key_of(endpoint_id: &str) -> Option<[u8; 32]> {
     if endpoint_id.len() != 64 {
         return None;
     }
-    let mut seed = [0u8; 32];
-    for (i, slot) in seed.iter_mut().enumerate() {
+    let mut key = [0u8; 32];
+    for (i, slot) in key.iter_mut().enumerate() {
         *slot = u8::from_str_radix(endpoint_id.get(i * 2..i * 2 + 2)?, 16).ok()?;
     }
-    Some(
-        ed25519_dalek::SigningKey::from_bytes(&seed)
-            .verifying_key()
-            .to_bytes(),
-    )
+    Some(key)
 }
 
 impl Net for FakeNet {
@@ -276,11 +358,17 @@ impl Net for FakeNet {
                 key: key_of(&id).expect("a bound endpoint id spells a key"),
                 wires: Rc::clone(&self.wires),
                 liars: Rc::clone(&self.liars),
+                manglers: Rc::clone(&self.manglers),
+                held: Rc::clone(&self.held),
                 switchboard: Rc::clone(&self.switchboard),
                 inbound: RefCell::new(rx),
             });
             Ok((id, handle))
         })
+    }
+
+    fn endpoint_id(&self, key: [u8; 32]) -> String {
+        id_of_key(key)
     }
 }
 
@@ -288,6 +376,8 @@ struct FakeEndpoint {
     id: String,
     wires: Wires,
     liars: Liars,
+    manglers: Manglers,
+    held: Held,
     /// The key this endpoint id spells — what a dialer's side of the wire
     /// tells the accepting kernel, so it can check who authenticates.
     key: [u8; 32],
@@ -296,7 +386,11 @@ struct FakeEndpoint {
 }
 
 impl NetHandle for FakeEndpoint {
-    fn connect(&self, endpoint_id: String) -> LocalFuture<'_, Result<Dialed, String>> {
+    fn connect(
+        &self,
+        endpoint_id: String,
+        alpn: String,
+    ) -> LocalFuture<'_, Result<Dialed, String>> {
         Box::pin(async move {
             let key = key_of(&endpoint_id)
                 .ok_or_else(|| format!("{endpoint_id} is not an endpoint id"))?;
@@ -320,9 +414,21 @@ impl NetHandle for FakeEndpoint {
                 .get(&self.id)
                 .copied()
                 .unwrap_or(self.key);
-            peer.unbounded_send((self.id.clone(), announced, there.transport))
-                .map_err(|_| "the peer is gone".to_string())?;
-            Ok((key, here.transport))
+            let accepted = (self.id.clone(), announced, alpn, there.transport);
+            match self.held.borrow_mut().get_mut(&endpoint_id) {
+                Some(queue) => queue.push(accepted),
+                None => peer
+                    .unbounded_send(accepted)
+                    .map_err(|_| "the peer is gone".to_string())?,
+            }
+            let mine = match self.manglers.borrow().get(&self.id) {
+                Some(mangle) => Box::new(Mangled {
+                    inner: here.transport,
+                    mangle: Rc::clone(mangle),
+                }) as Box<dyn EngineTransport>,
+                None => here.transport,
+            };
+            Ok((key, mine))
         })
     }
 
@@ -482,6 +588,12 @@ impl Default for FakeClock {
         // Far enough from zero that a stale lease can be expressed by
         // subtracting the TTL without underflowing.
         FakeClock(Rc::new(Cell::new(1_700_000_000_000)))
+    }
+}
+
+impl FakeClock {
+    fn advance(&self, ms: u64) {
+        self.0.set(self.0.get() + ms);
     }
 }
 
@@ -666,9 +778,13 @@ impl World {
     /// A second browser profile on the same fake network: separate storage,
     /// shared switchboard, so the two devices can dial each other.
     fn peer(&self) -> World {
+        self.peer_seeded(0x1234_5678_9abc_def0)
+    }
+
+    fn peer_seeded(&self, seed: u64) -> World {
         World {
             net: self.net.clone(),
-            rng: FakeRng::seeded(0x1234_5678_9abc_def0),
+            rng: FakeRng::seeded(seed),
             ..World::default()
         }
     }
@@ -1660,6 +1776,41 @@ fn close_then_abort_announces_nothing() {
 
 // -- sync --------------------------------------------------------------------
 
+/// Run the whole pairing ceremony between two booted devices: `joiner` shows
+/// a code, `adder` claims it, both users compare the digits and confirm.
+/// Answers the SAS both sides displayed — the same six digits, or the
+/// ceremony did not happen.
+fn pair(joiner: &Rc<Kernel>, adder: &Rc<Kernel>) -> String {
+    let code = block_on(joiner.pairing_offer()).unwrap();
+    assert_eq!(
+        joiner.pairing_status().unwrap(),
+        Phase::Offering(code.clone())
+    );
+    block_on(adder.pairing_claim(code)).unwrap();
+
+    let (here, there) = settle_until(|| async {
+        match (
+            joiner.pairing_status().unwrap(),
+            adder.pairing_status().unwrap(),
+        ) {
+            (Phase::AwaitingConfirm(here), Phase::AwaitingConfirm(there)) => Some((here, there)),
+            (Phase::Failed(why), _) | (_, Phase::Failed(why)) => panic!("pairing failed: {why}"),
+            _ => None,
+        }
+    });
+    assert_eq!(here, there, "both devices show the same six digits");
+
+    joiner.pairing_confirm().unwrap();
+    adder.pairing_confirm().unwrap();
+    settle_until(|| async {
+        (joiner.pairing_status().unwrap() == Phase::Done
+            && adder.pairing_status().unwrap() == Phase::Done)
+            .then_some(())
+    });
+    settle();
+    here
+}
+
 /// The todo list one session of `APP` sees.
 async fn titles(kernel: &Kernel, session: u32) -> Vec<String> {
     kernel
@@ -1688,6 +1839,9 @@ fn two_devices_on_one_network_converge_on_tasks() {
 
     let endpoint = b.device_status().unwrap().endpoint_id;
     assert!(!endpoint.is_empty(), "an open device binds an endpoint");
+    // Sync is within the group and nowhere else, so the two devices pair
+    // first — B shows the code, A claims it.
+    let _sas = pair(&b, &a);
     block_on(a.sync_connect(endpoint.clone())).unwrap();
     assert_eq!(
         a.sync_peers().unwrap(),
@@ -1727,6 +1881,7 @@ fn a_remote_change_is_checkpointed_so_a_reboot_still_has_it() {
         let sa = session(&a);
         settle();
         assert!(block_on(titles(&b, sb)).is_empty());
+        let _sas = pair(&b, &a);
         block_on(a.sync_connect(b.device_status().unwrap().endpoint_id)).unwrap();
         block_on(a.tasks_add(sa, "from a".into())).unwrap();
         settle_until(|| async {
@@ -1787,13 +1942,15 @@ fn an_endpoint_that_binds_late_shows_up_in_status_when_it_does() {
         !kernel.device_status().unwrap().endpoint_id.is_empty(),
         "status reports the endpoint id from the moment the bind lands"
     );
-    // And dialing stops answering "still binding": a well-formed id nobody
-    // holds now fails as the peer's absence, not as our own endpoint's.
+    // And dialing stops answering "still binding". What it answers instead
+    // is the group: a device this one has never paired with is refused
+    // before it is dialed at all (internal.wit `sync.connect`).
     let nobody = "ab".repeat(32);
     let refused = block_on(kernel.sync_connect(nobody)).unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Refused);
     assert!(
-        refused.message.contains("no device answers"),
-        "the endpoint is up, so the failure is the peer's: {}",
+        refused.message.contains("not a member"),
+        "the endpoint is up, so the failure is the group's: {}",
         refused.message
     );
 }
@@ -1872,6 +2029,7 @@ fn a_remote_change_checkpointing_does_not_overlap_a_local_one() {
     let (sa, sb) = (session(&a), session(&b));
     settle();
     assert!(block_on(titles(&b, sb)).is_empty());
+    let _sas = pair(&b, &a);
     block_on(a.sync_connect(b.device_status().unwrap().endpoint_id)).unwrap();
 
     there.forget_writes();
@@ -1919,6 +2077,7 @@ fn a_peer_that_goes_away_stops_being_reported_as_connected() {
     settle();
 
     let endpoint = b.device_status().unwrap().endpoint_id;
+    let _sas = pair(&b, &a);
     block_on(a.sync_connect(endpoint.clone())).unwrap();
     assert_eq!(
         a.sync_peers().unwrap(),
@@ -1951,6 +2110,7 @@ fn an_inbound_peer_that_authenticates_as_someone_else_is_dropped() {
     let b = there.boot();
     settle();
 
+    let _sas = pair(&b, &a);
     let a_endpoint = a.device_status().unwrap().endpoint_id;
     // A dials B announcing a key that is not A's.
     here.net.impersonate(&a_endpoint, [7u8; 32]);
@@ -1959,7 +2119,437 @@ fn an_inbound_peer_that_authenticates_as_someone_else_is_dropped() {
     let state = settle_until(|| async {
         let peers = b.sync_peers().unwrap();
         let row = peers.first()?;
-        (row.state != "connecting").then(|| row.state.clone())
+        row.state.starts_with("closed").then(|| row.state.clone())
     });
     assert_eq!(state, "closed: it authenticated as a different device");
+}
+
+// -- pairing -----------------------------------------------------------------
+
+/// The group as `sync.members` reports it, endpoint ids only, sorted so two
+/// devices' answers compare directly.
+fn member_ids(kernel: &Kernel) -> Vec<String> {
+    let mut ids: Vec<String> = block_on(kernel.sync_members())
+        .unwrap()
+        .into_iter()
+        .map(|member| member.endpoint_id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn pairing_enrolls_the_joiner_and_the_two_devices_then_sync() {
+    // The whole ceremony, end to end: the joiner shows a code, the adder
+    // claims it, both users see the same six digits and confirm, the adder
+    // enrolls the joiner and sends the group over, and the joiner adopts it
+    // and dials. Only then do the two devices sync at all.
+    let here = World::default();
+    let there = here.peer();
+    let joiner = here.boot();
+    let adder = there.boot();
+    let (sj, sa) = (session(&joiner), session(&adder));
+    settle();
+
+    // Before pairing each device is its own group of one, and neither knows
+    // the other.
+    assert_eq!(
+        member_ids(&joiner),
+        vec![joiner.device_status().unwrap().endpoint_id]
+    );
+    assert_eq!(
+        member_ids(&adder),
+        vec![adder.device_status().unwrap().endpoint_id]
+    );
+
+    let sas = pair(&joiner, &adder);
+    assert_eq!(sas.len(), 6, "six digits, in trusted pixels on both sides");
+
+    // Every transition was announced. The visor has no timer, so the phases
+    // the *other* device drove — the SAS arriving, the enrollment landing —
+    // reach a screen only as events.
+    for kernel in [&joiner, &adder] {
+        let phases: Vec<Phase> = kernel
+            .drain_events()
+            .into_iter()
+            .map(|event| match event {
+                Event::PairingChanged(phase) => phase,
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect();
+        assert!(
+            phases.contains(&Phase::AwaitingConfirm(sas.clone())),
+            "the digits were pushed: {phases:?}"
+        );
+        assert_eq!(phases.last(), Some(&Phase::Done));
+    }
+
+    let mut expected = vec![
+        joiner.device_status().unwrap().endpoint_id,
+        adder.device_status().unwrap().endpoint_id,
+    ];
+    expected.sort();
+    assert_eq!(
+        member_ids(&joiner),
+        expected,
+        "the joiner adopted the group"
+    );
+    assert_eq!(member_ids(&adder), expected, "the adder wrote it");
+    // And each device knows which row is itself.
+    for kernel in [&joiner, &adder] {
+        let mine: Vec<String> = block_on(kernel.sync_members())
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.me)
+            .map(|m| m.endpoint_id)
+            .collect();
+        assert_eq!(mine, vec![kernel.device_status().unwrap().endpoint_id]);
+    }
+
+    // The joiner dialed the adder as the last step of the ceremony, so tasks
+    // converge with no further `sync.connect`.
+    block_on(adder.tasks_add(sa, "after pairing".into())).unwrap();
+    let seen = settle_until(|| async {
+        let items = titles(&joiner, sj).await;
+        (!items.is_empty()).then_some(items)
+    });
+    assert_eq!(seen, vec!["after pairing"]);
+}
+
+#[test]
+fn a_second_claim_is_refused_and_burns_the_ceremony_it_interrupted() {
+    // PAIRING.md §1: the token is single-claim. A code that reached a second
+    // party has leaked, so the second claim is refused *and* the bound
+    // session dies — both users start over rather than one of them finishing
+    // a ceremony an eavesdropper watched.
+    let here = World::default();
+    let there = here.peer();
+    let elsewhere = here.peer_seeded(0x0fed_cba9_8765_4321);
+    let joiner = here.boot();
+    let first = there.boot();
+    let second = elsewhere.boot();
+    settle();
+
+    let code = block_on(joiner.pairing_offer()).unwrap();
+    block_on(first.pairing_claim(code.clone())).unwrap();
+    settle_until(|| async {
+        matches!(joiner.pairing_status().unwrap(), Phase::AwaitingConfirm(_)).then_some(())
+    });
+
+    block_on(second.pairing_claim(code)).unwrap();
+    let (joiner_phase, second_phase) = settle_until(|| async {
+        match (
+            joiner.pairing_status().unwrap(),
+            second.pairing_status().unwrap(),
+        ) {
+            (Phase::Failed(a), Phase::Failed(b)) => Some((a, b)),
+            _ => None,
+        }
+    });
+    assert!(
+        joiner_phase.contains("already tried this code"),
+        "the joiner's ceremony was burned: {joiner_phase}"
+    );
+    assert!(
+        second_phase.contains("spent or expired"),
+        "the second claimer was refused: {second_phase}"
+    );
+    // And nobody was enrolled.
+    assert_eq!(member_ids(&joiner).len(), 1);
+    assert_eq!(member_ids(&first).len(), 1);
+    assert_eq!(member_ids(&second).len(), 1);
+}
+
+#[test]
+fn a_reveal_that_does_not_match_the_commitment_aborts() {
+    // The commitment ordering is what stops the dialing side grinding the
+    // 20-bit SAS: it is committed to its nonce before it learns the
+    // joiner's. Both kernels here are honest, so the REVEAL is rewritten in
+    // flight — a peer that picked its nonce after the fact looks exactly
+    // like this.
+    let here = World::default();
+    let there = here.peer();
+    let joiner = here.boot();
+    let adder = there.boot();
+    settle();
+
+    there.net.tamper(
+        &adder.device_status().unwrap().endpoint_id,
+        Rc::new(|bytes: Vec<u8>| {
+            if bytes.starts_with(br#"{"Reveal""#) {
+                let zeros = ["0"; 32].join(",");
+                return format!(r#"{{"Reveal":{{"nonce":[{zeros}]}}}}"#).into_bytes();
+            }
+            bytes
+        }),
+    );
+
+    let code = block_on(joiner.pairing_offer()).unwrap();
+    block_on(adder.pairing_claim(code.clone())).unwrap();
+    let why = settle_until(|| async {
+        match joiner.pairing_status().unwrap() {
+            Phase::Failed(why) => Some(why),
+            _ => None,
+        }
+    });
+    assert!(
+        why.contains("did not match what it committed to"),
+        "the joiner refused the reveal: {why}"
+    );
+    assert_eq!(member_ids(&joiner).len(), 1, "nothing was enrolled");
+
+    // And the code died with the ceremony: it was claimed once, that claim
+    // failed, and a code that outlived its ceremony is a second chance for
+    // whoever else has seen it. The joiner is not answering that door.
+    block_on(adder.pairing_cancel()).unwrap();
+    assert_eq!(adder.pairing_status().unwrap(), Phase::Idle);
+    block_on(adder.pairing_claim(code)).unwrap();
+    let why = settle_until(|| async {
+        match adder.pairing_status().unwrap() {
+            Phase::Failed(why) => Some(why),
+            _ => None,
+        }
+    });
+    assert_eq!(why, "the other device went away");
+}
+
+#[test]
+fn a_cancel_before_the_confirm_tells_the_other_side() {
+    // internal.wit `pairing.cancel`: "Either side, at any point; the other
+    // side sees `failed`." A ceremony that just went quiet would leave the
+    // other user staring at six digits forever.
+    let here = World::default();
+    let there = here.peer();
+    let joiner = here.boot();
+    let adder = there.boot();
+    settle();
+
+    let code = block_on(joiner.pairing_offer()).unwrap();
+    block_on(adder.pairing_claim(code)).unwrap();
+    settle_until(|| async {
+        match (
+            joiner.pairing_status().unwrap(),
+            adder.pairing_status().unwrap(),
+        ) {
+            (Phase::AwaitingConfirm(_), Phase::AwaitingConfirm(_)) => Some(()),
+            _ => None,
+        }
+    });
+
+    block_on(adder.pairing_cancel()).unwrap();
+    assert_eq!(
+        adder.pairing_status().unwrap(),
+        Phase::Idle,
+        "the side that cancelled is back to nothing in flight"
+    );
+    let why = settle_until(|| async {
+        match joiner.pairing_status().unwrap() {
+            Phase::Failed(why) => Some(why),
+            _ => None,
+        }
+    });
+    assert_eq!(why, "the other device cancelled");
+    assert_eq!(member_ids(&joiner).len(), 1);
+    assert_eq!(member_ids(&adder).len(), 1);
+
+    // A cancel takes the code with it. The user who cancelled believes they
+    // revoked what was on their screen; an offer left standing would keep
+    // answering dials for the rest of its two minutes.
+    let code = block_on(joiner.pairing_offer()).unwrap();
+    block_on(joiner.pairing_cancel()).unwrap();
+    block_on(adder.pairing_claim(code)).unwrap();
+    let why = settle_until(|| async {
+        match adder.pairing_status().unwrap() {
+            Phase::Failed(why) => Some(why),
+            _ => None,
+        }
+    });
+    assert_eq!(why, "the other device went away");
+}
+
+#[test]
+fn an_offer_expires_after_two_minutes() {
+    // PAIRING.md §1: the offer stands 120 s. After that the code is dead on
+    // both sides — the joiner says so, and a claim that arrives late is
+    // refused rather than quietly honoured.
+    let here = World::default();
+    let there = here.peer();
+    let joiner = here.boot();
+    let adder = there.boot();
+    settle();
+
+    let code = block_on(joiner.pairing_offer()).unwrap();
+    here.clock.advance(120_000);
+    match joiner.pairing_status().unwrap() {
+        Phase::Failed(why) => assert!(why.contains("expired"), "{why}"),
+        other => panic!("the offer should have lapsed: {other:?}"),
+    }
+
+    // The adder's clock is its own, so it dials in good faith and is
+    // refused by the device that minted the code.
+    block_on(adder.pairing_claim(code)).unwrap();
+    let why = settle_until(|| async {
+        match adder.pairing_status().unwrap() {
+            Phase::Failed(why) => Some(why),
+            _ => None,
+        }
+    });
+    assert!(
+        why.contains("spent or expired"),
+        "the late claim was refused: {why}"
+    );
+    assert_eq!(member_ids(&joiner).len(), 1);
+}
+
+#[test]
+fn a_device_outside_the_group_is_closed_on_the_subduction_wire() {
+    // The post-handshake check. A device can believe it is a member — the
+    // group document reaches devices at different times — and still be a
+    // stranger to the device it dials. What it must not be is synced with.
+    let here = World::default();
+    let there = here.peer();
+    let elsewhere = here.peer_seeded(0x0fed_cba9_8765_4321);
+    let b = here.boot();
+    let a = there.boot();
+    let c = elsewhere.boot();
+    settle();
+
+    // A adds B, then loses touch with it.
+    let _sas = pair(&b, &a);
+    let b_endpoint = b.device_status().unwrap().endpoint_id;
+    here.net.cut(&b_endpoint);
+    settle();
+
+    // A adds C. C's group now has three devices; B's still has two, because
+    // B has not been reachable since.
+    let _sas = pair(&c, &a);
+    assert_eq!(member_ids(&c).len(), 3);
+    assert_eq!(member_ids(&b).len(), 2, "B has not heard about C");
+
+    // So C dials B in good faith, and B closes it with the reason.
+    let _attempt = block_on(c.sync_connect(b_endpoint));
+    let c_endpoint = c.device_status().unwrap().endpoint_id;
+    let state = settle_until(|| async {
+        let peers = b.sync_peers().unwrap();
+        let row = peers.iter().find(|p| p.endpoint_id == c_endpoint)?;
+        row.state.starts_with("closed").then(|| row.state.clone())
+    });
+    assert_eq!(state, "closed: not a member of this device's group");
+}
+
+#[test]
+fn a_device_dials_its_group_when_it_comes_back_up() {
+    // The group is the address book: no `sync.connect` from the visor is
+    // needed after the first pairing, or a reload would leave two paired
+    // devices sitting next to each other doing nothing.
+    let here = World::default();
+    let there = here.peer();
+    let b = here.boot();
+    let a = there.boot();
+    settle();
+    let _sas = pair(&b, &a);
+    let a_endpoint = a.device_status().unwrap().endpoint_id;
+
+    // B reloads: the old worker dies with every wire it held, and a fresh
+    // one comes up over the same storage. Nobody tells it to dial anything.
+    let b_endpoint = b.device_status().unwrap().endpoint_id;
+    drop(b);
+    here.net.cut(&b_endpoint);
+    // A has to have *noticed*: a dial that arrives while the peer still
+    // holds the dead connection is a second connection from one peer id,
+    // which subduction closes.
+    settle_until(|| async {
+        let peers = a.sync_peers().unwrap();
+        peers.first()?.state.starts_with("closed").then_some(())
+    });
+    let rebooted = here.boot();
+    let state = settle_until(|| async {
+        let peers = rebooted.sync_peers().unwrap();
+        let row = peers.iter().find(|p| p.endpoint_id == a_endpoint)?;
+        (row.state == "connected").then(|| row.state.clone())
+    });
+    assert_eq!(state, "connected");
+
+    // And it is a working connection, not just a row.
+    let sa = session(&a);
+    let sb = session(&rebooted);
+    block_on(a.tasks_add(sa, "while you were out".into())).unwrap();
+    let seen = settle_until(|| async {
+        let items = titles(&rebooted, sb).await;
+        (!items.is_empty()).then_some(items)
+    });
+    assert_eq!(seen, vec!["while you were out"]);
+}
+
+#[test]
+fn two_claims_that_arrive_together_still_leave_one_ceremony() {
+    // The single-claim rule has to hold when the two dials *overlap*, not
+    // just when one follows the other: a code shown on a screen can be
+    // claimed by two devices in the same instant. Both connections are held
+    // at the joiner's door and released together, so neither has read its
+    // CLAIM when the other arrives — which is precisely the window in which
+    // a second session could otherwise be bound over the first and be handed
+    // this user's confirmation.
+    let here = World::default();
+    let there = here.peer();
+    let elsewhere = here.peer_seeded(0x0fed_cba9_8765_4321);
+    let joiner = here.boot();
+    let first = there.boot();
+    let second = elsewhere.boot();
+    settle();
+
+    let joiner_endpoint = joiner.device_status().unwrap().endpoint_id;
+    let code = block_on(joiner.pairing_offer()).unwrap();
+    here.net.hold(&joiner_endpoint);
+    block_on(first.pairing_claim(code.clone())).unwrap();
+    block_on(second.pairing_claim(code)).unwrap();
+    settle();
+    assert_eq!(
+        joiner.pairing_status().unwrap(),
+        Phase::Offering(code_of(&joiner)),
+        "neither claim has been read yet",
+    );
+
+    here.net.release(&joiner_endpoint);
+    let (claimer, refused) = settle_until(|| async {
+        let (a, b) = (
+            first.pairing_status().unwrap(),
+            second.pairing_status().unwrap(),
+        );
+        match (&a, &b) {
+            (Phase::AwaitingConfirm(_), Phase::Failed(_))
+            | (Phase::Failed(_), Phase::AwaitingConfirm(_)) => Some((a, b)),
+            // Both failing is also an answer, and a legal one: whichever
+            // read second burned the ceremony the first had bound.
+            (Phase::Failed(_), Phase::Failed(_)) => Some((a, b)),
+            _ => None,
+        }
+    });
+    assert!(
+        !matches!(
+            (&claimer, &refused),
+            (Phase::AwaitingConfirm(_), Phase::AwaitingConfirm(_))
+        ),
+        "only one of the two can have claimed the code",
+    );
+
+    // Whatever the joiner's screen says, it is one ceremony's worth of
+    // state, and the code is spent: nothing further can claim it.
+    let third = joiner.pairing_status().unwrap();
+    assert!(
+        matches!(third, Phase::AwaitingConfirm(_) | Phase::Failed(_)),
+        "the joiner is in exactly one ceremony or none: {third:?}",
+    );
+    // And no device was enrolled by the overlap alone.
+    for kernel in [&joiner, &first, &second] {
+        assert_eq!(member_ids(kernel).len(), 1);
+    }
+}
+
+/// The code the joiner is currently showing.
+fn code_of(kernel: &Kernel) -> String {
+    match kernel.pairing_status().unwrap() {
+        Phase::Offering(code) => code,
+        other => panic!("this device is not showing a code: {other:?}"),
+    }
 }

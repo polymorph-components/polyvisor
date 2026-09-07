@@ -183,7 +183,7 @@ form. Polyvisor owns five implementations:
 |---|---|
 | `Transport` | one per connection over `polymorph:iroh` streams, relay-only: WebRTC is off in the worker because a SharedWorker has no `RTCPeerConnection` (the host backend never resolves there). Framing per `subduction_iroh` (u32 BE length prefix) so native subduction peers interoperate |
 | `Storage` | M3a: an in-memory item store serialized into the sealed checkpoint with the automerge docs. Items in their own files under the state root is the follow-up once checkpoint size matters |
-| `Policy` | the keyhive pull/read gate — ours, since `subduction_keyhive` is still legacy upstream; mined from it for semantics |
+| `Policy` | group membership, read off the user-system document (`polyvisor:us`): a remote peer may read/write exactly while its key is a member. Envelope encryption via keyhive's own gate is M3c |
 | `Signer` / `NodeEffect::Sign` | M3a: `ed25519-dalek` over a seed held in the sealed checkpoint (the seed posture; the same seed, imported through `polymorph:webcrypto`, builds the iroh identity). Later: a non-extractable platform key — signing is an effect with external custody, which is exactly what that needs |
 | `Clock` | `wasi:clocks@0.3` |
 
@@ -209,7 +209,10 @@ hold many, and one SharedWorker serves one device. The glue owns only
 what has to exist before the kernel does: the device **id** (the tab's
 sessionStorage anchor, or a fresh id it mints), because the worker is
 named after it. Everything else — the index, tiers, sealing, the sweep —
-is kernel logic over `kv`, `locks` and the OPFS state root.
+is kernel logic over `kv`, `locks` and the OPFS state root. A device
+starts as a group of one; pairing replaces the joiner's group with the
+adder's, members reconnect at boot, and non-members are closed after
+the handshake.
 
 - **The index** (`store`) is the one unsealed record: id, petname, tier,
   how the device rests, timestamps. Never the name, hue, word or any key.

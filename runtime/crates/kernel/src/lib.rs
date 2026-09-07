@@ -17,6 +17,7 @@ mod apps;
 mod checkpoint;
 mod device;
 mod events;
+mod pairing;
 mod seal;
 mod store;
 mod sync;
@@ -24,11 +25,22 @@ mod sync;
 pub use apps::{AppInfo, AssetInfo, ComponentArtifacts};
 pub use device::{DeviceStatus, IndexRow, Rest, State, Tier};
 pub use events::Event;
+pub use pairing::Phase;
 /// The task types are the engine's: the kernel no longer holds a list of its
 /// own, it holds an automerge document per app inside the engine.
 pub use polyvisor_engine::{EngineTransport, TaskSnapshot as Snapshot, TodoItem};
 pub use store::LEASE_TTL_MS;
-pub use sync::Peer;
+pub use sync::{Member, Peer};
+
+/// The subduction wire's ALPN, and pairing's. Versioned: a framing change is
+/// a new ALPN, and a peer that speaks only the other one is refused at the
+/// handshake rather than after a frame it cannot parse.
+///
+/// Both are the kernel's rather than the endpoint adapter's because the
+/// kernel is what routes an accepted connection by the one it negotiated
+/// (see `sync::accept_loop`).
+pub const SUBDUCTION_ALPN: &str = "polyvisor/subduction/0";
+pub const PAIRING_ALPN: &str = "polyvisor/pairing/0";
 
 use apps::Registry;
 use device::Device;
@@ -128,19 +140,35 @@ pub trait Net {
     /// Bind the endpoint, answering its id (z-base-32, iroh's spelling) and
     /// the handle that dials and accepts on it.
     fn bind(&self, seed: [u8; 32]) -> LocalFuture<'_, Result<Bound, String>>;
+
+    /// How a raw Ed25519 public key is spelled as an endpoint id.
+    ///
+    /// Pure, and deliberately not on [`NetHandle`]: the group's members are
+    /// recorded by key (that is what the subduction handshake proves and what
+    /// the policy checks), while everything a person sees or dials is the id.
+    /// A device that has not bound — or whose bind failed — still has a group
+    /// to show, so the spelling cannot depend on an endpoint being up.
+    ///
+    /// The spelling itself belongs to the endpoint component, which is why
+    /// this is a seam at all and not a function in the kernel.
+    fn endpoint_id(&self, key: [u8; 32]) -> String;
 }
 
 /// A bound endpoint: its id, and the handle that dials and accepts on it.
 pub type Bound = (String, Box<dyn NetHandle>);
 
 /// An accepted connection: the endpoint id that opened it, that id's raw
-/// Ed25519 public key, and its transport.
+/// Ed25519 public key, the ALPN it negotiated, and its transport.
 ///
 /// The key travels with the id for the same reason it does in [`Dialed`] —
 /// the z-base-32 spelling belongs to the endpoint component — and the kernel
 /// needs it here to check that the peer subduction authenticates is the one
 /// the endpoint id named (see `Kernel::sync_connect`'s inbound twin).
-pub type Accepted = (String, [u8; 32], Box<dyn EngineTransport>);
+///
+/// The ALPN travels with it because one endpoint now serves two wires
+/// ([`SUBDUCTION_ALPN`] and [`PAIRING_ALPN`]) and the accept loop is what
+/// routes between them.
+pub type Accepted = (String, [u8; 32], String, Box<dyn EngineTransport>);
 
 /// A dialed connection: the peer's raw Ed25519 public key, and its transport.
 ///
@@ -156,10 +184,12 @@ pub type Dialed = ([u8; 32], Box<dyn EngineTransport>);
 /// A bound endpoint. Arguments are owned so the returned future borrows only
 /// the handle.
 pub trait NetHandle {
-    /// Dial `endpoint_id` and open the connection's stream.
-    fn connect(&self, endpoint_id: String) -> LocalFuture<'_, Result<Dialed, String>>;
+    /// Dial `endpoint_id` on `alpn` and open the connection's stream.
+    fn connect(&self, endpoint_id: String, alpn: String)
+    -> LocalFuture<'_, Result<Dialed, String>>;
 
-    /// The next inbound connection, with the endpoint id that opened it.
+    /// The next inbound connection, with the endpoint id that opened it and
+    /// the ALPN it negotiated.
     fn accept(&self) -> LocalFuture<'_, Result<Accepted, String>>;
 }
 
@@ -286,6 +316,8 @@ pub struct Kernel {
     bind_error: RefCell<Option<String>>,
     /// What `sync.peers` reports, in the order peers were first seen.
     peers: RefCell<Vec<sync::PeerRecord>>,
+    /// The pairing ceremony, when one is running (internal.wit `pairing`).
+    pairing: RefCell<pairing::Pairing>,
     /// Serialises checkpoints — see [`Kernel::checkpoint`].
     checkpointing: RefCell<Checkpointing>,
 }
@@ -345,6 +377,7 @@ impl Kernel {
             endpoint_id: RefCell::new(String::new()),
             bind_error: RefCell::new(None),
             peers: RefCell::new(Vec::new()),
+            pairing: RefCell::new(pairing::Pairing::default()),
             checkpointing: RefCell::new(Checkpointing::default()),
         });
         // A sealed device has no seed in memory, so it has no engine and no
@@ -628,6 +661,7 @@ impl Kernel {
         self.endpoint_id.borrow_mut().clear();
         *self.bind_error.borrow_mut() = None;
         self.peers.borrow_mut().clear();
+        *self.pairing.borrow_mut() = pairing::Pairing::default();
         Ok(())
     }
 
