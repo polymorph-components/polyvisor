@@ -131,6 +131,12 @@ interface lifecycle {
         /// origin's `config.json`; the e2e harness runs its own). Live and
         /// untrusted: it carries ciphertext and endpoint ids, nothing else.
         relay: string,
+        /// This page's URL without query or fragment: the OAuth redirect.
+        page-url: string,
+        /// Google Drive API and OAuth bases; `none` = Google's. The e2e
+        /// harness points both at a fake.
+        drive-api: option<string>,
+        drive-oauth: option<string>,
     }
 
     boot: async func(config: boot-config) -> result<_, error>;
@@ -294,8 +300,8 @@ interface storage {
 
     status: async func() -> result<binding, error>;
     /// Mint a PKCE ceremony; returns the authorization URL for the popup.
-    /// `redirect` is the page URL the popup returns to.
-    oauth-start: async func(client: oauth-client, redirect: string) -> result<string, error>;
+    /// The redirect is the page URL from `boot-config.page-url`.
+    oauth-start: async func(client: oauth-client) -> result<string, error>;
     /// The popup landed back with `code` and `state`; exchange and seal.
     oauth-complete: async func(code: string, state: string) -> result<_, error>;
     /// Forget the tokens (does not touch the store).
