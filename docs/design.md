@@ -235,10 +235,42 @@ device that was merely behind produces no divergence and so no anchor,
 and its commits stay unreadable to a later-enrolled member until the
 next local mutation, whose envelope names this frontier, is written on
 top of them; latency again, not loss.
-Wire and store growth is bounded later by sedimentree fragments — a
-roll-up of a commit range into one item — which only a member that can
-open the whole range can build; that is an M-later item, not a gap in
-this one.
+
+**Fragments.** Wire and store growth is bounded by sedimentree
+fragments: a closed range of commits rolled up into one item whose
+payload is an automerge *bundle* of every change in it. Automerge draws
+the ranges, and its metric is sedimentree's — a commit heads a level-1
+fragment when its hash starts with a zero byte, about one in 256 — so
+the two agree on head, boundary and checkpoints with nothing in between
+to disagree. Compaction runs after a local mutation and after an absorb
+that landed; only a device that can read the whole range can build one,
+which falls out of the construction rather than being enforced (a
+commit it could not open was never applied, so no fragment was drawn
+over it). The roll-up is sealed like any commit, and its envelope names
+the key of whatever *carries* its boundary — the fragment below it,
+under that fragment's own reference, since the boundary commit's
+envelope went with its range and its key left the frontier when that
+range was covered. So the fragments form a chain a reader walks down:
+a member enrolled afterwards opens the newest, reads its whole range
+out of the bundle, and follows the embedded key to the one below.
+Sealing a fragment also retires the entry it names, so the head set
+stays one pair per readable branch rather than growing one per
+fragment. The loose commits the fragment carries are then dropped from
+local storage —
+sedimentree's own `minimize` decides which, so a commit concurrent with
+the range is never one of them — while the automerge document keeps its
+full history. Identity is head plus boundary, both functions of the
+change graph, so two devices build the same fragment; the second
+arrival is a no-op locally, and on the store the two land under one
+name and the last write wins, harmlessly, because they carry the same
+range. Nothing deletes from the store, so a device that pushed a range
+before compacting leaves those objects behind: correct, and no smaller
+— the saving is in what is written from then on, and in what a device
+that compacts before publishing sends at all. The pull skips those
+names on the strength of the document rather than a ledger: a change
+the document has applied and the tree no longer holds as an item is one
+a fragment carries, and fetching it back would undo the compaction on
+every pass.
 
 ## Storage
 

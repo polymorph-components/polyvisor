@@ -57,7 +57,7 @@ use std::rc::Rc;
 
 use data_encoding::{BASE64URL_NOPAD, HEXLOWER};
 use hmac::{Hmac, Mac as _};
-use polyvisor_engine::StoreItem;
+use polyvisor_engine::{ItemKind, StoreItem};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -270,6 +270,23 @@ impl Drive {
 // -- the exports -------------------------------------------------------------
 
 impl Kernel {
+    /// Whether this device holds a sedimentree fragment yet — a commit range
+    /// rolled up into one item (`docs/design.md` §"Read-back and partitions").
+    ///
+    /// Test introspection, in the shape of `Engine::live_connections`: which
+    /// commit closes a fragment is the hash's decision, so a test that wants
+    /// the compacted case has to write until one appears and cannot predict
+    /// the number. Nothing in the WIT world reads this.
+    #[must_use]
+    pub fn holds_a_fragment(&self) -> bool {
+        self.engine().is_ok_and(|engine| {
+            engine
+                .items()
+                .iter()
+                .any(|item| item.kind == ItemKind::Fragment)
+        })
+    }
+
     /// `storage.status`.
     pub fn storage_status(&self) -> Result<Binding, Error> {
         self.open()?;
@@ -533,7 +550,18 @@ impl Kernel {
         let mine: BTreeSet<String> = engine
             .items()
             .iter()
-            .map(|item| object_name(name_key, &item.tree, &item.commit))
+            .map(|item| object_name(name_key, &item.tree, &item.commit, item.kind))
+            // And the objects for changes this device has read but does not
+            // hold as items — a range a fragment carries instead
+            // (`Engine::read_not_held`). Nothing deletes them from the store,
+            // so without this the pull would fetch the whole compacted range
+            // back on every single pass, to be refused every time.
+            .chain(
+                engine
+                    .read_not_held()
+                    .iter()
+                    .map(|(tree, commit)| object_name(name_key, tree, commit, ItemKind::Commit)),
+            )
             .collect();
         let mut fetched = Vec::new();
         for (id, name) in &remote {
@@ -590,7 +618,7 @@ impl Kernel {
         let present: BTreeSet<&str> = remote.iter().map(|(_, name)| name.as_str()).collect();
         let mut pushed = false;
         for item in engine.items() {
-            let name = object_name(name_key, &item.tree, &item.commit);
+            let name = object_name(name_key, &item.tree, &item.commit, item.kind);
             if present.contains(name.as_str()) {
                 continue;
             }
@@ -1030,7 +1058,8 @@ fn json(response: &HttpResponse, what: &str) -> Result<serde_json::Value, Troubl
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// `hex(HMAC-SHA256(name_key, tree ‖ commit))` — the object's name.
+/// `hex(HMAC-SHA256(name_key, tree ‖ item id [‖ "fragment"]))` — the object's
+/// name.
 ///
 /// Derived rather than descriptive, and that is the point (docs/design.md
 /// "Storage"): a tree id is global and stable, so a plain name would tell
@@ -1041,11 +1070,26 @@ type HmacSha256 = Hmac<Sha256>;
 /// It is also the deduplication: the name is a function of the item's own
 /// digests, so an object that exists under it is already these bytes and the
 /// push skips it.
+///
+/// Which is exactly why the kind is mixed in for a fragment. A fragment is
+/// named by its *head*, and that head is also a commit — two different
+/// payloads for one `(tree, id)` pair. Left undistinguished they would race
+/// for one name and the dedup would silently keep whichever landed first. The
+/// commit case is left byte-for-byte as it was, so objects a group wrote
+/// before fragments existed keep their names.
 #[must_use]
-pub fn object_name(name_key: &[u8; 32], tree: &[u8; 32], commit: &[u8; 32]) -> String {
+pub fn object_name(
+    name_key: &[u8; 32],
+    tree: &[u8; 32],
+    commit: &[u8; 32],
+    kind: ItemKind,
+) -> String {
     let mut mac = HmacSha256::new_from_slice(name_key).expect("HMAC takes a key of any length");
     mac.update(tree);
     mac.update(commit);
+    if kind == ItemKind::Fragment {
+        mac.update(b"fragment");
+    }
     HEXLOWER.encode(&mac.finalize().into_bytes())
 }
 
@@ -1110,19 +1154,22 @@ mod tests {
         let key = [3u8; 32];
         let other = [4u8; 32];
         let (tree, commit) = ([1u8; 32], [2u8; 32]);
-        let name = object_name(&key, &tree, &commit);
+        let name = object_name(&key, &tree, &commit, ItemKind::Commit);
         assert_eq!(name.len(), 64, "hex of an HMAC-SHA256");
         assert_eq!(
             name,
-            object_name(&key, &tree, &commit),
+            object_name(&key, &tree, &commit, ItemKind::Commit),
             "derived, not drawn"
         );
         // A different group derives a different name for the same item, which
         // is what keeps two accounts' stores uncorrelatable.
-        assert_ne!(name, object_name(&other, &tree, &commit));
+        assert_ne!(name, object_name(&other, &tree, &commit, ItemKind::Commit));
         // The tree and the commit are separate inputs, not one concatenated
         // blob a shift could confuse.
-        assert_ne!(name, object_name(&key, &commit, &tree));
+        assert_ne!(name, object_name(&key, &commit, &tree, ItemKind::Commit));
+        // A fragment is named by its head, and that head is also a commit:
+        // the two must not land on one object.
+        assert_ne!(name, object_name(&key, &tree, &commit, ItemKind::Fragment));
         assert_ne!(folder_name(&key), folder_name(&other));
         assert!(folder_name(&key).starts_with("polyvisor-"));
         assert_eq!(folder_name(&key).len(), "polyvisor-".len() + 16);

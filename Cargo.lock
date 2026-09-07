@@ -1694,6 +1694,7 @@ dependencies = [
  "automerge",
  "beekem",
  "bincode",
+ "blake3",
  "ed25519-dalek",
  "future_form",
  "futures",

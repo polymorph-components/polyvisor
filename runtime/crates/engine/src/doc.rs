@@ -218,6 +218,28 @@ impl AppDoc {
         self.core.apply(items)
     }
 
+    /// The tree's stored fragment envelopes this document has not opened.
+    pub fn unapplied_fragments(&self, storage: &SnapshotStorage) -> Vec<(CommitId, Vec<u8>)> {
+        self.core.unapplied_fragments(storage)
+    }
+
+    /// Apply decrypted automerge bundles.
+    pub fn apply_bundles(&mut self, bundles: Vec<(CommitId, Vec<u8>)>) -> Absorbed {
+        self.core.apply_bundles(bundles)
+    }
+
+    /// The fragments automerge draws over this document at level 1 and
+    /// deeper. See `crate::document::Document::fragments`.
+    pub fn fragments(&self) -> Vec<automerge::Fragment> {
+        self.core.fragments()
+    }
+
+    /// The bundle bytes for those fragments. See
+    /// `crate::document::Document::bundle`.
+    pub fn bundle(&self, fragments: Vec<automerge::Fragment>) -> Vec<Vec<u8>> {
+        self.core.bundle(fragments)
+    }
+
     pub fn applied_ids(&self) -> std::collections::BTreeSet<CommitId> {
         self.core.applied_ids()
     }

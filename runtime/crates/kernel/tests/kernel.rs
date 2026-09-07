@@ -3529,3 +3529,70 @@ fn a_device_that_joins_a_group_stops_reading_its_old_folder() {
     });
     assert!(seen.contains(&"from the adder".to_string()));
 }
+
+#[test]
+fn a_compacted_range_reaches_the_store_as_one_object() {
+    // Compaction seen from the store. A writes — with no store bound, so
+    // nothing has been pushed yet — until automerge closes a level-1 fragment
+    // (about one commit in 256; the threshold is the hash's own, so the loop
+    // is a draw and the bound is generous). Only then does it bind the store,
+    // and what goes up is the fragment plus the handful of commits left loose
+    // after it, not one object per mutation.
+    //
+    // Which is the whole shape of the saving, and the reason it is tested
+    // this way round: nothing deletes from the store (docs/design.md
+    // "Read-back and partitions"), so a device that had been pushing all
+    // along would leave its covered objects behind — correct, and no smaller.
+    let drive = FakeDrive::shared();
+    let here = World::default().with_drive(&drive);
+    let there = here.peer().with_drive(&drive);
+    let a = here.boot();
+    let b = there.boot();
+    let (sa, sb) = (session(&a), session(&b));
+    settle();
+
+    // Paired, so B holds A's group and A's store-name key.
+    let _sas = pair(&b, &a);
+    settle();
+    // Cut the network: everything B learns from here came through the store.
+    let (ida, idb) = (
+        a.device_status().unwrap().endpoint_id,
+        b.device_status().unwrap().endpoint_id,
+    );
+    here.net.unplug(&ida);
+    here.net.unplug(&idb);
+    settle();
+
+    // A fragment is one commit in 256, so the run is bounded well above the
+    // mean rather than at it; a run that reached the bound would mean the
+    // depth metric moved.
+    let mut written = 0usize;
+    for n in 1..=4096 {
+        block_on(a.tasks_add(sa, format!("task {n}"))).unwrap();
+        written = n;
+        if a.holds_a_fragment() {
+            break;
+        }
+    }
+    assert!(written < 4096, "no level-1 fragment in 4096 commits");
+
+    connect_store(&a);
+    settle();
+    let objects = drive.objects().len();
+    assert!(
+        objects < written,
+        "the range went up as one object, not {written}: {objects} in the folder",
+    );
+
+    connect_store(&b);
+    let seen = settle_until(|| async {
+        let _synced = b.sync_now().await;
+        let seen = titles(&b, sb).await;
+        (seen.len() == written).then_some(seen)
+    });
+    assert_eq!(
+        seen.len(),
+        written,
+        "B read the whole range out of the store"
+    );
+}

@@ -20,7 +20,7 @@
 //! that founder's, shared by construction.
 
 use automerge::{ObjType, ROOT, ReadDoc, transaction::Transactable};
-use sedimentree_core::id::SedimentreeId;
+use sedimentree_core::{id::SedimentreeId, loose_commit::id::CommitId};
 use sha2::{Digest as _, Sha256};
 use subduction_protocol::command::NewCommit;
 
@@ -120,6 +120,24 @@ impl UsDoc {
 
     pub fn absorb(&mut self, storage: &SnapshotStorage) -> bool {
         self.core.absorb(storage)
+    }
+
+    /// The fragments automerge draws over this document at level 1 and
+    /// deeper. See `crate::document::Document::fragments`.
+    pub fn fragments(&self) -> Vec<automerge::Fragment> {
+        self.core.fragments()
+    }
+
+    /// The commits this document has applied — its own history, whether or
+    /// not the tree still holds the items that carried it.
+    pub fn applied_ids(&self) -> std::collections::BTreeSet<CommitId> {
+        self.core.applied_ids()
+    }
+
+    /// The bundle bytes for those fragments. See
+    /// `crate::document::Document::bundle`.
+    pub fn bundle(&self, fragments: Vec<automerge::Fragment>) -> Vec<Vec<u8>> {
+        self.core.bundle(fragments)
     }
 
     pub fn last_local_commit(&mut self) -> Option<NewCommit> {

@@ -15,14 +15,16 @@
 //! do — and it would quietly relabel their authorship as ours.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use future_form::{FutureForm as _, Local};
 use futures::future::LocalBoxFuture;
 use sedimentree_core::{
+    depth::CountLeadingZeroBytes,
     fragment::Fragment,
     id::SedimentreeId,
     loose_commit::{LooseCommit, id::CommitId},
+    sedimentree::Sedimentree,
 };
 use serde::{Deserialize, Serialize};
 use subduction_crypto::signed::Signed;
@@ -82,6 +84,21 @@ pub struct TreeState {
     pub fragments: Vec<Item>,
 }
 
+/// Which sedimentree item a [`StoreItem`] carries.
+///
+/// The store is names plus opaque bytes, but the two item kinds decode into
+/// different envelopes (`Signed<LooseCommit>` vs `Signed<Fragment>`) and are
+/// checked differently, so the record has to say which it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ItemKind {
+    /// One automerge change.
+    #[default]
+    Commit,
+    /// A roll-up of a commit range: one automerge bundle.
+    Fragment,
+}
+
 /// A stored sedimentree item: its signed envelope and its payload blob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
@@ -89,7 +106,7 @@ pub struct Item {
     pub blob: Vec<u8>,
 }
 
-/// One sedimentree item as the durable store carries it: the tree and commit
+/// One sedimentree item as the durable store carries it: the tree and item id
 /// that name it, and the bytes.
 ///
 /// Ids are raw bytes rather than `SedimentreeId`/`CommitId` so the kernel can
@@ -99,9 +116,15 @@ pub struct Item {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreItem {
     pub tree: [u8; 32],
+    /// The commit id for a commit, the head for a fragment.
     pub commit: [u8; 32],
     pub signed: Vec<u8>,
     pub blob: Vec<u8>,
+    /// `#[serde(default)]` — `Commit` — because objects written before
+    /// fragments existed carry no such field, and a device must still read
+    /// its group's older objects.
+    #[serde(default)]
+    pub kind: ItemKind,
 }
 
 /// Map-backed item storage. Interior mutability is a `RefCell`: the driver
@@ -133,39 +156,124 @@ impl SnapshotStorage {
             .unwrap_or_default()
     }
 
-    /// Every stored commit of every tree, as the durable store carries them.
+    /// Every stored fragment of `tree` as `(head, blob)`. The blob is an
+    /// automerge *bundle* (or, on an app tree, an envelope around one) —
+    /// see `crate::document::Document::apply_bundles`.
+    pub fn fragment_blobs(&self, tree: SedimentreeId) -> Vec<(CommitId, Vec<u8>)> {
+        self.trees
+            .borrow()
+            .get(&tree)
+            .map(|t| {
+                t.fragments
+                    .iter()
+                    .map(|(head, (_signed, blob))| (*head, blob.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether `tree` already holds a fragment headed at `head`. What
+    /// compaction asks before building one: a fragment is identified by its
+    /// head, so a head we hold is a fragment we have already built or
+    /// received.
+    pub fn holds_fragment(&self, tree: SedimentreeId, head: CommitId) -> bool {
+        self.trees
+            .borrow()
+            .get(&tree)
+            .is_some_and(|t| t.fragments.contains_key(&head))
+    }
+
+    /// Every item of every tree, as the durable store carries them.
     ///
     /// What the durable store pushes (docs/design.md "Storage"): one object
-    /// per item, content-addressed by the pair that names it. Commits only —
-    /// this engine authors no fragments (nothing calls `add_fragments`, and
-    /// compaction is not implemented), so a fragment could only arrive from a
-    /// peer that had one, and there is none to have.
+    /// per item, content-addressed by the pair that names it. Fragments go up
+    /// beside commits — a device that pulls one gets the whole range in a
+    /// single object, which is the saving compaction exists for.
     pub fn all_items(&self) -> Vec<StoreItem> {
         self.trees
             .borrow()
             .iter()
             .flat_map(|(tree, t)| {
-                t.commits
-                    .iter()
-                    .map(|(id, (signed, blob))| StoreItem {
-                        tree: *tree.as_bytes(),
-                        commit: *id.as_bytes(),
-                        signed: signed.as_bytes().to_vec(),
-                        blob: blob.clone(),
-                    })
-                    .collect::<Vec<_>>()
+                let commits = t.commits.iter().map(|(id, (signed, blob))| StoreItem {
+                    tree: *tree.as_bytes(),
+                    commit: *id.as_bytes(),
+                    signed: signed.as_bytes().to_vec(),
+                    blob: blob.clone(),
+                    kind: ItemKind::Commit,
+                });
+                let fragments = t.fragments.iter().map(|(head, (signed, blob))| StoreItem {
+                    tree: *tree.as_bytes(),
+                    commit: *head.as_bytes(),
+                    signed: signed.as_bytes().to_vec(),
+                    blob: blob.clone(),
+                    kind: ItemKind::Fragment,
+                });
+                commits.chain(fragments).collect::<Vec<_>>()
             })
             .collect()
     }
 
-    /// Whether `tree` already holds `commit`. What the push path asks before
-    /// uploading: the store is addressed by name, and a name it already has
-    /// is an object already written.
+    /// Whether `tree` holds `commit`.
     pub fn holds(&self, tree: SedimentreeId, commit: CommitId) -> bool {
         self.trees
             .borrow()
             .get(&tree)
             .is_some_and(|t| t.commits.contains_key(&commit))
+    }
+
+    /// Drop every loose commit of `tree` that a fragment we hold carries.
+    ///
+    /// The decision is sedimentree's own, not ours:
+    /// `Sedimentree::minimize(&CountLeadingZeroBytes)` keeps a loose commit
+    /// unless every range it belongs to is covered by a kept fragment
+    /// (sedimentree_core/src/sedimentree/commit_dag.rs:128). Anything it
+    /// keeps stays, so a commit concurrent with the range — a branch this
+    /// device could not see when it built the fragment — is never dropped.
+    ///
+    /// **The invariant this adds on top.** `minimize` is asked only about
+    /// *anchored* fragments: those whose every boundary id is the head of
+    /// another fragment we hold, plus those whose boundary is empty (they
+    /// reach the root). A fragment whose boundary hangs on a commit we hold
+    /// nothing for is a fragment nobody can walk below, and letting it
+    /// authorise a drop would strand the commits under it — readable in the
+    /// document, gone from the tree, and with no item left naming a way down.
+    /// That is not hypothetical once fragments arrive from peers, where a
+    /// middle one of a chain can turn up before the one under it.
+    ///
+    /// Fragments themselves are only ever added here, never removed.
+    /// `minimize` would also drop a level-1 fragment subsumed by a level-2
+    /// one, and level-2 fragments do exist (one commit in 65 536) — not
+    /// dropping them is the conservative side of that trade: a redundant
+    /// item costs storage and a little sync chatter, and dropping one on a
+    /// judgement this code did not make could cost the range it carried.
+    ///
+    /// Answers how many commits went.
+    pub fn prune(&self, tree: SedimentreeId) -> usize {
+        let (commits, fragments) = self.metadata(tree);
+        let heads: BTreeSet<CommitId> = fragments.iter().map(Fragment::head).collect();
+        let anchored: Vec<Fragment> = fragments
+            .into_iter()
+            .filter(|f| f.boundary().iter().all(|id| heads.contains(id)))
+            .collect();
+        if anchored.is_empty() {
+            return 0;
+        }
+        let keep = Sedimentree::new(anchored, commits).minimize(&CountLeadingZeroBytes);
+        let kept: BTreeSet<CommitId> = keep.loose_commits().map(LooseCommit::head).collect();
+        let mut trees = self.trees.borrow_mut();
+        let Some(entry) = trees.get_mut(&tree) else {
+            return 0;
+        };
+        let doomed: Vec<CommitId> = entry
+            .commits
+            .keys()
+            .filter(|id| !kept.contains(id))
+            .copied()
+            .collect();
+        for id in &doomed {
+            let _dropped = entry.commits.remove(id);
+        }
+        doomed.len()
     }
 
     /// The tree's decoded metadata, for `Handle::hydrate_tree` after a
