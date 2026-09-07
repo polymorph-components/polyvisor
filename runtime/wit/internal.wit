@@ -119,8 +119,9 @@ interface lifecycle {
 
     record boot-config {
         /// The home origin, as an absolute URL without a trailing slash.
-        /// Release artifacts and, until installation lands, app bundles are
-        /// fetched from it.
+        /// It may carry a path (a GitHub Pages project site is served
+        /// under `/<repo>/`). Release artifacts and, until installation
+        /// lands, app bundles are fetched from it.
         home-origin: string,
         /// The device this worker is: the glue's sessionStorage anchor, or
         /// an id the glue minted for a fresh device. The glue names the

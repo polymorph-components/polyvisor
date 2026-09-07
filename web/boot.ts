@@ -257,7 +257,10 @@ fetch(new URL("config.json", location.href), { cache: "no-store" })
     control.postMessage({
       t: "hello",
       device,
-      homeOrigin: location.origin,
+      // The directory this page is served from, not `location.origin`: a
+      // GitHub Pages project site lives under `/<repo>/`, and the kernel
+      // fetches `{home-origin}/apps/...`, so the prefix must be kept.
+      homeOrigin: new URL(".", location.href).href.replace(/\/$/, ""),
       relay,
       // The OAuth redirect (`lifecycle.boot-config.page-url`): this page's
       // URL without query or fragment, which is where the popup comes back

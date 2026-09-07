@@ -262,8 +262,8 @@ const ready: Promise<Exports> = (async () => {
       driveOauth: string | undefined;
     },
   ) => Promise<void>;
-  // The home origin without a trailing slash, per `lifecycle.boot-config`.
-  // `location.origin` is spelled that way, and every tab that can reach this
+  // The home origin without a trailing slash, per `lifecycle.boot-config`;
+  // the tab derives it from its own URL, and every tab that can reach this
   // worker is on the home origin by construction.
   // `option<string>` lowers as `T | undefined` (m1-context.md "Value
   // mapping"), so an absent base is passed as the absence itself rather
