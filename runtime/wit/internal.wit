@@ -105,6 +105,10 @@ interface lifecycle {
         /// SharedWorker after it, so the id must exist before the kernel
         /// does; everything else about the device is the kernel's.
         device: string,
+        /// The iroh relay this device binds its endpoint through (the home
+        /// origin's `config.json`; the e2e harness runs its own). Live and
+        /// untrusted: it carries ciphertext and endpoint ids, nothing else.
+        relay: string,
     }
 
     boot: async func(config: boot-config) -> result<_, error>;
@@ -149,6 +153,10 @@ interface device {
         hue: u16,
         /// The audible anchor word (trusted pixels only). "" while sealed.
         word: string,
+        /// This device's iroh endpoint id (z-base-32, iroh's spelling): what
+        /// another device dials. "" while sealed, and until the endpoint is
+        /// bound.
+        endpoint-id: string,
     }
 
     status: async func() -> result<device-status, error>;
@@ -165,6 +173,24 @@ interface device {
     /// Destroy this device: its namespace and its index row. The worker is
     /// useless afterwards; the visor switches away (`shell.switch-device`).
     erase: async func() -> result<_, error>;
+}
+
+/// Peer sync, the manual form: dial another device by its endpoint id.
+/// The devices then run the subduction protocol over the connection and
+/// converge every tree both hold. Pairing (who may connect, what they may
+/// read) is the next milestone; for now a dialed peer is trusted with
+/// everything, and the visor says so.
+interface sync {
+    use types.{error};
+
+    record peer {
+        endpoint-id: string,
+        /// Framework voice: "connecting", "connected", "closed: <why>".
+        state: string,
+    }
+
+    connect: async func(endpoint-id: string) -> result<_, error>;
+    peers: async func() -> result<list<peer>, error>;
 }
 
 /// The device index: what a boot may show before any seal opens. Every
@@ -333,9 +359,23 @@ world runtime {
     /// pointer it keeps in `kv`. That is what keeps the worker JSPI-free.
     import wasi:filesystem/types@0.3.1;
     import wasi:filesystem/preopens@0.3.1;
+    /// The transport. The endpoint component (polymorph-iroh's, composed
+    /// in at build time with `wac plug`) implements these; what the glue
+    /// sees are the endpoint's own imports (websocket, webrtc, webcrypto,
+    /// a sockets stub).
+    import polymorph:iroh/endpoint@0.1.0;
+    import polymorph:iroh/identity-from-keys@0.1.0;
+    /// The device's signing identity rests as an Ed25519 seed inside the
+    /// sealed checkpoint (the "seed" posture); at boot the seed is imported
+    /// into the platform's key store so the iroh identity can be built
+    /// from it. A platform-held, non-extractable identity is a later
+    /// hardening.
+    import polymorph:webcrypto/ed25519-sign@0.1.0;
+    import polymorph:webcrypto/ed25519-verify@0.1.0;
 
     export lifecycle;
     export device;
+    export sync;
     export store;
     export apps;
     export event-source;
@@ -347,6 +387,7 @@ world visor {
     include polymorph:stream-dom/producer@0.1.0;
 
     import device;
+    import sync;
     import store;
     import apps;
     import events;

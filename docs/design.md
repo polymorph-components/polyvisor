@@ -170,7 +170,7 @@ form. Polyvisor owns five implementations:
 | `Transport` | one per connection over `polymorph:iroh` streams (relay via `polymorph:websocket`); framing per `subduction_iroh` so native subduction peers interoperate |
 | `Storage` | sedimentree items in the device's sealed state root (`wasi:filesystem@0.3`) |
 | `Policy` | the keyhive pull/read gate — ours, since `subduction_keyhive` is still legacy upstream; mined from it for semantics |
-| `Signer` / `NodeEffect::Sign` | a `polymorph:webcrypto` non-extractable Ed25519 handle; signing is an effect with external custody, which is what a platform key needs |
+| `Signer` / `NodeEffect::Sign` | M3a: `ed25519-dalek` over a seed held in the sealed checkpoint (the seed posture; the same seed, imported through `polymorph:webcrypto`, builds the iroh identity). Later: a non-extractable platform key — signing is an effect with external custody, which is exactly what that needs |
 | `Clock` | `wasi:clocks@0.3` |
 
 Why the branch rather than the released crates: one driver loop the
@@ -289,9 +289,14 @@ native tests, so browser gates are mandatory for every visor change.
   checkpoint/resume on OPFS, locks and the sweep, entry/keep/unseal/erase
   in the visor, and the hostile-fixture frame-teardown scenario. Reload
   survival with worker respawn as the normal case.
-- **M3a** sans-IO driver: the five traits, iroh transport, interop with
-  a legacy peer. **M3b** keyhive policy, user-system doc, pairing,
-  `tasks` over automerge.
+- **M3a** the engine in the loop: `tasks` becomes an automerge document
+  from the start, the sans-IO subduction driver with polyvisor's trait
+  implementations, an iroh transport over the composed endpoint
+  component, manual dial by endpoint id, two devices converging over a
+  local relay in e2e. Policy is allow-all until M3b. Wire compatibility
+  with native subduction peers is a gate only when a native peer exists
+  (headless, parked). **M3b** keyhive policy, user-system doc, pairing,
+  the device group.
 - **M4** storage: per-destination egress, S3 provider component, bucket
   sync, picker, provider panel in a frame.
 - **M5** passkey PRF rung, recovery kits, Drive provider.
