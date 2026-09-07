@@ -3,41 +3,160 @@
 //! Shipped as a `<style>` element the visor creates itself, first thing:
 //! the trusted pixels run under no stream-dom policy and must not depend on
 //! anything the page provides, so there is exactly one stylesheet and it is
-//! this string. No theming, no variables beyond the anchor hue (which is
-//! per-element, since it is device identity and not decoration).
+//! this string.
+//!
+//! Every colour here is a function of one number the stylesheet does not
+//! contain: `--hue`, which `#visor-root` carries as an inline style and
+//! only in the arm that saw `device.status` say the device is open
+//! (docs/design.md "Devices"). So the palette cascades — strip, drawer,
+//! buttons and voices all shift together — while the fact that decides
+//! whether anything is painted at all stays one expression in one place.
 
 pub(crate) const CSS: &str = r#"
-#visor-strip, #visor-drawer { font: 14px/1.4 system-ui, sans-serif; color: #f4f4f5; }
+/* The two arms of the anchor rule, and the only place either is spelled.
+   Claimed: every colour is `--hue` at a fixed lightness/chroma. Unclaimed:
+   the same lightnesses at zero chroma, so an unpainted visor is the same
+   shape in grey rather than a second design. */
+#visor-root {
+  position: relative;
+  font: 14px/1.4 system-ui, sans-serif;
+  color: oklch(0.2 0.02 var(--hue));
+  --strip: oklch(0.62 0.14 var(--hue));
+  --drawer: oklch(0.7 0.11 var(--hue));
+  --accent: oklch(0.71 0.16 var(--hue));
+  --edge: oklch(0.45 0.09 var(--hue));
+  --quiet: oklch(0.38 0.05 var(--hue));
+  --plate: oklch(0.93 0.03 var(--hue));
+  --plate-ink: oklch(0.25 0.06 var(--hue));
+  --field: oklch(0.88 0.04 var(--hue));
+}
+#visor-root.unclaimed {
+  color: oklch(0.2 0 0);
+  --strip: oklch(0.62 0 0);
+  --drawer: oklch(0.7 0 0);
+  --accent: oklch(0.71 0 0);
+  --edge: oklch(0.45 0 0);
+  --quiet: oklch(0.38 0 0);
+  --plate: oklch(0.93 0 0);
+  --plate-ink: oklch(0.25 0 0);
+  --field: oklch(0.88 0 0);
+}
 
-/* Fixed on all three axes so no content can push the anchor around. */
+/* Fixed on all three axes so no content can push the anchor around, and
+   the one thing in this tree that is never overlaid: the drawer is
+   absolutely positioned below it rather than in flow, so opening anything
+   moves no pixel of the strip (docs/design.md M1: "strip geometry immobile
+   with the app mounted"). */
 #visor-strip {
   box-sizing: border-box;
   height: 56px; min-height: 56px; max-height: 56px;
-  display: flex; align-items: center; gap: 12px;
-  padding: 0 12px;
-  background: #18181b;
-  border-bottom: 1px solid #3f3f46;
+  display: flex; align-items: center;
+  padding: 0 8px;
+  position: relative; z-index: 3;
+  background: var(--strip);
+  border-bottom: 1px solid var(--edge);
 }
 
-/* Content-sized, capped, and scrolling past the cap: growth is bounded so
-   the drawer can never squeeze the strip out of the viewport. */
+/* The two halves. Each is a whole button so the target is the half, not
+   the glyph: one is "what is running", the other "who this is". */
+#visor-app, #visor-self {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 8px;
+  background: none; border: 0; border-radius: 8px;
+  padding: 4px 8px; text-align: left;
+}
+#visor-self { flex-direction: row-reverse; text-align: right; }
+#visor-app[aria-pressed="true"], #visor-self[aria-pressed="true"] { background: var(--drawer); }
+#visor-divider { width: 1px; align-self: stretch; margin: 5px; background: var(--edge); }
+#visor-app-glyph, #visor-circle {
+  width: 28px; height: 28px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  /* The plate, not the drawer colour: a pressed half wears the drawer
+     colour, and a glyph the same colour as its half vanishes. */
+  background: var(--plate); color: var(--plate-ink);
+}
+#visor-app-glyph { border-radius: 6px; }
+#visor-circle { border-radius: 50%; }
+.stack { flex: 1; min-width: 0; }
+.stack .top, .stack .bottom { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stack .bottom { font-size: 12px; }
+
+/* Everything below the strip is an overlay on the app zone, never a push:
+   the scrim covers the app, the drawer covers the scrim, and both start
+   exactly where the strip ends. */
+#visor-scrim { position: fixed; inset: 56px 0 0 0; z-index: 1; background: oklch(0 0 0 / 0.25); }
 #visor-drawer {
+  position: absolute; top: 56px; left: 0; right: 0; z-index: 2;
   box-sizing: border-box;
-  max-height: 60vh; overflow-y: auto;
+  height: min(60vh, 480px);
+  overflow: hidden;
+  background: var(--drawer);
+  border-bottom: 1px solid var(--edge);
+  animation: visor-drawer-open 180ms ease-out;
+}
+#visor-drawer.closing { animation: visor-drawer-close 180ms ease-in forwards; }
+
+/* One pane per tenant, stacked so two can be on screen at once while one
+   slides out. The drawer's height is fixed and the pane scrolls inside it,
+   so no sheet's length can move anything.
+
+   The four backgrounds are the local/scroll shadow technique: the first two
+   are drawer-coloured covers pinned to the content (`local`), the second
+   two are shadows pinned to the viewport (`scroll`). Where there is more
+   content above or below, the cover has scrolled away and the shadow shows
+   — so "there is more" is visible without a scrollbar being trusted to say
+   it. */
+.pane {
+  position: absolute; inset: 0;
+  overflow-y: auto;
   padding: 12px;
-  background: #27272a;
-  border-bottom: 1px solid #3f3f46;
+  box-sizing: border-box;
+  background:
+    linear-gradient(var(--drawer) 30%, transparent) center top / 100% 32px,
+    linear-gradient(transparent, var(--drawer) 70%) center bottom / 100% 32px,
+    radial-gradient(farthest-side at 50% 0, oklch(0 0 0 / 0.35), transparent) center top / 100% 12px,
+    radial-gradient(farthest-side at 50% 100%, oklch(0 0 0 / 0.35), transparent) center bottom / 100% 12px;
+  background-repeat: no-repeat;
+  background-attachment: local, local, scroll, scroll;
+  background-color: var(--drawer);
+}
+.pane.enter-from-right { animation: visor-enter-right 200ms ease-out; }
+.pane.enter-from-left { animation: visor-enter-left 200ms ease-out; }
+.pane.leave-to-left { animation: visor-leave-left 200ms ease-in forwards; }
+.pane.leave-to-right { animation: visor-leave-right 200ms ease-in forwards; }
+
+@keyframes visor-drawer-open { from { height: 0; } }
+@keyframes visor-drawer-close { to { height: 0; } }
+@keyframes visor-enter-right { from { transform: translateX(100%); } }
+@keyframes visor-enter-left { from { transform: translateX(-100%); } }
+@keyframes visor-leave-left { to { transform: translateX(-100%); } }
+@keyframes visor-leave-right { to { transform: translateX(100%); } }
+
+/* Movement is decoration; the states it moves between are not. Zeroing the
+   duration keeps every `animationend` the visor unmounts on firing. */
+@media (prefers-reduced-motion: reduce) {
+  #visor-root * { animation-duration: 0s !important; }
 }
 
-#visor-identity { display: flex; align-items: center; gap: 8px; }
-#visor-circle { width: 28px; height: 28px; border-radius: 50%; flex: none; }
-#visor-context { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#visor-actions { display: flex; gap: 8px; flex: none; }
+/* Unsaved changes, over the drawer: the only thing in this tree that takes
+   the press away from what raised it. */
+#visor-confirm {
+  position: absolute; top: 56px; left: 0; right: 0; z-index: 4;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 12px;
+  box-sizing: border-box;
+  background: var(--drawer);
+  border-bottom: 1px solid var(--edge);
+}
 
-button { font: inherit; color: inherit; background: #3f3f46; border: 1px solid #52525b; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
-button[aria-pressed="true"] { background: #52525b; }
+/* The line at the top of every pane. Only the pane that is staying
+   carries the id — during a slide there are two of these on screen. */
+.notice { margin-bottom: 8px; min-height: 1.4em; }
+
+button { font: inherit; color: inherit; background: var(--accent); border: 1px solid var(--edge); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+button[aria-pressed="true"] { border-color: var(--plate-ink); }
 button[disabled] { opacity: 0.5; cursor: default; }
-input[type="text"], input[type="password"] { font: inherit; color: inherit; background: #18181b; border: 1px solid #52525b; border-radius: 6px; padding: 6px 8px; }
+input[type="text"], input[type="password"] { font: inherit; color: inherit; background: var(--field); border: 1px solid var(--edge); border-radius: 6px; padding: 6px 8px; }
 label { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
 
 .app-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
@@ -45,7 +164,7 @@ label { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
 
 /* The device ceremonies: unseal, keep, the entry picker, erase. Minimal
    on purpose — this chrome is slated for a redesign. */
-.sheet { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; padding: 8px 0; border-top: 1px solid #3f3f46; }
+.sheet { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; padding: 8px 0; border-top: 1px solid var(--edge); }
 .sheet-head { margin-bottom: 4px; }
 .sheet-error { margin-top: 2px; }
 .choice { display: flex; gap: 8px; }
@@ -99,22 +218,17 @@ label { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
   user-select: all;
 }
 
-/* Unclaimed: before `device.status` reports `open` there is no identity to
-   show, so the strip wears zero chroma — no hue, no name, no word. The
-   circle gets its grey here and *only* here: the painted hue is an inline
-   style the open branch alone emits (docs/design.md "Devices": a page
-   imitating the picker must not be able to paint the user's colour). */
-#visor-strip.unclaimed #visor-circle { background: #52525b; }
-
 /* The three voices. polyvisor speaking. */
-.framework { color: #a1a1aa; font-style: italic; }
+.framework { color: var(--quiet); font-style: italic; }
 /* The user's own words, echoed: upright, weighted, never quoted. */
-.user { font-weight: 600; font-style: normal; color: #fafafa; }
+.user { font-weight: 600; font-style: normal; color: inherit; }
 /* A publisher's words: plated, monospace, quoted, so foreign text is
-   visibly foreign wherever it lands. */
+   visibly foreign wherever it lands. The plate is derived from the hue
+   like everything else, but far lighter than the drawer it sits on, so it
+   stays a plate at every hue. */
 .app {
   font-family: ui-monospace, monospace;
-  background: #e4e4e7; color: #18181b;
+  background: var(--plate); color: var(--plate-ink);
   border-radius: 4px; padding: 2px 6px;
   quotes: '"' '"';
 }
@@ -146,15 +260,36 @@ mod tests {
         assert!(CSS.contains("height: 56px; min-height: 56px; max-height: 56px;"));
     }
 
-    /// The unclaimed dress is a stylesheet fact, not a per-element one:
-    /// the strip carries the class and the circle's grey follows from it,
-    /// so no code path can grey the strip and still paint the circle.
+    /// The anchor rule, as a property of the stylesheet: no colour with any
+    /// chroma in it names a hue of its own. Every one of them reads
+    /// `var(--hue)`, and `--hue` is set at exactly one site — the inline
+    /// style on `#visor-root` that the open arm of `Ident` emits — so a
+    /// visor that never saw `device.status` say "open" cannot show the
+    /// user's colour, whatever else it renders (docs/design.md "Devices").
+    /// Achromatic colours (the greys of the unclaimed dress, the scroll
+    /// shadows) carry a hue component too, but it decides nothing.
     #[test]
-    fn stylesheet_greys_the_unclaimed_anchor() {
-        assert!(CSS.contains("#visor-strip.unclaimed #visor-circle"));
-        // ...and the stylesheet itself never names a hue: the anchor colour
-        // reaches the DOM only through the inline style the open branch of
-        // `Identity` emits.
+    fn no_colour_with_chroma_names_its_own_hue() {
+        let mut chromatic = 0;
+        for tail in CSS.split("oklch(").skip(1) {
+            let args = &tail[..tail.find(')').expect("unclosed oklch()")];
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            assert!(parts.len() >= 3, "oklch({args}) has too few components");
+            if parts[1] == "0" {
+                continue;
+            }
+            chromatic += 1;
+            assert!(
+                parts[2].starts_with("var(--hue"),
+                "oklch({args}) has chroma and yet names its own hue"
+            );
+        }
+        assert!(chromatic > 0, "the stylesheet paints nothing from the hue");
+        // The palette both arms of the rule define, spelled once each.
+        assert!(CSS.contains("#visor-root.unclaimed"));
+        assert!(CSS.contains("--strip: oklch(0.62 0.14 var(--hue));"));
+        assert!(CSS.contains("--strip: oklch(0.62 0 0);"));
+        // No second colour syntax to smuggle a hue through.
         assert!(!CSS.contains("hsl("));
     }
 

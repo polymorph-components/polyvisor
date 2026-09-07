@@ -13,8 +13,8 @@ use futures::stream::StreamExt as _;
 use futures::{executor::LocalPool, task::LocalSpawnExt as _};
 use polyvisor_kernel::{
     Accepted, BootConfig, Bound, Clock, Dialed, EngineTransport, Error, ErrorCode, Event, Fetch,
-    Files, HttpResponse, IndexRow, Kernel, LEASE_TTL_MS, LocalFuture, Locks, Net, NetHandle, Phase,
-    Platform, Rest, Rng, Seams, Spawn, State, Tier,
+    Files, HttpResponse, IndexRow, Kernel, LEASE_TTL_MS, LocalFuture, Locks, MetaScope, Net,
+    NetHandle, Phase, Platform, Rest, Rng, Seams, Spawn, State, Tier,
 };
 
 // -- harness -----------------------------------------------------------------
@@ -1425,6 +1425,60 @@ fn name_and_hue_persist_across_a_reload_and_an_out_of_range_hue_is_refused() {
     let reread = world.boot().device_status().unwrap();
     assert_eq!(reread.name, "kitchen");
     assert_eq!(reread.hue, 200);
+}
+
+#[test]
+fn meta_persists_across_a_reload_and_is_unavailable_while_sealed() {
+    let world = World::default();
+    let kernel = world.boot();
+    block_on(kernel.set_meta(
+        MetaScope::User,
+        BTreeMap::from([("petname".into(), "Lann".into())]),
+    ))
+    .unwrap();
+    block_on(kernel.set_meta(
+        MetaScope::App("app-1".into()),
+        BTreeMap::from([("glyph".into(), "L".into())]),
+    ))
+    .unwrap();
+    assert_eq!(
+        kernel.meta(MetaScope::User).unwrap(),
+        BTreeMap::from([("petname".into(), "Lann".into())])
+    );
+    assert_eq!(
+        kernel.meta(MetaScope::App("app-1".into())).unwrap(),
+        BTreeMap::from([("glyph".into(), "L".into())])
+    );
+    // An app with no meta ever set answers empty, not an error.
+    assert_eq!(
+        kernel.meta(MetaScope::App("unknown".into())).unwrap(),
+        BTreeMap::new()
+    );
+    block_on(kernel.keep("desk".into(), Some("open sesame".into()))).unwrap();
+
+    let reread = world.boot();
+    assert_eq!(
+        reread.device_status().unwrap().state,
+        State::Sealed,
+        "a durable device under a passphrase boots sealed"
+    );
+    assert_eq!(
+        reread.meta(MetaScope::User).unwrap_err().code,
+        ErrorCode::Unavailable,
+        "meta rides in the sealed checkpoint: unavailable while sealed"
+    );
+    assert_eq!(
+        block_on(reread.set_meta(MetaScope::Device, BTreeMap::new()))
+            .unwrap_err()
+            .code,
+        ErrorCode::Unavailable
+    );
+    block_on(reread.unseal("open sesame".into())).unwrap();
+    assert_eq!(
+        reread.meta(MetaScope::User).unwrap(),
+        BTreeMap::from([("petname".into(), "Lann".into())]),
+        "meta persisted across the reload, readable once unsealed"
+    );
 }
 
 #[test]

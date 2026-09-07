@@ -193,6 +193,16 @@ interface device {
     set-hue: async func(hue: u16) -> result<_, error>;
     reroll-word: async func() -> result<string, error>;
 
+    /// The user's own labels for themself, this device, and each installed
+    /// app — petname, glyph, whatever the visor settles on. Free-form while
+    /// the field set is in flux: keys are the visor's vocabulary, values are
+    /// user voice. Personal: rides in the sealed checkpoint with name/hue/
+    /// word, so `unavailable` while sealed.
+    variant meta-scope { user, device, app(string) }
+    meta: async func(scope: meta-scope) -> result<list<tuple<string, string>>, error>;
+    /// Replaces the whole map for `scope`.
+    set-meta: async func(scope: meta-scope, entries: list<tuple<string, string>>) -> result<_, error>;
+
     /// Promote to durable. `passphrase = none` is `rests-open`. Idempotent
     /// on the petname; changing the rest of a kept device is `refused`
     /// (reseal is a later milestone).

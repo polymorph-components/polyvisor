@@ -510,6 +510,32 @@ impl guest::device::Guest for Component {
     async fn reroll_word() -> Result<String, Error> {
         kernel()?.reroll_word().await.map_err(map_error)
     }
+    async fn meta(scope: guest::device::MetaScope) -> Result<Vec<(String, String)>, Error> {
+        let scope = match scope {
+            guest::device::MetaScope::User => polyvisor_kernel::MetaScope::User,
+            guest::device::MetaScope::Device => polyvisor_kernel::MetaScope::Device,
+            guest::device::MetaScope::App(id) => polyvisor_kernel::MetaScope::App(id),
+        };
+        Ok(kernel()?
+            .meta(scope)
+            .map_err(map_error)?
+            .into_iter()
+            .collect())
+    }
+    async fn set_meta(
+        scope: guest::device::MetaScope,
+        entries: Vec<(String, String)>,
+    ) -> Result<(), Error> {
+        let scope = match scope {
+            guest::device::MetaScope::User => polyvisor_kernel::MetaScope::User,
+            guest::device::MetaScope::Device => polyvisor_kernel::MetaScope::Device,
+            guest::device::MetaScope::App(id) => polyvisor_kernel::MetaScope::App(id),
+        };
+        kernel()?
+            .set_meta(scope, entries.into_iter().collect())
+            .await
+            .map_err(map_error)
+    }
     async fn keep(petname: String, passphrase: Option<String>) -> Result<(), Error> {
         kernel()?.keep(petname, passphrase).await.map_err(map_error)
     }
