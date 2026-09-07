@@ -202,6 +202,21 @@ keyhive is pinned to git `main` for the CGKA transitive-authority fix
 (66a6632: relay access no longer grants CGKA membership) that the
 released 0.5.0 lacks; the pull ≠ read tier separation depends on it.
 
+## Storage
+
+The store is dumb and untrusted: it holds ciphertext at unguessable
+names. What goes to it is exactly what the sync engine already carries —
+sedimentree items (app-tree keyhive envelopes, the group document's
+signed commits, keyhive's signed ops) — so a device that pulls from the
+store converges the same way it would from a peer, and the store needs no
+schema of its own. Object names are `hex(HMAC(name-key, tree-id ‖ item
+id))` under one folder per group in the user's Drive `appDataFolder`;
+the name key is derived from the device seed's group secret so every
+device in the group derives the same names and a store operator learns
+only that N objects exist. Tokens rest sealed beside the device seed;
+the OAuth code is the one artifact that crosses the port, bound to a PKCE
+verifier that never left the kernel.
+
 ## Devices
 
 A device is one kernel identity and everything it holds; a browser may
@@ -331,8 +346,14 @@ native tests, so browser gates are mandatory for every visor change.
   authenticated QUIC — content encryption is what untrusted *storage*
   (M4) needs, and building the group first gives keyhive a membership
   to key.
-- **M4** storage: per-destination egress, S3 provider component, bucket
-  sync, picker, provider panel in a frame.
+- **M4** storage: Google Drive as the first (and, for now, only) dumb
+  store — user-only, keyed object names, the OAuth ceremony split
+  between kernel (PKCE, exchange, sealed tokens) and shell (the popup),
+  push after every local change and pull at boot and on demand; a fake
+  Drive in e2e. Provider-as-component (the `provider` world, per-
+  destination egress, the picker) waits for a second provider: one
+  backend does not justify a boundary. S3 is deferred; Drive is what a
+  person has.
 - **M5** passkey PRF rung, recovery kits, Drive provider.
 - Parked: app worker (above); native shell; JS producers.
 

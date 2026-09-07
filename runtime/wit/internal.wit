@@ -253,6 +253,59 @@ interface pairing {
     status: async func() -> result<phase, error>;
 }
 
+/// Durable storage on a dumb store the user owns. M4 ships one backend,
+/// Google Drive, user-only: every object is written to the user's own
+/// Drive under names derived from a key the group holds, and read back by
+/// the same names. The store sees ciphertext (app-tree envelopes,
+/// keyhive's signed ops, the group document's signed commits) at
+/// unguessable names and nothing else. Sync through the store is the
+/// non-realtime path: a device that was never online with its peers
+/// still converges by pulling what they pushed.
+///
+/// The OAuth ceremony splits along capabilities: the kernel mints the
+/// PKCE verifier and the authorization URL (`oauth-start`), the visor's
+/// glue opens the popup (`shell.open-popup`) and relays the returned
+/// `code`+`state` (`oauth-complete`); the kernel exchanges them itself
+/// over `wasi:http` and seals the tokens beside the device seed. The
+/// one-shot code may cross the port; the tokens never do.
+interface storage {
+    use types.{error};
+
+    record oauth-client {
+        /// An installed-app OAuth client id/secret pair. Google documents
+        /// the installed-app secret as "not treated as a secret": it
+        /// identifies the app and gates nothing without the user's
+        /// consent. Nothing is baked in; the user or the operator types it.
+        client-id: string,
+        client-secret: string,
+    }
+
+    record binding {
+        /// "gdrive" is the only provider in M4.
+        provider: string,
+        /// Framework voice: "not connected", "connected as <email>",
+        /// "connected", "needs re-authorization: <why>".
+        state: string,
+        /// Epoch milliseconds of the last successful pull and push, 0 if
+        /// never.
+        last-pull: u64,
+        last-push: u64,
+    }
+
+    status: async func() -> result<binding, error>;
+    /// Mint a PKCE ceremony; returns the authorization URL for the popup.
+    /// `redirect` is the page URL the popup returns to.
+    oauth-start: async func(client: oauth-client, redirect: string) -> result<string, error>;
+    /// The popup landed back with `code` and `state`; exchange and seal.
+    oauth-complete: async func(code: string, state: string) -> result<_, error>;
+    /// Forget the tokens (does not touch the store).
+    disconnect: async func() -> result<_, error>;
+    /// Push every local item the store lacks, then pull every item the
+    /// store has that this device lacks. Also runs unprompted after every
+    /// local change and at boot; this is the visor's "sync now".
+    sync-now: async func() -> result<_, error>;
+}
+
 /// The device index: what a boot may show before any seal opens. Every
 /// device on this origin, for the entry picker. Carries nothing personal
 /// beyond the petname.
@@ -407,6 +460,11 @@ interface shell {
     /// moment a device is kept. `false` means the browser declined; the
     /// device is durable regardless, only more evictable.
     request-persistence: async func() -> bool;
+    /// Open `url` in a popup and resolve with the `code` and `state` query
+    /// parameters the popup returns to this page's URL with; `none` if the
+    /// user closed it. A window is a page capability, so the ceremony's
+    /// browser half lives here and the kernel never sees a window.
+    open-popup: async func(url: string) -> option<tuple<string, string>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +508,7 @@ world runtime {
     export device;
     export sync;
     export pairing;
+    export storage;
     export store;
     export apps;
     export event-source;
@@ -463,6 +522,7 @@ world visor {
     import device;
     import sync;
     import pairing;
+    import storage;
     import store;
     import apps;
     import events;
