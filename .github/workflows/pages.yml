@@ -26,10 +26,12 @@ jobs:
           deno-version: v2.x
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-tools,just
+          tool: wasm-tools,just,wac-cli
       - uses: Swatinem/rust-cache@v2
-      - run: just build-wasm
-      - run: deno task build
+      # `site` composes first: the shipped runtime is the wac-plugged
+      # artifact (justfile `compose`), and a dist built from the bare one
+      # fails loudly in web/build.ts.
+      - run: just build-wasm site
       - uses: actions/upload-pages-artifact@v3
         with:
           path: web/dist
