@@ -16,7 +16,7 @@
     "@remote-dom/core": "npm:@remote-dom/core@^1.11.1",
     "@remote-dom/core/receivers": "npm:@remote-dom/core@^1.11.1/receivers",
     "@remote-dom/core/elements": "npm:@remote-dom/core@^1.11.1/elements",
-    "@polymorph/stream-dom-receiver/": "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/197492374936b3b4ce5af55f2bac50fa6b551597/receiver/src/",
+    "@polymorph/stream-dom-receiver/": "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/e35dc357137a3563aa891662a626b3310a7078c4/receiver/src/",
     "@std/assert": "jsr:@std/assert@^1",
     "playwright": "npm:playwright@1.62.1",
     "@std/fs": "jsr:@std/fs@^1",

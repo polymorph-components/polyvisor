@@ -1189,15 +1189,23 @@ const scenarios: Scenario[] = [
       await launchTodoMvc(page);
       await page.frameLocator("#app-zone iframe").locator("input").first()
         .waitFor({ timeout: 30_000 });
-      // The app emits no `<link>` in M1 (apps/todomvc/src/lib.rs's CONTRACT
-      // note), and the frame's CSP has no connect-src at all: there is
-      // nothing the frame could fetch even if it named something.
+      // The app's one fetch is its stylesheet, a `blob:` URL the frame
+      // minted from the bundle (web/frame.ts's `resolveAsset`) — Playwright
+      // reports it as a request but it is not network. The frame's CSP has
+      // no connect-src at all, so nothing else can leave.
+      const notBlob = fromFrame.filter((url) => !url.startsWith("blob:"));
       check(
-        fromFrame.length === 0,
-        `the app frame made ${fromFrame.length} request(s): ${
-          fromFrame.join(", ")
+        notBlob.length === 0,
+        `the app frame made ${notBlob.length} non-blob request(s): ${
+          notBlob.join(", ")
         }`,
       );
+
+      // The stylesheet did apply: `.todoapp { background: #fff }` from
+      // apps/todomvc/assets/todomvc-app.css.
+      const background = await todoFrame(page).locator("section.todoapp")
+        .evaluate((el) => getComputedStyle(el).backgroundColor);
+      eq(background, "rgb(255, 255, 255)", "the stylesheet did not apply");
     },
   },
 
