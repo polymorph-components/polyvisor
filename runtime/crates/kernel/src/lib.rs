@@ -24,7 +24,7 @@ mod store;
 mod sync;
 
 pub use apps::{AppInfo, AssetInfo, ComponentArtifacts};
-pub use device::{DeviceStatus, IndexRow, Rest, State, Tier};
+pub use device::{DeviceStatus, IndexRow, MetaScope, Rest, State, Tier};
 pub use drive::{Binding, HttpResponse};
 pub use events::Event;
 pub use pairing::Phase;
@@ -550,6 +550,46 @@ impl Kernel {
                 ));
             }
             d.hue = hue;
+            Ok(())
+        })?;
+        self.checkpoint().await
+    }
+
+    /// internal.wit `device.meta`: an unknown app id answers an empty map
+    /// rather than an error — the visor asks before it knows whether the app
+    /// has ever set anything.
+    pub fn meta(&self, scope: MetaScope) -> Result<BTreeMap<String, String>, Error> {
+        self.open()?;
+        let state = self.state.borrow();
+        let device = state.device.as_ref().expect("open implies a device");
+        Ok(match scope {
+            MetaScope::User => device.meta.user.clone(),
+            MetaScope::Device => device.meta.device.clone(),
+            MetaScope::App(id) => device.meta.app.get(&id).cloned().unwrap_or_default(),
+        })
+    }
+
+    /// internal.wit `device.set-meta`: replaces the whole map for `scope`.
+    /// An empty map for an app scope removes that app's entry rather than
+    /// leaving an empty one behind.
+    pub async fn set_meta(
+        &self,
+        scope: MetaScope,
+        meta: BTreeMap<String, String>,
+    ) -> Result<(), Error> {
+        self.open()?;
+        self.with_device(|d| {
+            match scope {
+                MetaScope::User => d.meta.user = meta,
+                MetaScope::Device => d.meta.device = meta,
+                MetaScope::App(id) => {
+                    if meta.is_empty() {
+                        d.meta.app.remove(&id);
+                    } else {
+                        d.meta.app.insert(id, meta);
+                    }
+                }
+            }
             Ok(())
         })?;
         self.checkpoint().await

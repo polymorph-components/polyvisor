@@ -221,20 +221,56 @@ async function open(ctx: BrowserContext, origin: string): Promise<Page> {
 // The visor, as these scenarios drive it
 //
 // Every selector and every label below is the visor's own tree (visor/src/
-// ui.rs): `#visor-strip` with `.unclaimed` until the device is open,
-// `#visor-circle` carrying the hue and nothing else ever painting it,
-// `#visor-drawer` holding one tenant at a time, `.sheet` / `.sheet-error` /
-// `.app-row` / `.device-row`. They live in one block so a visor rename is one
-// edit here rather than six.
+// ui.rs): `#visor-root` carrying `.unclaimed` until the device is open and
+// the `--hue` inline style when it is (nothing else ever paints it),
+// `#visor-strip` with its two halves `#visor-app` and `#visor-self`,
+// `#visor-drawer` holding one `.pane` per tenant, `.sheet` / `.sheet-error`
+// / `.app-row` / `.device-row`. They live in one block so a visor rename is
+// one edit here rather than six.
+//
+// The drawer is no longer a toggle: with nothing running it is pinned open
+// on the app list, so "close" means "back to the app list" and pressing the
+// half whose sheet is already showing does nothing at all.
 // ---------------------------------------------------------------------------
 
 const strip = (page: Page) => page.locator("#visor-strip");
 const drawer = (page: Page) => page.locator("#visor-drawer");
+/** The strip's left half: what is running (the app list, or the running
+ * app's own sheet). */
+const appsButton = (page: Page) => page.locator("#visor-app");
+/** The strip's right half: who this is, and this device's settings. */
+const settingsButton = (page: Page) => page.locator("#visor-self");
 
-/** Press one of the strip's tenant buttons and wait for the drawer. */
-async function openTenant(page: Page, label: string): Promise<void> {
-  await strip(page).getByRole("button", { name: label, exact: true }).click();
+/** Wait for the drawer to hold exactly one pane, done sliding.
+ *
+ * A tenant switch renders two panes for the length of the slide — the one
+ * arriving still wearing an `enter-` class — and a click into a moving
+ * target lands wherever the animation had got to. */
+async function paneSettled(page: Page): Promise<void> {
   await drawer(page).waitFor({ timeout: 10_000 });
+  await page.waitForFunction(
+    () => {
+      const panes = document.querySelectorAll("#visor-drawer .pane");
+      return panes.length === 1 &&
+        !(panes[0] as HTMLElement).className.includes("enter");
+    },
+    undefined,
+    { timeout: 10_000 },
+  );
+}
+
+/** Press the strip's left half and wait for the pane it raises. With
+ * nothing running that is the app list; with a session it is that session's
+ * own sheet. */
+async function openApps(page: Page): Promise<void> {
+  await appsButton(page).click();
+  await paneSettled(page);
+}
+
+/** Press the strip's right half: the settings sheet. */
+async function openSettingsSheet(page: Page): Promise<void> {
+  await settingsButton(page).click();
+  await paneSettled(page);
 }
 
 /** The `.sheet` whose head says `head` — the drawer stacks several. */
@@ -248,14 +284,16 @@ function sheet(page: Page, head: string | RegExp) {
  * `awaitFrame` is false for an app that is expected to be refused: the
  * hostile fixture's frame can be torn down before a `waitForSelector` on it
  * ever polls, and "the frame existed for a moment" is not part of any claim
- * — the claim is what the strip says afterwards.
+ * — the claim is what the visor says afterwards.
  */
 async function launchApp(
   page: Page,
   title: string,
   awaitFrame = true,
 ): Promise<void> {
-  await openTenant(page, "Apps");
+  // With nothing running the app list is already what the drawer is
+  // showing, so this press is usually a no-op — which is the point.
+  await openApps(page);
   const row = drawer(page).locator(".app-row").filter({ hasText: title })
     .first();
   await row.waitFor({ timeout: 10_000 });
@@ -271,14 +309,39 @@ async function launchTodoMvc(page: Page): Promise<void> {
   await launchApp(page, "TodoMVC");
 }
 
-/** Settings → the device's user-voice name. */
+/**
+ * Press `Save` in the settings sheet and wait for the draft to be clean.
+ *
+ * The button disables itself exactly when `draft == seed`, and the seed
+ * only catches up once every kernel call the save made has come back
+ * (visor/src/ui.rs `save_draft`) — so this is the one observable that says
+ * the device, and not merely the screen, has the new value. Reloading
+ * without it races the checkpoint.
+ */
+async function saveDraft(page: Page): Promise<void> {
+  await drawer(page).getByRole("button", { name: "Save", exact: true })
+    .click();
+  await page.waitForFunction(
+    () => {
+      const save = Array.from(
+        document.querySelectorAll("#visor-drawer button"),
+      ).find((b) => b.textContent === "Save") as HTMLButtonElement | undefined;
+      return save !== undefined && save.disabled;
+    },
+    undefined,
+    { timeout: 15_000 },
+  );
+}
+
+/** Settings → the device's user-voice petname. Typed into the draft, and
+ * `Save` is the only thing the kernel hears. */
 async function setDeviceName(page: Page, name: string): Promise<void> {
-  await openTenant(page, "Settings");
-  const field = drawer(page).locator("label").filter({ hasText: /^name$/ })
-    .locator("input");
+  await openSettingsSheet(page);
+  const field = drawer(page).locator("label").filter({
+    hasText: /^device petname$/,
+  }).locator("input");
   await field.fill(name);
-  // The visor writes on `change`, not on every keystroke.
-  await field.blur();
+  await saveDraft(page);
 }
 
 /**
@@ -292,7 +355,7 @@ async function keepDevice(
   petname: string,
   passphrase?: string,
 ): Promise<void> {
-  if (await drawer(page).count() === 0) await openTenant(page, "Settings");
+  await openSettingsSheet(page);
   const keep = sheet(page, "Keep this device");
   await keep.waitFor({ timeout: 10_000 });
   await keep.locator("input[type=text]").fill(petname);
@@ -309,15 +372,16 @@ async function keepDevice(
   await sheet(page, "kept as").waitFor({ timeout: 15_000 });
 }
 
-/** Is the strip painted with an identity? `.unclaimed` is the whole dress:
- * one class, and `#visor-circle` gets a background only in the open arm. */
+/** Is the visor painted with an identity? One class and one inline
+ * variable, both on `#visor-root`: `--hue` is emitted by the open arm alone
+ * and every colour in the stylesheet is a function of it. */
 async function claimed(page: Page): Promise<boolean> {
-  const cls = await strip(page).getAttribute("class") ?? "";
-  const style = await page.locator("#visor-circle").getAttribute("style") ?? "";
-  const painted = style.includes("hsl(");
-  if (cls.includes("unclaimed") && painted) {
+  const root = page.locator("#visor-root");
+  const cls = await root.getAttribute("class") ?? "";
+  const style = await root.getAttribute("style") ?? "";
+  if (cls.includes("unclaimed") && style.includes("--hue")) {
     throw new Failure(
-      "the strip is unclaimed and yet the anchor colour is painted — " +
+      "the visor is unclaimed and yet the anchor colour is painted — " +
         'docs/design.md "Devices" forbids exactly that',
     );
   }
@@ -346,13 +410,10 @@ async function claimed(page: Page): Promise<boolean> {
 
 const devicesSheet = (page: Page) => sheet(page, "Devices");
 
-const settingsButton = (page: Page) =>
-  strip(page).getByRole("button", { name: "Settings", exact: true });
-
 /** Settings open, showing the Devices section. */
 async function openSettings(page: Page): Promise<void> {
   if (await devicesSheet(page).count() > 0) return;
-  await settingsButton(page).click();
+  await openSettingsSheet(page);
   await devicesSheet(page).waitFor({ timeout: 10_000 });
 }
 
@@ -596,9 +657,11 @@ async function connectDrive(page: Page): Promise<void> {
     }
     await new Promise((r) => setTimeout(r, 500));
     // Re-read: the ceremony completes in the kernel, and this world has no
-    // timer. Closing and reopening Settings is the press that reads.
-    await settingsButton(page).click();
-    await settingsButton(page).click();
+    // timer. The press that opens Settings is the read — and the drawer is
+    // not a toggle any more, so leaving it and coming back is what makes
+    // that press happen again.
+    await openApps(page);
+    await openSettings(page);
   }
 }
 
@@ -773,8 +836,11 @@ const scenarios: Scenario[] = [
       check(box !== null, "#visor-strip has no box");
       eq(box!.height, 56, "#visor-strip height");
       // The strip says "waking" until `device.status` answers over the
-      // worker port; the placeholder is the first kernel-backed pixel.
-      await strip.getByText("this device").waitFor({ timeout: 10_000 });
+      // worker port; the placeholder is the first kernel-backed pixel, and
+      // it is the right half — the one that speaks for this device.
+      await page.locator("#visor-self").getByText("this device").waitFor({
+        timeout: 10_000,
+      });
     },
   },
 
@@ -900,7 +966,7 @@ const scenarios: Scenario[] = [
       eq(after, before, "#visor-strip geometry moved when the app mounted");
 
       const plated = await strip.locator("q").first().textContent();
-      eq(plated, "TodoMVC", "the strip's context should plate the app title");
+      eq(plated, "TodoMVC", "the strip's left half should plate the app title");
     },
   },
 
@@ -960,16 +1026,16 @@ const scenarios: Scenario[] = [
       );
 
       // Settle before measuring, and settle on facts rather than on a
-      // timeout: the strip's claim is about where it ends up, and launching
-      // went through the Apps drawer, which is part of the visor's own tree
-      // and legitimately moves the strip while it is open. Comparing a
-      // drawer-open frame against a drawer-closed baseline would fail for a
-      // reason that has nothing to do with the app.
-      const context = page.locator("#visor-context");
-      await context.getByText("ended", { exact: false }).waitFor({
+      // timeout: the strip's claim is about where it ends up. The drawer is
+      // no part of that any more — it overlays the app zone instead of
+      // pushing anything — so the baseline was taken with it open and the
+      // comparison is made with it open again, and neither is a special
+      // case. With nothing running the drawer is pinned on the app list, so
+      // the session ending puts it back there; the notice is read from it.
+      const notice = page.locator("#visor-notice");
+      await notice.getByText("ended", { exact: false }).waitFor({
         timeout: 10_000,
       });
-      await drawer(page).waitFor({ state: "detached", timeout: 10_000 });
 
       // The trusted pixels do not move because an app misbehaved.
       const after = await strip(page).boundingBox();
@@ -980,9 +1046,9 @@ const scenarios: Scenario[] = [
       // Framework voice for the reason, the app's own title plated: the
       // publisher's text never enters the sentence unquoted.
       eq(
-        await context.locator("q").first().textContent(),
+        await notice.locator("q").first().textContent(),
         "Hostile fixture",
-        "the strip should plate the ended app's title",
+        "the notice should plate the ended app's title",
       );
     },
   },
@@ -1079,7 +1145,7 @@ const scenarios: Scenario[] = [
       await visorReady(page);
       await strip(page).getByText("this device").waitFor({ timeout: 15_000 });
 
-      await openTenant(page, "Settings");
+      await openSettingsSheet(page);
       await drawer(page).getByRole("button", { name: "Other devices" }).click();
       const rows = drawer(page).locator(".device-row");
       await drawer(page).getByRole("button", { name: "Start fresh here" })
@@ -1456,6 +1522,80 @@ const scenarios: Scenario[] = [
         connectedCleanly(said),
         `a recovered 401 left the binding reading "${said}"`,
       );
+    },
+  },
+
+  {
+    // Unsaved changes are the user's, and the visor is the only thing that
+    // holds them: a field typed into the settings sheet reaches the kernel
+    // on `Save` and nowhere else, and a transition away from a dirty sheet
+    // asks rather than dropping it (visor/src/ui.rs `Draft`).
+    name: "visor-drafts",
+    async run(ctx, origin) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+      await openSettingsSheet(page);
+      const field = drawer(page).locator("label").filter({
+        hasText: /^device petname$/,
+      }).locator("input");
+      const confirm = page.locator("#visor-confirm");
+
+      await field.fill("half typed");
+
+      // Leaving a dirty sheet asks. Cancel means "I was not done": the
+      // sheet stays, and so does every character of it.
+      await appsButton(page).click();
+      await confirm.waitFor({ timeout: 10_000 });
+      await confirm.getByRole("button", { name: "Cancel", exact: true })
+        .click();
+      await confirm.waitFor({ state: "detached", timeout: 10_000 });
+      eq(await field.inputValue(), "half typed", "Cancel dropped the draft");
+
+      // Revert means "throw it away and go": the transition happens, and
+      // the sheet goes back to what the kernel last said — which for a
+      // device nobody has named is nothing.
+      await appsButton(page).click();
+      await confirm.waitFor({ timeout: 10_000 });
+      await confirm.getByRole("button", { name: "Revert", exact: true })
+        .click();
+      await paneSettled(page);
+      check(
+        await drawer(page).locator(".app-row").count() > 0,
+        "Revert did not go on to the transition it was asked about",
+      );
+      await openSettingsSheet(page);
+      eq(await field.inputValue(), "", "Revert kept the abandoned draft");
+
+      // Saved, and it is the kernel that remembers it: a reload has no
+      // draft at all, and reads the name back off the device.
+      await field.fill("the workbench");
+      await saveDraft(page);
+      await page.reload();
+      await visorReady(page);
+      await strip(page).getByText("the workbench").waitFor({ timeout: 15_000 });
+      await openSettingsSheet(page);
+      eq(
+        await field.inputValue(),
+        "the workbench",
+        "the saved device petname did not survive a reload",
+      );
+
+      // The user's own labels ride in the same draft and land on the strip:
+      // the petname in the right half's top line, and the glyph — of which
+      // only the first character is ever drawn — in the circle.
+      await drawer(page).locator("label").filter({ hasText: /^your petname$/ })
+        .locator("input").fill("ada");
+      await drawer(page).locator("label").filter({ hasText: /^your glyph$/ })
+        .locator("input").fill("🜁x");
+      await saveDraft(page);
+      await page.waitForFunction(
+        () => document.querySelector("#visor-circle")?.textContent === "🜁",
+        undefined,
+        { timeout: 10_000 },
+      );
+      await page.locator("#visor-self").getByText("ada").waitFor({
+        timeout: 10_000,
+      });
     },
   },
 
