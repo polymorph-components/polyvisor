@@ -78,6 +78,14 @@ interface kv {
     keys: async func(prefix: string) -> list<string>;
 }
 
+/// Web Locks, read side. The worker glue itself holds this device's lock
+/// (`pm-device-<id>`) for the worker's lifetime — a lock releases when its
+/// holder dies, which is the liveness signal the sweep needs; the kernel
+/// only asks whether some other worker holds one.
+interface locks {
+    is-held: async func(name: string) -> bool;
+}
+
 // ---------------------------------------------------------------------------
 // Kernel: what the runtime component exports. The visor imports the same
 // interfaces; the worker glue proxies them.
@@ -92,23 +100,54 @@ interface lifecycle {
         /// Release artifacts and, until installation lands, app bundles are
         /// fetched from it.
         home-origin: string,
+        /// The device this worker is: the glue's sessionStorage anchor, or
+        /// an id the glue minted for a fresh device. The glue names the
+        /// SharedWorker after it, so the id must exist before the kernel
+        /// does; everything else about the device is the kernel's.
+        device: string,
     }
 
     boot: async func(config: boot-config) -> result<_, error>;
 }
 
-/// The device this runtime is: the identity the visor shows.
+/// The device this runtime is.
+///
+/// Lifecycle: a device starts `fresh` (ephemeral tier: its namespace is
+/// swept once its worker is gone and its lease stale). "Keep this device"
+/// promotes it to durable and fixes how it rests: `rests-open` leaves the
+/// data key in the namespace, so the protection is the browser profile's
+/// access control and the visor says so; `passphrase` wraps the key under
+/// Argon2id and unsealing is the login, every session. A device that rests
+/// under a passphrase boots `sealed`: `status` answers with the id and
+/// state only, and every other kernel call is `unavailable` until `unseal`
+/// — except `erase`, which needs no key (a forgotten passphrase must not
+/// make a device un-erasable), and `store.devices`, which is unsealed by
+/// definition. `fresh` is not a gate: an ephemeral device is fully usable,
+/// and its colour is freshly minted, so painting it before "keep" gives an
+/// impostor nothing.
+/// Nothing personal (name, hue, word) is readable — or renderable — before
+/// the seal opens; that is what makes unseal-as-login unspoofable.
 interface device {
     use types.{error};
+
+    enum state { fresh, sealed, open }
+    enum tier { ephemeral, durable }
+    enum rest { rests-open, passphrase }
 
     record device-status {
         /// Stable per device.
         id: string,
-        /// User voice. "" until the user names it.
+        state: state,
+        tier: tier,
+        rest: rest,
+        /// The device's own label in the index, user voice, readable
+        /// before unseal (ruled acceptable in the clear). "" until kept.
+        petname: string,
+        /// User voice. "" until the user names it. Empty while sealed.
         name: string,
-        /// The anchor colour, degrees on the hue wheel.
+        /// The anchor colour, degrees on the hue wheel. 0 while sealed.
         hue: u16,
-        /// The audible anchor word (framework voice; trusted pixels only).
+        /// The audible anchor word (trusted pixels only). "" while sealed.
         word: string,
     }
 
@@ -116,6 +155,36 @@ interface device {
     set-name: async func(name: string) -> result<_, error>;
     set-hue: async func(hue: u16) -> result<_, error>;
     reroll-word: async func() -> result<string, error>;
+
+    /// Promote to durable. `passphrase = none` is `rests-open`. Idempotent
+    /// on the petname; changing the rest of a kept device is `refused`
+    /// (reseal is a later milestone).
+    keep: async func(petname: string, passphrase: option<string>) -> result<_, error>;
+    /// The login. A wrong passphrase is `refused`; the state stays sealed.
+    unseal: async func(passphrase: string) -> result<_, error>;
+    /// Destroy this device: its namespace and its index row. The worker is
+    /// useless afterwards; the visor switches away (`shell.switch-device`).
+    erase: async func() -> result<_, error>;
+}
+
+/// The device index: what a boot may show before any seal opens. Every
+/// device on this origin, for the entry picker. Carries nothing personal
+/// beyond the petname.
+interface store {
+    use types.{error};
+    use device.{tier, rest};
+
+    record entry {
+        id: string,
+        petname: string,
+        tier: tier,
+        rest: rest,
+        /// Epoch milliseconds.
+        created: u64,
+        last-used: u64,
+    }
+
+    devices: async func() -> result<list<entry>, error>;
 }
 
 /// Installed apps and their live sessions.
@@ -168,9 +237,8 @@ interface apps {
     abort: async func(session: session-id, reason: string);
 }
 
-/// Kernel-originated events. The runtime exports this; the worker glue
-/// long-polls it and fans each event out to every connected visor, whose
-/// own glue serves the same interface from a local queue.
+/// Kernel-originated events, as the visor consumes them: a long poll the
+/// visor's glue serves from a per-tab queue.
 interface events {
     use types.{session-id};
 
@@ -183,6 +251,21 @@ interface events {
 
     /// Resolves with the next event; parks while there is none.
     next: async func() -> event;
+}
+
+/// Kernel-originated events, as the runtime produces them. Non-parking:
+/// the worker glue drains after every export call it dispatches and fans
+/// the result out to every tab's queue. Until the engine lands, every
+/// event is born inside an export activation the glue made, so draining
+/// there misses nothing. A parking `next` export was the first design;
+/// polyengine traps an async export parked on a guest-internal waker with
+/// no host call outstanding as a deadlock (polyengine#292), where wasmtime
+/// would stay pending. Revisit when that is resolved or when the engine
+/// produces events from host-call completions.
+interface event-source {
+    use events.{event};
+
+    drain: async func() -> list<event>;
 }
 
 /// Service dispatch for app sessions: each public service interface in
@@ -219,6 +302,14 @@ interface shell {
     close-frame: async func(session: session-id) -> result<_, error>;
     /// `location.reload()`.
     reload: func();
+    /// Re-anchor this tab to another device (or, with `none`, to a fresh
+    /// one) and reload: the anchor is the tab's sessionStorage pointer and
+    /// the worker is named after it, so a device switch is a page reload.
+    switch-device: func(device: option<string>);
+    /// `navigator.storage.persist()` — a window capability, asked at the
+    /// moment a device is kept. `false` means the browser declined; the
+    /// device is durable regardless, only more evictable.
+    request-persistence: async func() -> bool;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,15 +319,26 @@ interface shell {
 /// The runtime component: kernel + engine, in the device's SharedWorker.
 world runtime {
     import kv;
+    import locks;
     import wasi:clocks/monotonic-clock@0.3.1;
     import wasi:clocks/system-clock@0.3.1;
     import wasi:random/random@0.3.1;
     import wasi:http/client@0.3.1;
+    /// The state root: the glue preopens the origin's OPFS at `/`; the
+    /// kernel keeps each device under `/<id>/`. The 0.3 track is async in
+    /// WIT — except four stream-returning functions (`read-directory` and
+    /// the three `*-via-stream`), and the OPFS host answers
+    /// `read-directory` with a Promise. So the kernel never lists a
+    /// directory: every path it touches is named, from a generation
+    /// pointer it keeps in `kv`. That is what keeps the worker JSPI-free.
+    import wasi:filesystem/types@0.3.1;
+    import wasi:filesystem/preopens@0.3.1;
 
     export lifecycle;
     export device;
+    export store;
     export apps;
-    export events;
+    export event-source;
     export app-services;
 }
 
@@ -245,6 +347,7 @@ world visor {
     include polymorph:stream-dom/producer@0.1.0;
 
     import device;
+    import store;
     import apps;
     import events;
     import shell;

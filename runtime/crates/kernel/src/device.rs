@@ -1,97 +1,156 @@
-//! Device identity: minted once on first boot, then read back from kv.
+//! Device identity and the index row: what a device *is*, split into the part
+//! that may be read before any seal opens (the index row, in `kv`) and the
+//! part that may not (the record, in the encrypted checkpoint).
 
 use serde::{Deserialize, Serialize};
 
-use std::cell::RefCell;
 use std::sync::LazyLock;
 
-use crate::{Error, ErrorCode, Platform, Rng};
+use crate::{Error, ErrorCode};
 
-/// The single kv key the device record lives under.
-pub const KV_KEY: &str = "device";
-
-/// Bumped when the record's shape changes; a record from the future is an
-/// error rather than a silent partial read.
-const SCHEMA: u32 = 1;
+/// Bumped when a stored shape changes; a record from the future is an error
+/// rather than a silent partial read.
+pub const SCHEMA: u32 = 2;
 
 const WORDS: &str = include_str!("../eff_short_wordlist.txt");
+
+/// `polyvisor:internal/device.state`, plus the terminal state an erased
+/// device sits in. `Erased` has no WIT spelling on purpose: after `erase`
+/// there is no device left to describe, so every export answers
+/// `unavailable` (see `Kernel::not_erased`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    Fresh,
+    Sealed,
+    Open,
+    Erased,
+}
+
+/// `polyvisor:internal/device.tier`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tier {
+    Ephemeral,
+    Durable,
+}
+
+/// `polyvisor:internal/device.rest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Rest {
+    RestsOpen,
+    Passphrase,
+}
 
 /// `polyvisor:internal/device.device-status`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceStatus {
     pub id: String,
+    pub state: State,
+    pub tier: Tier,
+    pub rest: Rest,
+    pub petname: String,
     pub name: String,
     pub hue: u16,
     pub word: String,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct Device {
+/// `polyvisor:internal/store.entry` — the one unsealed record (docs/design.md
+/// "Devices"). Lives in `kv` under `index/<id>`; carries nothing personal
+/// beyond the petname.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexRow {
     v: u32,
     pub id: String,
-    pub name: String,
-    pub hue: u16,
-    pub word: String,
+    pub petname: String,
+    pub tier: Tier,
+    pub rest: Rest,
+    /// Epoch milliseconds.
+    pub created: u64,
+    /// Epoch milliseconds. The lease: refreshed at boot and on every
+    /// checkpoint, and read by the sweep (`crate::store::sweep`).
+    pub last_used: u64,
 }
 
-impl Device {
-    pub async fn load_or_mint(platform: &dyn Platform, rng: &dyn Rng) -> Result<Device, Error> {
-        if let Some(bytes) = platform.get(KV_KEY.to_string()).await {
-            let device: Device = serde_json::from_slice(&bytes).map_err(|e| {
-                Error::new(
-                    ErrorCode::Failed,
-                    format!("the stored device record could not be read: {e}"),
-                )
-            })?;
-            if device.v != SCHEMA {
-                return Err(Error::new(
-                    ErrorCode::Failed,
-                    format!(
-                        "the stored device record is version {}; this runtime speaks {SCHEMA}",
-                        device.v
-                    ),
-                ));
-            }
-            return Ok(device);
-        }
-        let device = Device {
+impl IndexRow {
+    /// A fresh device: ephemeral, resting open, unnamed.
+    pub fn fresh(id: &str, now: u64) -> IndexRow {
+        IndexRow {
             v: SCHEMA,
-            id: mint_id(rng),
-            name: String::new(),
-            hue: (draw(rng) % 360) as u16,
-            word: word_at(draw(rng)),
-        };
-        platform.set(KV_KEY.to_string(), device.encode()?).await;
-        Ok(device)
+            id: id.to_string(),
+            petname: String::new(),
+            tier: Tier::Ephemeral,
+            rest: Rest::RestsOpen,
+            created: now,
+            last_used: now,
+        }
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<IndexRow, Error> {
+        let row: IndexRow = serde_json::from_slice(bytes).map_err(|e| {
+            Error::new(
+                ErrorCode::Failed,
+                format!("a device index row could not be read: {e}"),
+            )
+        })?;
+        if row.v != SCHEMA {
+            return Err(Error::new(
+                ErrorCode::Failed,
+                format!(
+                    "a device index row is version {}; this runtime speaks {SCHEMA}",
+                    row.v
+                ),
+            ));
+        }
+        Ok(row)
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         serde_json::to_vec(self).map_err(|e| {
             Error::new(
                 ErrorCode::Failed,
-                format!("the device record could not be written: {e}"),
+                format!("the device index row could not be written: {e}"),
             )
         })
     }
-
-    pub fn status(&self) -> DeviceStatus {
-        DeviceStatus {
-            id: self.id.clone(),
-            name: self.name.clone(),
-            hue: self.hue,
-            word: self.word.clone(),
-        }
-    }
 }
 
-/// A word other than the current one: rerolling to the same word would read
-/// as a broken button.
-pub fn reroll(device: &RefCell<Device>, rng: &dyn Rng) -> String {
-    let current = device.borrow().word.clone();
-    loop {
-        let word = word_at(draw(rng));
-        if word != current {
-            return word;
+/// The personal half: name, hue, anchor word. Never in `kv` — it rides in the
+/// encrypted checkpoint (docs/design.md "Devices": the index carries "never
+/// the name, hue, word or any key").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    pub name: String,
+    pub hue: u16,
+    pub word: String,
+}
+
+impl Device {
+    /// A fresh device's anchor.
+    ///
+    /// Drawn from the RNG, not derived from the id: the id is public (it
+    /// names the SharedWorker and sits in every index row), and internal.wit
+    /// `device` says nothing personal is readable before unseal. A hue and a
+    /// word that are a pure function of the id would be readable by anyone
+    /// who knows the id, which is exactly the visor's anti-impostor signal
+    /// given away. Because it is drawn rather than derived, the anchor has to
+    /// be checkpointed at once — see `Kernel::boot`'s mint path.
+    pub fn mint(rng: &dyn crate::Rng) -> Device {
+        Device {
+            name: String::new(),
+            hue: (draw(rng) % 360) as u16,
+            word: word_at(draw(rng)),
+        }
+    }
+
+    /// A word other than the current one: rerolling to the same word would
+    /// read as a broken button.
+    pub fn reroll(&self, rng: &dyn crate::Rng) -> String {
+        loop {
+            let word = word_at(draw(rng));
+            if word != self.word {
+                return word;
+            }
         }
     }
 }
@@ -104,14 +163,8 @@ fn word_at(draw: u32) -> String {
     WORD_LIST[draw as usize % WORD_LIST.len()].to_string()
 }
 
-fn draw(rng: &dyn Rng) -> u32 {
+fn draw(rng: &dyn crate::Rng) -> u32 {
     let mut bytes = [0u8; 4];
     rng.fill(&mut bytes);
     u32::from_le_bytes(bytes)
-}
-
-fn mint_id(rng: &dyn Rng) -> String {
-    let mut bytes = [0u8; 16];
-    rng.fill(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

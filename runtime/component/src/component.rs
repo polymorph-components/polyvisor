@@ -1,7 +1,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use polyvisor_kernel::{BootConfig, Fetch, Kernel, LocalFuture, Platform, Rng};
+use polyvisor_kernel::{
+    BootConfig, Clock, Fetch, Files, Kernel, LocalFuture, Locks, Platform, Rng, Seams,
+};
 
 // No `async:` option on purpose. With it, wit-bindgen applies one blanket
 // mode to every function; `async: true` then lowers WIT-sync functions (the
@@ -21,8 +23,10 @@ wit_bindgen::generate!({
 });
 
 use exports::polyvisor::internal as guest;
-use polyvisor::internal::kv;
 use polyvisor::internal::types::{Error, ErrorCode};
+use polyvisor::internal::{kv, locks};
+use wasi::filesystem::preopens;
+use wasi::filesystem::types::{Descriptor, DescriptorFlags, OpenFlags, PathFlags};
 
 thread_local! {
     /// `Rc` so a call can take a handle and await without holding the cell
@@ -61,6 +65,34 @@ impl Platform for Kv {
     }
     fn set(&self, key: String, value: Vec<u8>) -> LocalFuture<'_, ()> {
         Box::pin(async move { kv::set(key, value).await })
+    }
+    fn delete(&self, key: String) -> LocalFuture<'_, ()> {
+        Box::pin(async move { kv::delete(key).await })
+    }
+    fn keys(&self, prefix: String) -> LocalFuture<'_, Vec<String>> {
+        Box::pin(async move { kv::keys(prefix).await })
+    }
+}
+
+struct WebLocks;
+
+impl Locks for WebLocks {
+    fn is_held(&self, name: String) -> LocalFuture<'_, bool> {
+        Box::pin(async move { locks::is_held(name).await })
+    }
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        // Two `wasi:clocks` versions are in `wit/deps`, so the generated
+        // module carries the version in its name.
+        let now = wasi::clocks0_3_1::system_clock::now();
+        // Before the epoch is not a time this kernel has an opinion about;
+        // the lease arithmetic saturates anyway.
+        let seconds = now.seconds.max(0) as u64;
+        seconds * 1_000 + u64::from(now.nanoseconds) / 1_000_000
     }
 }
 
@@ -136,6 +168,145 @@ async fn http_get(url: &str) -> Result<Vec<u8>, String> {
     Ok(body.collect().await)
 }
 
+// -- the state root ------------------------------------------------------------
+
+// `wasi:filesystem@0.3` over the OPFS root the glue preopens at `/`.
+//
+// Nothing here lists a directory. `read-directory` is one of the four
+// stream-returning functions the 0.3 track left sync in WIT, and the OPFS
+// host answers it with a Promise, which traps a worker that runs without
+// JSPI (internal.wit `world runtime`). Every path below arrives named from
+// the kernel, which keeps its generation pointer in `kv` for exactly this
+// reason.
+//
+// The kernel's `Files` seam has no error channel either (see its docs): a
+// read that fails is `None`, a write that fails is a generation the pointer
+// never advances to, and a removal that fails is a path the next write
+// overwrites.
+
+thread_local! {
+    /// The preopened root, looked up once. `get-directories` mints a fresh
+    /// descriptor resource per call, so caching it is also what keeps the
+    /// handle table from growing with every checkpoint.
+    static ROOT: RefCell<Option<Rc<Descriptor>>> = const { RefCell::new(None) };
+}
+
+fn root() -> Option<Rc<Descriptor>> {
+    if let Some(root) = ROOT.with(|r| r.borrow().clone()) {
+        return Some(root);
+    }
+    // internal.wit `world runtime`: "the glue preopens the origin's OPFS at
+    // `/`". Only that name. Falling back to whatever came first would mean
+    // writing a device's state into some other host's directory on the
+    // strength of a guess; no preopen at `/` is a glue that has not held up
+    // its end, and the honest answer is that there is no state root.
+    let mut preopens = preopens::get_directories();
+    let index = preopens.iter().position(|(_, path)| path == "/")?;
+    let root = Rc::new(preopens.swap_remove(index).0);
+    ROOT.with(|r| *r.borrow_mut() = Some(root.clone()));
+    Some(root)
+}
+
+/// The kernel speaks absolute paths within the root; `open-at` and its
+/// siblings speak relative ones.
+fn relative(path: &str) -> String {
+    path.trim_start_matches('/').to_string()
+}
+
+struct StateRoot;
+
+impl Files for StateRoot {
+    fn read(&self, path: String) -> LocalFuture<'_, Option<Vec<u8>>> {
+        Box::pin(async move { read_file(&path).await })
+    }
+    fn write(&self, path: String, bytes: Vec<u8>) -> LocalFuture<'_, Result<(), ()>> {
+        Box::pin(async move { write_file(&path, bytes).await })
+    }
+    fn remove_file(&self, path: String) -> LocalFuture<'_, ()> {
+        Box::pin(async move {
+            if let Some(root) = root() {
+                let _ = root.unlink_file_at(relative(&path)).await;
+            }
+        })
+    }
+    fn remove_dir(&self, path: String) -> LocalFuture<'_, ()> {
+        Box::pin(async move {
+            if let Some(root) = root() {
+                let _ = root.remove_directory_at(relative(&path)).await;
+            }
+        })
+    }
+}
+
+async fn read_file(path: &str) -> Option<Vec<u8>> {
+    let root = root()?;
+    let file = root
+        .open_at(
+            PathFlags::empty(),
+            relative(path),
+            OpenFlags::empty(),
+            DescriptorFlags::READ,
+        )
+        .await
+        .ok()?;
+    let (stream, result) = file.read_via_stream(0);
+    let bytes = stream.collect().await;
+    // The future is the error channel: a stream that ends early ends the same
+    // way a complete one does, so a partial read is only visible here.
+    result.await.ok()?;
+    Some(bytes)
+}
+
+/// `Err(())` for anything that kept the whole buffer from reaching the file.
+/// The kernel turns that into a checkpoint that does not advance its pointer,
+/// so the distinction between "no root", "would not open" and "the stream
+/// closed early" buys nothing downstream.
+async fn write_file(path: &str, bytes: Vec<u8>) -> Result<(), ()> {
+    let root = root().ok_or(())?;
+    let path = relative(path);
+    // `open-at` will not create the parents, and a checkpoint writes into a
+    // generation directory that has never existed.
+    let mut prefix = String::new();
+    let mut components: Vec<&str> = path.split('/').collect();
+    components.pop();
+    for component in components {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        // `exist` is the normal answer on every write after the first, and a
+        // real failure here surfaces as the `open-at` below failing.
+        let _ = root.create_directory_at(prefix.clone()).await;
+    }
+
+    let file = root
+        .open_at(
+            PathFlags::empty(),
+            path,
+            OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            DescriptorFlags::WRITE,
+        )
+        .await
+        .map_err(|_| ())?;
+
+    // `write-via-stream` is a sync function returning the completion future:
+    // hand the host the readable end first, then fill it, then drop the
+    // writer so the host sees the end of the data, then await the result.
+    let (mut writer, reader) = wit_stream::new();
+    let done = file.write_via_stream(reader, 0);
+    let unwritten = writer.write_all(bytes).await;
+    drop(writer);
+    let completed = done.await.is_ok();
+    // A non-empty remainder means the host closed the stream early: the file
+    // now holds a prefix of what was asked for, which is precisely the torn
+    // write the pointer must not advance over.
+    if unwritten.is_empty() && completed {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 // -- exports -----------------------------------------------------------------
 
 struct Component;
@@ -145,10 +316,16 @@ impl guest::lifecycle::Guest for Component {
         let kernel = Kernel::boot(
             BootConfig {
                 home_origin: config.home_origin,
+                device: config.device,
             },
-            Box::new(Kv),
-            Box::new(Http),
-            Box::new(Random),
+            Seams {
+                platform: Box::new(Kv),
+                files: Box::new(StateRoot),
+                locks: Box::new(WebLocks),
+                clock: Box::new(SystemClock),
+                fetch: Box::new(Http),
+                rng: Box::new(Random),
+            },
         )
         .await
         .map_err(map_error)?;
@@ -157,11 +334,36 @@ impl guest::lifecycle::Guest for Component {
     }
 }
 
+fn tier(tier: polyvisor_kernel::Tier) -> guest::device::Tier {
+    match tier {
+        polyvisor_kernel::Tier::Ephemeral => guest::device::Tier::Ephemeral,
+        polyvisor_kernel::Tier::Durable => guest::device::Tier::Durable,
+    }
+}
+
+fn rest(rest: polyvisor_kernel::Rest) -> guest::device::Rest {
+    match rest {
+        polyvisor_kernel::Rest::RestsOpen => guest::device::Rest::RestsOpen,
+        polyvisor_kernel::Rest::Passphrase => guest::device::Rest::Passphrase,
+    }
+}
+
 impl guest::device::Guest for Component {
     async fn status() -> Result<guest::device::DeviceStatus, Error> {
-        let status = kernel()?.device_status();
+        let status = kernel()?.device_status().map_err(map_error)?;
         Ok(guest::device::DeviceStatus {
             id: status.id,
+            // `erased` never reaches here: it answers `unavailable` above.
+            state: match status.state {
+                polyvisor_kernel::State::Fresh => guest::device::State::Fresh,
+                polyvisor_kernel::State::Sealed => guest::device::State::Sealed,
+                polyvisor_kernel::State::Open | polyvisor_kernel::State::Erased => {
+                    guest::device::State::Open
+                }
+            },
+            tier: tier(status.tier),
+            rest: rest(status.rest),
+            petname: status.petname,
             name: status.name,
             hue: status.hue,
             word: status.word,
@@ -176,6 +378,32 @@ impl guest::device::Guest for Component {
     async fn reroll_word() -> Result<String, Error> {
         kernel()?.reroll_word().await.map_err(map_error)
     }
+    async fn keep(petname: String, passphrase: Option<String>) -> Result<(), Error> {
+        kernel()?.keep(petname, passphrase).await.map_err(map_error)
+    }
+    async fn unseal(passphrase: String) -> Result<(), Error> {
+        kernel()?.unseal(passphrase).await.map_err(map_error)
+    }
+    async fn erase() -> Result<(), Error> {
+        kernel()?.erase().await.map_err(map_error)
+    }
+}
+
+impl guest::store::Guest for Component {
+    async fn devices() -> Result<Vec<guest::store::Entry>, Error> {
+        let rows = kernel()?.devices().await.map_err(map_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| guest::store::Entry {
+                id: row.id,
+                petname: row.petname,
+                tier: tier(row.tier),
+                rest: rest(row.rest),
+                created: row.created,
+                last_used: row.last_used,
+            })
+            .collect())
+    }
 }
 
 fn app_info(info: polyvisor_kernel::AppInfo) -> guest::apps::AppInfo {
@@ -187,7 +415,12 @@ fn app_info(info: polyvisor_kernel::AppInfo) -> guest::apps::AppInfo {
 
 impl guest::apps::Guest for Component {
     async fn installed() -> Result<Vec<guest::apps::AppInfo>, Error> {
-        Ok(kernel()?.installed().into_iter().map(app_info).collect())
+        Ok(kernel()?
+            .installed()
+            .map_err(map_error)?
+            .into_iter()
+            .map(app_info)
+            .collect())
     }
     async fn launch(app: String) -> Result<u32, Error> {
         kernel()?.launch(&app).map_err(map_error)
@@ -232,19 +465,22 @@ impl guest::apps::Guest for Component {
     }
 }
 
-impl guest::events::Guest for Component {
-    async fn next() -> guest::events::Event {
-        // `next` has no error channel, and its contract is to park while
-        // there is nothing. Before boot there can never be anything, so
-        // parking forever is the honest answer; the glue boots first.
+impl guest::event_source::Guest for Component {
+    async fn drain() -> Vec<guest::event_source::Event> {
+        // Before boot there is nothing to drain, and `drain` has no error
+        // channel: an empty list is the honest answer.
         let Ok(kernel) = kernel() else {
-            return std::future::pending().await;
+            return Vec::new();
         };
-        match kernel.next_event().await {
-            polyvisor_kernel::Event::SessionEnded(session, why) => {
-                guest::events::Event::SessionEnded((session, why))
-            }
-        }
+        kernel
+            .drain_events()
+            .into_iter()
+            .map(|event| match event {
+                polyvisor_kernel::Event::SessionEnded(session, why) => {
+                    guest::event_source::Event::SessionEnded((session, why))
+                }
+            })
+            .collect()
     }
 }
 
@@ -279,21 +515,25 @@ impl guest::app_services::Guest for Component {
         kernel()
             .map_err(|_| unavailable_service())?
             .tasks_add(session, title)
+            .await
     }
     async fn tasks_set_completed(session: u32, id: String, completed: bool) -> Result<(), String> {
         kernel()
             .map_err(|_| unavailable_service())?
             .tasks_set_completed(session, &id, completed)
+            .await
     }
     async fn tasks_set_title(session: u32, id: String, title: String) -> Result<(), String> {
         kernel()
             .map_err(|_| unavailable_service())?
             .tasks_set_title(session, &id, title)
+            .await
     }
     async fn tasks_remove(session: u32, id: String) -> Result<(), String> {
         kernel()
             .map_err(|_| unavailable_service())?
             .tasks_remove(session, &id)
+            .await
     }
 }
 

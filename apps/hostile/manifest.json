@@ -1,0 +1,7 @@
+{
+  "id": "hostile",
+  "title": "Hostile fixture",
+  "component": "app.component.wasm",
+  "plan": "app.component.plan.json",
+  "assets": []
+}

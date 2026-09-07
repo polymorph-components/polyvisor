@@ -1,12 +1,15 @@
-//! The kernel's outbound event queue. `next` parks while the queue is empty;
-//! one waker suffices because the runtime has exactly one consumer (the
-//! worker glue long-polls `events.next`) on one thread.
+//! The kernel's outbound event queue.
+//!
+//! Non-parking by contract (internal.wit `event-source`): the worker glue
+//! drains after every export call it dispatches, and until the engine lands
+//! every event is born inside an export activation the glue made, so draining
+//! there misses nothing. The first design was a parking `next` — polyengine
+//! traps an async export parked on a guest-internal waker with no host call
+//! outstanding as a deadlock (polyengine#292), so there is no waker here at
+//! all, only a queue.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
 
 /// `polyvisor:internal/events.event`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,36 +19,15 @@ pub enum Event {
 }
 
 #[derive(Default)]
-pub struct Events {
-    queue: RefCell<VecDeque<Event>>,
-    waiter: RefCell<Option<Waker>>,
-}
+pub struct Events(RefCell<VecDeque<Event>>);
 
 impl Events {
     pub fn push(&self, event: Event) {
-        self.queue.borrow_mut().push_back(event);
-        if let Some(waker) = self.waiter.borrow_mut().take() {
-            waker.wake();
-        }
+        self.0.borrow_mut().push_back(event);
     }
 
-    pub fn next(&self) -> Next<'_> {
-        Next { events: self }
-    }
-}
-
-pub struct Next<'a> {
-    events: &'a Events,
-}
-
-impl Future for Next<'_> {
-    type Output = Event;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Event> {
-        if let Some(event) = self.events.queue.borrow_mut().pop_front() {
-            return Poll::Ready(event);
-        }
-        *self.events.waiter.borrow_mut() = Some(cx.waker().clone());
-        Poll::Pending
+    /// Everything queued, in order, leaving the queue empty.
+    pub fn drain(&self) -> Vec<Event> {
+        self.0.borrow_mut().drain(..).collect()
     }
 }

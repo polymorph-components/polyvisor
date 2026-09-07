@@ -1,0 +1,19 @@
+[package]
+name = "polyvisor-hostile"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# No `hooks`: this fixture has no state. It renders once and is refused.
+dioxus.workspace = true
+stream-dom-dioxus.workspace = true
+# Named directly (not just through stream-dom-dioxus) because this crate does
+# its own `generate!` and has to `with:`-remap the stream-dom interfaces onto
+# the guest crate's generated modules.
+stream-dom-guest.workspace = true
+wit-bindgen.workspace = true

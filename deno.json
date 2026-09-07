@@ -27,6 +27,7 @@
     "check": "deno check web/ e2e/",
     "test": "deno test -A --permit-no-files web/",
     "build": "deno run -A web/build.ts",
+    "build:fixtures": "deno run -A web/build.ts --fixtures",
     "e2e": "deno run -A e2e/run.ts"
   },
   "compilerOptions": {

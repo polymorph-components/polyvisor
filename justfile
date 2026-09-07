@@ -20,7 +20,12 @@ build-wasm:
 site:
     deno task build
 
-e2e: build-wasm site
+# web/dist plus the test fixtures the e2e scenarios need (apps/hostile). NOT
+# what a home origin serves: the production Pages build runs `site`.
+site-fixtures:
+    deno task build:fixtures
+
+e2e: build-wasm site-fixtures
     deno task e2e
 
 # Everything CI runs, in order (docs/design.md "Delivery": cargo test,
