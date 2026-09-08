@@ -637,6 +637,163 @@ interface InstallRequest {
   fragment: string;
   title: string;
   hue: number;
+  /** The user's *saved* glyph for this app (`device.meta`,
+   * `meta-scope.app`), or "" for none. */
+  glyph: string;
+}
+
+/** Both must match web/icon-sw.ts, the cache's only reader. Versioned in
+ * the name: a change to what is stored gets a new cache, not a migration. */
+const ICON_CACHE = "polyvisor-launcher-icons-v1";
+const ICON_DIR = "launcher-icons/";
+
+/** The framework's own icons: real files, the fallback whenever the painted
+ * path does not come off, so art never blocks an install. */
+function staticIcons(
+  base: URL,
+): { src: string; sizes: string; type: string }[] {
+  return [
+    {
+      src: new URL("icon-512.png", base).href,
+      sizes: "512x512",
+      type: "image/png",
+    },
+    {
+      src: new URL("icon-192.png", base).href,
+      sizes: "192x192",
+      type: "image/png",
+    },
+  ];
+}
+
+/** Poll `ready` to a deadline. Nothing below has a single event meaning
+ * "and now it would actually answer a fetch". */
+async function waitFor(ready: () => boolean, ms: number): Promise<boolean> {
+  const deadline = performance.now() + ms;
+  while (performance.now() < deadline) {
+    if (ready()) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return ready();
+}
+
+/**
+ * Register the launcher-icon worker; `true` once it would answer a fetch
+ * from this page. Lazy — called from `installApp` and nowhere else.
+ *
+ * `activated` and a controller that is OURS, not merely non-null: a worker
+ * only intercepts fetches from clients it controls, and `controller` may be
+ * some other worker entirely.
+ */
+async function iconWorker(base: URL): Promise<boolean> {
+  if (!("serviceWorker" in navigator)) return false;
+  // Base scope, not `launcher-icons/` (see web/icon-sw.ts), and
+  // base-relative — never `/icon-sw.js`, somebody else's page on a project
+  // Pages site.
+  const scope = base.href;
+  const script = new URL("icon-sw.js", base).href;
+  const found = await navigator.serviceWorker.getRegistration(scope);
+  // `getRegistration` also answers with a broader-scoped registration that
+  // merely contains this URL; only one at this exact scope is in the way.
+  const here = found?.scope === scope ? found : undefined;
+  if (here !== undefined) {
+    // Some other worker owns this scope. Registering would replace it, and
+    // it is not ours to replace: take the static icons instead.
+    const owner = here.active ?? here.waiting ?? here.installing;
+    if (owner !== null && owner.scriptURL !== script) return false;
+  }
+  const reg = here !== undefined && here.active?.scriptURL === script
+    ? here
+    : await navigator.serviceWorker.register(script, {
+      type: "module",
+      scope,
+    });
+  if (!await waitFor(() => reg.active?.state === "activated", 10_000)) {
+    return false;
+  }
+  return await waitFor(
+    () => navigator.serviceWorker.controller?.scriptURL === script,
+    10_000,
+  );
+}
+
+/** One icon: the glyph, white, centred on the hue. Same formula as the
+ * strip (visor/src/style.rs `--strip: oklch(0.62 0.14 var(--hue))`). A
+ * colour emoji font paints its own colours and ignores the white, which is
+ * right — the user picked that emoji, not a silhouette of it. */
+async function paintIcon(
+  glyph: string,
+  hue: number,
+  size: number,
+): Promise<ArrayBuffer> {
+  // The PNG is digested and stored immediately, with no repaint later, so a
+  // font that has not loaded would be tofu for good.
+  if (document.fonts !== undefined) await document.fonts.ready;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (ctx === null) throw new Error("no 2d canvas context");
+  ctx.fillStyle = `oklch(0.62 0.14 ${hue})`;
+  ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = "#ffffff";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = `${Math.round(size * 0.62)}px system-ui, sans-serif`;
+  // The first `char` only, as the strip draws it (visor/src/ui.rs
+  // `glyph_of`).
+  ctx.fillText([...glyph][0] ?? "", size / 2, size / 2);
+  const blob = await new Promise<Blob | null>((resolve) =>
+    canvas.toBlob(resolve, "image/png")
+  );
+  if (blob === null) throw new Error("canvas produced no PNG");
+  return await blob.arrayBuffer();
+}
+
+/** Hex SHA-256 of `bytes`, from WebCrypto. It names an icon by its content:
+ * the same image reuses one entry, a different one gets a different URL
+ * instead of overwriting art a browser may still be holding. Not a secret —
+ * the space of glyph-on-hue images is small enough to enumerate. */
+async function digest(bytes: ArrayBuffer): Promise<string> {
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Paint, store and name this install's icons, or `undefined` for "use the
+ * static ones" (docs/design.md "Routing" for what this probe does and does
+ * not show).
+ *
+ * Everything is in place before this returns — worker controlling, both
+ * PNGs cached — so the manifest never names an icon nothing answers.
+ */
+async function paintedIcons(
+  glyph: string,
+  hue: number,
+  base: URL,
+): Promise<{ src: string; sizes: string; type: string }[] | undefined> {
+  if (glyph === "") return undefined;
+  try {
+    if (!await iconWorker(base)) return undefined;
+    const cache = await caches.open(ICON_CACHE);
+    const icons: { src: string; sizes: string; type: string }[] = [];
+    for (const size of [512, 192]) {
+      const png = await paintIcon(glyph, hue, size);
+      const src = new URL(`${ICON_DIR}${await digest(png)}.png`, base).href;
+      await cache.put(
+        src,
+        new Response(png, { headers: { "content-type": "image/png" } }),
+      );
+      icons.push({ src, sizes: `${size}x${size}`, type: "image/png" });
+    }
+    return icons;
+  } catch {
+    // A refused canvas, a quota, a disallowed registration: static icons,
+    // not a failed install.
+    return undefined;
+  }
 }
 
 /** The blob URL our own `<link rel=manifest>` currently points at, so a
@@ -664,6 +821,12 @@ async function installApp(
   // `--strip: oklch(0.62 0.14 var(--hue))`).
   const themeColor = `oklch(0.62 0.14 ${request.hue})`;
 
+  // The saved glyph on the user's hue, served by the launcher-icon worker,
+  // or the framework's static icons when that does not come off. Both are
+  // real https: URLs under the page's base; a `blob:` icon is not.
+  const icons = await paintedIcons(request.glyph, request.hue, base) ??
+    staticIcons(base);
+
   const manifest = {
     name: `${request.title} — polyvisor`,
     short_name: request.title,
@@ -671,21 +834,7 @@ async function installApp(
     start_url: startUrl,
     scope,
     id,
-    // Static, on the home origin: Android's WebAPK server fetches icons by
-    // URL itself, so a blob: icon is unreachable to it and the install
-    // degrades to a shortcut. The glyph-on-hue icon is gone with that.
-    icons: [
-      {
-        src: new URL("icon-512.png", base).href,
-        sizes: "512x512",
-        type: "image/png",
-      },
-      {
-        src: new URL("icon-192.png", base).href,
-        sizes: "192x192",
-        type: "image/png",
-      },
-    ],
+    icons,
     theme_color: themeColor,
     background_color: "#ffffff",
   };
@@ -888,8 +1037,10 @@ async function main(): Promise<void> {
       }),
     // internal.wit `shell.install-app`: mints the manifest, points the
     // document at it, and calls whatever install prompt the browser
-    // deferred earlier. Errors (icon encoding, most plausibly) surface as
-    // the WIT's `result<_, error>` arm, same reasoning as `open-frame`.
+    // deferred earlier. The icon path swallows its own failures into a
+    // static-icon fallback, so what surfaces on the WIT's `result<_,
+    // error>` arm is a manifest that could not be put in place at all —
+    // same reasoning as `open-frame`.
     installApp: (request: InstallRequest) =>
       installApp(request).catch((err: unknown) => {
         throw new ComponentException({

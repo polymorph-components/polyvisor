@@ -189,10 +189,17 @@ await ensureDir(DIST);
 await bundle("boot.ts", "boot.js");
 await bundle("worker.ts", "worker.js");
 await bundle("frame.ts", "frame.js");
+// The launcher-icon service worker (web/icon-sw.ts). It lands beside
+// `index.html` rather than inside `launcher-icons/` because a worker's
+// default scope is its own directory and it needs the page's base: a
+// broader scope would need a `Service-Worker-Allowed` response header,
+// which a GitHub Pages deployment cannot set. It derives every path it uses
+// from `registration.scope`, so a project-site subpath needs nothing here.
+await bundle("icon-sw.ts", "icon-sw.js");
 await copy(join(ROOT, "web", "index.html"), join(DIST, "index.html"));
-// Launcher icons at real https: URLs: Android's WebAPK server fetches a
-// manifest's icons itself, so a blob: icon can never mint an installed app
-// (docs/design.md "Routing", the `launch/` bullet).
+// The framework's own launcher icons, at real https: URLs: the fallback
+// whenever an install has no saved glyph to paint or the icon worker does
+// not come up (docs/design.md "Routing", the `launch/` bullet).
 for (const icon of ["icon-512.png", "icon-192.png"]) {
   await copy(join(ROOT, "web", icon), join(DIST, icon), { overwrite: true });
 }

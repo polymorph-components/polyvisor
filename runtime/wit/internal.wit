@@ -525,14 +525,26 @@ interface shell {
     /// web app manifest the glue cannot know. `title` is app voice, shown
     /// by the OS launcher unplated, so the glue composes the manifest name
     /// from it and the framework's own; `hue` is the user's, for the
-    /// window's theme colour. The icon is the framework's own static one:
-    /// Android's WebAPK server fetches icons by URL, so nothing painted on
-    /// the client can be a launcher icon (docs/design.md "Routing").
+    /// window's theme colour and for the icon's ground.
+    ///
+    /// `glyph` is the *saved* app glyph (`device.meta`, `meta-scope.app`,
+    /// the visor's `glyph` key) — never an unsaved draft: an install writes
+    /// into the OS's app registry, so what it paints has to be something
+    /// the user committed to. Empty means the user set none, and the glue
+    /// falls back to the framework's own static icons.
+    ///
+    /// A worker-served icon reaches an Android launcher only if the install
+    /// uses image bytes the browser itself fetched: a remote WebAPK-minting
+    /// server cannot reach a service worker, whose responses exist only
+    /// inside this browser. Which of the two the Android path does is the
+    /// open question (docs/design.md "Routing").
     record install-request {
         /// From `apps.install-fragment`: what the installed window opens at.
         fragment: string,
         title: string,
         hue: u16,
+        /// The saved app glyph, or "" for none.
+        glyph: string,
     }
 
     /// How an install request ended on the page.
@@ -550,6 +562,14 @@ interface shell {
     /// against the page's own base, so a `blob:` manifest resolves nothing
     /// relative to itself — points the document's manifest link at it, and
     /// calls the install prompt the browser offered earlier, if any.
+    ///
+    /// With a non-empty `glyph` the glue first paints the glyph on the
+    /// user's hue at 512 and 192, stores the PNGs in a dedicated Cache
+    /// Storage cache under opaque content-digest URLs, and names those URLs
+    /// in the manifest; a service worker on the home origin is what answers
+    /// them. Any failure along that path — no service worker, no canvas, no
+    /// activation in time — falls back to the framework's static icons, so
+    /// an install never fails for want of art.
     install-app: async func(request: install-request) -> result<install-outcome, error>;
 }
 
