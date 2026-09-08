@@ -257,16 +257,22 @@ const appsButton = (page: Page) => page.locator("#visor-app");
 /** The strip's right half: who this is, and this device's settings. */
 const settingsButton = (page: Page) => page.locator("#visor-self");
 
-/** Wait for the drawer to hold exactly one pane, done sliding.
+/** Wait for the drawer to hold exactly one pane, done sliding and not on its
+ * way out.
  *
  * A tenant switch renders two panes for the length of the slide — the one
  * arriving still wearing an `enter-` class — and a click into a moving
- * target lands wherever the animation had got to. */
+ * target lands wherever the animation had got to. A drawer in mid-close is
+ * one pane and no `enter` class, so "settled" has to exclude `closing` too
+ * (visor/src/ui.rs `drawer_class`) or this passes on a pane that is
+ * leaving. */
 async function paneSettled(page: Page): Promise<void> {
   await drawer(page).waitFor({ timeout: 10_000 });
   await page.waitForFunction(
     () => {
-      const panes = document.querySelectorAll("#visor-drawer .pane");
+      const d = document.querySelector("#visor-drawer");
+      if (d === null || d.className.includes("closing")) return false;
+      const panes = d.querySelectorAll(".pane");
       return panes.length === 1 &&
         !(panes[0] as HTMLElement).className.includes("enter");
     },
@@ -318,6 +324,19 @@ async function launchApp(
     await page.waitForSelector("#app-zone iframe[sandbox]", {
       timeout: 30_000,
     });
+    // The frame is not the end of the launch: the visor closes the drawer
+    // over it (visor/src/ui.rs `apply`, the `(Some(t), None)` arm), and that
+    // close outlives the frame's arrival — first as an open drawer whose
+    // `closing` render has not landed yet, then as a mounted `closing`
+    // drawer, which is `inert` and so hands every press to the scrim
+    // underneath. Returning inside that window makes the caller press a
+    // drawer that is on its way out. `Drawer::Closed` unmounts the element,
+    // so its absence is the visor's own statement that the launch is over.
+    await page.waitForFunction(
+      () => document.querySelector("#visor-drawer") === null,
+      undefined,
+      { timeout: 10_000 },
+    );
   }
 }
 
@@ -2984,7 +3003,10 @@ const scenarios: Scenario[] = [
       await openSettingsSheet(page);
       // A glyph, saved: with no glyph the circle has no text, and the
       // contrast sweep below only measures leaves with some — the circle
-      // must carry one to be in scope for it at all.
+      // must carry one to be in scope for it at all. Which is the point of
+      // saving it here: the circle is a medium-dark plate under light ink
+      // (visor/src/style.rs `#visor-circle`, `--strip-edge`), so the sweep
+      // has to answer for that pairing at every hue like any other text.
       await drawer(page).locator("label").filter({ hasText: /^your glyph$/ })
         .locator("input").fill("A");
       await saveDraft(page);
@@ -3014,8 +3036,9 @@ const scenarios: Scenario[] = [
         },
         "the circle's fixed geometry drifted",
       );
-      // Self is selected right now (the settings sheet is open): dark inset
-      // outline, no light fill — unlike the app half's own pressed dress.
+      // Self is selected right now (the settings sheet is open): a marker
+      // along its bottom edge and no fill — unlike the app half's own
+      // pressed dress, and out of the way of the circle beside it.
       const selfPressed = await page.locator("#visor-self").evaluate((el) => {
         const s = getComputedStyle(el);
         return { bg: s.backgroundColor, shadow: s.boxShadow };
@@ -3025,12 +3048,16 @@ const scenarios: Scenario[] = [
           selfPressed.bg === "transparent",
         `self selected must have no fill, got ${selfPressed.bg}`,
       );
+      // The offsets, not merely "some shadow": an outline on all four sides
+      // is what this replaced, and it reads as a box around the identity.
       check(
         selfPressed.shadow.includes("inset") &&
-          selfPressed.shadow.includes("2px"),
-        `self selected must show a 2px inset outline, got ${selfPressed.shadow}`,
+          /(^|\s)0px -2px 0px(\s|$)/.test(
+            selfPressed.shadow.replace(" inset", ""),
+          ),
+        `self selected must be marked along its bottom edge only, got ${selfPressed.shadow}`,
       );
-      // The circle itself does not change with selection: same read
+      // The circle itself does not change with selection: same plate
       // whether settings is open or not.
       const circleSelected = await page.locator("#visor-circle").evaluate(
         (el) => getComputedStyle(el).backgroundColor,

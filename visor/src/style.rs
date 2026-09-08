@@ -97,10 +97,10 @@ pub(crate) const CSS: &str = r#"
   padding: 4px 8px; text-align: left;
 }
 #visor-root #visor-self { flex-direction: row-reverse; text-align: right; }
-/* The light fill is reserved for app selection; self uses an inset dark
-   border instead (below), since it sits beside the already-dark circle. */
+/* The light fill is reserved for app selection; self is marked underneath
+   instead, so the identity beside it is never dressed by the selection. */
 #visor-root #visor-app[aria-pressed="true"] { background: oklch(1 0 0 / 0.18); box-shadow: none; }
-#visor-root #visor-self[aria-pressed="true"] { background: none; box-shadow: inset 0 0 0 2px var(--strip-ink); }
+#visor-root #visor-self[aria-pressed="true"] { background: none; box-shadow: inset 0 -2px 0 var(--strip-edge); }
 #visor-divider { width: 1px; align-self: stretch; margin: 5px; background: var(--strip-edge); }
 #visor-app-glyph, #visor-circle {
   flex: none;
@@ -108,12 +108,14 @@ pub(crate) const CSS: &str = r#"
 }
 /* The app's mark is the glyph itself, unboxed and large. */
 #visor-app-glyph { width: 40px; height: 40px; font-size: 28px; border-radius: 6px; }
-/* Text glyphs take `color`; emoji retain their own artwork regardless. Fixed
+/* Text glyphs take `color`; emoji retain their own artwork regardless. The
+   plate is a shade of the strip rather than its ink: enough to read the mark
+   against, not so dark that it becomes the loudest thing on the strip. Fixed
    regardless of press state — the circle is who you are, not the selection. */
 #visor-circle {
   width: 32px; height: 32px; border-radius: 50%;
   font-size: 20px; line-height: 1; font-weight: 600;
-  background: var(--strip-ink); color: var(--accent-ink);
+  background: var(--strip-edge); color: var(--accent-ink);
 }
 #visor-root .stack { flex: 1; min-width: 0; }
 #visor-root .stack .top, #visor-root .stack .bottom { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -186,10 +188,13 @@ pub(crate) const CSS: &str = r#"
 @keyframes visor-leave-left { to { transform: translateX(-100%); } }
 @keyframes visor-leave-right { to { transform: translateX(100%); } }
 
-/* Movement is decoration; the states it moves between are not. Zeroing the
-   duration keeps every `animationend` the visor unmounts on firing. */
+/* Movement is decoration; the states it moves between are not. 1ms, not 0s:
+   a zero-duration animation can finish without ever dispatching the
+   `animationend` the visor unmounts on (observed 9 runs in 10 on a throttled
+   CPU, leaving the drawer stuck mid-switch), and 1ms is imperceptible while
+   still being an animation the browser reports the end of. */
 @media (prefers-reduced-motion: reduce) {
-  #visor-root * { animation-duration: 0s !important; }
+  #visor-root * { animation-duration: 1ms !important; }
 }
 
 /* Unsaved changes, resting on the strip: the only thing in this tree that
