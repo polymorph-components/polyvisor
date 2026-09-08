@@ -8,10 +8,10 @@
 //! rendered by this one component so there is exactly one tree, and no
 //! ordering question about which of them the receiver mounts first.
 //!
-//! The drawer *overlays* the app zone rather than pushing anything: the
-//! strip is the line between trusted pixels and the app, so it never moves,
-//! in any drawer state (docs/design.md M1: "strip geometry immobile with
-//! the app mounted").
+//! The strip is the line between trusted pixels and the app zone, so
+//! whatever the visor opens goes on the visor's side of that line — above
+//! the strip — and pushes the strip, and the app zone under it, down
+//! rather than covering it.
 //!
 //! The visor holds no state of its own beyond what is on screen right now
 //! (docs/design.md "Visor and apps render through stream-dom"): identity,
@@ -987,15 +987,50 @@ pub(crate) fn Visor() -> Element {
     };
 
     rsx! {
-        // One positioned root, so the drawer can overlay the app zone
-        // instead of pushing it: the strip is the line between trusted
-        // pixels and the app, and a line that moves when the visor opens
-        // something is not a line (docs/design.md M1, "strip geometry
-        // immobile with the app mounted").
+        // One positioned root. The drawer is rendered before the strip so
+        // it sits in normal flow above it: the strip is the line between
+        // trusted pixels and the app zone, so whatever the visor opens goes
+        // on the visor's side of that line — above the strip — and pushes
+        // the strip, and the app zone under it, down rather than covering
+        // it.
         div { id: "visor-root", class: "{root_class}", style: painted,
             // The trusted pixels depend on nothing the page provides, so
             // the visor ships its own stylesheet as part of its own tree.
             style { "{CSS}" }
+
+            if let Some(t) = tenant {
+                // Only when there is something behind the drawer to
+                // dismiss back to. With nothing running the drawer is
+                // where the visor rests, and a scrim over an empty app
+                // zone would be a dismissal to nowhere.
+                if running {
+                    div { id: "visor-scrim", onclick: move |_| request.call(Action::Close) }
+                }
+                div {
+                    id: "visor-drawer",
+                    class: "{drawer_class}",
+                    onanimationend: move |_| {
+                        // `closing` is the whole discriminator: the bridge
+                        // reports no animation name, and the close path
+                        // drops any pane still sliding, so the drawer's own
+                        // animation is the only one that can be ending
+                        // under it while this is true.
+                        if closing() {
+                            closing.set(false);
+                            drawer.set(Drawer::Closed);
+                        }
+                    },
+                    if let Some((from, forward)) = leaving() {
+                        div {
+                            key: "{from:?}",
+                            class: if forward { "pane leave-to-left" } else { "pane leave-to-right" },
+                            onanimationend: move |_| leaving.set(None),
+                            {sheet_for(from, false)}
+                        }
+                    }
+                    div { key: "{t:?}", class: "{entering}", {sheet_for(t, true)} }
+                }
+            }
 
             div { id: "visor-strip",
                 // Left half: what is running. Both halves need a kernel
@@ -1056,40 +1091,6 @@ pub(crate) fn Visor() -> Element {
                 // The anchor word is a recognition secret between the user
                 // and this device: spoken only in the settings sheet, on
                 // request, never left standing in the strip.
-            }
-
-            if let Some(t) = tenant {
-                // Only when there is something behind the drawer to
-                // dismiss back to. With nothing running the drawer is
-                // where the visor rests, and a scrim over an empty app
-                // zone would be a dismissal to nowhere.
-                if running {
-                    div { id: "visor-scrim", onclick: move |_| request.call(Action::Close) }
-                }
-                div {
-                    id: "visor-drawer",
-                    class: "{drawer_class}",
-                    onanimationend: move |_| {
-                        // `closing` is the whole discriminator: the bridge
-                        // reports no animation name, and the close path
-                        // drops any pane still sliding, so the drawer's own
-                        // animation is the only one that can be ending
-                        // under it while this is true.
-                        if closing() {
-                            closing.set(false);
-                            drawer.set(Drawer::Closed);
-                        }
-                    },
-                    if let Some((from, forward)) = leaving() {
-                        div {
-                            key: "{from:?}",
-                            class: if forward { "pane leave-to-left" } else { "pane leave-to-right" },
-                            onanimationend: move |_| leaving.set(None),
-                            {sheet_for(from, false)}
-                        }
-                    }
-                    div { key: "{t:?}", class: "{entering}", {sheet_for(t, true)} }
-                }
             }
 
             // Unsaved changes, over the drawer that holds them. The three
