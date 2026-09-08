@@ -1070,6 +1070,26 @@ impl Kernel {
     /// another user, another key or a flipped bit is the same (`crate::route`).
     pub async fn route_decode(&self, fragment: String) -> Result<(AppInfo, String), Error> {
         self.open()?;
+        // The second kind first (`crate::route` module docs): plaintext,
+        // keyless, resolved by a registry lookup rather than the sealed
+        // path below.
+        if let Some(app) = route::launch_app(&fragment) {
+            let info = self.registry.info(app).ok_or_else(|| {
+                Error::new(
+                    ErrorCode::UnknownApp,
+                    "that link names an app that is not installed",
+                )
+            })?;
+            let engine = self.engine()?;
+            // Minted here so a later `route-encode` for this session's
+            // window agrees with this install id (same reason `route_encode`
+            // mints one).
+            let (_, wrote) = engine.visor_install(app).await.map_err(engine_failed)?;
+            if wrote {
+                self.checkpoint().await?;
+            }
+            return Ok((info, String::new()));
+        }
         let engine = self.engine()?;
         let (key, wrote) = engine.visor_route_key().await.map_err(engine_failed)?;
         if wrote {
@@ -1092,6 +1112,20 @@ impl Kernel {
             )
         })?;
         Ok((info, route))
+    }
+
+    /// The fragment an installed app's window opens at (internal.wit
+    /// `apps.install-fragment`): `launch/<app>`, plaintext and keyless
+    /// (`crate::route` module docs on the second kind).
+    pub fn install_fragment(&self, app: &str) -> Result<String, Error> {
+        self.open()?;
+        if self.registry.info(app).is_none() {
+            return Err(Error::new(
+                ErrorCode::UnknownApp,
+                format!("no app named {app} is installed"),
+            ));
+        }
+        Ok(route::launch_fragment(app))
     }
 
     // -- app services --------------------------------------------------------

@@ -351,6 +351,38 @@ pub(crate) async fn route_decode(fragment: &str) -> Result<(App, String), String
         })
 }
 
+/// The fragment an installed app's window opens at (internal.wit
+/// `apps.install-fragment`): `launch/<app-id>`, plaintext and keyless
+/// (docs/design.md "Routing", the `launch/` bullet — it must outlive
+/// route-key convergence, and names a package the launcher already shows).
+pub(crate) async fn install_fragment(app: &str) -> Result<String, String> {
+    api::apps::install_fragment(app.to_string())
+        .await
+        .map_err(message)
+}
+
+/// How an install request ended on the page (internal.wit
+/// `shell.install-outcome`). Re-exported rather than wrapped in a crate
+/// enum: the two variants are already the whole shape the UI needs to
+/// branch on.
+pub(crate) type InstallOutcome = api::shell::InstallOutcome;
+
+/// Install `app` as its own installed web app (internal.wit
+/// `shell.install-app`).
+pub(crate) async fn install_app(
+    fragment: String,
+    title: String,
+    hue: u16,
+) -> Result<InstallOutcome, String> {
+    api::shell::install_app(api::shell::InstallRequest {
+        fragment,
+        title,
+        hue,
+    })
+    .await
+    .map_err(message)
+}
+
 pub(crate) async fn close_frame(session: SessionId) -> Result<(), String> {
     api::shell::close_frame(session).await.map_err(message)
 }

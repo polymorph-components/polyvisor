@@ -716,6 +716,9 @@ impl guest::apps::Guest for Component {
             route,
         })
     }
+    async fn install_fragment(app: String) -> Result<String, Error> {
+        kernel()?.install_fragment(&app).map_err(map_error)
+    }
     async fn close(session: u32) -> Result<(), Error> {
         kernel()?.close(session);
         Ok(())

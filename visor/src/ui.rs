@@ -30,7 +30,8 @@ use dioxus::html::Key;
 use dioxus::prelude::*;
 
 use crate::kernel::{
-    self, App, Binding, Entry, Event, Member, Meta, MetaScope, Peer, SessionId, Status,
+    self, App, Binding, Entry, Event, InstallOutcome, Member, Meta, MetaScope, Peer, SessionId,
+    Status,
 };
 use crate::state::{
     Action, Drawer, Gate, Phase, Rest, Tenant, Tier, boot_drawer, claim_code, grouped,
@@ -879,6 +880,26 @@ pub(crate) fn Visor() -> Element {
         apply.call(Action::Close);
     };
 
+    // Install the running app as its own OS-level app: the visor's own act,
+    // since the fragment it opens at is the kernel's (`install-fragment`)
+    // and the name the launcher shows is composed by the glue from the
+    // app's title (docs/design.md "Routing", the `launch/` bullet).
+    let install_as_app = move |app: App, hue: u16| async move {
+        let outcome = match kernel::install_fragment(&app.id).await {
+            Ok(fragment) => {
+                kernel::install_app(fragment, app.title.expose().to_string(), hue).await
+            }
+            Err(e) => Err(e),
+        };
+        notice.set(Some(Notice::Plain(match outcome {
+            Ok(InstallOutcome::Prompted) => "the browser is asking whether to install it".into(),
+            Ok(InstallOutcome::Manual) => {
+                "install it from the browser's menu — the app's manifest is in place".into()
+            }
+            Err(e) => e,
+        })));
+    };
+
     // "Other devices": the index is cheap and the ages on it go stale, so
     // the press that shows the sheet is also the read.
     let show_devices = use_callback(move |()| {
@@ -1069,7 +1090,7 @@ pub(crate) fn Visor() -> Element {
     // the two this is: only the pane that is staying carries the ids, since
     // two elements with one id is a tree nobody can query.
     let sheet_for = move |t: Tenant, current: bool| -> Element {
-        let (self_id, tier, rest, petname, endpoint_id, word) = match status.read().as_ref() {
+        let (self_id, tier, rest, petname, endpoint_id, word, hue) = match status.read().as_ref() {
             Some(s) => (
                 s.id.clone(),
                 s.tier,
@@ -1077,6 +1098,7 @@ pub(crate) fn Visor() -> Element {
                 s.petname.clone(),
                 s.endpoint_id.clone(),
                 s.word.clone(),
+                s.hue,
             ),
             None => (
                 String::new(),
@@ -1085,6 +1107,7 @@ pub(crate) fn Visor() -> Element {
                 String::new(),
                 String::new(),
                 String::new(),
+                0,
             ),
         };
         let live = session.read().as_ref().map(|(id, app)| (*id, app.clone()));
@@ -1191,6 +1214,19 @@ pub(crate) fn Visor() -> Element {
                             button {
                                 onclick: move |_| async move { close_session(id).await },
                                 "Close app"
+                            }
+                            // Only offered for a live session: the fragment
+                            // is `install-fragment`'s, this app's `launch/`
+                            // route (docs/design.md "Routing").
+                            button {
+                                onclick: {
+                                    let live = live.clone();
+                                    move |_| {
+                                        let app = live.clone().unwrap().1;
+                                        async move { install_as_app(app, hue).await }
+                                    }
+                                },
+                                "Install as app"
                             }
                         }
                     }

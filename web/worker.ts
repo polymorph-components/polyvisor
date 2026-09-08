@@ -472,6 +472,13 @@ self.onconnect = (ev: MessageEvent) => {
         (await ready)[I.apps].routeEncode(s, route),
       routeDecode: async (fragment: string) =>
         (await ready)[I.apps].routeDecode(fragment),
+      // Control port only, same reasoning: `install-fragment` is asked by
+      // the visor's own AppInfo sheet to compose a manifest's `start_url`
+      // (internal.wit `apps.install-fragment`, `shell.install-app`) — a
+      // session port has no business minting the fragment a launcher would
+      // open it at.
+      installFragment: async (app: string) =>
+        (await ready)[I.apps].installFragment(app),
       sessionApp: async (s: number) => (await ready)[I.apps].sessionApp(s),
       component: async (s: number) => (await ready)[I.apps].component(s),
       assets: async (s: number) => (await ready)[I.apps].assets(s),

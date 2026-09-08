@@ -1482,6 +1482,128 @@ const scenarios: Scenario[] = [
   },
 
   {
+    // The other route kind (docs/design.md "Routing", the `launch/` bullet):
+    // plaintext, keyless, resolved by `route-decode` to this user's install
+    // of the package. Opening the fragment cold — no click, the visor
+    // decodes it itself at boot (visor/src/ui.rs) — is the whole point: a
+    // launcher replays `start_url` unattended.
+    name: "launch-fragment-opens-app",
+    async run(ctx, origin) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+      await keepDevice(page, "the workbench");
+
+      const tab = await ctx.newPage();
+      await tab.goto(origin + "/#launch/todomvc");
+      await visorReady(tab);
+      await tab.waitForSelector("#app-zone iframe[sandbox]", {
+        timeout: 30_000,
+      });
+      // Once the frame is up the bar switches to `app/` (docs/design.md:
+      // "Once the frame is up the bar switches to `app/` as for any
+      // launch"), same mechanism as any other open (`encodeFragment` in
+      // web/boot.ts).
+      await tab.waitForFunction(
+        () => /^#app\//.test(location.hash),
+        undefined,
+        { timeout: 10_000 },
+      );
+
+      // A bogus package: `unknown-app`, in a fresh tab so nothing from the
+      // first device's session lingers.
+      const bad = await ctx.newPage();
+      await bad.goto(origin + "/#launch/nope");
+      await visorReady(bad);
+      await bad.waitForTimeout(2_000);
+      check(
+        await bad.locator("#app-zone iframe").count() === 0,
+        "a bogus launch/ fragment must not open a frame",
+      );
+      const notice = bad.locator("#visor-notice");
+      await notice.getByText(/installed/i).waitFor({ timeout: 10_000 });
+    },
+  },
+
+  {
+    // Playwright cannot complete an OS install (there is no chrome around
+    // the page to click "Install"), so this asserts the one artifact the
+    // glue actually controls: the manifest `shell.install-app` mints
+    // (internal.wit `shell.install-app`, docs/design.md "Routing"). The
+    // button lives on the visor track (visor/src/ui.rs `AppInfo` sheet);
+    // if it has not landed yet this scenario fails at the click and that
+    // failure names exactly what is missing.
+    name: "install-app-manifest",
+    async run(ctx, origin) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+      await keepDevice(page, "the workbench");
+      await launchTodoMvc(page);
+
+      await appsButton(page).click();
+      await paneSettled(page);
+      await page.getByRole("button", { name: "Install as app" }).click();
+
+      await page.waitForFunction(
+        () => document.querySelector("link[rel=manifest]") !== null,
+        undefined,
+        { timeout: 10_000 },
+      );
+
+      const manifest = await page.evaluate(async () => {
+        const href =
+          document.querySelector<HTMLLinkElement>("link[rel=manifest]")!
+            .href;
+        const res = await fetch(href);
+        return await res.json();
+      });
+
+      const base = await page.evaluate(() => new URL(".", location.href).href);
+      const startUrl = await page.evaluate(
+        (b) => new URL("#launch/todomvc", b).href,
+        base,
+      );
+
+      eq(
+        manifest.start_url,
+        startUrl,
+        "manifest start_url must be launch/todomvc absolute against the page base",
+      );
+      eq(manifest.scope, base, "manifest scope must be the page base");
+      check(
+        typeof manifest.id === "string" &&
+          manifest.id.includes("launch/todomvc"),
+        "manifest id must be absolute and name launch/todomvc",
+      );
+      check(
+        typeof manifest.name === "string" && manifest.name.includes("TodoMVC"),
+        "manifest name must carry the app's title",
+      );
+      check(
+        Array.isArray(manifest.icons) && manifest.icons.length === 2 &&
+          manifest.icons.every((i: { src: string }) =>
+            i.src.startsWith(new URL(".", page.url()).href) &&
+            i.src.endsWith(".png")
+          ),
+        "manifest must carry two https: icons under the page's base",
+      );
+      // ...and the icons must actually be there: a WebAPK server fetches
+      // them by URL.
+      for (const icon of manifest.icons as { src: string }[]) {
+        const res = await page.request.get(icon.src);
+        check(res.ok(), `icon ${icon.src} is not served`);
+      }
+      // The Pages rule (docs/design.md "Routing"): nothing in the manifest
+      // may be root-absolute, which on a project Pages site names somebody
+      // else's page.
+      const flat = JSON.stringify(manifest);
+      check(
+        !/"\/[^/]/.test(flat),
+        "no manifest field may start with a root-absolute /",
+      );
+    },
+  },
+
+  {
     name: "frame-violation-ends-session",
     async run(ctx, origin) {
       const page = await open(ctx, origin);
