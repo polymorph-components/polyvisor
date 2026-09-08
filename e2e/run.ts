@@ -1260,6 +1260,22 @@ const scenarios: Scenario[] = [
       const background = await todoFrame(page).locator("section.todoapp")
         .evaluate((el) => getComputedStyle(el).backgroundColor);
       eq(background, "rgb(255, 255, 255)", "the stylesheet did not apply");
+
+      // The checkboxes are `data:` SVG background images in that stylesheet
+      // (todomvc-app.css `.toggle + label`), which `img-src` must admit. A
+      // computed `background-image` reads the same whether or not CSP let
+      // the image load, so load a `data:` image in the frame and see.
+      const dataImageLoads = await todoFrame(page).locator("body").evaluate(
+        () =>
+          new Promise<boolean>((resolve) => {
+            const img = new Image();
+            img.onload = () => resolve(true);
+            img.onerror = () => resolve(false);
+            img.src =
+              "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='1' height='1'/>";
+          }),
+      );
+      check(dataImageLoads, "the frame's CSP blocks data: images");
     },
   },
 
