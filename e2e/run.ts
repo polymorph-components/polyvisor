@@ -22,6 +22,17 @@ const BUILT = new URL("../web/dist", import.meta.url).pathname;
 // Static server
 // ---------------------------------------------------------------------------
 
+/** The extra path prefix the same site is ALSO reachable under, so a
+ * scenario can check that nothing the site emits is root-absolute.
+ *
+ * A GitHub Pages project site serves the whole deployment from
+ * `/<repo>/`, where `/` is somebody else's page (docs/design.md
+ * "Routing"). Mounting the identical tree twice — at `/` and here — costs
+ * two lines and lets one scenario open the subpath copy and assert that
+ * everything it resolves, the service worker scope included, stays under
+ * it. */
+const SUBPATH = "/pages-subpath/";
+
 function serve(dist: string): { origin: string; stop(): Promise<void> } {
   const server = Deno.serve({
     port: 0, // The kernel picks; parallel checkouts must not collide.
@@ -30,6 +41,8 @@ function serve(dist: string): { origin: string; stop(): Promise<void> } {
   }, async (req) => {
     const url = new URL(req.url);
     let path = decodeURIComponent(url.pathname);
+    // The second mount of the same tree; see SUBPATH.
+    if (path.startsWith(SUBPATH)) path = "/" + path.slice(SUBPATH.length);
     if (path.endsWith("/")) path += "index.html";
     // `normalize` collapses `..` before the join, so a request cannot climb
     // out of dist.
@@ -334,6 +347,135 @@ async function saveDraft(page: Page): Promise<void> {
     undefined,
     { timeout: 15_000 },
   );
+}
+
+/**
+ * The running app's own glyph (`device.meta`, `meta-scope.app`), typed and
+ * SAVED — which is the value an install is allowed to paint with.
+ *
+ * The app sheet carries no `Save` of its own: the draft it writes into is
+ * the same one the settings sheet saves, so the save here is the "unsaved
+ * changes" dialog that guards the transition away from a dirty sheet
+ * (visor/src/ui.rs `#visor-confirm`). Returns once the app sheet, reopened,
+ * shows the value read back off the kernel (`read_app_meta`) — so a caller
+ * that installs next is installing against a saved map, not a draft.
+ */
+async function setAppGlyph(page: Page, glyph: string): Promise<void> {
+  await openApps(page);
+  // `^glyph$`: the settings sheet's field is "your glyph", and this is the
+  // app sheet's.
+  const field = drawer(page).locator("label").filter({ hasText: /^glyph$/ })
+    .locator("input");
+  await field.waitFor({ timeout: 10_000 });
+  // Typed until it stays typed. Unlike the settings sheet, the app sheet
+  // seeds its draft from a kernel read that lands AFTER the pane is on
+  // screen (visor/src/ui.rs: the `AppInfo` arm spawns `read_app_meta` and
+  // calls `seed_draft` only when it comes back), so a glyph typed the
+  // instant the pane settles can be wiped by that seed arriving — leaving a
+  // clean draft, no "unsaved changes" dialog, and nothing saved. The seed
+  // happens once per transition, so this converges immediately.
+  const deadline = performance.now() + 15_000;
+  for (;;) {
+    await field.fill(glyph);
+    await page.waitForTimeout(300);
+    if (await field.inputValue() === glyph) break;
+    check(
+      performance.now() < deadline,
+      "the app sheet's glyph field would not hold a value",
+    );
+  }
+  await settingsButton(page).click();
+  const confirm = page.locator("#visor-confirm");
+  await confirm.waitFor({ timeout: 10_000 });
+  await confirm.getByRole("button", { name: "Save", exact: true }).click();
+  await confirm.waitFor({ state: "detached", timeout: 15_000 });
+  await paneSettled(page);
+  await openApps(page);
+  await page.waitForFunction(
+    (want) => {
+      const label = Array.from(
+        document.querySelectorAll("#visor-drawer label"),
+      ).find((l) => l.querySelector("span")?.textContent === "glyph");
+      const input = label?.querySelector("input") as
+        | HTMLInputElement
+        | undefined;
+      return input?.value === want;
+    },
+    glyph,
+    { timeout: 15_000 },
+  );
+}
+
+/** Press "Install as app" and read back the manifest.
+ *
+ * Waits for the link's href to CHANGE: a second install starts with the
+ * first one's link in the document, so "a link is present" would read the
+ * previous manifest back while this install is still painting. */
+async function installAndReadManifest(
+  page: Page,
+  // deno-lint-ignore no-explicit-any
+): Promise<any> {
+  await openApps(page);
+  const before = await page.evaluate(() =>
+    document.querySelector<HTMLLinkElement>("link[rel=manifest]")?.href ?? ""
+  );
+  await page.getByRole("button", { name: "Install as app" }).click();
+  await page.waitForFunction(
+    (was) => {
+      const link = document.querySelector<HTMLLinkElement>(
+        "link[rel=manifest]",
+      );
+      return link !== null && link.href !== was;
+    },
+    before,
+    { timeout: 30_000 },
+  );
+  return await page.evaluate(async () => {
+    const href =
+      document.querySelector<HTMLLinkElement>("link[rel=manifest]")!.href;
+    return await (await fetch(href)).json();
+  });
+}
+
+/** Fetch an icon FROM THE PAGE (the only client the worker controls) and
+ * decode it: `ok` and a byte length would pass on an HTML error page
+ * wearing a `.png` URL. `ink` counts near-white pixels, `corner` the
+ * ground. */
+async function probeIcon(page: Page, src: string): Promise<{
+  status: number;
+  type: string | null;
+  width: number;
+  height: number;
+  ink: number;
+  corner: [number, number, number];
+}> {
+  return await page.evaluate(async (url) => {
+    const res = await fetch(url);
+    const type = res.headers.get("content-type");
+    const none = [0, 0, 0] as [number, number, number];
+    if (!res.ok) {
+      return { status: res.status, type, width: 0, height: 0, ink: 0, corner: none };
+    }
+    const bitmap = await createImageBitmap(await res.blob());
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext("2d")!;
+    ctx.drawImage(bitmap, 0, 0);
+    const { data } = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+    let ink = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i] > 235 && data[i + 1] > 235 && data[i + 2] > 235) ink++;
+    }
+    return {
+      status: res.status,
+      type,
+      width: bitmap.width,
+      height: bitmap.height,
+      ink,
+      corner: [data[0], data[1], data[2]] as [number, number, number],
+    };
+  }, src);
 }
 
 /** Settings → the device's user-voice petname. Typed into the draft, and
@@ -1245,13 +1387,10 @@ const scenarios: Scenario[] = [
   },
 
   {
-    // Playwright cannot complete an OS install (there is no chrome around
-    // the page to click "Install"), so this asserts the one artifact the
-    // glue actually controls: the manifest `shell.install-app` mints
-    // (internal.wit `shell.install-app`, docs/design.md "Routing"). The
-    // button lives on the visor track (visor/src/ui.rs `AppInfo` sheet);
-    // if it has not landed yet this scenario fails at the click and that
-    // failure names exactly what is missing.
+    // Playwright cannot complete an OS install, so this asserts what the
+    // glue does control: the manifest `shell.install-app` mints and the
+    // icons it paints, stores and serves (docs/design.md "Routing", which
+    // also records what a green run here does NOT say about Android).
     name: "install-app-manifest",
     async run(ctx, origin) {
       const page = await open(ctx, origin);
@@ -1259,25 +1398,31 @@ const scenarios: Scenario[] = [
       await keepDevice(page, "the workbench");
       await launchTodoMvc(page);
 
-      await appsButton(page).click();
-      await paneSettled(page);
-      await page.getByRole("button", { name: "Install as app" }).click();
-
-      await page.waitForFunction(
-        () => document.querySelector("link[rel=manifest]") !== null,
-        undefined,
-        { timeout: 10_000 },
-      );
-
-      const manifest = await page.evaluate(async () => {
-        const href =
-          document.querySelector<HTMLLinkElement>("link[rel=manifest]")!
-            .href;
-        const res = await fetch(href);
-        return await res.json();
-      });
-
       const base = await page.evaluate(() => new URL(".", location.href).href);
+
+      // Baseline: no saved glyph, so the static icons — real files, no
+      // service worker involved.
+      const plain = await installAndReadManifest(page);
+      check(
+        Array.isArray(plain.icons) && plain.icons.length === 2 &&
+          plain.icons.every((i: { src: string }) =>
+            i.src === base + "icon-512.png" || i.src === base + "icon-192.png"
+          ),
+        "an install with no saved glyph must fall back to the static icons",
+      );
+      for (const icon of plain.icons as { src: string }[]) {
+        // `page.request` never goes through a service worker: the network
+        // is what answers here.
+        const res = await page.request.get(icon.src);
+        check(res.ok(), `static icon ${icon.src} is not served`);
+      }
+
+      // "★" and not an emoji: a colour emoji font ignores the white fill
+      // the pixel checks below look for. Two typed, one drawn — the icon
+      // must agree with the strip's first-`char` rule.
+      await setAppGlyph(page, "★x");
+
+      const manifest = await installAndReadManifest(page);
       const startUrl = await page.evaluate(
         (b) => new URL("#launch/todomvc", b).href,
         base,
@@ -1298,28 +1443,178 @@ const scenarios: Scenario[] = [
         typeof manifest.name === "string" && manifest.name.includes("TodoMVC"),
         "manifest name must carry the app's title",
       );
+
+      // The worker's now: under the page's base and named by a digest.
+      const icons = manifest.icons as { src: string; sizes: string }[];
       check(
-        Array.isArray(manifest.icons) && manifest.icons.length === 2 &&
-          manifest.icons.every((i: { src: string }) =>
-            i.src.startsWith(new URL(".", page.url()).href) &&
-            i.src.endsWith(".png")
+        Array.isArray(icons) && icons.length === 2 &&
+          icons.every((i) =>
+            new RegExp(
+              "^" + base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+                "launcher-icons/[0-9a-f]{64}\\.png$",
+            ).test(i.src)
           ),
-        "manifest must carry two https: icons under the page's base",
+        `manifest icons must be base-relative digest URLs: ${
+          JSON.stringify(icons)
+        }`,
       );
-      // ...and the icons must actually be there: a WebAPK server fetches
-      // them by URL.
-      for (const icon of manifest.icons as { src: string }[]) {
-        const res = await page.request.get(icon.src);
-        check(res.ok(), `icon ${icon.src} is not served`);
-      }
-      // The Pages rule (docs/design.md "Routing"): nothing in the manifest
-      // may be root-absolute, which on a project Pages site names somebody
-      // else's page.
-      const flat = JSON.stringify(manifest);
+      eq(
+        icons.map((i) => i.sizes).sort(),
+        ["192x192", "512x512"],
+        "the manifest must name both launcher sizes",
+      );
       check(
-        !/"\/[^/]/.test(flat),
+        !icons.some((i) => i.src.includes("★")),
+        "the glyph must not appear literally in an icon URL",
+      );
+
+      const bySize = new Map(icons.map((i) => [i.sizes, i.src]));
+      const big = await probeIcon(page, bySize.get("512x512")!);
+      const small = await probeIcon(page, bySize.get("192x192")!);
+      eq(
+        [big.status, big.width, big.height],
+        [200, 512, 512],
+        "the 512 icon must be served and decode at 512x512",
+      );
+      eq(
+        [small.status, small.width, small.height],
+        [200, 192, 192],
+        "the 192 icon must be served and decode at 192x192",
+      );
+      eq(big.type, "image/png", "the launcher icon's content type");
+      // A glyph really is on it: white ink present, corner still the hue
+      // ground. An all-ground image (a glyph that never rendered) and an
+      // all-white one both fail here.
+      check(
+        big.ink > 0 && big.ink < 512 * 512,
+        `the 512 icon must carry white glyph ink on a coloured ground ` +
+          `(ink=${big.ink})`,
+      );
+      check(
+        !(big.corner[0] > 235 && big.corner[1] > 235 && big.corner[2] > 235),
+        `the icon's corner must be the hue ground, not ink: ${big.corner}`,
+      );
+
+      // NOT network-hosted: the same URL off the network is a 404, because
+      // no such file exists in the deployment. This is what says the icon
+      // came out of Cache Storage and not off disk.
+      for (const icon of icons) {
+        const res = await page.request.get(icon.src);
+        eq(
+          res.status(),
+          404,
+          `${icon.src} must not be served by the network — the worker is ` +
+            `the only thing that answers it`,
+        );
+      }
+
+      // A miss is a 404, never the app shell.
+      const missing = await probeIcon(
+        page,
+        base + "launcher-icons/" + "0".repeat(64) + ".png",
+      );
+      eq(missing.status, 404, "an unknown launcher icon must be a 404");
+
+      // Not an offline cache: an unrelated fetch from the controlled page
+      // still reaches the network.
+      const config = await page.evaluate(async () =>
+        await (await fetch("./config.json")).json()
+      );
+      check(
+        typeof config?.relay === "string",
+        "an unrelated fetch from the controlled page must reach the network",
+      );
+
+      // A different saved glyph is a different image at a different URL —
+      // also the check that the paint reads the saved map.
+      await setAppGlyph(page, "▲");
+      const second = await installAndReadManifest(page);
+      const secondIcons = second.icons as { src: string; sizes: string }[];
+      check(
+        secondIcons.every((i) => !icons.some((j) => j.src === i.src)),
+        "a different saved glyph must produce different icon URLs",
+      );
+      const repainted = await probeIcon(
+        page,
+        secondIcons.find((i) => i.sizes === "512x512")!.src,
+      );
+      eq(
+        [repainted.status, repainted.width],
+        [200, 512],
+        "the repainted 512 icon must be served and decode",
+      );
+      check(
+        repainted.ink !== big.ink,
+        "a different glyph must paint a different amount of ink",
+      );
+
+      // The cache outlives the page, and nothing here deletes.
+      await page.reload();
+      await visorReady(page);
+      await page.waitForFunction(
+        () => navigator.serviceWorker.controller !== null,
+        undefined,
+        { timeout: 15_000 },
+      );
+      const survived = await probeIcon(page, bySize.get("512x512")!);
+      eq(
+        [survived.status, survived.width],
+        [200, 512],
+        "a launcher icon must survive a page reload",
+      );
+
+      // The Pages rule: nothing root-absolute, which on a project site
+      // names somebody else's page.
+      check(
+        !/"\/[^/]/.test(JSON.stringify(manifest)),
         "no manifest field may start with a root-absolute /",
       );
+    },
+  },
+
+  {
+    // The same install on a deployment that is not at the origin root —
+    // every GitHub Pages project site. Exercises what a `/`-hardcode would
+    // break: scope, script URL and icon URLs all derived from the base.
+    name: "install-icons-under-a-subpath",
+    async run(ctx, origin) {
+      const page = await ctx.newPage();
+      page.on("pageerror", (e) => console.error("  page error:", e.message));
+      await page.goto(origin + SUBPATH);
+      await visorReady(page);
+      await keepDevice(page, "the workbench");
+      await launchTodoMvc(page);
+      await setAppGlyph(page, "★");
+
+      const manifest = await installAndReadManifest(page);
+      const base = origin + SUBPATH;
+      const icons = manifest.icons as { src: string; sizes: string }[];
+      check(
+        icons.length === 2 &&
+          icons.every((i) =>
+            i.src.startsWith(base + "launcher-icons/") && i.src.endsWith(".png")
+          ),
+        `icons must resolve under the deployment subpath: ${
+          JSON.stringify(icons)
+        }`,
+      );
+      // The worker took the subpath as its scope, not the origin root.
+      const scopes = await page.evaluate(async () =>
+        (await navigator.serviceWorker.getRegistrations()).map((r) => r.scope)
+      );
+      eq(scopes, [base], "the icon worker's scope must be the page's base");
+
+      const probe = await probeIcon(
+        page,
+        icons.find((i) => i.sizes === "512x512")!.src,
+      );
+      eq(
+        [probe.status, probe.width, probe.height],
+        [200, 512, 512],
+        "the subpath deployment's launcher icon must be served and decode",
+      );
+      check(probe.ink > 0, "the subpath icon must carry glyph ink");
+      await page.close();
     },
   },
 

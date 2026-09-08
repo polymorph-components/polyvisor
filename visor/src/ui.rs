@@ -791,10 +791,16 @@ pub(crate) fn Visor() -> Element {
     // since the fragment it opens at is the kernel's (`install-fragment`)
     // and the name the launcher shows is composed by the glue from the
     // app's title (docs/design.md "Routing", the `launch/` bullet).
-    let install_as_app = move |app: App, hue: u16| async move {
+    //
+    // `glyph` is read off `app_meta` — the map the kernel last confirmed —
+    // and never off `draft.app`, which is text the user is still typing.
+    // An install is written into the OS's app registry and replayed for
+    // months; seeding it from an unsaved field would mint a launcher icon
+    // the user could then Revert away from.
+    let install_as_app = move |app: App, hue: u16, glyph: String| async move {
         let outcome = match kernel::install_fragment(&app.id).await {
             Ok(fragment) => {
-                kernel::install_app(fragment, app.title.expose().to_string(), hue).await
+                kernel::install_app(fragment, app.title.expose().to_string(), hue, glyph).await
             }
             Err(e) => Err(e),
         };
@@ -1091,13 +1097,16 @@ pub(crate) fn Visor() -> Element {
                             }
                             // Only offered for a live session: the fragment
                             // is `install-fragment`'s, this app's `launch/`
-                            // route (docs/design.md "Routing").
+                            // route (docs/design.md "Routing"). The glyph
+                            // is the saved one, read here off `app_meta`
+                            // rather than out of the draft above.
                             button {
                                 onclick: {
                                     let live = live.clone();
                                     move |_| {
                                         let app = live.clone().unwrap().1;
-                                        async move { install_as_app(app, hue).await }
+                                        let glyph = glyph_of(&app_meta.read());
+                                        async move { install_as_app(app, hue, glyph).await }
                                     }
                                 },
                                 "Install as app"

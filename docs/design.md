@@ -509,16 +509,36 @@ interprets.
   which on a project Pages site is somebody else's page), so a `blob:`
   manifest resolves nothing relative to itself and the same package on
   the same origin is the same installed app on every device. The icon is
-  the framework's own, at a static URL: Android installs are WebAPKs,
-  minted by a server that fetches the manifest's icons itself, so an icon
-  painted on the client (the user's glyph on the user's hue was the
-  plan) can never reach the launcher; the composed name is what does.
-  Whether that server also re-fetches the *manifest* by URL — which would
-  rule out a `blob:` manifest too, and leave a service worker on the home
-  origin as the only way to serve one per install — is the open probe;
-  apps distributed off the home origin will need that answer, and a
-  global app identity, before `launch/` can name anything but a
-  registry id. Chromium only; iOS
+  the user's saved glyph for that package, painted white on the user's
+  hue at 512 and 192. The PNGs are not files the build ships: the page
+  paints them at install time and puts them in a dedicated versioned
+  Cache Storage cache (`polyvisor-launcher-icons-v1`) under
+  `launcher-icons/<sha-256-of-the-image>.png` URLs — real `https:` URLs
+  under the page's base, never `blob:` — and a service worker registered
+  lazily on that same press answers them. The digest names an icon by
+  its content, so a repaint gets a new URL instead of overwriting art
+  something may still hold; it is not a secret, since the space of
+  glyph-on-hue images is small enough to enumerate. The fetch handler
+  intercepts exactly those URLs and passes everything else through
+  untouched — not an offline cache — and a URL it has no image for is a
+  404, never the app shell. No saved glyph, or a worker that does not
+  come up in time, falls back to the framework's static icons; art never
+  blocks an install. The cached art is **unsealed** (plain PNG bytes
+  readable by anything with the browser profile, unlike everything the
+  kernel stores) and **evictable** (dropped under storage pressure, and
+  the URLs 404 until the next install repaints them). It carries one
+  glyph on one hue, and no app data, key material or identifier.
+  What this does NOT settle is Android. A remote WebAPK-minting server
+  cannot reach a service worker at all — its responses exist only inside
+  this browser — so a worker-served icon reaches the launcher only if
+  the install uses image bytes the browser itself fetched. Which of the
+  two the Android path does is the open question, and only a real device
+  install answers it: nothing observed in desktop Chromium is evidence
+  either way, and a previous install having succeeded says nothing about
+  why. The `blob:` manifest is untouched meanwhile — kept as the working
+  Android baseline rather than traded for a guess. Apps distributed off
+  the home origin will need that answer, and a global app identity,
+  before `launch/` can name anything but a registry id. Chromium only; iOS
   partitions storage per home-screen app, so a per-app install there
   would be a device of its own. Unverified and to be probed: that the
   fragment survives in `start_url` (a `?launch=` query is an acceptable

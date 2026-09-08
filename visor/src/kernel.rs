@@ -369,15 +369,22 @@ pub(crate) type InstallOutcome = api::shell::InstallOutcome;
 
 /// Install `app` as its own installed web app (internal.wit
 /// `shell.install-app`).
+///
+/// `glyph` is the app's SAVED glyph (`meta-scope.app`), never the sheet's
+/// unsaved draft: an install writes into the OS's app registry, so the mark
+/// it carries has to be one the user committed to. "" means none, and the
+/// glue falls back to the framework's static icons.
 pub(crate) async fn install_app(
     fragment: String,
     title: String,
     hue: u16,
+    glyph: String,
 ) -> Result<InstallOutcome, String> {
     api::shell::install_app(api::shell::InstallRequest {
         fragment,
         title,
         hue,
+        glyph,
     })
     .await
     .map_err(message)
