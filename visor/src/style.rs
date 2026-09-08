@@ -167,6 +167,29 @@ pub(crate) const CSS: &str = r#"
 button { font: inherit; color: var(--accent-ink); background: var(--accent); border: 1px solid var(--accent); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
 button[aria-pressed="true"] { border-color: var(--plate-ink); box-shadow: inset 0 0 0 1px var(--accent-ink); }
 button[disabled] { opacity: 0.5; cursor: default; }
+/* The colour slider is the hue wheel itself, unrolled: a gradient
+   interpolated in oklch around the long way so it visits every hue once at
+   the strip's lightness/chroma, and the thumb sits on the one chosen. It
+   names hues 0 and 360 — every hue, which is why it reveals none (see the
+   stylesheet test). */
+input[type="range"] {
+  appearance: none; -webkit-appearance: none;
+  flex: 1; min-width: 120px; max-width: 320px; height: 14px; margin: 0;
+  border-radius: 7px; border: 1px solid var(--edge);
+  background: linear-gradient(to right in oklch longer hue, oklch(0.62 0.14 0), oklch(0.62 0.14 360));
+  accent-color: var(--accent);
+}
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none; -webkit-appearance: none;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: var(--strip); border: 2px solid var(--plate);
+  box-shadow: 0 0 0 1px var(--strip-edge);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 18px; height: 18px; border-radius: 50%;
+  background: var(--strip); border: 2px solid var(--plate);
+  box-shadow: 0 0 0 1px var(--strip-edge);
+}
 input[type="text"], input[type="password"] { font: inherit; color: inherit; background: var(--field); border: 1px solid var(--edge); border-radius: 6px; padding: 6px 8px; }
 label { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
 
@@ -283,7 +306,13 @@ mod tests {
     #[test]
     fn no_colour_with_chroma_names_its_own_hue() {
         let mut chromatic = 0;
-        for tail in CSS.split("oklch(").skip(1) {
+        // The colour slider is exempt: its track is the whole wheel, every
+        // hue at once, so the numbers it names (0 and 360) say nothing
+        // about which one is this device's.
+        let start = CSS.find("input[type=\"range\"] {").unwrap();
+        let end = start + CSS[start..].find("input[type=\"text\"]").unwrap();
+        let scanned = format!("{}{}", &CSS[..start], &CSS[end..]);
+        for tail in scanned.split("oklch(").skip(1) {
             let args = &tail[..tail.find(')').expect("unclosed oklch()")];
             let parts: Vec<&str> = args.split_whitespace().collect();
             assert!(parts.len() >= 3, "oklch({args}) has too few components");
