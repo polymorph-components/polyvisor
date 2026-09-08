@@ -66,14 +66,14 @@ pub(crate) const CSS: &str = r#"
 #visor-app[aria-pressed="true"], #visor-self[aria-pressed="true"] { background: var(--drawer); }
 #visor-divider { width: 1px; align-self: stretch; margin: 5px; background: var(--edge); }
 #visor-app-glyph, #visor-circle {
-  width: 28px; height: 28px; flex: none;
+  flex: none;
   display: flex; align-items: center; justify-content: center;
-  /* The plate, not the drawer colour: a pressed half wears the drawer
-     colour, and a glyph the same colour as its half vanishes. */
-  background: var(--plate); color: var(--plate-ink);
 }
-#visor-app-glyph { border-radius: 6px; }
-#visor-circle { border-radius: 50%; }
+/* The app's mark is the glyph itself, unboxed and large. */
+#visor-app-glyph { width: 40px; height: 40px; font-size: 28px; border-radius: 6px; }
+/* The plate, not the drawer colour: a pressed half wears the drawer
+   colour, and a glyph the same colour as its half vanishes. */
+#visor-circle { width: 28px; height: 28px; border-radius: 50%; background: var(--plate); color: var(--plate-ink); }
 .stack { flex: 1; min-width: 0; }
 .stack .top, .stack .bottom { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .stack .bottom { font-size: 12px; }
@@ -92,6 +92,9 @@ pub(crate) const CSS: &str = r#"
   border-bottom: 1px solid var(--edge);
   animation: visor-drawer-open 180ms ease-out;
 }
+/* A handheld has no room to spare beside the drawer, so it takes more of
+   the height. */
+@media (max-width: 600px) { #visor-drawer { height: 80vh; } }
 #visor-drawer.closing { animation: visor-drawer-close 180ms ease-in forwards; }
 
 /* One pane per tenant, stacked so two can be on screen at once while one
