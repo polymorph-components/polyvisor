@@ -101,18 +101,19 @@ pub(crate) const CSS: &str = r#"
 #visor-divider { width: 1px; align-self: stretch; margin: 5px; background: var(--strip-edge); }
 #visor-app-glyph, #visor-circle {
   flex: none;
-  display: flex; align-items: center; justify-content: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--strip-edge);
+  color: var(--accent-ink);
+  font-size: 28px; line-height: 1; font-weight: 600;
+  width: 36px; height: 36px; 
 }
-/* The app's mark is the glyph itself, unboxed and large. */
-#visor-app-glyph { width: 40px; height: 40px; font-size: 28px; border-radius: 6px; }
-/* Text glyphs take `color`; emoji retain their own artwork regardless. The
-   plate is a shade of the strip rather than its ink: enough to read the mark
-   against, not so dark that it becomes the loudest thing on the strip. Fixed
-   regardless of press state — the circle is who you are, not the selection. */
+#visor-app-glyph {
+   border-radius: 6px; 
+}
 #visor-circle {
-  width: 32px; height: 32px; border-radius: 50%;
-  font-size: 20px; line-height: 1; font-weight: 600;
-  background: var(--strip-edge); color: var(--accent-ink);
+  border-radius: 50%;
 }
 #visor-root .stack { flex: 1; min-width: 0; }
 #visor-root .stack .top, #visor-root .stack .bottom { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
