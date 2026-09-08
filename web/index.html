@@ -11,12 +11,14 @@
          milestone. The frame's CSP is a different thing entirely and IS
          pinned, in the srcdoc web/boot.ts builds. -->
     <style>
-    html,
+    html, body { margin: 0; }
     body {
-      margin: 0;
-      height: 100%;
-    }
-    body {
+      /* `dvh` (dynamic viewport height) instead of an inherited `100%`: the
+         app zone below the strip should follow the viewport the browser is
+         currently giving the page, including as its own toolbar shows or
+         hides, not a size fixed at load. See #visor-drawer in visor/src/style.rs
+         for the matching `svh` reasoning on the drawer. */
+      height: 100dvh;
       display: flex;
       flex-direction: column;
       font: 16px/1.4 system-ui, sans-serif;

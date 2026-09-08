@@ -119,18 +119,24 @@ pub(crate) const CSS: &str = r#"
    The scrim covers the app zone behind the strip and drawer alike, fixed
    to the viewport since neither the strip nor the drawer moves it. */
 #visor-scrim { position: fixed; inset: 0; z-index: 1; background: oklch(0 0 0 / 0.25); }
+/* `svh`, not `vh`: a handheld's own toolbar can collapse to expand the
+   viewport, and `vh` tracks that larger size — sizing against it lets the
+   toolbar sit over the strip. `max-height` caps whatever `height` asks for
+   so at least 96px stays below the strip (the `max(0px, …)` floor is for
+   screens too short to have that room at all). */
 #visor-drawer {
   position: relative; z-index: 2;
   box-sizing: border-box;
-  height: min(60vh, 480px);
+  height: min(60svh, 480px);
+  max-height: max(0px, calc(100svh - 56px - 96px));
   overflow: hidden;
   background: var(--drawer);
   border-bottom: 1px solid var(--edge);
   animation: visor-drawer-open 180ms ease-out;
 }
 /* A handheld has no room to spare beside the drawer, so it takes more of
-   the height. */
-@media (max-width: 600px) { #visor-drawer { height: 80vh; } }
+   the height (still under the same max-height cap above). */
+@media (max-width: 600px) { #visor-drawer { height: 80svh; } }
 #visor-drawer.closing { animation: visor-drawer-close 180ms ease-in forwards; }
 
 /* One pane per tenant, stacked so two can be on screen at once while one
