@@ -1106,8 +1106,11 @@ const scenarios: Scenario[] = [
       // Closing the session is the glue's own act of clearing the bar
       // (internal.wit `shell`: "clears it in close-frame") — no navigation
       // involved, so this is the one place that is not also covered by the
-      // notice-only checks below.
-      await strip(page).getByRole("button", { name: "Close", exact: true })
+      // notice-only checks below. The strip's left half opens the running
+      // app's sheet, and "Close app" is in there.
+      await page.locator("#visor-app").click();
+      await paneSettled(page);
+      await drawer(page).getByRole("button", { name: "Close app", exact: true })
         .click();
       await page.waitForFunction(
         () => location.hash === "",
@@ -1130,7 +1133,7 @@ const scenarios: Scenario[] = [
         0,
         "a bogus fragment opened a frame anyway",
       );
-      await page.locator("#visor-context").getByText(/link/i).waitFor({
+      await drawer(page).getByText(/link/i).waitFor({
         timeout: 10_000,
       });
 
@@ -1148,7 +1151,7 @@ const scenarios: Scenario[] = [
           0,
           "another device's route key opened this bookmark",
         );
-        await b.locator("#visor-context").getByText(/link/i).waitFor({
+        await drawer(b).getByText(/link/i).waitFor({
           timeout: 10_000,
         });
       } finally {
