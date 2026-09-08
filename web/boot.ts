@@ -41,6 +41,32 @@ import { proxyInterfaces } from "./rpc.ts";
 
 const CEREMONY_CHANNEL = "polyvisor.oauth";
 
+// ---------------------------------------------------------------------------
+// The browser's own install prompt (internal.wit `shell.install-app`)
+//
+// Chromium fires `beforeinstallprompt` once, early, and only if the page is
+// still listening synchronously when it does — a handler added later (e.g.
+// from inside `installApp`, once the user has actually asked to install)
+// can simply miss it, and there is no way to ask the browser to fire it
+// again. So it is captured here, at module top, before anything else runs
+// (including the returning-popup and framed-window early-outs above this
+// comment, which is fine: those windows never call `installApp` and the
+// listener is inert if they park or refuse). `preventDefault` defers the
+// browser's own mini-infobar so `installApp` decides when to call
+// `.prompt()` instead of the browser deciding on its own schedule.
+// ---------------------------------------------------------------------------
+
+interface BeforeInstallPromptEvent extends Event {
+  prompt(): Promise<void>;
+}
+
+let deferredInstall: BeforeInstallPromptEvent | undefined;
+
+addEventListener("beforeinstallprompt", (e: Event) => {
+  e.preventDefault();
+  deferredInstall = e as BeforeInstallPromptEvent;
+});
+
 const returned = popupReturn(location.search);
 if (returned !== undefined) {
   const channel = new BroadcastChannel(CEREMONY_CHANNEL);
@@ -602,6 +628,134 @@ function closeFrame(session: number): void {
 }
 
 // ---------------------------------------------------------------------------
+// Installing a launch (internal.wit `shell.install-app`, docs/design.md
+// "Routing", the `launch/` bullet)
+// ---------------------------------------------------------------------------
+
+interface InstallRequest {
+  fragment: string;
+  title: string;
+  glyph: string;
+  hue: number;
+}
+
+/** The blob URL our own `<link rel=manifest>` currently points at, so a
+ * later install can revoke it. Never revokes a URL this glue did not mint —
+ * there is none to inherit; `index.html` carries no such link. */
+let manifestBlobUrl: string | undefined;
+
+/** One 512×512 (or `size`, scaled) PNG of the app's glyph on the user's hue,
+ * as a `blob:` URL. This is the one place the trusted pixels reach the
+ * launcher (internal.wit `shell.install-app` docs) — an installed app's
+ * icon is not app-controlled art, it is the visor's own paint of the
+ * user's labels for it, exactly as the strip button beside it is. */
+function paintIcon(glyph: string, hue: number, size: number): Promise<string> {
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+  // Same formula as the strip's own hue paint (visor/src/style.rs
+  // `--strip: oklch(0.62 0.14 var(--hue))`), so an installed app's icon
+  // reads as the same colour as its button in the strip it came from.
+  ctx.fillStyle = `oklch(0.62 0.14 ${hue})`;
+  ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = "white";
+  ctx.font = `${Math.round(size * 0.6)}px system-ui, sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(glyph, size / 2, size / 2);
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob === null) {
+        reject(new Error("the browser refused to encode the app icon"));
+        return;
+      }
+      resolve(URL.createObjectURL(blob));
+    }, "image/png");
+  });
+}
+
+async function installApp(
+  request: InstallRequest,
+): Promise<"prompted" | "manual"> {
+  // Absolute against the page's own base — never `/`, which on a GitHub
+  // Pages project site names somebody else's page (docs/design.md
+  // "Routing"). `base` is the directory this page is served from, the same
+  // one the OAuth return and the worker's `homeOrigin` use. `id` is derived
+  // from the fragment alone (not `start_url`, which a future kind's fragment
+  // grammar might vary in ways that should not mint a new installed app for
+  // the same package) so the same package on the same origin is the same
+  // installed app on every device, per the design's `launch/` bullet.
+  const base = new URL(".", location.href);
+  const startUrl = new URL("#" + request.fragment, base).href;
+  const scope = base.href;
+  const id = new URL(request.fragment, base).href;
+
+  const [icon512, icon192] = await Promise.all([
+    paintIcon(request.glyph, request.hue, 512),
+    paintIcon(request.glyph, request.hue, 192),
+  ]);
+  const themeColor = `oklch(0.62 0.14 ${request.hue})`;
+
+  const manifest = {
+    name: `${request.title} — polyvisor`,
+    short_name: request.title,
+    display: "standalone",
+    start_url: startUrl,
+    scope,
+    id,
+    icons: [
+      { src: icon512, sizes: "512x512", type: "image/png" },
+      { src: icon192, sizes: "192x192", type: "image/png" },
+    ],
+    theme_color: themeColor,
+    background_color: "#ffffff",
+  };
+
+  const manifestUrl = URL.createObjectURL(
+    new Blob([JSON.stringify(manifest)], { type: "application/manifest+json" }),
+  );
+
+  let link = document.querySelector<HTMLLinkElement>("link[rel=manifest]");
+  if (link === null) {
+    link = document.createElement("link");
+    link.rel = "manifest";
+    document.head.append(link);
+  }
+  // Revoke only a URL this glue minted — a previous install's blob, not
+  // whatever (nothing, today) `index.html` shipped the link pointing at.
+  if (manifestBlobUrl !== undefined) URL.revokeObjectURL(manifestBlobUrl);
+  manifestBlobUrl = manifestUrl;
+  // A prompt the browser offered earlier was offered for the manifest that
+  // was in place then — another app's, if this is the second install of the
+  // visit — so it goes with that manifest, and the one that counts is
+  // whatever the browser offers for this one. Chromium re-evaluates
+  // installability when the link changes and fires a fresh
+  // `beforeinstallprompt`; a bounded wait catches it, and none in time means
+  // the browser is not offering one (already installed, or no such event),
+  // which is `manual`.
+  deferredInstall = undefined;
+  link.href = manifestUrl;
+  const offered = await new Promise<BeforeInstallPromptEvent | undefined>(
+    (resolve) => {
+      const poll = setInterval(() => {
+        if (deferredInstall === undefined) return;
+        clearInterval(poll);
+        resolve(deferredInstall);
+      }, 50);
+      setTimeout(() => {
+        clearInterval(poll);
+        resolve(undefined);
+      }, 2_000);
+    },
+  );
+  if (offered === undefined) return "manual";
+  deferredInstall = undefined;
+  await offered.prompt();
+  return "prompted";
+}
+
+// ---------------------------------------------------------------------------
 // Bring-up
 // ---------------------------------------------------------------------------
 
@@ -753,6 +907,17 @@ async function main(): Promise<void> {
         // channel, and a subscription made afterwards is one that can miss
         // it.
         globalThis.open(url, "_blank", "popup,noopener,width=520,height=640");
+      }),
+    // internal.wit `shell.install-app`: mints the manifest, points the
+    // document at it, and calls whatever install prompt the browser
+    // deferred earlier. Errors (icon encoding, most plausibly) surface as
+    // the WIT's `result<_, error>` arm, same reasoning as `open-frame`.
+    installApp: (request: InstallRequest) =>
+      installApp(request).catch((err: unknown) => {
+        throw new ComponentException({
+          code: "failed",
+          message: String((err as Error)?.message ?? err),
+        });
       }),
   };
 

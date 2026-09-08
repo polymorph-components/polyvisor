@@ -45,6 +45,14 @@
 //! flipped bit, a foreign prefix and a truncated token are not told apart,
 //! because the answer to all four is the same: this device cannot open this
 //! link.
+//!
+//! **The second kind, `launch/<app-id>`.** docs/design.md "Routing" explains
+//! why an installed app's `start_url` cannot be an `app/` token: it is
+//! written once into the OS's app registry and replayed for months, so it
+//! must outlive route-key convergence, and it names a package the launcher
+//! already displays, so there is nothing to hide. `launch/` is plaintext and
+//! keyless — the app id verbatim, nothing sealed — and decodes to this
+//! user's install of that package at route `""`.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -158,6 +166,21 @@ pub fn decode(key: &[u8; 32], fragment: &str) -> Result<([u8; INSTALL_LEN], Stri
     }
     let route = std::str::from_utf8(route).map_err(|_| RouteError::Unreadable)?;
     Ok((install, route.to_string()))
+}
+
+/// The second kind's prefix (module docs): plaintext, keyless, no token.
+pub const LAUNCH_PREFIX: &str = "launch/";
+
+/// The fragment an installed app's window opens at: `launch/<app>`.
+pub fn launch_fragment(app: &str) -> String {
+    format!("{LAUNCH_PREFIX}{app}")
+}
+
+/// The app id a `launch/` fragment names, or `None` if `fragment` is not one
+/// (wrong prefix, or an empty id — `launch/` alone names nothing).
+pub fn launch_app(fragment: &str) -> Option<&str> {
+    let app = fragment.strip_prefix(LAUNCH_PREFIX)?;
+    if app.is_empty() { None } else { Some(app) }
 }
 
 /// The two subkeys, so the SIV computation and the encryption never share a
@@ -283,5 +306,26 @@ mod tests {
         let short = encode(&KEY, INSTALL, "a").unwrap();
         let long = encode(&KEY, INSTALL, &"r".repeat(MAX_ROUTE)).unwrap();
         assert_eq!(short.len(), long.len());
+    }
+
+    #[test]
+    fn launch_round_trips() {
+        let fragment = launch_fragment("todomvc");
+        assert_eq!(fragment, "launch/todomvc");
+        assert_eq!(launch_app(&fragment), Some("todomvc"));
+    }
+
+    /// An `app/` token is not a launch, even though both share the `/`
+    /// separator — the kind prefixes must not be confused.
+    #[test]
+    fn app_fragment_is_not_a_launch() {
+        let fragment = encode(&KEY, INSTALL, "todo/active").unwrap();
+        assert_eq!(launch_app(&fragment), None);
+    }
+
+    #[test]
+    fn empty_launch_remainder_is_none() {
+        assert_eq!(launch_app("launch/"), None);
+        assert_eq!(launch_app("launch"), None);
     }
 }
