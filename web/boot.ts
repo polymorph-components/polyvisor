@@ -175,11 +175,26 @@ function fatal(message: string): void {
  * `shell.switch-device` is a reload of one of them. */
 const ANCHOR = "polyvisor.device";
 
-/** The anchored device id, minting and anchoring a fresh one if this tab has
- * none. 16 random bytes as hex: the id is only ever an opaque name. */
+/** The last device this profile saw promoted to durable (docs/design.md
+ * "Devices", last bullet). localStorage, not sessionStorage: it is shared by
+ * every tab of the origin, which is the point — a fresh tab with no anchor
+ * of its own adopts it instead of minting "new tab, new stranger". Written
+ * from `device.status`, read here, cleared only by an explicit
+ * `switch-device(none)`. */
+const LAST = "polyvisor.last-device";
+
+/** The anchored device id: this tab's own anchor if it has one, else the
+ * profile's last kept device (adopted and anchored here so the rest of this
+ * tab's life reads the same sessionStorage path), else a fresh mint. 16
+ * random bytes as hex: the id is only ever an opaque name. */
 function deviceId(): string {
   const anchored = sessionStorage.getItem(ANCHOR);
   if (anchored !== null && anchored !== "") return anchored;
+  const last = localStorage.getItem(LAST);
+  if (last !== null && last !== "") {
+    sessionStorage.setItem(ANCHOR, last);
+    return last;
+  }
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   const fresh = Array.from(bytes, (b) => b.toString(16).padStart(2, "0"))
     .join("");
@@ -312,6 +327,28 @@ const kernel = proxyInterfaces(control, [
   I.storage,
   I.events,
 ]);
+
+// The other end of the LAST pointer: `device.status`'s `tier` is the kernel's
+// only word on whether this device has been kept (runtime/wit internal.wit
+// "Lifecycle": `enum tier { ephemeral, durable }`, and on the wire an enum is
+// its kebab-case case name as a plain string — bindgen's codegen.rs, "enum =
+// string literal union of kebab-case case names"). `ephemeral` devices are
+// swept, so only `durable` is worth remembering across tabs; every other
+// `device` method passes straight through the proxy underneath.
+const rawDevice = kernel[I.device] as Record<string, unknown>;
+kernel[I.device] = new Proxy(rawDevice, {
+  get(target, key, receiver) {
+    if (key !== "status") return Reflect.get(target, key, receiver);
+    return async (...args: unknown[]) => {
+      const result = await (target.status as (...a: unknown[]) => Promise<
+        { tier?: string }
+      >)(...args);
+      if (result?.tier === "durable") localStorage.setItem(LAST, device);
+      return result;
+    };
+  },
+});
+
 const apps = kernel[I.apps] as {
   component(session: number): Promise<ComponentArtifacts>;
   abort(session: number, reason: string): Promise<void>;
@@ -624,10 +661,18 @@ async function main(): Promise<void> {
     // Also sync. Re-anchoring is all this does — the worker is named after
     // the anchor, so the reload is what actually moves the tab to the other
     // device (docs/design.md "Devices": "Switching devices is a reload").
-    // `none` drops the anchor, and the next boot mints a fresh id.
+    // `none` drops the anchor AND the LAST pointer (an explicit new device,
+    // per the design's "or an explicit switch-device(none), which clears the
+    // pointer too") so the next boot mints a fresh id rather than adopting
+    // the one just left; switching TO a named target leaves LAST alone —
+    // `device.status` after the reload rewrites it if that target is
+    // durable, and if it isn't, LAST still names whatever this profile's
+    // last durable device was.
     switchDevice: (target: string | undefined) => {
-      if (target === undefined) sessionStorage.removeItem(ANCHOR);
-      else sessionStorage.setItem(ANCHOR, target);
+      if (target === undefined) {
+        sessionStorage.removeItem(ANCHOR);
+        localStorage.removeItem(LAST);
+      } else sessionStorage.setItem(ANCHOR, target);
       location.reload();
     },
     // A window capability, asked at the moment a device is kept. `false` is

@@ -207,6 +207,9 @@ async function visorReady(page: Page): Promise<void> {
 /** The tab's device anchor, as `web/boot.ts` spells it. */
 const ANCHOR = "polyvisor.device";
 
+/** The profile's last kept device, as `web/boot.ts` spells it. */
+const LAST = "polyvisor.last-device";
+
 async function open(ctx: BrowserContext, origin: string): Promise<Page> {
   const page = await ctx.newPage();
   page.on("pageerror", (e) => console.error("  page error:", e.message));
@@ -1161,6 +1164,44 @@ const scenarios: Scenario[] = [
   },
 
   {
+    // The case the per-tab anchor used to break (docs/design.md "Devices",
+    // last bullet): a bookmark opened in a genuinely fresh tab — no
+    // sessionStorage anchor, because Chromium only copies that on
+    // duplicate/`window.open`, not on a plain navigation to a URL typed or
+    // clicked elsewhere. Before LAST, this minted a brand-new device with
+    // no route key, so the token could never decrypt. With LAST, the fresh
+    // tab adopts the profile's kept device and the bookmark just opens.
+    name: "bookmark-in-a-new-tab",
+    async run(ctx, origin) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+      await keepDevice(page, "the workbench");
+      await launchTodoMvc(page);
+      // `route.set` is debounced (docs/design.md "Routing"), so the
+      // fragment is not necessarily there the instant the frame opens.
+      await page.waitForFunction(() => location.hash !== "", undefined, {
+        timeout: 10_000,
+      });
+      const h = await page.evaluate(() => location.hash);
+
+      // `ctx.newPage()`, not a second window off `page`: a genuinely new
+      // tab shares the profile's localStorage but starts with an empty
+      // sessionStorage of its own — nothing here copies the anchor.
+      const tab = await ctx.newPage();
+      await tab.goto(origin + "/" + h);
+      await visorReady(tab);
+      await tab.waitForSelector("#app-zone iframe[sandbox]", {
+        timeout: 30_000,
+      });
+      eq(
+        await tab.evaluate(() => location.hash),
+        h,
+        "the adopted-device tab did not open at the bookmarked fragment",
+      );
+    },
+  },
+
+  {
     name: "frame-violation-ends-session",
     async run(ctx, origin) {
       const page = await open(ctx, origin);
@@ -1313,11 +1354,29 @@ const scenarios: Scenario[] = [
       await setDeviceName(page, "the workbench");
       await keepDevice(page, "laptop");
 
-      // Dropping the anchor is exactly what `shell.switch-device(none)`
-      // does; doing it here rather than through a button keeps this
-      // scenario to what the WIT guarantees, so it does not depend on which
-      // control the visor happens to offer for a second device.
+      // Dropping only the tab's own anchor is a lost anchor, not a new
+      // device: `device.status` wrote LAST when this device was kept above
+      // (docs/design.md "Devices", last bullet), and it is still there.
+      // `deviceId` adopts it, so this reload is the SAME device and the
+      // picker never appears at all.
       await page.evaluate((key) => sessionStorage.removeItem(key), ANCHOR);
+      await page.reload();
+      await visorReady(page);
+      await strip(page).getByText("the workbench").waitFor({ timeout: 15_000 });
+      eq(
+        await drawer(page).locator(".device-row").count(),
+        0,
+        "a lost anchor with a kept LAST device showed the picker anyway",
+      );
+
+      // Now drop LAST too: an explicit new device, per the design's "only a
+      // profile with no kept device ... mints". This is exactly what
+      // `shell.switch-device(none)` does; doing it here rather than through
+      // a button keeps this scenario to what the WIT guarantees, so it does
+      // not depend on which control the visor happens to offer for a
+      // second device.
+      await page.evaluate((key) => sessionStorage.removeItem(key), ANCHOR);
+      await page.evaluate((key) => localStorage.removeItem(key), LAST);
       await page.reload();
       await visorReady(page);
 
@@ -1619,10 +1678,16 @@ const scenarios: Scenario[] = [
         // — the OPFS and the sealed tokens are the context's.
         //
         // NAVIGATED, not closed, and this is the whole reason: the device
-        // anchor is `sessionStorage` (web/boot.ts), which is per TAB. A
-        // second tab in the same context is a second DEVICE — no group, no
-        // tokens, nothing of B's — so closing this one would not put B to
-        // sleep, it would replace it.
+        // anchor is `sessionStorage` (web/boot.ts), which is per TAB — but
+        // a second tab is no longer reliably a second device (docs/design.md
+        // "Devices", last bullet): B here is ephemeral, so its LAST pointer
+        // was never written and a second tab would still mint fresh, but a
+        // KEPT device's second tab would instead ADOPT it — same group,
+        // same tokens, B's own worker still up. Closing this tab is
+        // therefore not a dependable way to take B offline for either case;
+        // navigating it away is, because it is the same client dropping
+        // its hold on B's SharedWorker (a worker lives while a client holds
+        // it) regardless of what any other tab would resolve to.
         await b.goto("about:blank");
 
         // Written while B could not be listening, so the store is the only
