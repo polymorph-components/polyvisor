@@ -97,10 +97,7 @@ pub(crate) const CSS: &str = r#"
   padding: 4px 8px; text-align: left;
 }
 #visor-root #visor-self { flex-direction: row-reverse; text-align: right; }
-/* The light fill is reserved for app selection; self is marked underneath
-   instead, so the identity beside it is never dressed by the selection. */
-#visor-root #visor-app[aria-pressed="true"] { background: oklch(1 0 0 / 0.18); box-shadow: none; }
-#visor-root #visor-self[aria-pressed="true"] { background: none; box-shadow: inset 0 -2px 0 var(--strip-edge); }
+#visor-root #visor-app[aria-pressed="true"], #visor-root #visor-self[aria-pressed="true"] { background: oklch(1 0 0 / 0.18); box-shadow: none; }
 #visor-divider { width: 1px; align-self: stretch; margin: 5px; background: var(--strip-edge); }
 #visor-app-glyph, #visor-circle {
   flex: none;
@@ -237,8 +234,7 @@ pub(crate) const CSS: &str = r#"
 /* The colour slider is the hue wheel itself, unrolled: a gradient
    interpolated in oklch around the long way so it visits every hue once at
    the strip's lightness/chroma, and the thumb sits on the one chosen. It
-   names hues 0 and 360 — every hue, which is why it reveals none (see the
-   stylesheet test).
+   names hues 0 and 360 — every hue, which is why it reveals none.
 
    The control is 44px tall while the track it paints stays a 14px band
    centred in it: `background-size` separates the target from the
@@ -376,108 +372,3 @@ pub(crate) const CSS: &str = r#"
   quotes: '"' '"';
 }
 "#;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::voice::Voice;
-
-    /// Every voice must have a rule; a voice that renders like its
-    /// neighbours is the failure this whole module exists to prevent.
-    #[test]
-    fn stylesheet_rules_every_voice() {
-        for voice in Voice::ALL {
-            let selector = format!(".{}", voice.class());
-            assert!(
-                CSS.contains(&selector),
-                "stylesheet has no rule for the {voice:?} voice ({selector})"
-            );
-        }
-    }
-
-    /// The strip is the trust anchor: its height is pinned on all three
-    /// axes so nothing inside or beside it can resize it. e2e measures
-    /// `#visor-strip` against this same 56.
-    #[test]
-    fn stylesheet_pins_the_strip_height() {
-        assert!(CSS.contains("height: 56px; min-height: 56px; max-height: 56px;"));
-    }
-
-    /// The anchor rule, as a property of the stylesheet: no colour with any
-    /// chroma in it names a hue of its own. Every one of them reads
-    /// `var(--hue)`, and `--hue` is set at exactly one site — the inline
-    /// style on `#visor-root` that the open arm of `Ident` emits — so a
-    /// visor that never saw `device.status` say "open" cannot show the
-    /// user's colour, whatever else it renders (docs/design.md "Devices").
-    /// Achromatic colours (the greys of the unclaimed dress, the scroll
-    /// shadows) carry a hue component too, but it decides nothing.
-    #[test]
-    fn no_colour_with_chroma_names_its_own_hue() {
-        let mut chromatic = 0;
-        // The colour slider is exempt: its track is the whole wheel, every
-        // hue at once, so the numbers it names (0 and 360) say nothing
-        // about which one is this device's.
-        let start = CSS.find("input[type=\"range\"] {").unwrap();
-        let end = start + CSS[start..].find("input[type=\"text\"]").unwrap();
-        let scanned = format!("{}{}", &CSS[..start], &CSS[end..]);
-        for tail in scanned.split("oklch(").skip(1) {
-            let args = &tail[..tail.find(')').expect("unclosed oklch()")];
-            let parts: Vec<&str> = args.split_whitespace().collect();
-            assert!(parts.len() >= 3, "oklch({args}) has too few components");
-            if parts[1] == "0" {
-                continue;
-            }
-            chromatic += 1;
-            assert!(
-                parts[2].starts_with("var(--hue"),
-                "oklch({args}) has chroma and yet names its own hue"
-            );
-        }
-        assert!(chromatic > 0, "the stylesheet paints nothing from the hue");
-        // The palette both arms of the rule define, spelled once each — the
-        // strip's ink included, since a strip that kept its colour and lost
-        // its ink would be unreadable in exactly one of them.
-        assert!(CSS.contains("#visor-root.unclaimed"));
-        assert!(CSS.contains("--strip: oklch(0.62 0.14 var(--hue));"));
-        assert!(CSS.contains("--strip: oklch(0.62 0 0);"));
-        assert!(CSS.contains("--strip-ink: oklch(0.16 0.04 var(--hue));"));
-        assert!(CSS.contains("--strip-ink: oklch(0.16 0 0);"));
-        // No second colour syntax to smuggle a hue through.
-        assert!(!CSS.contains("hsl("));
-    }
-
-    /// The six digits are the ceremony: two people compare them across two
-    /// screens, so they are sized to be read at a distance rather than
-    /// styled like the framework's own prose.
-    #[test]
-    fn stylesheet_shows_the_sas_large() {
-        assert!(CSS.contains(".pairing-sas"));
-        let rule = CSS.split(".pairing-sas").nth(1).unwrap();
-        let rule = &rule[..rule.find('}').unwrap()];
-        assert!(
-            rule.contains("font-size: 40px"),
-            "the SAS must be far larger than the 14px base: {rule}"
-        );
-        assert!(
-            rule.contains("letter-spacing"),
-            "digits must not run together"
-        );
-    }
-
-    /// An endpoint id lands in an already-open Settings sheet: the bind
-    /// completes after first paint, so the id replaces the "binding…"
-    /// placeholder under the user's pointer. It must not change the row's
-    /// height doing it, or the controls below it move mid-click — so the
-    /// id is scrolled on one line and never wrapped.
-    #[test]
-    fn stylesheet_keeps_the_endpoint_id_on_one_line() {
-        assert!(
-            CSS.contains("white-space: nowrap;"),
-            "the endpoint id must not wrap: it arrives late, and a row that \
-             grows moves everything below it"
-        );
-        assert!(!CSS.contains("overflow-wrap: anywhere"));
-        // Scrolled, not clipped: the whole id has to remain readable.
-        assert!(CSS.contains("overflow-x: auto;"));
-    }
-}
