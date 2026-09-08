@@ -415,6 +415,9 @@ self.onconnect = (ev: MessageEvent) => {
       setName: async (name: string) => (await ready)[I.device].setName(name),
       setHue: async (hue: number) => (await ready)[I.device].setHue(hue),
       rerollWord: async () => (await ready)[I.device].rerollWord(),
+      meta: async (scope: unknown) => (await ready)[I.device].meta(scope),
+      setMeta: async (scope: unknown, entries: [string, string][]) =>
+        (await ready)[I.device].setMeta(scope, entries),
       keep: async (petname: string, passphrase: string | undefined) =>
         (await ready)[I.device].keep(petname, passphrase),
       unseal: async (passphrase: string) =>

@@ -1,16 +1,24 @@
-//! The trusted pixels: the strip, and the drawer behind it.
+//! The trusted pixels: the strip, and the drawer it opens over the app.
 //!
 //! The strip is the trust anchor — always present, fixed height, and the
-//! only place the device identity is shown. The drawer is everything that
-//! needs room: the app list, the device settings, and the two device
-//! ceremonies (unseal, and the entry picker). Both are rendered by this one
-//! component so there is exactly one tree, and no ordering question about
-//! which of them the receiver mounts first.
+//! only place the device identity is shown. Two halves and nothing else:
+//! what is running, and who this is. The drawer is everything that needs
+//! room: the app list, the running app's own labels, the device settings,
+//! and the two device ceremonies (unseal, and the entry picker). Both are
+//! rendered by this one component so there is exactly one tree, and no
+//! ordering question about which of them the receiver mounts first.
+//!
+//! The strip is the line between trusted pixels and the app zone, so
+//! whatever the visor opens goes on the visor's side of that line — above
+//! the strip — and pushes the strip, and the app zone under it, down
+//! rather than covering it.
 //!
 //! The visor holds no state of its own beyond what is on screen right now
 //! (docs/design.md "Visor and apps render through stream-dom"): identity,
-//! hue, word, the app list and the device index are kernel state, read at
-//! mount and re-read only when the visor itself changed them.
+//! hue, word, the labels, the app list and the device index are kernel
+//! state, read at mount and re-read only when the visor itself changed
+//! them. The one exception is a [`Draft`], which is what a user has typed
+//! and not saved — on screen, and nowhere else.
 //!
 //! The one rule the whole file is arranged around (design.md "Devices"):
 //! **the anchor colour is never painted before the device is `open`.** A
@@ -20,16 +28,151 @@
 
 use dioxus::prelude::*;
 
-use crate::kernel::{self, App, Binding, Entry, Event, Member, Peer, SessionId, Status};
+use crate::kernel::{
+    self, App, Binding, Entry, Event, Member, Meta, MetaScope, Peer, SessionId, Status,
+};
 use crate::state::{
     Action, Drawer, Gate, Phase, Rest, Tenant, Tier, boot_drawer, claim_code, grouped,
 };
 use crate::style::CSS;
 use crate::voice::{AppText, AppVoice, Voice, coarse_age};
 
-/// What the strip says when nothing is running. Two shapes because a
-/// session ending is framework voice with the app's *title* plated — the
-/// one place the two voices share a sentence.
+/// The two keys this visor writes into every meta map. internal.wit
+/// `device.meta` leaves the vocabulary to the visor ("keys are the visor's
+/// vocabulary, values are user voice"), so these two names are the whole
+/// of it, and they mean the same thing in all three scopes.
+const PETNAME: &str = "petname";
+const GLYPH: &str = "glyph";
+
+/// A glyph as the strip draws it: the first `char` of the field, or
+/// nothing. `chars().next()` and not a byte slice — the field is free text
+/// and an emoji is the likely case, so slicing would panic on exactly what
+/// users type.
+fn glyph_of(meta: &Meta) -> String {
+    meta.get(GLYPH)
+        .and_then(|s| s.chars().next())
+        .map(String::from)
+        .unwrap_or_default()
+}
+
+fn petname_of(meta: &Meta) -> String {
+    meta.get(PETNAME).cloned().unwrap_or_default()
+}
+
+/// Write one field of a draft's meta map. An emptied field removes its key
+/// rather than storing "": `set-meta` replaces the whole map, so an empty
+/// value would be a key that means nothing — and, worse, would leave the
+/// draft comparing unequal to its seed, which is the whole definition of
+/// "unsaved changes" here.
+fn set_field(meta: &mut Meta, key: &str, value: String) {
+    if value.is_empty() {
+        meta.remove(key);
+    } else {
+        meta.insert(key.to_string(), value);
+    }
+}
+
+/// What a sheet has been told but the kernel has not.
+///
+/// The visor still holds no state of its own beyond what is on screen
+/// (docs/design.md "Visor and apps render through stream-dom"): a draft is
+/// exactly what is on screen and not yet said. Two copies are kept — the
+/// seed as the sheet was opened, the draft as it stands — because their
+/// inequality is the only honest definition of "unsaved changes", and
+/// because a save writes only the fields that differ rather than restating
+/// the whole identity to the kernel.
+#[derive(Clone, PartialEq, Default)]
+struct Draft {
+    name: String,
+    hue: u16,
+    user: Meta,
+    app: Meta,
+}
+
+/// Commit a draft: one kernel call per field that actually changed, then
+/// the local apply, then the seed catches up so the sheet is clean again.
+///
+/// The gate is bumped before the first call and not after the local apply,
+/// for the reason [`read_status`] spells out: a read already in flight is
+/// answering about the identity this is replacing, whichever lands first.
+///
+/// A failure leaves the seed alone, so the sheet stays dirty and the
+/// user's text is still theirs to retry with — the kernel's refusal is the
+/// notice, not a silent revert.
+#[allow(clippy::too_many_arguments)]
+async fn save_draft(
+    draft: Signal<Draft>,
+    mut seed: Signal<Draft>,
+    mut status: Signal<Option<Status>>,
+    mut user_meta: Signal<Meta>,
+    mut app_meta: Signal<Meta>,
+    mut notice: Signal<Option<Notice>>,
+    app_id: Option<String>,
+    mut status_gate: CopyValue<Gate>,
+) {
+    let (was, now) = (seed(), draft());
+    status_gate.write().bump();
+    let mut failed = false;
+    let mut fail = |e: String, failed: &mut bool| {
+        notice.set(Some(Notice::Plain(e)));
+        *failed = true;
+    };
+
+    if now.name != was.name {
+        match kernel::set_name(now.name.clone()).await {
+            Ok(()) => status.with_mut(|s| {
+                if let Some(s) = s {
+                    s.name = now.name.clone()
+                }
+            }),
+            Err(e) => fail(e, &mut failed),
+        }
+    }
+    if now.hue != was.hue {
+        match kernel::set_hue(now.hue).await {
+            Ok(()) => status.with_mut(|s| {
+                if let Some(s) = s {
+                    s.hue = now.hue
+                }
+            }),
+            Err(e) => fail(e, &mut failed),
+        }
+    }
+    if now.user != was.user {
+        match kernel::set_meta(MetaScope::User, now.user.clone()).await {
+            Ok(()) => user_meta.set(now.user.clone()),
+            Err(e) => fail(e, &mut failed),
+        }
+    }
+    // Only ever the live app's map: `AppInfo` exists only while a session
+    // runs, and Settings seeds `app` from that same session, so there is no
+    // path here that could write one app's labels into another's.
+    if now.app != was.app
+        && let Some(id) = app_id
+    {
+        match kernel::set_meta(MetaScope::App(id), now.app.clone()).await {
+            Ok(()) => app_meta.set(now.app.clone()),
+            Err(e) => fail(e, &mut failed),
+        }
+    }
+    if !failed {
+        seed.set(now);
+    }
+}
+
+/// One app's labels (internal.wit `device.meta`, `meta-scope.app`). Read
+/// when a session opens — the strip's left half speaks for the running app
+/// — and again when its sheet is opened.
+async fn read_app_meta(id: String, mut app_meta: Signal<Meta>, mut notice: Signal<Option<Notice>>) {
+    match kernel::meta(MetaScope::App(id)).await {
+        Ok(m) => app_meta.set(m),
+        Err(e) => notice.set(Some(Notice::Plain(e))),
+    }
+}
+
+/// What the drawer says when something happened that the user did not ask
+/// for. Two shapes because a session ending is framework voice with the
+/// app's *title* plated — the one place the two voices share a sentence.
 #[derive(Clone, PartialEq)]
 enum Notice {
     Plain(String),
@@ -47,22 +190,24 @@ async fn open_app(
     app: App,
     route: String,
     mut session: Signal<Option<(SessionId, App)>>,
+    app_meta: Signal<Meta>,
     mut notice: Signal<Option<Notice>>,
-    mut drawer: Signal<Drawer>,
-    mut drawer_gate: CopyValue<Gate>,
+    apply: Callback<Action>,
 ) {
     match kernel::launch(&app.id).await {
         Err(e) => notice.set(Some(Notice::Plain(e))),
         Ok(id) => match kernel::open_frame(id, &route).await {
             Ok(()) => {
                 notice.set(None);
+                let app_id = app.id.clone();
                 session.set(Some((id, app)));
+                // The strip's left half now speaks for this app.
+                read_app_meta(app_id, app_meta, notice).await;
                 // The frame gets the screen; the drawer never covers it.
-                // The bump is `set_drawer`'s, spelled out here because this
-                // is a free function: a boot decision still in flight must
-                // not reopen a drawer over the frame that just opened.
-                drawer_gate.write().bump();
-                drawer.set(drawer().reduce(Action::Close));
+                // `apply` and not a bare `drawer.set`: it bumps `drawer_gate`,
+                // so a boot decision still in flight cannot reopen a drawer
+                // over the frame that just opened.
+                apply.call(Action::Close);
             }
             Err(e) => {
                 // The session outlived the frame that was to show it;
@@ -108,9 +253,9 @@ thread_local! {
 /// `on_unsealed` reads the identity again and the flag is still unspent.
 async fn restore_bookmark(
     session: Signal<Option<(SessionId, App)>>,
+    app_meta: Signal<Meta>,
     mut notice: Signal<Option<Notice>>,
-    drawer: Signal<Drawer>,
-    drawer_gate: CopyValue<Gate>,
+    apply: Callback<Action>,
 ) {
     if FRAGMENT_SPENT.with(|spent| spent.replace(true)) {
         return;
@@ -120,16 +265,17 @@ async fn restore_bookmark(
     };
     match kernel::route_decode(&f).await {
         Err(e) => notice.set(Some(Notice::Plain(e))),
-        Ok((app, route)) => open_app(app, route, session, notice, drawer, drawer_gate).await,
+        Ok((app, route)) => open_app(app, route, session, app_meta, notice, apply).await,
     }
 }
 
-/// Read the device's identity, and the app list unless the device is
-/// sealed. The app list is skipped while sealed on purpose: every kernel
-/// call other than `status`/`unseal`/`erase` answers `unavailable` then
-/// (internal.wit `device`), so asking would only manufacture an error to
-/// show. A `fresh` device is read in full — it is not sealed, and
-/// internal.wit `device` rules that "`fresh` is not a gate".
+/// Read the device's identity, and — unless the device is sealed — the app
+/// list and the user's own labels. Both are skipped while sealed on
+/// purpose: every kernel call other than `status`/`unseal`/`erase` answers
+/// `unavailable` then (internal.wit `device`), so asking would only
+/// manufacture an error to show. A `fresh` device is read in full — it is
+/// not sealed, and internal.wit `device` rules that "`fresh` is not a
+/// gate".
 ///
 /// Gated like [`read_status`]: this is called after the ceremonies that
 /// change the device, and a user write landing while it is out must win.
@@ -142,10 +288,11 @@ async fn read_identity(
     mut status: Signal<Option<Status>>,
     mut apps: Signal<Vec<App>>,
     mut notice: Signal<Option<Notice>>,
+    mut user_meta: Signal<Meta>,
     gate: CopyValue<Gate>,
     session: Signal<Option<(SessionId, App)>>,
-    drawer: Signal<Drawer>,
-    drawer_gate: CopyValue<Gate>,
+    app_meta: Signal<Meta>,
+    apply: Callback<Action>,
 ) {
     let token = gate.peek().begin();
     match kernel::status().await {
@@ -161,20 +308,36 @@ async fn read_identity(
             status.set(Some(s));
             if sealed {
                 apps.set(Vec::new());
+                user_meta.set(Meta::new());
                 return;
             }
         }
     }
     match kernel::installed().await {
         Ok(list) => {
-            // Inside the gate: a read this one superseded is not the one to
-            // spend the fragment, and the newer read will spend it instead.
             if gate.peek().apply(token) {
                 apps.set(list);
-                restore_bookmark(session, notice, drawer, drawer_gate).await;
             }
         }
         Err(e) => notice.set(Some(Notice::Plain(e))),
+    }
+    // The strip's right half shows these, so they are boot state and not
+    // sheet state: a user who never opens Settings still sees their own
+    // petname and glyph on the anchor.
+    match kernel::meta(MetaScope::User).await {
+        Ok(m) => {
+            if gate.peek().apply(token) {
+                user_meta.set(m);
+            }
+        }
+        Err(e) => notice.set(Some(Notice::Plain(e))),
+    }
+    // Last, so the strip is whole — identity, labels, app list — before a
+    // bookmark's launch takes its turn. Inside the gate: a read this one
+    // superseded is not the one to spend the fragment, and the newer read
+    // will spend it instead.
+    if gate.peek().apply(token) {
+        restore_bookmark(session, app_meta, notice, apply).await;
     }
 }
 
@@ -305,7 +468,7 @@ async fn apply_phase(
     let paired = next == Phase::Done;
     pairing_phase.set(next);
     if paired {
-        // Framework voice, in the strip's context line: the ceremony is
+        // Framework voice, on the drawer's notice line: the ceremony is
         // over and the drawer may well be shut by the time it lands.
         notice.set(Some(Notice::Plain("device paired".into())));
         read_members(members, notice).await;
@@ -324,6 +487,25 @@ pub(crate) fn Visor() -> Element {
     let members = use_signal(Vec::<Member>::new);
     let pairing_phase = use_signal(Phase::default);
     let binding = use_signal(|| None::<Binding>);
+    // The user's own labels, and the running app's. Kernel state, like
+    // everything else here — and written back only by a save, so the strip
+    // never shows a label the kernel has not been told about.
+    let user_meta = use_signal(Meta::new);
+    let mut app_meta = use_signal(Meta::new);
+
+    // What the sheets are editing. `seed` is the identity as the sheet was
+    // opened, `draft` as it stands; dirty is exactly `draft != seed`.
+    let mut seed = use_signal(Draft::default);
+    let mut draft = use_signal(Draft::default);
+    // A transition the user asked for while the draft was dirty. It waits
+    // on `#visor-confirm` rather than happening.
+    let mut pending = use_signal(|| None::<Action>);
+    // Shut, but still on screen playing its close animation. The drawer
+    // stays `Open(t)` throughout — this is what says the tenant showing is
+    // the one on its way out — and `onanimationend` is what finally closes.
+    let mut closing = use_signal(|| false);
+    // The tenant sliding out under the new one, and whether it goes left.
+    let mut leaving = use_signal(|| None::<(Tenant, bool)>);
 
     // Two orderings, both between a spawned read and a user's write. They
     // are `CopyValue` rather than `Signal` on purpose: a generation is
@@ -331,14 +513,172 @@ pub(crate) fn Visor() -> Element {
     // to it would re-render the visor on every press that bumps it.
     //
     // `status_gate`: bumped by everything that changes this device
-    // (set-name, colour, word, keep, unseal), read by `read_status` and
+    // (a saved draft, word, keep, unseal), read by `read_status` and
     // `read_identity`.
     //
-    // `drawer_gate`: bumped by every press that opens or closes a tenant,
-    // read by the boot decision below — which is the only writer of
-    // `drawer` that the user did not ask for.
+    // `drawer_gate`: bumped by every transition the user caused, read by
+    // the boot decision below — which is the only writer of `drawer` that
+    // the user did not ask for.
     let mut status_gate = use_hook(|| CopyValue::new(Gate::default()));
     let mut drawer_gate = use_hook(|| CopyValue::new(Gate::default()));
+
+    // Settings carries three things that are only ever as fresh as their
+    // last read: the peer list, the group, and this device's own endpoint
+    // id — which is "" until the spawned bind completes, so first paint has
+    // none. All are read by the transition that shows the tenant. So one
+    // refresh, used by three things: that transition, the section's own
+    // "Refresh" button, and every pairing act (each of which is a phase
+    // change the kernel is the authority on).
+    let refresh_devices = use_callback(move |()| {
+        spawn(async move {
+            read_status(status, notice, status_gate).await;
+            read_peers(peers, notice).await;
+            read_members(members, notice).await;
+            read_pairing(pairing_phase, members, notice).await;
+        });
+    });
+
+    // The Storage section's own re-read: the transition that shows
+    // Settings, and every act in the section (connect, sync, disconnect),
+    // each of which changes what `storage.status` answers.
+    let refresh_storage = use_callback(move |()| {
+        spawn(async move {
+            read_storage(binding, notice).await;
+        });
+    });
+
+    // Open a sheet on what the kernel last said. Called once per *opening*
+    // — never on a press that lands on the tenant already showing — so a
+    // half-typed field is never taken away from the user who typed it.
+    let seed_draft = use_callback(move |()| {
+        let identity = status.read();
+        let next = Draft {
+            name: identity
+                .as_ref()
+                .map(|s| s.name.clone())
+                .unwrap_or_default(),
+            hue: identity.as_ref().map(|s| s.hue).unwrap_or(0),
+            user: user_meta(),
+            app: app_meta(),
+        };
+        drop(identity);
+        seed.set(next.clone());
+        draft.set(next);
+    });
+
+    // Every drawer transition, and the only writer of `drawer`, `closing`
+    // and `leaving` other than the two animation handlers and the boot.
+    //
+    // The animation bookkeeping is here rather than in the reducer because
+    // it is about the two renders either side of a transition, which is not
+    // something a plain value can know. Three shapes:
+    //
+    // * shutting — the drawer stays mounted with `closing`, and the
+    //   `onanimationend` below is what sets `Closed`. Any pane in mid-slide
+    //   is dropped first: the bridge carries no animation name
+    //   (stream-dom-dioxus `convert_animation_data` answers ""), so
+    //   `closing` has to be the whole discriminator, and that only holds if
+    //   the drawer's own animation is the only one under it.
+    // * switching — the old tenant keeps rendering as a second pane until
+    //   its own animation ends, and the direction is the sign of the
+    //   ordinals.
+    // * opening — nothing to slide out of the way.
+    let apply = use_callback(move |action: Action| {
+        drawer_gate.write().bump();
+        // Pinned is "nothing is running": with no app on screen the drawer
+        // has nothing to be in the way of, so it rests on the app list.
+        let pinned = session.read().is_none();
+        let from = drawer().tenant();
+        let next = drawer().reduce(action, pinned);
+        match (from, next.tenant()) {
+            (Some(_), None) => {
+                leaving.set(None);
+                closing.set(true);
+            }
+            (Some(a), Some(b)) if a != b => {
+                closing.set(false);
+                leaving.set(Some((a, b.ordinal() > a.ordinal())));
+                drawer.set(next);
+            }
+            (None, Some(_)) => {
+                closing.set(false);
+                drawer.set(next);
+            }
+            // The tenant showing is the one asked for. Still cancels a
+            // close in flight: pressing the half you just left reopens it.
+            _ => closing.set(false),
+        }
+        if from == next.tenant() {
+            return;
+        }
+        match next.tenant() {
+            Some(Tenant::Settings) => {
+                seed_draft.call(());
+                refresh_devices.call(());
+                refresh_storage.call(());
+            }
+            // The sheet is about the running app, so its labels are read
+            // before they are seeded — the strip has them already, but a
+            // second device of the group may have relabelled it since.
+            Some(Tenant::AppInfo) => {
+                let id = session
+                    .read()
+                    .as_ref()
+                    .map(|(_, a): &(SessionId, App)| a.id.clone());
+                spawn(async move {
+                    if let Some(id) = id {
+                        read_app_meta(id, app_meta, notice).await;
+                    }
+                    seed_draft.call(());
+                });
+            }
+            _ => {}
+        }
+    });
+
+    // Every transition the *user* asked for. A dirty sheet is not left
+    // silently: the transition is parked on `pending` and `#visor-confirm`
+    // asks. Everything that calls `apply` directly instead — the boot, a
+    // session opening or ending, an opened seal — is a transition the user
+    // did not ask for and cannot be asked about, so a dirty draft is simply
+    // dropped there.
+    let request = use_callback(move |action: Action| {
+        if draft() != seed() {
+            pending.set(Some(action));
+        } else {
+            apply.call(action);
+        }
+    });
+
+    let save_now = use_callback(move |after: Option<Action>| {
+        let app_id = session
+            .read()
+            .as_ref()
+            .map(|(_, a): &(SessionId, App)| a.id.clone());
+        spawn(async move {
+            save_draft(
+                draft,
+                seed,
+                status,
+                user_meta,
+                app_meta,
+                notice,
+                app_id,
+                status_gate,
+            )
+            .await;
+            if let Some(action) = after {
+                apply.call(action);
+            }
+        });
+    });
+
+    let revert_now = use_callback(move |after: Option<Action>| {
+        draft.set(seed());
+        if let Some(action) = after {
+            apply.call(action);
+        }
+    });
 
     // The boot read: identity first, then the index, then whichever
     // ceremony the two of them together call for.
@@ -348,25 +688,26 @@ pub(crate) fn Visor() -> Element {
     // `src/use_future.rs:63`), so a later status re-read cannot re-run it.
     // Running once is not enough on its own, though: it *finishes* late.
     // `visorReady` and the strip only wait for `device.status`, so the
-    // Settings button goes live while `store.devices` is still in flight,
-    // and a user who presses it then had the drawer shut under them when
-    // the boot decided `Closed`. So the decision applies only if the user
-    // has not touched the drawer meanwhile — after which it is not the
-    // boot's business what is open. Nor `restore_bookmark`, which bumps the
-    // same gate when it opens a frame: a bookmark that opened is the
-    // strongest statement about what this page load is for, so the boot's
-    // own idea of which tenant to show is dropped by exactly the mechanism
-    // a user's press would have dropped it by.
+    // strip goes live while `store.devices` is still in flight, and a user
+    // who pressed it then had the drawer changed under them when the boot
+    // decided. So the decision applies only if the user has not touched the
+    // drawer meanwhile — after which it is not the boot's business what is
+    // open. Nor `restore_bookmark`'s business: it closes the drawer through
+    // `apply`, which bumps the same gate, and a bookmark that opened is the
+    // strongest statement about what this page load is for — so the boot's
+    // own idea of which tenant to show is dropped by exactly the mechanism a
+    // user's press would have dropped it by.
     use_future(move || async move {
         let token = drawer_gate.peek().begin();
         read_identity(
             status,
             apps,
             notice,
+            user_meta,
             status_gate,
             session,
-            drawer,
-            drawer_gate,
+            app_meta,
+            apply,
         )
         .await;
         let index = kernel::devices().await.unwrap_or_default();
@@ -382,7 +723,15 @@ pub(crate) fn Visor() -> Element {
             let others_kept = index
                 .iter()
                 .any(|e| e.id != s.id && e.tier == Tier::Durable);
-            drawer.set(boot_drawer(s.state, s.tier, &s.petname, others_kept));
+            // `boot_drawer`'s `Closed` is "no ceremony to raise", not "show
+            // nothing": nothing is running at boot, so the reducer rests it
+            // on the app list.
+            drawer.set(
+                match boot_drawer(s.state, s.tier, &s.petname, others_kept) {
+                    Drawer::Closed => Drawer::Closed.reduce(Action::Close, true),
+                    raised => raised,
+                },
+            );
         }
         entries.set(index);
     });
@@ -399,10 +748,15 @@ pub(crate) fn Visor() -> Element {
                     {
                         let _ = kernel::close_frame(id).await;
                         session.set(None);
+                        app_meta.set(Meta::new());
                         notice.set(Some(Notice::Ended {
                             app: app.title,
                             reason,
                         }));
+                        // Nothing is running now, so this rests the drawer
+                        // on the app list — which is where the notice is
+                        // read, and the strip has not moved to say it.
+                        apply.call(Action::Close);
                     }
                 }
                 // The other device acted: a peer that confirmed, an offer
@@ -416,17 +770,10 @@ pub(crate) fn Visor() -> Element {
         }
     });
 
-    // Every `drawer.set` below is a user's own doing, and each bumps
-    // `drawer_gate` so a boot decision still in flight cannot undo it.
-    let mut set_drawer = move |next: Drawer| {
-        drawer_gate.write().bump();
-        drawer.set(next);
-    };
-
     // A press on the app list is a plain launch: no route, so the frame
     // answers `route.get` with "" (internal.wit `shell.open-frame`).
     let open = move |app: App| async move {
-        open_app(app, String::new(), session, notice, drawer, drawer_gate).await
+        open_app(app, String::new(), session, app_meta, notice, apply).await
     };
 
     let close_session = move |id: SessionId| async move {
@@ -435,15 +782,18 @@ pub(crate) fn Visor() -> Element {
             notice.set(Some(Notice::Plain(e)));
         }
         session.set(None);
-        set_drawer(drawer().reduce(Action::Close));
+        app_meta.set(Meta::new());
+        apply.call(Action::Close);
     };
 
     // "Other devices": the index is cheap and the ages on it go stale, so
     // the press that shows the sheet is also the read.
-    let show_devices = move |_| async move {
-        entries.set(kernel::devices().await.unwrap_or_default());
-        set_drawer(drawer().reduce(Action::Toggle(Tenant::Devices)));
-    };
+    let show_devices = use_callback(move |()| {
+        spawn(async move {
+            entries.set(kernel::devices().await.unwrap_or_default());
+        });
+        request.call(Action::Show(Tenant::Devices));
+    });
 
     // Every handler below is passed to a child *component*, and so has to
     // survive a re-render unchanged or the child cannot memoize.
@@ -464,68 +814,29 @@ pub(crate) fn Visor() -> Element {
     // these `Callback<_, impl Future>` rather than `EventHandler<_>`. The
     // work is `spawn`ed instead, which is exactly what an async handler
     // would have done.
-    let toggle_apps = use_callback(move |t: Tenant| {
-        set_drawer(drawer().reduce(Action::Toggle(t)));
-    });
-
-    // Settings carries two things that are only ever as fresh as their last
-    // read: the peer list, and this device's own endpoint id — which is ""
-    // until the spawned bind completes, so first paint has none. Both are
-    // read by the press that shows the tenant, exactly as "Other devices"
-    // is for the index. A press that *closes* Settings reads nothing.
-    // Everything the Devices section shows is only ever as fresh as its
-    // last read, and there is no timer in this world to make it otherwise.
-    // So one refresh, used by three things: the press that opens Settings,
-    // the section's own "Refresh" button, and every pairing act (each of
-    // which is a phase change the kernel is the authority on).
-    let refresh_devices = use_callback(move |()| {
-        spawn(async move {
-            read_status(status, notice, status_gate).await;
-            read_peers(peers, notice).await;
-            read_members(members, notice).await;
-            read_pairing(pairing_phase, members, notice).await;
-        });
-    });
-
-    // The Storage section's own re-read: the press that opens Settings,
-    // and every act in the section (connect, sync, disconnect), each of
-    // which changes what `storage.status` answers.
-    let refresh_storage = use_callback(move |()| {
-        spawn(async move {
-            read_storage(binding, notice).await;
-        });
-    });
-
-    let show_settings = use_callback(move |t: Tenant| {
-        let next = drawer().reduce(Action::Toggle(t));
-        set_drawer(next);
-        if next == Drawer::Open(Tenant::Settings) {
-            refresh_devices.call(());
-            refresh_storage.call(());
-        }
-    });
-
-    // Unseal is the one ceremony where a *later* status read is the point:
-    // the seal opening is what the sheet was for. So the gate is bumped
-    // first and the read that follows carries the new generation.
     let on_unsealed = use_callback(move |()| {
+        // Unseal is the one ceremony where a *later* status read is the
+        // point: the seal opening is what the sheet was for. So the gate is
+        // bumped first and the read that follows carries the new
+        // generation.
         status_gate.write().bump();
         spawn(async move {
             read_identity(
                 status,
                 apps,
                 notice,
+                user_meta,
                 status_gate,
                 session,
-                drawer,
-                drawer_gate,
+                app_meta,
+                apply,
             )
             .await;
-            set_drawer(drawer().reduce(Action::Close));
+            apply.call(Action::Close);
         });
     });
 
-    let on_stay = use_callback(move |()| set_drawer(drawer().reduce(Action::Close)));
+    let on_stay = use_callback(move |()| apply.call(Action::Close));
 
     let on_kept = use_callback(move |persisted: bool| {
         status_gate.write().bump();
@@ -539,19 +850,39 @@ pub(crate) fn Visor() -> Element {
                 status,
                 apps,
                 notice,
+                user_meta,
                 status_gate,
                 session,
-                drawer,
-                drawer_gate,
+                app_meta,
+                apply,
             )
             .await;
         });
     });
 
-    let live = session.read().as_ref().map(|(id, app)| (*id, app.clone()));
+    // The word is not part of the draft: a reroll is a new secret from the
+    // kernel, not an edit, and there is nothing to type or take back.
+    let on_reroll = use_callback(move |()| {
+        status_gate.write().bump();
+        spawn(async move {
+            match kernel::reroll_word().await {
+                Ok(word) => status.with_mut(|s| {
+                    if let Some(s) = s {
+                        s.word = word
+                    }
+                }),
+                Err(e) => notice.set(Some(Notice::Plain(e))),
+            }
+        });
+    });
+
+    let on_save = use_callback(move |()| save_now.call(None));
+    let on_revert = use_callback(move |()| revert_now.call(None));
+
+    let running = session.read().is_some();
     let tenant = drawer().tenant();
     let ident = Ident::of(&status.read());
-    // The whole strip wears the unclaimed dress while the seal is shut, so
+    // The whole visor wears the unclaimed dress while the seal is shut, so
     // "no identity to show" is one fact with one rendering, not a
     // per-element negotiation.
     //
@@ -561,196 +892,350 @@ pub(crate) fn Visor() -> Element {
     // \"keep\" gives an impostor nothing." Only the passphrase tier has a
     // screen worth imitating, and that is the one this greys.
     let claimed = matches!(ident, Ident::Open(_));
-    let strip_class = if claimed { "" } else { "unclaimed" };
-    let (self_id, tier, rest, petname, endpoint_id) = match status.read().as_ref() {
-        Some(s) => (
-            s.id.clone(),
-            s.tier,
-            s.rest,
-            s.petname.clone(),
-            s.endpoint_id.clone(),
-        ),
-        None => (
-            String::new(),
-            Tier::Ephemeral,
-            Rest::RestsOpen,
-            String::new(),
-            String::new(),
-        ),
+    let locked = !claimed;
+    let root_class = if claimed { "" } else { "unclaimed" };
+
+    // The single site that paints the anchor colour, and it is inside the
+    // `Open` arm — which is only ever constructed from a `device.status`
+    // that was not sealed, so a page imitating the picker has no branch
+    // that reaches it (docs/design.md "Devices"). It is a variable rather
+    // than one element's background because the whole palette derives from
+    // it now (visor/src/style.rs), but it is still one expression in one
+    // place, and `--hue` appears nowhere else in the DOM.
+    let painted = match &ident {
+        Ident::Open(a) => Some(format!(
+            "--hue: {}",
+            // The draft owns the colour while its sheet is open, so the
+            // visor recolours under the slider and reverts with it.
+            if tenant == Some(Tenant::Settings) {
+                draft().hue
+            } else {
+                a.hue
+            }
+        )),
+        Ident::Waking | Ident::Unclaimed => None,
     };
 
-    rsx! {
-        // The trusted pixels depend on nothing the page provides, so the
-        // visor ships its own stylesheet as part of its own tree.
-        style { "{CSS}" }
+    // The device's own line in the right stack. Three ways to have no name
+    // and each says something different: not asked yet, asked and sealed,
+    // open but never named.
+    let (device_line, device_named) = match &ident {
+        Ident::Waking => ("waking".to_string(), false),
+        Ident::Unclaimed => ("no device open".to_string(), false),
+        Ident::Open(a) if a.name.is_empty() => ("this device".to_string(), false),
+        Ident::Open(a) => (a.name.clone(), true),
+    };
+    let user_petname = petname_of(&user_meta.read());
+    let app_petname = petname_of(&app_meta.read());
+    // No glyphs before the identity is painted: they are the user's own
+    // marks, and the same rule covers them as covers the colour.
+    let user_glyph = if claimed {
+        glyph_of(&user_meta.read())
+    } else {
+        String::new()
+    };
+    let app_glyph = if claimed {
+        glyph_of(&app_meta.read())
+    } else {
+        String::new()
+    };
 
-        // Drawer above strip: the strip is the line between trusted pixels
-        // and the app zone, so whatever the visor opens goes on its own side
-        // of that line and pushes the strip down rather than sitting between
-        // it and the app.
-        if let Some(tenant) = tenant {
-            div { id: "visor-drawer",
-                match tenant {
-                    Tenant::Apps => rsx! {
-                        for app in apps.read().iter().cloned() {
-                            div { key: "{app.id}", class: "app-row",
-                                div { class: "app-row-title", AppVoice { text: app.title.clone() } }
-                                button {
-                                    onclick: move |_| { let app = app.clone(); async move { open(app).await } },
-                                    "Open"
-                                }
-                            }
-                        }
-                        if apps.read().is_empty() {
-                            span { class: "{Voice::Framework.class()}", "no apps are installed" }
-                        }
-                    },
+    let on_apps = tenant == Some(Tenant::Apps) || tenant == Some(Tenant::AppInfo);
+    let on_self = tenant == Some(Tenant::Settings);
+    let shutting = closing();
+    let drawer_class = if shutting { "closing" } else { "" };
+    let entering = match leaving() {
+        Some((_, true)) => "pane enter-from-right",
+        Some((_, false)) => "pane enter-from-left",
+        None => "pane",
+    };
 
-                    Tenant::Unseal => rsx! {
-                        UnsealSheet { petname: petname.clone(), on_open: on_unsealed }
-                    },
+    // One pane's worth of drawer. Rendered twice while a switch is
+    // animating — the tenant coming in and the one going out — so it is a
+    // closure rather than an arm inlined in the tree. `current` is which of
+    // the two this is: only the pane that is staying carries the ids, since
+    // two elements with one id is a tree nobody can query.
+    let sheet_for = move |t: Tenant, current: bool| -> Element {
+        let (self_id, tier, rest, petname, endpoint_id, word) = match status.read().as_ref() {
+            Some(s) => (
+                s.id.clone(),
+                s.tier,
+                s.rest,
+                s.petname.clone(),
+                s.endpoint_id.clone(),
+                s.word.clone(),
+            ),
+            None => (
+                String::new(),
+                Tier::Ephemeral,
+                Rest::RestsOpen,
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
+        };
+        let live = session.read().as_ref().map(|(id, app)| (*id, app.clone()));
+        let live_id = live.as_ref().map(|(id, _)| *id);
+        let (info_petname, info_glyph) = {
+            let d = draft.read();
+            (
+                d.app.get(PETNAME).cloned().unwrap_or_default(),
+                d.app.get(GLYPH).cloned().unwrap_or_default(),
+            )
+        };
 
-                    Tenant::Devices => rsx! {
-                        DevicesSheet {
-                            entries: entries.read().clone(),
-                            self_id: self_id.clone(),
-                            on_stay,
-                        }
-                    },
-
-                    Tenant::Settings => rsx! {
-                        label {
-                            span { class: "{Voice::Framework.class()}", "name" }
-                            input {
-                                r#type: "text",
-                                // `initial_value`, not `value`. dioxus-html
-                                // marks `value` *volatile*: it is written to
-                                // the DOM on every diff, not only when it
-                                // changed — so any re-render while the user
-                                // is typing resets the field to whatever the
-                                // kernel last said the name was. That is not
-                                // hypothetical here: the press that opens
-                                // this sheet spawns a `device.status` read,
-                                // and the endpoint id binding makes it
-                                // return *changed* — so the field was being
-                                // cleared under the user between typing and
-                                // committing, and the name was silently
-                                // never set.
-                                //
-                                // Seeded once per opening of the tenant
-                                // instead (the drawer rebuilds this arm each
-                                // time), and the DOM owns the text from
-                                // there: the visor writes on `change`, so
-                                // there is nothing the signal needs to push
-                                // back in.
-                                initial_value: status.read().as_ref().map(|s| s.name.clone()).unwrap_or_default(),
-                                onchange: move |e| async move {
-                                    // Bumped before the kernel call, not
-                                    // after the local apply: a read already
-                                    // in flight is answering about the name
-                                    // this is replacing, whichever lands
-                                    // first.
-                                    status_gate.write().bump();
-                                    let name = e.value();
-                                    match kernel::set_name(name.clone()).await {
-                                        Ok(()) => status.with_mut(|s| { if let Some(s) = s { s.name = name } }),
-                                        Err(e) => notice.set(Some(Notice::Plain(e))),
-                                    }
-                                },
-                            }
-                        }
-                        label {
-                            span { class: "{Voice::Framework.class()}", "colour" }
-                            input {
-                                r#type: "range", min: "0", max: "359",
-                                // Volatile, exactly as the name field above:
-                                // a slider being dragged is a user write in
-                                // the DOM, and a status read landing mid-drag
-                                // would snap it back.
-                                initial_value: "{status.read().as_ref().map(|s| s.hue).unwrap_or(0)}",
-                                onchange: move |e| async move {
-                                    let Ok(hue) = e.value().parse::<u16>() else { return };
-                                    status_gate.write().bump();
-                                    match kernel::set_hue(hue).await {
-                                        Ok(()) => status.with_mut(|s| { if let Some(s) = s { s.hue = hue } }),
-                                        Err(e) => notice.set(Some(Notice::Plain(e))),
-                                    }
-                                },
-                            }
-                        }
-                        label {
-                            span { class: "{Voice::Framework.class()}", "word" }
-                            span { class: "{Voice::Framework.class()}", "{status.read().as_ref().map(|s| s.word.clone()).unwrap_or_default()}" }
-                            button {
-                                onclick: move |_| async move {
-                                    status_gate.write().bump();
-                                    match kernel::reroll_word().await {
-                                        Ok(word) => status.with_mut(|s| { if let Some(s) = s { s.word = word } }),
-                                        Err(e) => notice.set(Some(Notice::Plain(e))),
-                                    }
-                                },
-                                "Reroll"
-                            }
-                        }
-
-                        if tier == Tier::Durable {
-                            KeptNote { petname: petname.clone(), rest }
-                        } else {
-                            KeepSheet { on_kept }
-                        }
-
-                        StorageSection {
-                            binding: binding.read().clone(),
-                            on_refresh: refresh_storage,
-                        }
-
-                        DevicesSection {
-                            endpoint_id: endpoint_id.clone(),
-                            members: members.read().clone(),
-                            peers: peers.read().clone(),
-                            phase: pairing_phase.read().clone(),
-                            on_refresh: refresh_devices,
-                        }
-
-                        div { class: "sheet",
-                            button { onclick: show_devices, "Other devices" }
-                            EraseControl {}
-                        }
-                    },
-                }
-            }
-        }
-
-        div { id: "visor-strip", class: "{strip_class}",
-            Identity { ident }
-            div { id: "visor-context",
-                match (&live, &*notice.read()) {
-                    (Some((_, app)), _) => rsx! {
-                        span { class: "{Voice::Framework.class()}", "showing " }
-                        AppVoice { text: app.title.clone() }
-                    },
-                    (None, Some(Notice::Ended { app, reason })) => rsx! {
+        rsx! {
+            // Whatever happened that the user did not ask for. It lives at
+            // the top of every pane because the strip has no room to say
+            // it any more and no business moving to make some.
+            div { id: if current { Some("visor-notice") } else { None }, class: "notice",
+                match &*notice.read() {
+                    Some(Notice::Ended { app, reason }) => rsx! {
                         AppVoice { text: app.clone() }
                         span { class: "{Voice::Framework.class()}", " ended: {reason}" }
                     },
-                    (None, Some(Notice::Plain(message))) => rsx! {
+                    Some(Notice::Plain(message)) => rsx! {
                         span { class: "{Voice::Framework.class()}", "{message}" }
                     },
-                    (None, None) => rsx! {
-                        span { class: "{Voice::Framework.class()}", "nothing is running" }
-                    },
+                    None => rsx! {},
                 }
             }
-            div { id: "visor-actions",
-                // Both tenants need a kernel that answers, so neither is
-                // offered before the seal opens; the ceremony the boot
-                // raised is what the user has to act on instead.
-                TenantButton { label: "Apps", tenant: Tenant::Apps, open: tenant == Some(Tenant::Apps), disabled: !claimed,
-                    onpress: toggle_apps }
-                TenantButton { label: "Settings", tenant: Tenant::Settings, open: tenant == Some(Tenant::Settings), disabled: !claimed,
-                    onpress: show_settings }
-                if let Some((id, _)) = live {
-                    button { onclick: move |_| async move { close_session(id).await }, "Close" }
+
+            match t {
+                Tenant::Apps => rsx! {
+                    for app in apps.read().iter().cloned() {
+                        div { key: "{app.id}", class: "app-row",
+                            div { class: "app-row-title", AppVoice { text: app.title.clone() } }
+                            button {
+                                onclick: move |_| { let app = app.clone(); async move { open(app).await } },
+                                "Open"
+                            }
+                        }
+                    }
+                    if apps.read().is_empty() {
+                        span { class: "{Voice::Framework.class()}", "no apps are installed" }
+                    }
+                },
+
+                // The running app, and the user's own words for it. Only
+                // reachable while a session runs — the strip's left half
+                // shows the app list otherwise — so the title is the live
+                // one and the draft's `app` map is that app's.
+                Tenant::AppInfo => rsx! {
+                    div { class: "sheet",
+                        match &live {
+                            Some((_, app)) => rsx! {
+                                div { class: "sheet-head", AppVoice { text: app.title.clone() } }
+                            },
+                            None => rsx! {
+                                span { class: "{Voice::Framework.class()}", "nothing running" }
+                            },
+                        }
+                        label {
+                            span { class: "{Voice::Framework.class()}", "petname" }
+                            // Controlled, unlike the fields this replaced.
+                            // `value` is volatile in dioxus-html — written
+                            // on every diff — which is why the old fields
+                            // read the kernel once and let the DOM own the
+                            // text: a status re-read landing mid-typing
+                            // reset them. Nothing re-reads a draft, so the
+                            // signal is the field's only writer and the
+                            // volatility has nothing to overwrite with.
+                            input {
+                                r#type: "text",
+                                value: "{info_petname}",
+                                oninput: move |e| {
+                                    let mut d = draft.write();
+                                    set_field(&mut d.app, PETNAME, e.value());
+                                },
+                            }
+                        }
+                        label {
+                            span { class: "{Voice::Framework.class()}", "glyph" }
+                            input {
+                                r#type: "text",
+                                value: "{info_glyph}",
+                                oninput: move |e| {
+                                    let mut d = draft.write();
+                                    set_field(&mut d.app, GLYPH, e.value());
+                                },
+                            }
+                        }
+                        if let Some(id) = live_id {
+                            button {
+                                onclick: move |_| async move { close_session(id).await },
+                                "Close app"
+                            }
+                        }
+                    }
+                },
+
+                Tenant::Unseal => rsx! {
+                    UnsealSheet { petname: petname.clone(), on_open: on_unsealed }
+                },
+
+                Tenant::Devices => rsx! {
+                    DevicesSheet {
+                        entries: entries.read().clone(),
+                        self_id: self_id.clone(),
+                        on_stay,
+                    }
+                },
+
+                Tenant::Settings => rsx! {
+                    SettingsSheet {
+                        draft,
+                        seed,
+                        word: word.clone(),
+                        tier,
+                        petname: petname.clone(),
+                        rest,
+                        binding: binding.read().clone(),
+                        endpoint_id: endpoint_id.clone(),
+                        members: members.read().clone(),
+                        peers: peers.read().clone(),
+                        phase: pairing_phase.read().clone(),
+                        on_reroll,
+                        on_refresh_storage: refresh_storage,
+                        on_refresh_devices: refresh_devices,
+                        on_kept,
+                        on_devices: show_devices,
+                        on_save,
+                        on_revert,
+                    }
+                },
+            }
+        }
+    };
+
+    rsx! {
+        // One positioned root. The drawer is rendered before the strip so
+        // it sits in normal flow above it: the strip is the line between
+        // trusted pixels and the app zone, so whatever the visor opens goes
+        // on the visor's side of that line — above the strip — and pushes
+        // the strip, and the app zone under it, down rather than covering
+        // it.
+        div { id: "visor-root", class: "{root_class}", style: painted,
+            // The trusted pixels depend on nothing the page provides, so
+            // the visor ships its own stylesheet as part of its own tree.
+            style { "{CSS}" }
+
+            if let Some(t) = tenant {
+                // Only when there is something behind the drawer to
+                // dismiss back to. With nothing running the drawer is
+                // where the visor rests, and a scrim over an empty app
+                // zone would be a dismissal to nowhere.
+                if running {
+                    div { id: "visor-scrim", onclick: move |_| request.call(Action::Close) }
+                }
+                div {
+                    id: "visor-drawer",
+                    class: "{drawer_class}",
+                    onanimationend: move |_| {
+                        // `closing` is the whole discriminator: the bridge
+                        // reports no animation name, and the close path
+                        // drops any pane still sliding, so the drawer's own
+                        // animation is the only one that can be ending
+                        // under it while this is true.
+                        if closing() {
+                            closing.set(false);
+                            drawer.set(Drawer::Closed);
+                        }
+                    },
+                    if let Some((from, forward)) = leaving() {
+                        div {
+                            key: "{from:?}",
+                            class: if forward { "pane leave-to-left" } else { "pane leave-to-right" },
+                            onanimationend: move |_| leaving.set(None),
+                            {sheet_for(from, false)}
+                        }
+                    }
+                    div { key: "{t:?}", class: "{entering}", {sheet_for(t, true)} }
+                }
+            }
+
+            div { id: "visor-strip",
+                // Left half: what is running. Both halves need a kernel
+                // that answers, so neither is offered before the seal
+                // opens; the ceremony the boot raised is what the user has
+                // to act on instead.
+                button {
+                    id: "visor-app",
+                    disabled: "{locked}",
+                    aria_pressed: "{on_apps}",
+                    onclick: move |_| {
+                        request.call(Action::Show(if running { Tenant::AppInfo } else { Tenant::Apps }))
+                    },
+                    div { id: "visor-app-glyph", "{app_glyph}" }
+                    div { class: "stack",
+                        div { class: "top",
+                            match session.read().as_ref() {
+                                Some((_, app)) => rsx! { AppVoice { text: app.title.clone() } },
+                                None => rsx! {
+                                    span { class: "{Voice::Framework.class()}", "nothing running" }
+                                },
+                            }
+                        }
+                        div { class: "bottom",
+                            if !app_petname.is_empty() {
+                                span { class: "{Voice::User.class()}", "{app_petname}" }
+                            }
+                        }
+                    }
+                }
+
+                div { id: "visor-divider" }
+
+                // Right half: who this is, and which device this is.
+                button {
+                    id: "visor-self",
+                    disabled: "{locked}",
+                    aria_pressed: "{on_self}",
+                    onclick: move |_| request.call(Action::Show(Tenant::Settings)),
+                    div { id: "visor-circle", "{user_glyph}" }
+                    div { class: "stack",
+                        div { class: "top",
+                            if user_petname.is_empty() {
+                                span { class: "{Voice::Framework.class()} placeholder", "you" }
+                            } else {
+                                span { class: "{Voice::User.class()}", "{user_petname}" }
+                            }
+                        }
+                        div { class: "bottom",
+                            if device_named {
+                                span { class: "{Voice::User.class()}", "{device_line}" }
+                            } else {
+                                span { class: "{Voice::Framework.class()} placeholder", "{device_line}" }
+                            }
+                        }
+                    }
+                }
+                // The anchor word is a recognition secret between the user
+                // and this device: spoken only in the settings sheet, on
+                // request, never left standing in the strip.
+            }
+
+            // Unsaved changes, over the drawer that holds them. The three
+            // answers are the three things a user could mean, and none of
+            // them is "lose it quietly".
+            if let Some(action) = pending() {
+                div { id: "visor-confirm", role: "dialog",
+                    span { class: "{Voice::Framework.class()}", "unsaved changes" }
+                    button {
+                        onclick: move |_| {
+                            pending.set(None);
+                            save_now.call(Some(action));
+                        },
+                        "Save"
+                    }
+                    button {
+                        onclick: move |_| {
+                            pending.set(None);
+                            revert_now.call(Some(action));
+                        },
+                        "Revert"
+                    }
+                    button { onclick: move |_| pending.set(None), "Cancel" }
                 }
             }
         }
@@ -782,8 +1267,9 @@ impl Ident {
     }
 }
 
-/// The painted identity. A plain value so `Identity` is a pure function of
-/// it and re-renders only when the identity changed.
+/// The painted identity. A plain value, and the only shape a hue is
+/// carried in: constructing one is what says the kernel called this device
+/// unsealed.
 #[derive(Clone, PartialEq)]
 struct Anchor {
     name: String,
@@ -795,47 +1281,6 @@ impl Anchor {
         Anchor {
             name: status.name.clone(),
             hue: status.hue,
-        }
-    }
-}
-
-#[component]
-fn Identity(ident: Ident) -> Element {
-    let anchor = match ident {
-        // No circle colour, no name, no word: the greys come from the
-        // `.unclaimed` rule on the strip, and no hue is computed at all.
-        Ident::Waking => {
-            return rsx! {
-                div { id: "visor-identity",
-                    div { id: "visor-circle" }
-                    span { class: "{Voice::Framework.class()} placeholder", "waking" }
-                }
-            };
-        }
-        Ident::Unclaimed => {
-            return rsx! {
-                div { id: "visor-identity",
-                    div { id: "visor-circle" }
-                    span { class: "{Voice::Framework.class()} placeholder", "no device open" }
-                }
-            };
-        }
-        Ident::Open(a) => a,
-    };
-    rsx! {
-        div { id: "visor-identity",
-            // Per-element, not a theme variable: the hue is this device's
-            // identity, and identity does not cascade. This is the single
-            // site that paints it, and it is inside the `Open` arm.
-            div { id: "visor-circle", style: "background: hsl({anchor.hue}deg 65% 50%)" }
-            if anchor.name.is_empty() {
-                span { class: "{Voice::Framework.class()} placeholder", "this device" }
-            } else {
-                span { class: "{Voice::User.class()}", "{anchor.name}" }
-            }
-            // The anchor word is a recognition secret between the user and
-            // this device: spoken only in the settings sheet, on request,
-            // never left standing in the strip.
         }
     }
 }
@@ -1472,22 +1917,129 @@ fn EraseControl() -> Element {
     }
 }
 
-/// A strip button that opens its tenant. `aria-pressed` is the open state
-/// the stylesheet keys off, so pressed-ness is one fact, not two.
+/// Everything about this device, and the user, that is a field rather
+/// than a ceremony.
+///
+/// The four editable fields go through the draft, not the kernel: what a
+/// user has typed and not saved is theirs, and the kernel hears about it
+/// once, on `Save`. `Revert` puts the sheet back to what the kernel last
+/// said. The word is the exception and is deliberately not a field — a
+/// reroll is a new secret from the kernel, immediate, with nothing to take
+/// back.
 #[component]
-fn TenantButton(
-    label: String,
-    tenant: Tenant,
-    open: bool,
-    disabled: bool,
-    onpress: EventHandler<Tenant>,
+#[allow(clippy::too_many_arguments)]
+fn SettingsSheet(
+    draft: Signal<Draft>,
+    seed: Signal<Draft>,
+    word: String,
+    tier: Tier,
+    petname: String,
+    rest: Rest,
+    binding: Option<Binding>,
+    endpoint_id: String,
+    members: Vec<Member>,
+    peers: Vec<Peer>,
+    phase: Phase,
+    on_reroll: EventHandler<()>,
+    on_refresh_storage: EventHandler<()>,
+    on_refresh_devices: EventHandler<()>,
+    on_kept: EventHandler<bool>,
+    on_devices: EventHandler<()>,
+    on_save: EventHandler<()>,
+    on_revert: EventHandler<()>,
 ) -> Element {
+    let mut draft = draft;
+    // Read out rather than held: the field values are wanted here, and a
+    // read guard alive across the tree would be one the input handlers
+    // below have to hope nobody took a write against.
+    let (name, hue, user_petname, user_glyph) = {
+        let d = draft.read();
+        (
+            d.name.clone(),
+            d.hue,
+            d.user.get(PETNAME).cloned().unwrap_or_default(),
+            d.user.get(GLYPH).cloned().unwrap_or_default(),
+        )
+    };
+    let clean = draft() == seed();
+
     rsx! {
-        button {
-            aria_pressed: "{open}",
-            disabled: "{disabled}",
-            onclick: move |_| onpress.call(tenant),
-            "{label}"
+        label {
+            span { class: "{Voice::Framework.class()}", "device petname" }
+            input {
+                r#type: "text",
+                value: "{name}",
+                oninput: move |e| draft.write().name = e.value(),
+            }
+        }
+        label {
+            span { class: "{Voice::Framework.class()}", "colour" }
+            // `oninput`, not `onchange`: the hue is what the whole visor is
+            // painted from, so the drag is the preview — the strip, the
+            // drawer and every button recolour under the thumb, and
+            // `Revert` is what undoes it.
+            input {
+                r#type: "range", min: "0", max: "359",
+                value: "{hue}",
+                oninput: move |e| {
+                    if let Ok(hue) = e.value().parse::<u16>() {
+                        draft.write().hue = hue;
+                    }
+                },
+            }
+        }
+        label {
+            span { class: "{Voice::Framework.class()}", "your petname" }
+            input {
+                r#type: "text",
+                value: "{user_petname}",
+                oninput: move |e| {
+                    let mut d = draft.write();
+                    set_field(&mut d.user, PETNAME, e.value());
+                },
+            }
+        }
+        label {
+            span { class: "{Voice::Framework.class()}", "your glyph" }
+            input {
+                r#type: "text",
+                value: "{user_glyph}",
+                oninput: move |e| {
+                    let mut d = draft.write();
+                    set_field(&mut d.user, GLYPH, e.value());
+                },
+            }
+        }
+        div { class: "choice",
+            button { disabled: "{clean}", onclick: move |_| on_save.call(()), "Save" }
+            button { onclick: move |_| on_revert.call(()), "Revert" }
+        }
+
+        label {
+            span { class: "{Voice::Framework.class()}", "word" }
+            span { class: "{Voice::Framework.class()}", "{word}" }
+            button { onclick: move |_| on_reroll.call(()), "Reroll" }
+        }
+
+        if tier == Tier::Durable {
+            KeptNote { petname: petname.clone(), rest }
+        } else {
+            KeepSheet { on_kept }
+        }
+
+        StorageSection { binding, on_refresh: on_refresh_storage }
+
+        DevicesSection {
+            endpoint_id,
+            members,
+            peers,
+            phase,
+            on_refresh: on_refresh_devices,
+        }
+
+        div { class: "sheet",
+            button { onclick: move |_| on_devices.call(()), "Other devices" }
+            EraseControl {}
         }
     }
 }

@@ -2,15 +2,33 @@
 //! only stateful thing in the visor's chrome is testable natively.
 
 /// What the drawer is showing when it is open. A closed set, so this is an
-/// enum and not an abstraction. `Apps`/`Settings` are the strip's own
-/// buttons; `Unseal` and `Devices` are ceremonies the boot may raise on its
-/// own, and `Devices` is additionally reachable from `Settings`.
+/// enum and not an abstraction. `Apps`/`AppInfo` are what the strip's left
+/// half raises and `Settings` what its right half does; `Unseal` and
+/// `Devices` are ceremonies the boot may raise on its own, and `Devices` is
+/// additionally reachable from `Settings`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Tenant {
     Apps,
+    AppInfo,
     Settings,
     Unseal,
     Devices,
+}
+
+impl Tenant {
+    /// Where this tenant sits on the one axis the drawer slides along, so a
+    /// switch has a direction: a sheet reached from the strip's left half
+    /// enters from the left of one reached from its right half, and
+    /// "Other devices" — reached from Settings — enters from the right of
+    /// it. Ties (`Apps`/`AppInfo`, which are the same half) slide the same
+    /// way as any other rightward move; only the sign is read.
+    pub(crate) fn ordinal(self) -> u8 {
+        match self {
+            Tenant::Apps | Tenant::AppInfo => 0,
+            Tenant::Settings | Tenant::Unseal => 1,
+            Tenant::Devices => 2,
+        }
+    }
 }
 
 /// `device.state` from internal.wit, as a plain value: the reducer decides
@@ -45,6 +63,10 @@ pub(crate) enum Rest {
 /// other kernel call is `unavailable` until `unseal`, and a device that is
 /// brand new on an origin that already holds a kept one is far more likely
 /// to be a reload that lost its anchor than a deliberate second device.
+///
+/// `Closed` here means "no ceremony to raise", not "show nothing": the
+/// caller runs the result through [`Drawer::reduce`] with the pinned flag,
+/// which at boot — nothing is running yet — rests it on the app list.
 ///
 // CONTRACT: the dispatch spells the "brand new" test two ways ("state is
 // fresh" and "our status.tier == ephemeral && status.petname == \"\""). The
@@ -190,22 +212,31 @@ pub(crate) enum Drawer {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Action {
-    /// A strip button for a tenant was pressed.
-    Toggle(Tenant),
-    /// Something happened that the drawer must get out of the way of —
-    /// a session opening, or closing, or a seal opening.
+    /// A half of the strip was pressed, or a sheet sent the user on. Never
+    /// closes: showing what is already shown is identity, so the drawer is
+    /// not a toggle any more and a press can never leave the user looking
+    /// at nothing.
+    Show(Tenant),
+    /// Something happened that the drawer must get out of the way of — a
+    /// session opening, or closing, a seal opening, or the scrim pressed.
     Close,
 }
 
 impl Drawer {
-    pub(crate) fn reduce(self, action: Action) -> Drawer {
+    /// `pinned` is "nothing is running": with no app on screen there is
+    /// nothing for the drawer to be in the way of, so the app list is what
+    /// the visor rests at and `Closed` is not a state it can reach. With a
+    /// session running the app owns the screen and `Close` means it.
+    pub(crate) fn reduce(self, action: Action, pinned: bool) -> Drawer {
+        let rest = if pinned {
+            Drawer::Open(Tenant::Apps)
+        } else {
+            Drawer::Closed
+        };
         match action {
-            // The same button again closes: a strip button is a toggle,
-            // never a one-way trip, so the strip is always one press from
-            // showing nothing but itself.
-            Action::Toggle(t) if self == Drawer::Open(t) => Drawer::Closed,
-            Action::Toggle(t) => Drawer::Open(t),
-            Action::Close => Drawer::Closed,
+            Action::Show(t) if self == Drawer::Open(t) => self,
+            Action::Show(t) => Drawer::Open(t),
+            Action::Close => rest,
         }
     }
 
@@ -221,33 +252,68 @@ impl Drawer {
 mod tests {
     use super::*;
 
+    /// Showing what is already shown is identity: a press on the half of
+    /// the strip whose sheet is open must not shut it, or the drawer would
+    /// flicker every time a user pressed the thing they were reading.
     #[test]
-    fn same_tenant_twice_closes() {
-        let d = Drawer::default().reduce(Action::Toggle(Tenant::Apps));
-        assert_eq!(d, Drawer::Open(Tenant::Apps));
-        assert_eq!(d.reduce(Action::Toggle(Tenant::Apps)), Drawer::Closed);
+    fn showing_the_open_tenant_changes_nothing() {
+        for pinned in [true, false] {
+            let d = Drawer::Open(Tenant::Apps);
+            assert_eq!(d.reduce(Action::Show(Tenant::Apps), pinned), d);
+        }
     }
 
     #[test]
     fn other_tenant_replaces() {
-        let d = Drawer::default().reduce(Action::Toggle(Tenant::Apps));
+        let d = Drawer::default().reduce(Action::Show(Tenant::Apps), true);
         assert_eq!(
-            d.reduce(Action::Toggle(Tenant::Settings)),
+            d.reduce(Action::Show(Tenant::Settings), true),
             Drawer::Open(Tenant::Settings)
         );
+    }
+
+    /// Nothing running: the app list is where the drawer rests, so a close
+    /// lands there and `Closed` is not reachable at all.
+    #[test]
+    fn pinned_close_opens_the_app_list() {
+        for from in [
+            Drawer::Open(Tenant::Settings),
+            Drawer::Open(Tenant::Devices),
+            Drawer::Open(Tenant::Unseal),
+            Drawer::Closed,
+        ] {
+            assert_eq!(
+                from.reduce(Action::Close, true),
+                Drawer::Open(Tenant::Apps),
+                "pinned close from {from:?}"
+            );
+        }
     }
 
     /// A session opening (and closing) sends `Close`: the app frame gets
     /// the screen, the drawer never covers it.
     #[test]
-    fn session_change_closes_the_drawer() {
+    fn unpinned_close_shuts_the_drawer() {
         for open in [
             Drawer::Open(Tenant::Apps),
+            Drawer::Open(Tenant::AppInfo),
             Drawer::Open(Tenant::Settings),
             Drawer::Closed,
         ] {
-            assert_eq!(open.reduce(Action::Close), Drawer::Closed);
+            assert_eq!(open.reduce(Action::Close, false), Drawer::Closed);
         }
+    }
+
+    /// The slide direction is a sign, and it has to be the one the strip
+    /// implies: the left half's sheets sit left of the right half's, and
+    /// "Other devices" sits right of Settings, which is where it is
+    /// reached from.
+    #[test]
+    fn ordinals_order_the_sheets_left_to_right() {
+        assert_eq!(Tenant::Apps.ordinal(), Tenant::AppInfo.ordinal());
+        assert!(Tenant::Apps.ordinal() < Tenant::Settings.ordinal());
+        assert_eq!(Tenant::Unseal.ordinal(), Tenant::Settings.ordinal());
+        assert!(Tenant::Settings.ordinal() < Tenant::Devices.ordinal());
     }
 
     #[test]
@@ -271,12 +337,13 @@ mod tests {
     }
 
     /// The seal opening is a `Close`: the ceremony is over and the strip is
-    /// now painted with a real identity, which is the thing to look at.
+    /// now painted with a real identity. Nothing is running at that moment,
+    /// so what the drawer rests at is the app list.
     #[test]
-    fn unseal_success_closes_the_drawer() {
+    fn unseal_success_rests_on_the_app_list() {
         assert_eq!(
-            Drawer::Open(Tenant::Unseal).reduce(Action::Close),
-            Drawer::Closed
+            Drawer::Open(Tenant::Unseal).reduce(Action::Close, true),
+            Drawer::Open(Tenant::Apps)
         );
     }
 
@@ -316,7 +383,7 @@ mod tests {
     #[test]
     fn devices_is_reachable_from_settings() {
         assert_eq!(
-            Drawer::Open(Tenant::Settings).reduce(Action::Toggle(Tenant::Devices)),
+            Drawer::Open(Tenant::Settings).reduce(Action::Show(Tenant::Devices), true),
             Drawer::Open(Tenant::Devices)
         );
     }

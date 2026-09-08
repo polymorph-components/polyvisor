@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use crate::{Error, ErrorCode};
@@ -126,6 +127,26 @@ pub struct Device {
     pub name: String,
     pub hue: u16,
     pub word: String,
+    /// The user's own labels — petname, glyph, whatever the visor settles on
+    /// (internal.wit `meta-scope`). Absent from checkpoints written before
+    /// this field existed; `serde(default)` keeps those loading.
+    #[serde(default)]
+    pub meta: Meta,
+}
+
+/// One map per `MetaScope`; see internal.wit `meta-scope`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Meta {
+    pub user: BTreeMap<String, String>,
+    pub device: BTreeMap<String, String>,
+    pub app: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// Which map `meta`/`set_meta` reads or replaces.
+pub enum MetaScope {
+    User,
+    Device,
+    App(String),
 }
 
 impl Device {
@@ -143,6 +164,7 @@ impl Device {
             name: String::new(),
             hue: (draw(rng) % 360) as u16,
             word: word_at(draw(rng)),
+            meta: Meta::default(),
         }
     }
 

@@ -344,7 +344,12 @@ function base64(bytes: ArrayBuffer): string {
  * cannot reach the network at all. Everything it renders comes down the
  * mutation stream or out of a `blob:` the parent minted, which is why
  * `style-src` allows `blob:` (the app bundle's stylesheet is an asset, so
- * `<link href>` resolves to a blob URL).
+ * `<link href>` resolves to a blob URL). `img-src` also allows `data:`: the
+ * bytes of a `data:` URL are inline in whatever names it — here, the
+ * stylesheet's `background-image` SVGs — so nothing leaves the frame. An
+ * `<img src="data:...">` from the app is still refused, by the receiver
+ * policy (web/policy.ts: URL-kind attributes take asset handles only), not
+ * by this CSP.
  *
  * The hash covers the exact text between the tags INCLUDING the two
  * newlines, because that is what the browser hashes.
@@ -359,7 +364,7 @@ async function frameSrcdoc(frameJs: string): Promise<string> {
     "default-src 'none'",
     `script-src 'sha256-${base64(digest)}' 'wasm-unsafe-eval'`,
     "style-src blob:",
-    "img-src blob:",
+    "img-src blob: data:",
     "font-src blob:",
     "media-src blob:",
     "form-action 'none'",

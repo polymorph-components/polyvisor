@@ -256,6 +256,41 @@ pub(crate) async fn reroll_word() -> Result<String, String> {
     api::device::reroll_word().await.map_err(message)
 }
 
+/// Which map `meta`/`set_meta` reads or replaces (internal.wit `meta-scope`).
+/// The `device` scope exists in the contract but nothing in the visor edits
+/// it yet, so it has no variant here.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum MetaScope {
+    User,
+    App(String),
+}
+
+fn meta_scope(scope: MetaScope) -> api::device::MetaScope {
+    match scope {
+        MetaScope::User => api::device::MetaScope::User,
+        MetaScope::App(id) => api::device::MetaScope::App(id),
+    }
+}
+
+pub(crate) type Meta = std::collections::BTreeMap<String, String>;
+
+/// The user's own labels for themself, this device, and one app
+/// (internal.wit `device.meta`).
+pub(crate) async fn meta(scope: MetaScope) -> Result<Meta, String> {
+    Ok(api::device::meta(meta_scope(scope))
+        .await
+        .map_err(message)?
+        .into_iter()
+        .collect())
+}
+
+/// Replaces the whole map for `scope` (internal.wit `device.set-meta`).
+pub(crate) async fn set_meta(scope: MetaScope, meta: Meta) -> Result<(), String> {
+    api::device::set_meta(meta_scope(scope), meta.into_iter().collect())
+        .await
+        .map_err(message)
+}
+
 pub(crate) async fn installed() -> Result<Vec<App>, String> {
     Ok(api::apps::installed()
         .await

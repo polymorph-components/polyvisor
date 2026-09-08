@@ -131,7 +131,8 @@ there.
 - An opaque-origin `srcdoc` document carrying its own `<meta>` CSP
   (`default-src 'none'`; `script-src` the loader's hash plus
   `'wasm-unsafe-eval'`; `style-src`/`img-src`/`font-src`/`media-src
-  blob:` — the asset stylesheet is a `blob:`). CSP
+  blob:` — the asset stylesheet is a `blob:`; `img-src` also `data:`, for
+  the stylesheet's inline SVG backgrounds, which fetch nothing). CSP
   policies compose with the embedder's header policy, so the frame is
   network-dead regardless. `sandbox="allow-scripts allow-forms"`;
   `form-action 'none'`. The loader is a constant; everything variable
@@ -512,8 +513,8 @@ interprets.
 - **M0** archive, skeleton, this record, both WIT packages, CI.
 - **M1** three realms, one TodoMVC: stub kernel with in-memory `tasks`;
   visor strip + settings sheet; frame loader under policy; ports.
-  Gates: app renders in the opaque frame; strip geometry immobile with
-  the app mounted; zero network requests from the frame; `jspi: false`;
+  Gates: app renders in the opaque frame; zero network requests from
+  the frame; `jspi: false`;
   the frame policy's unit tests. (The frame-teardown integration test
   waits for a hostile fixture component — M2. The path was exercised
   anyway: the policy caught the TodoMVC example's outbound `href`.)
