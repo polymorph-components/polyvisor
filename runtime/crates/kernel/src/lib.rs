@@ -19,6 +19,7 @@ mod device;
 mod drive;
 mod events;
 mod pairing;
+mod route;
 mod seal;
 mod store;
 mod sync;
@@ -1027,6 +1028,72 @@ impl Kernel {
             })
     }
 
+    // -- routes --------------------------------------------------------------
+
+    /// The fragment text (`app/<token>`, no `#`) for this session's app at
+    /// `route` — internal.wit `apps.route-encode`. The app never sees the key
+    /// and never sees the token's construction; it says where it is and the
+    /// visor writes the URL.
+    pub async fn route_encode(&self, session: SessionId, route: String) -> Result<String, Error> {
+        self.open()?;
+        let app = self.session_app_id(session)?;
+        // Cloned out of the cell before the first await: nothing may hold a
+        // borrow of ours across a suspension point, because the host can
+        // re-enter while one is in flight (see `write_checkpoint`).
+        let engine = self.engine()?;
+        let (install, install_wrote) = engine.visor_install(&app).await.map_err(engine_failed)?;
+        let (key, key_wrote) = engine.visor_route_key().await.map_err(engine_failed)?;
+        // Both calls mint on first use, and a minted install id or route key
+        // that no checkpoint carries is a bookmark that stops resolving after
+        // a reload — same reason every `tasks_*` mutation checkpoints.
+        if install_wrote || key_wrote {
+            self.checkpoint().await?;
+        }
+        route::encode(&key, install, &route).map_err(|why| match why {
+            route::RouteError::TooLong => Error::new(
+                ErrorCode::Refused,
+                format!(
+                    "this app's location is too long to put in a link ({} bytes; the limit is {})",
+                    route.len(),
+                    route::MAX_ROUTE
+                ),
+            ),
+            route::RouteError::Unreadable => {
+                Error::new(ErrorCode::Failed, "this link could not be written")
+            }
+        })
+    }
+
+    /// What a fragment names: the app, and the route the app wrote into it —
+    /// internal.wit `apps.route-decode`. Every way a fragment can fail to
+    /// open is one answer, because the honest thing to say about a link from
+    /// another user, another key or a flipped bit is the same (`crate::route`).
+    pub async fn route_decode(&self, fragment: String) -> Result<(AppInfo, String), Error> {
+        self.open()?;
+        let engine = self.engine()?;
+        let (key, wrote) = engine.visor_route_key().await.map_err(engine_failed)?;
+        if wrote {
+            self.checkpoint().await?;
+        }
+        let (install, route) = route::decode(&key, &fragment).map_err(|_| unopenable_link())?;
+        let installs = engine.visor_installs().await.map_err(engine_failed)?;
+        // An install id this device's visor document has never held decrypted
+        // under our key, so it is ours — but from a state we have not synced.
+        // That is the same "cannot open this" as a foreign link.
+        let app = installs
+            .into_iter()
+            .find(|(id, _)| *id == install)
+            .map(|(_, app)| app)
+            .ok_or_else(unopenable_link)?;
+        let info = self.registry.info(&app).ok_or_else(|| {
+            Error::new(
+                ErrorCode::UnknownApp,
+                "that link names an app that is no longer installed",
+            )
+        })?;
+        Ok((info, route))
+    }
+
     // -- app services --------------------------------------------------------
 
     pub async fn tasks_revision(&self, session: SessionId) -> Result<u64, String> {
@@ -1276,4 +1343,18 @@ async fn open_or_mint(
 
 fn erased() -> Error {
     Error::new(ErrorCode::Unavailable, "this device has been erased")
+}
+
+/// The engine's failures reach the kernel as prose it passes on unread.
+fn engine_failed(why: String) -> Error {
+    Error::new(ErrorCode::Failed, why)
+}
+
+/// The one thing said about a fragment this device cannot open, whatever the
+/// reason (`crate::route`).
+fn unopenable_link() -> Error {
+    Error::new(
+        ErrorCode::NotFound,
+        "this link is not one this device can open",
+    )
 }

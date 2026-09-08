@@ -132,6 +132,31 @@ mod service {
     }
 }
 
+/// `polyvisor:app/route`, thin like [`service`] above.
+#[cfg(target_arch = "wasm32")]
+mod route {
+    use crate::bindings::polyvisor::app::route;
+
+    pub fn get() -> String {
+        route::get()
+    }
+
+    pub fn set(route: &str) {
+        route::set(route)
+    }
+}
+
+/// Off the component target there is no host to answer it; same reason as
+/// `service`'s native stub just below.
+#[cfg(not(target_arch = "wasm32"))]
+mod route {
+    pub fn get() -> String {
+        String::new()
+    }
+
+    pub fn set(_route: &str) {}
+}
+
 /// Off the component target there is no service and no host to answer it.
 /// The stub exists only so the components below type-check under a native
 /// `cargo clippy --workspace --all-targets`; it is never linked into the
@@ -214,7 +239,16 @@ const STYLESHEET: &str = "asset:0f827d119b7bec30534b1767e8ab8ee0f2890c98f93baa11
 pub fn app() -> Element {
     // The snapshot. Owned by the `tasks` service; this is a cached view of it.
     let items = use_signal(Vec::<TodoItem>::new);
-    let filter = use_signal(|| FilterState::All);
+    // The route is this app's own prior output, relayed back by the visor —
+    // not user-typed input (`wit/app.wit` `route`: "a route this app is
+    // handed is one it wrote itself on one of the user's own devices"). An
+    // unknown value (including a plain launch's "") is simply `All`, the
+    // same as a value this app never wrote.
+    let filter = use_signal(|| match route::get().as_str() {
+        "active" => FilterState::Active,
+        "completed" => FilterState::Completed,
+        _ => FilterState::All,
+    });
 
     // On mount: the first snapshot.
     use_future(move || refresh(items));
@@ -450,10 +484,14 @@ fn ListFooter(
                 }
             }
             ul { class: "filters",
-                for (state , state_text , url) in [
-                    (FilterState::All, "All", "#/"),
-                    (FilterState::Active, "Active", "#/active"),
-                    (FilterState::Completed, "Completed", "#/completed"),
+                // `#/`, `#/active`, `#/completed` stay as in-frame anchors
+                // (the frame policy allows `#`-fragment hrefs); the visor's
+                // *page* fragment that carries the bookmarkable route is a
+                // different thing, set below via `route::set`.
+                for (state , state_text , url , route_value) in [
+                    (FilterState::All, "All", "#/", ""),
+                    (FilterState::Active, "Active", "#/active", "active"),
+                    (FilterState::Completed, "Completed", "#/completed", "completed"),
                 ] {
                     li {
                         a {
@@ -461,7 +499,8 @@ fn ListFooter(
                             class: if filter() == state { "selected" },
                             onclick: move |evt: MouseEvent| {
                                 evt.prevent_default();
-                                filter.set(state)
+                                filter.set(state);
+                                route::set(route_value);
                             },
                             {state_text}
                         }

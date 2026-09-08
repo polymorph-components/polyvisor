@@ -311,8 +311,44 @@ pub(crate) async fn close(session: SessionId) -> Result<(), String> {
     api::apps::close(session).await.map_err(message)
 }
 
-pub(crate) async fn open_frame(session: SessionId) -> Result<(), String> {
-    api::shell::open_frame(session).await.map_err(message)
+/// Show a session's frame. `route` is what the frame answers
+/// `polyvisor:app/route.get` with (internal.wit `shell.open-frame`): the
+/// route a bookmark carried, or "" for a plain launch.
+pub(crate) async fn open_frame(session: SessionId, route: &str) -> Result<(), String> {
+    api::shell::open_frame(session, route.to_string())
+        .await
+        .map_err(message)
+}
+
+/// This page's fragment without its `#`, or `None` when there is none.
+///
+/// Sync in the contract (internal.wit `shell.fragment`) because it is a
+/// read of the page's own URL, which the glue already has.
+pub(crate) fn fragment() -> Option<String> {
+    api::shell::fragment()
+}
+
+/// What a bookmark resolves to: the app to launch, and the route to hand
+/// its frame.
+///
+/// The visor never looks inside `fragment`. The kernel owns the grammar
+/// and the token is opaque — install id and route sealed under the user's
+/// route key (internal.wit `apps.route-decode`) — so a fragment this
+/// device cannot open is a kernel `not-found`, with the kernel's own
+/// framework-voice message, and not a shape this file could recognise.
+pub(crate) async fn route_decode(fragment: &str) -> Result<(App, String), String> {
+    api::apps::route_decode(fragment.to_string())
+        .await
+        .map_err(message)
+        .map(|t| {
+            (
+                App {
+                    id: t.app.id,
+                    title: AppText::from_kernel(t.app.title),
+                },
+                t.route,
+            )
+        })
 }
 
 pub(crate) async fn close_frame(session: SessionId) -> Result<(), String> {

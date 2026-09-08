@@ -373,7 +373,27 @@ interface apps {
         plan: string,
     }
 
+    /// What a bookmark resolves to: the app it names and the route the app
+    /// wrote into it (`polyvisor:app/route`), "" for a plain launch.
+    record route-target {
+        app: app-info,
+        route: string,
+    }
+
     installed: async func() -> result<list<app-info>, error>;
+    /// The page fragment (without `#`) that names `session`'s app at
+    /// `route` — the bookmarkable form of "this app, here". The kernel
+    /// owns the grammar (`app/<token>`) and the token is opaque: install
+    /// id and route sealed under the user's route key, deterministically,
+    /// so equal state is equal text. `refused` when `route` is over the
+    /// kernel's length cap.
+    route-encode: async func(session: session-id, route: string) -> result<string, error>;
+    /// The inverse: a fragment the visor found on the page, resolved to an
+    /// app this device may launch. `not-found` for anything that is not a
+    /// fragment this user's route key sealed, including one from another
+    /// user's device; `unknown-app` when it names an app no longer
+    /// installed.
+    route-decode: async func(fragment: string) -> result<route-target, error>;
     /// Start an instance. The glue binds a port to the returned session;
     /// the visor opens a frame for it through `shell.open-frame`, and the
     /// frame fetches `component`/`assets`/`asset` over that port, which
@@ -459,9 +479,21 @@ interface shell {
     /// fetches the session's component bytes from the kernel, obtains the
     /// port the worker bound to the session, and posts both into a
     /// constant, hash-pinned srcdoc loader. At most one frame per session.
-    open-frame: async func(session: session-id) -> result<_, error>;
+    ///
+    /// `route` is what the frame answers `polyvisor:app/route.get` with:
+    /// the route a bookmark carried, or "" for a plain launch. The glue
+    /// also writes the page fragment for this session (`apps.route-encode`)
+    /// here, on every `route.set` the frame relays, and clears it in
+    /// `close-frame`: the URL bar belongs to the one open session, and the
+    /// glue owns it (`history.replaceState` only — an app never gets a
+    /// history entry; docs/design.md "Routing").
+    open-frame: async func(session: session-id, route: string) -> result<_, error>;
     /// Tear the frame down. Idempotent.
     close-frame: async func(session: session-id) -> result<_, error>;
+    /// The page's fragment without its `#`, or `none` when there is none.
+    /// Read once per page load by the visor, after unseal, and handed to
+    /// `apps.route-decode`; the visor never parses it.
+    fragment: func() -> option<string>;
     /// `location.reload()`.
     reload: func();
     /// Re-anchor this tab to another device (or, with `none`, to a fresh

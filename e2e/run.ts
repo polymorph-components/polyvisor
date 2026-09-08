@@ -687,7 +687,9 @@ async function pullUntilTodo(page: Page, title: string): Promise<void> {
     await new Promise((r) => setTimeout(r, 2_000));
     await remountTodoMvc(page);
     try {
-      await todoFrame(page).getByText(title).first().waitFor({ timeout: 3_000 });
+      await todoFrame(page).getByText(title).first().waitFor({
+        timeout: 3_000,
+      });
       return;
     } catch {
       if (performance.now() > deadline) {
@@ -734,11 +736,26 @@ async function addTodo(page: Page, title: string): Promise<void> {
 }
 
 /** Reload the page and put TodoMVC back on screen: a fresh mount, which is
- * a fresh `tasks.items` read. */
+ * a fresh `tasks.items` read. A reload with the app open leaves `#app/<token>`
+ * in the URL, and the visor auto-restores whatever fragment it finds after
+ * boot (docs/design.md "Routing"), so this — and every other
+ * reload-with-the-app-open site below — waits for that restore rather than
+ * pressing "Apps" itself, which would race the visor's own click. With no
+ * app open (a page that arrived at the bare origin) there is no fragment,
+ * and the press is the only way. */
 async function remountTodoMvc(page: Page): Promise<void> {
+  const bookmarked = await page.evaluate(() =>
+    location.hash.startsWith("#app/")
+  );
   await page.reload();
   await visorReady(page);
-  await launchTodoMvc(page);
+  if (bookmarked) {
+    await page.waitForSelector("#app-zone iframe[sandbox]", {
+      timeout: 30_000,
+    });
+  } else {
+    await launchTodoMvc(page);
+  }
 }
 
 /**
@@ -992,12 +1009,154 @@ const scenarios: Scenario[] = [
       // tab here would hide exactly the failure this scenario is for.
       await page.reload();
       await visorReady(page);
-      await launchTodoMvc(page);
+      await page.waitForSelector("#app-zone iframe[sandbox]", {
+        timeout: 30_000,
+      });
       const again = page.frameLocator("#app-zone iframe");
       await again.getByText("write the gate").first().waitFor({
         timeout: 30_000,
       });
       await again.locator("li.completed").first().waitFor({ timeout: 15_000 });
+    },
+  },
+
+  {
+    // "This app, here" (docs/design.md "Routing"): the URL bar names a
+    // running session and the app's own route inside it, so a bookmark of
+    // it reopens the same app at the same filter — on this device only,
+    // because the token is sealed under a key only this user's devices
+    // hold (wit/app.wit `route`, internal.wit `apps.route-encode`).
+    name: "bookmark-round-trip",
+    async run(ctx, origin, browser) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+      // A device with no route key yet mints one on its first encode
+      // (README/dispatch: "minted on first use"); "kept" is not what that
+      // needs, but every other scenario that leans on a device surviving
+      // more than one page is kept first, and this one reloads twice.
+      await keepDevice(page, "the workbench");
+      await launchTodoMvc(page);
+      // TodoMVC's footer — and the filter links in it — only renders with
+      // at least one todo (apps/todomvc/src/lib.rs: the footer is gated on
+      // `!items.read().is_empty()`), and the todo persists on this device,
+      // so one add here is enough for the reopened app in step (c) too.
+      await addTodo(page, "bookmark this filter");
+
+      const h0 = await page.evaluate(() => location.hash);
+      check(
+        /^#app\/[A-Za-z0-9_-]+$/.test(h0),
+        `a plain launch did not write a bookmarkable fragment: ${h0}`,
+      );
+
+      const filters = todoFrame(page).locator("ul.filters a");
+      const active = filters.filter({ hasText: "Active" });
+      const all = filters.filter({ hasText: "All" });
+
+      await active.click();
+      await page.waitForFunction(
+        (want) => location.hash !== want,
+        h0,
+        { timeout: 10_000 },
+      );
+      const h1 = await page.evaluate(() => location.hash);
+      check(h1 !== h0, "the Active filter did not change the fragment");
+
+      // Deterministic encryption: the same (install, route) pair seals to
+      // the same token every time, so returning to "All" returns the URL
+      // to exactly H0 rather than to some other equally-valid encoding of
+      // the same plain launch.
+      await all.click();
+      await page.waitForFunction(
+        (want) => location.hash === want,
+        h0,
+        { timeout: 10_000 },
+      );
+      await active.click();
+      await page.waitForFunction(
+        (want) => location.hash === want,
+        h1,
+        { timeout: 10_000 },
+      );
+
+      // Reopening H1 with no click at all: the visor decodes the fragment
+      // on boot, launches the app at the route it names, and the app
+      // starts already filtered — proving the route travelled through the
+      // URL and not through anything client-side kept warm.
+      await page.goto(origin + "/" + h1);
+      await page.reload();
+      await visorReady(page);
+      await page.waitForSelector("#app-zone iframe[sandbox]", {
+        timeout: 30_000,
+      });
+      eq(
+        await page.evaluate(() => location.hash),
+        h1,
+        "reopening a bookmark changed the fragment",
+      );
+      const reopenedFilters = todoFrame(page).locator("ul.filters a");
+      await reopenedFilters.filter({ hasText: "Active" }).evaluate((el) =>
+        el.className
+      ).then((cls) =>
+        check(
+          cls.includes("selected"),
+          `the reopened app was not filtered to Active: class="${cls}"`,
+        )
+      );
+
+      // Closing the session is the glue's own act of clearing the bar
+      // (internal.wit `shell`: "clears it in close-frame") — no navigation
+      // involved, so this is the one place that is not also covered by the
+      // notice-only checks below. The strip's left half opens the running
+      // app's sheet, and "Close app" is in there.
+      await page.locator("#visor-app").click();
+      await paneSettled(page);
+      await drawer(page).getByRole("button", { name: "Close app", exact: true })
+        .click();
+      await page.waitForFunction(
+        () => location.hash === "",
+        undefined,
+        { timeout: 10_000 },
+      );
+
+      // A fragment that is not a token this device's route key sealed:
+      // `not-found`, and the visor says so in its own voice rather than
+      // opening anything. `goto` to a URL that differs only in its fragment
+      // is a same-document navigation — no boot, and the visor ignores
+      // `hashchange` by ruling (docs/design.md "Routing") — so the reload
+      // is what makes this a bookmark being opened rather than a bar edit.
+      await page.goto(origin + "/#app/not-a-real-token");
+      await page.reload();
+      await visorReady(page);
+      await page.waitForTimeout(2_000);
+      eq(
+        await page.locator("#app-zone iframe").count(),
+        0,
+        "a bogus fragment opened a frame anyway",
+      );
+      await drawer(page).getByText(/link/i).waitFor({
+        timeout: 10_000,
+      });
+
+      // A second device — fresh context, fresh route key — cannot open
+      // H1 either: the token decrypts only under the key of the device
+      // (or its group) that sealed it, and this one has never paired.
+      const ctxB = await browser.newContext();
+      try {
+        const b = await ctxB.newPage();
+        await b.goto(origin + "/" + h1);
+        await visorReady(b);
+        await b.waitForTimeout(2_000);
+        eq(
+          await b.locator("#app-zone iframe").count(),
+          0,
+          "another device's route key opened this bookmark",
+        );
+        await drawer(b).getByText(/link/i).waitFor({
+          timeout: 10_000,
+        });
+      } finally {
+        await ctxB.close();
+      }
     },
   },
 
@@ -1219,7 +1378,9 @@ const scenarios: Scenario[] = [
         // fail for a reason it is not about.
         await b.reload();
         await visorReady(b);
-        await launchTodoMvc(b);
+        await b.waitForSelector("#app-zone iframe[sandbox]", {
+          timeout: 30_000,
+        });
         for (const title of ["from A", "from B"]) {
           await todoFrame(b).getByText(title).first().waitFor({
             timeout: 30_000,
@@ -1691,7 +1852,9 @@ async function main(): Promise<void> {
         // context, not just this scenario's own: a scenario with a second
         // device fails at that device as often as at this one, and dumping
         // only `ctx` prints nothing at all when the failure is over there.
-        for (const page of browser?.contexts().flatMap((c) => c.pages()) ?? []) {
+        for (
+          const page of browser?.contexts().flatMap((c) => c.pages()) ?? []
+        ) {
           const dump = await page.evaluate(() => ({
             strip: document.querySelector("#visor-strip")?.textContent ??
               "<none>",

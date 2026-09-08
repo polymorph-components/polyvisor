@@ -179,6 +179,96 @@ enum Notice {
     Ended { app: AppText, reason: String },
 }
 
+/// Launch `app` and give its frame the screen, with `route` as what the
+/// frame answers `polyvisor:app/route.get` with (internal.wit
+/// `shell.open-frame`): "" for a press on the app list, and the route a
+/// bookmark carried for [`restore_bookmark`]. One function because the two
+/// paths differ in that string and in nothing else — including the failure
+/// handling, where a frame that will not open has to take its session with
+/// it or every failure leaks a session id.
+async fn open_app(
+    app: App,
+    route: String,
+    mut session: Signal<Option<(SessionId, App)>>,
+    app_meta: Signal<Meta>,
+    mut notice: Signal<Option<Notice>>,
+    apply: Callback<Action>,
+) {
+    match kernel::launch(&app.id).await {
+        Err(e) => notice.set(Some(Notice::Plain(e))),
+        Ok(id) => match kernel::open_frame(id, &route).await {
+            Ok(()) => {
+                notice.set(None);
+                let app_id = app.id.clone();
+                session.set(Some((id, app)));
+                // The strip's left half now speaks for this app.
+                read_app_meta(app_id, app_meta, notice).await;
+                // The frame gets the screen; the drawer never covers it.
+                // `apply` and not a bare `drawer.set`: it bumps `drawer_gate`,
+                // so a boot decision still in flight cannot reopen a drawer
+                // over the frame that just opened.
+                apply.call(Action::Close);
+            }
+            Err(e) => {
+                // The session outlived the frame that was to show it;
+                // leaving it live would leak a session id per failure.
+                let _ = kernel::close(id).await;
+                notice.set(Some(Notice::Plain(e)));
+            }
+        },
+    }
+}
+
+thread_local! {
+    /// Has this page load already spent its fragment?
+    ///
+    /// A `thread_local` and not a hook: [`restore_bookmark`] is reached from
+    /// [`read_identity`], which is a free function called from three different
+    /// callbacks, and the rule is about the *page load* rather than about any
+    /// one component's lifetime. The component realm is single-threaded
+    /// (one guest instance per page), so this is a plain `Cell`.
+    static FRAGMENT_SPENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Open what the page's fragment names, once per page load.
+///
+/// The fragment is read but never parsed: the kernel owns the grammar and
+/// the token is opaque (internal.wit `apps.route-decode`), so the visor's
+/// whole part is to hand the text over and act on the answer. A fragment
+/// this device cannot open comes back as an error whose framework-voice
+/// message is the kernel's, and it is shown as-is — the visor has no
+/// sentence of its own to compose about a link it cannot read.
+///
+/// Once per page load, because [`read_identity`] runs again after every
+/// ceremony that changes the device (unseal, keep). Relaunching there
+/// would put the bookmarked app back on screen over whatever the user has
+/// since opened, so the flag is spent on the first run that gets this far
+/// — before the first await, so two reads in flight together cannot both
+/// claim it.
+///
+/// It is never reached while the device is sealed: `read_identity` returns
+/// at the seal, and every kernel call this makes would answer
+/// `unavailable` anyway (internal.wit `device`). A device sealed at boot
+/// restores its bookmark when the unseal ceremony succeeds, because
+/// `on_unsealed` reads the identity again and the flag is still unspent.
+async fn restore_bookmark(
+    session: Signal<Option<(SessionId, App)>>,
+    app_meta: Signal<Meta>,
+    mut notice: Signal<Option<Notice>>,
+    apply: Callback<Action>,
+) {
+    if FRAGMENT_SPENT.with(|spent| spent.replace(true)) {
+        return;
+    }
+    let Some(f) = kernel::fragment() else {
+        return;
+    };
+    match kernel::route_decode(&f).await {
+        Err(e) => notice.set(Some(Notice::Plain(e))),
+        Ok((app, route)) => open_app(app, route, session, app_meta, notice, apply).await,
+    }
+}
+
 /// Read the device's identity, and — unless the device is sealed — the app
 /// list and the user's own labels. Both are skipped while sealed on
 /// purpose: every kernel call other than `status`/`unseal`/`erase` answers
@@ -189,12 +279,20 @@ enum Notice {
 ///
 /// Gated like [`read_status`]: this is called after the ceremonies that
 /// change the device, and a user write landing while it is out must win.
+///
+/// The unsealed path ends in [`restore_bookmark`], which is the one place
+/// a page's fragment is spent: it is the first moment the device is known
+/// to be open, which is also the first moment `apps.route-decode` and
+/// `apps.launch` will answer anything but `unavailable`.
 async fn read_identity(
     mut status: Signal<Option<Status>>,
     mut apps: Signal<Vec<App>>,
     mut notice: Signal<Option<Notice>>,
     mut user_meta: Signal<Meta>,
     gate: CopyValue<Gate>,
+    session: Signal<Option<(SessionId, App)>>,
+    app_meta: Signal<Meta>,
+    apply: Callback<Action>,
 ) {
     let token = gate.peek().begin();
     match kernel::status().await {
@@ -233,6 +331,13 @@ async fn read_identity(
             }
         }
         Err(e) => notice.set(Some(Notice::Plain(e))),
+    }
+    // Last, so the strip is whole — identity, labels, app list — before a
+    // bookmark's launch takes its turn. Inside the gate: a read this one
+    // superseded is not the one to spend the fragment, and the newer read
+    // will spend it instead.
+    if gate.peek().apply(token) {
+        restore_bookmark(session, app_meta, notice, apply).await;
     }
 }
 
@@ -587,10 +692,24 @@ pub(crate) fn Visor() -> Element {
     // who pressed it then had the drawer changed under them when the boot
     // decided. So the decision applies only if the user has not touched the
     // drawer meanwhile — after which it is not the boot's business what is
-    // open.
+    // open. Nor `restore_bookmark`'s business: it closes the drawer through
+    // `apply`, which bumps the same gate, and a bookmark that opened is the
+    // strongest statement about what this page load is for — so the boot's
+    // own idea of which tenant to show is dropped by exactly the mechanism a
+    // user's press would have dropped it by.
     use_future(move || async move {
         let token = drawer_gate.peek().begin();
-        read_identity(status, apps, notice, user_meta, status_gate).await;
+        read_identity(
+            status,
+            apps,
+            notice,
+            user_meta,
+            status_gate,
+            session,
+            app_meta,
+            apply,
+        )
+        .await;
         let index = kernel::devices().await.unwrap_or_default();
         // The user has taken over: neither the decision nor the index it
         // was based on is the newest thing on screen any more. `entries` is
@@ -651,27 +770,10 @@ pub(crate) fn Visor() -> Element {
         }
     });
 
+    // A press on the app list is a plain launch: no route, so the frame
+    // answers `route.get` with "" (internal.wit `shell.open-frame`).
     let open = move |app: App| async move {
-        match kernel::launch(&app.id).await {
-            Err(e) => notice.set(Some(Notice::Plain(e))),
-            Ok(id) => match kernel::open_frame(id).await {
-                Ok(()) => {
-                    notice.set(None);
-                    let app_id = app.id.clone();
-                    session.set(Some((id, app)));
-                    // The strip's left half now speaks for this app.
-                    read_app_meta(app_id, app_meta, notice).await;
-                    // The frame gets the screen; the drawer never covers it.
-                    apply.call(Action::Close);
-                }
-                Err(e) => {
-                    // The session outlived the frame that was to show it;
-                    // leaving it live would leak a session id per failure.
-                    let _ = kernel::close(id).await;
-                    notice.set(Some(Notice::Plain(e)));
-                }
-            },
-        }
+        open_app(app, String::new(), session, app_meta, notice, apply).await
     };
 
     let close_session = move |id: SessionId| async move {
@@ -719,7 +821,17 @@ pub(crate) fn Visor() -> Element {
         // generation.
         status_gate.write().bump();
         spawn(async move {
-            read_identity(status, apps, notice, user_meta, status_gate).await;
+            read_identity(
+                status,
+                apps,
+                notice,
+                user_meta,
+                status_gate,
+                session,
+                app_meta,
+                apply,
+            )
+            .await;
             apply.call(Action::Close);
         });
     });
@@ -734,7 +846,17 @@ pub(crate) fn Visor() -> Element {
                     "the browser declined to persist storage".into(),
                 )));
             }
-            read_identity(status, apps, notice, user_meta, status_gate).await;
+            read_identity(
+                status,
+                apps,
+                notice,
+                user_meta,
+                status_gate,
+                session,
+                app_meta,
+                apply,
+            )
+            .await;
         });
     });
 

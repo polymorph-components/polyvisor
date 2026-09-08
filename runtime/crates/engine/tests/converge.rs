@@ -1495,3 +1495,108 @@ fn a_third_device_learns_the_first_era_from_the_second() {
         );
     });
 }
+
+#[test]
+fn the_route_key_is_minted_once() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 40, None);
+    let ea = Rc::clone(&a.engine);
+
+    pool.run_until(async move {
+        let (first, wrote) = ea.visor_route_key().await.unwrap();
+        assert!(wrote, "the first call mints, and the kernel checkpoints");
+        let (second, wrote) = ea.visor_route_key().await.unwrap();
+        assert!(!wrote, "the second call finds the key already there");
+        assert_eq!(first, second, "and it is the same key");
+    });
+}
+
+#[test]
+fn an_install_id_is_per_app_and_stable() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 41, None);
+    let ea = Rc::clone(&a.engine);
+
+    pool.run_until(async move {
+        let (todo, wrote) = ea.visor_install("polyvisor:app/todomvc").await.unwrap();
+        assert!(wrote);
+        let (again, wrote) = ea.visor_install("polyvisor:app/todomvc").await.unwrap();
+        assert!(
+            !wrote,
+            "the same app resolves to the install it already has"
+        );
+        assert_eq!(todo, again);
+
+        let (other, wrote) = ea.visor_install("polyvisor:app/notes").await.unwrap();
+        assert!(wrote);
+        assert_ne!(todo, other, "a different app is a different install");
+
+        let mut listed = ea.visor_installs().await.unwrap();
+        listed.sort_by_key(|(_, app)| app.clone());
+        assert_eq!(
+            listed,
+            vec![
+                (other, "polyvisor:app/notes".to_string()),
+                (todo, "polyvisor:app/todomvc".to_string()),
+            ],
+        );
+    });
+}
+
+#[test]
+fn a_snapshot_restores_the_route_key_and_the_installs() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 42, None);
+    let ea = Rc::clone(&a.engine);
+    let (snapshot, key, installs) = pool.run_until(async move {
+        let (key, _wrote) = ea.visor_route_key().await.unwrap();
+        let _install = ea.visor_install("polyvisor:app/todomvc").await.unwrap();
+        (
+            ea.snapshot().await.unwrap(),
+            key,
+            ea.visor_installs().await.unwrap(),
+        )
+    });
+
+    let mut pool = LocalPool::new();
+    let restored = device(&pool, 42, Some(snapshot));
+    let engine = Rc::clone(&restored.engine);
+    pool.run_until(async move {
+        let (after, wrote) = engine.visor_route_key().await.unwrap();
+        assert!(!wrote, "a restored device does not mint a second key");
+        assert_eq!(after, key);
+        assert_eq!(engine.visor_installs().await.unwrap(), installs);
+    });
+}
+
+#[test]
+fn two_founders_converge_on_one_route_key() {
+    // Each device mints before it has ever met the other, and the schema's
+    // answer is last-writer-wins on a scalar (`engine::visor`): after pairing
+    // both devices read one key — the loser's pre-pairing bookmarks are the
+    // documented cost.
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 43, None);
+    let b = device(&pool, 44, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+
+    pool.run_until(async move {
+        let (key_a, _wrote) = ea.visor_route_key().await.unwrap();
+        let (key_b, _wrote) = eb.visor_route_key().await.unwrap();
+        assert_ne!(key_a, key_b, "two devices mint different keys");
+
+        wire(&ea, &eb).await;
+
+        let (seen_a, seen_b) = until(|| async {
+            let (seen_a, _) = ea.visor_route_key().await.unwrap();
+            let (seen_b, _) = eb.visor_route_key().await.unwrap();
+            (seen_a == seen_b).then_some((seen_a, seen_b))
+        })
+        .await;
+        assert_eq!(seen_a, seen_b);
+        assert!(
+            seen_a == key_a || seen_a == key_b,
+            "the survivor is one of the two that were minted",
+        );
+    });
+}

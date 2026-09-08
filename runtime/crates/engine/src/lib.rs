@@ -25,6 +25,7 @@ mod storage;
 mod transport;
 mod us;
 mod vault;
+mod visor;
 
 pub use clock::EngineClock;
 pub use doc::{TaskSnapshot, TodoItem};
@@ -165,6 +166,14 @@ pub struct Engine<T: Transport<Local> + 'static> {
     /// `Rng` at every start (see [`Engine::new`]) — and this is that draw,
     /// kept until the group document is first opened.
     name_key_seed: [u8; 32],
+    /// This boot's fresh entropy, kept for the visor document's minting
+    /// (`crate::visor`): the route key is `mix(b"polyvisor:route-key", seed,
+    /// entropy)` and an install id is `sha256(b"polyvisor:install" ‖ seed ‖
+    /// entropy ‖ app)`. The raw draw rather than one mixed value, because the
+    /// two formulas consume it differently; like `name_key_seed` it is only
+    /// ever read on the branch that mints, so a restored document keeps the
+    /// value it was founded with.
+    visor_entropy: [u8; 32],
     /// Restored-but-not-yet-hydrated state. `Engine::new` cannot talk to its
     /// own driver — the caller has not spawned it yet — so a restored
     /// snapshot's trees are handed to the driver on the first async call.
@@ -265,6 +274,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             us: RefCell::new(us),
             name_key: RefCell::new(name_key),
             name_key_seed: mix(b"polyvisor:name-key", &seed, &entropy),
+            visor_entropy: entropy,
             members,
             conns: RefCell::new(Vec::new()),
             pending_hydration: RefCell::new((!hydrate.is_empty()).then_some(hydrate)),
@@ -324,6 +334,63 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     pub async fn tasks_remove(&self, app: &str, id: &str) -> Result<(), String> {
         let id = id.to_string();
         self.mutate(app, move |doc| doc.remove(&id)).await
+    }
+
+    // -- the visor document ---------------------------------------------------
+
+    /// The user's route key, minted on first use. `wrote` says a local commit
+    /// was authored, which is the kernel's cue to checkpoint.
+    ///
+    /// Read and mint inside one mutation: the read that decides whether to
+    /// mint may not be separated from the write by an await, or two callers
+    /// racing the first use would mint twice and the second would overwrite
+    /// the first (see `crate::visor` on last-writer-wins).
+    pub async fn visor_route_key(&self) -> Result<([u8; 32], bool), String> {
+        let minted = mix(b"polyvisor:route-key", &self.seed, &self.visor_entropy);
+        self.mutate(visor::VISOR_APP, move |doc| {
+            Ok(match visor::route_key(doc) {
+                Some(key) => (key, false),
+                None => {
+                    visor::set_route_key(doc, minted)?;
+                    (minted, true)
+                }
+            })
+        })
+        .await
+    }
+
+    /// The install id for `app` — the existing one, or a fresh one.
+    ///
+    /// Existing wins, and where two unpaired devices each minted one it is the
+    /// smallest that wins: both entries survive the merge, so the choice has
+    /// to be a rule both devices apply identically (`crate::visor`).
+    pub async fn visor_install(&self, app: &str) -> Result<([u8; 16], bool), String> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"polyvisor:install");
+        hasher.update(self.seed);
+        hasher.update(self.visor_entropy);
+        hasher.update(app.as_bytes());
+        let digest = hasher.finalize();
+        let mut minted = [0u8; 16];
+        minted.copy_from_slice(&digest[..16]);
+        let app = app.to_string();
+        self.mutate(visor::VISOR_APP, move |doc| {
+            if let Some((id, _)) = visor::installs(doc)
+                .into_iter()
+                .find(|(_, held)| *held == app)
+            {
+                return Ok((id, false));
+            }
+            visor::add_install(doc, minted, &app)?;
+            Ok((minted, true))
+        })
+        .await
+    }
+
+    /// Every (install id, app id) the visor document holds.
+    pub async fn visor_installs(&self) -> Result<Vec<([u8; 16], String)>, String> {
+        self.open_app(visor::VISOR_APP).await?;
+        self.with_app(visor::VISOR_APP, |doc| Ok(visor::installs(doc)))
     }
 
     // -- the user-system document --------------------------------------------

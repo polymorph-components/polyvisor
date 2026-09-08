@@ -703,6 +703,19 @@ impl guest::apps::Guest for Component {
     async fn asset(session: u32, handle: Vec<u8>) -> Result<Vec<u8>, Error> {
         kernel()?.asset(session, &handle).await.map_err(map_error)
     }
+    async fn route_encode(session: u32, route: String) -> Result<String, Error> {
+        kernel()?
+            .route_encode(session, route)
+            .await
+            .map_err(map_error)
+    }
+    async fn route_decode(fragment: String) -> Result<guest::apps::RouteTarget, Error> {
+        let (app, route) = kernel()?.route_decode(fragment).await.map_err(map_error)?;
+        Ok(guest::apps::RouteTarget {
+            app: app_info(app),
+            route,
+        })
+    }
     async fn close(session: u32) -> Result<(), Error> {
         kernel()?.close(session);
         Ok(())

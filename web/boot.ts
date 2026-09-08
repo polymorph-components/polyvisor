@@ -315,6 +315,7 @@ const kernel = proxyInterfaces(control, [
 const apps = kernel[I.apps] as {
   component(session: number): Promise<ComponentArtifacts>;
   abort(session: number, reason: string): Promise<void>;
+  routeEncode(session: number, route: string): Promise<string>;
 };
 
 function requestFramePort(session: number): Promise<MessagePort> {
@@ -379,6 +380,28 @@ async function frameSrcdoc(frameJs: string): Promise<string> {
 
 const frames = new Map<number, HTMLIFrameElement>();
 
+/** Which session's route currently owns the page's URL fragment, or
+ * `undefined` when no open frame has written one yet. `close-frame` clears
+ * the fragment only when the closing session is this one — internal.wit
+ * `shell`: "the URL bar belongs to the one open session, and the glue owns
+ * it" — so a session that never wrote a fragment (or one that lost the bar
+ * to a later frame, which "at most one frame per session" makes impossible
+ * anyway) does not clear someone else's bookmark on its way out. */
+let fragmentOwner: number | undefined;
+
+/** `history.replaceState` only — never `pushState` (internal.wit `shell`:
+ * "an app never gets a history entry"). */
+function writeFragment(session: number, fragment: string): void {
+  fragmentOwner = session;
+  history.replaceState(null, "", "#" + fragment);
+}
+
+function clearFragment(session: number): void {
+  if (fragmentOwner !== session) return;
+  fragmentOwner = undefined;
+  history.replaceState(null, "", location.pathname + location.search);
+}
+
 /** One listener for every frame's lifetime traffic, registered once: a
  * listener per frame would outlive the frame it closed over. The frame
  * cannot state its session — `ev.source` identifies it, and `frames` says
@@ -386,7 +409,12 @@ const frames = new Map<number, HTMLIFrameElement>();
  * supplied by the glue from the port a call arrived on, never taken from
  * the caller"). */
 globalThis.addEventListener("message", (ev: MessageEvent) => {
-  if ((ev.data as { t?: string })?.t !== "error") return;
+  const data = ev.data as { t?: string };
+  if (data?.t === "route") {
+    onFrameRoute(ev.source, String((data as { route: string }).route));
+    return;
+  }
+  if (data?.t !== "error") return;
   let ended: number | undefined;
   for (const [session, iframe] of frames) {
     if (ev.source === iframe.contentWindow) ended = session;
@@ -406,7 +434,67 @@ globalThis.addEventListener("message", (ev: MessageEvent) => {
   );
 });
 
-async function openFrame(session: number, srcdoc: string): Promise<void> {
+/** Pending `route.set` relays, keyed by session: coalesced so a burst of
+ * clicks (TodoMVC's filter, e.g.) writes the encoder once per settle rather
+ * than once per click. 250ms: fast enough that a bookmark taken right after
+ * a click is fresh, slow enough that a click storm does not spend a
+ * `route-encode` (an AES-GCM seal) per keystroke. */
+const routeDebounce = new Map<number, number>();
+
+/** The newest encode asked for per session. Encodes are not ordered by the
+ * kernel — the first one on a device also mints the route key and
+ * checkpoints, so it can land after a `route.set` that followed it — and an
+ * older answer arriving later must not put an older route in the bar. */
+const routeSeq = new Map<number, number>();
+
+/** Encode `route` for `session` and, if it is still the newest ask and the
+ * frame is still up, write it to the bar. */
+function encodeFragment(session: number, route: string): void {
+  const seq = (routeSeq.get(session) ?? 0) + 1;
+  routeSeq.set(session, seq);
+  void apps.routeEncode(session, route).then((fragment) => {
+    if (!frames.has(session) || routeSeq.get(session) !== seq) return;
+    writeFragment(session, fragment);
+  }).catch((err: unknown) => {
+    console.error(
+      "polyvisor: route-encode failed:",
+      (err as Error)?.message ?? err,
+    );
+  });
+}
+
+function onFrameRoute(source: MessageEventSource | null, route: string): void {
+  let session: number | undefined;
+  for (const [s, iframe] of frames) {
+    if (source === iframe.contentWindow) session = s;
+  }
+  if (session === undefined) return; // frame already gone
+  // The kernel refuses a route over its length cap (`refused`, 238 UTF-8
+  // bytes: internal.wit `apps.route-encode`) — dropped here rather than
+  // sent, so a bug in an app's own route does not spend a round trip on a
+  // call whose answer is already known.
+  if (new TextEncoder().encode(route).length > 238) {
+    console.warn(
+      `polyvisor: session ${session} set a route over the encoder's cap; ignored`,
+    );
+    return;
+  }
+  const existing = routeDebounce.get(session);
+  if (existing !== undefined) clearTimeout(existing);
+  routeDebounce.set(
+    session,
+    setTimeout(() => {
+      routeDebounce.delete(session);
+      encodeFragment(session, route);
+    }, 250) as unknown as number,
+  );
+}
+
+async function openFrame(
+  session: number,
+  route: string,
+  srcdoc: string,
+): Promise<void> {
   if (frames.has(session)) return; // at most one frame per session
   const [artifacts, port] = await Promise.all([
     apps.component(session),
@@ -437,6 +525,7 @@ async function openFrame(session: number, srcdoc: string): Promise<void> {
             wasm: artifacts.wasm,
             plan: artifacts.plan,
             port,
+            route,
           },
           // The frame's origin is opaque; "*" is the only target that names
           // it, and it is safe because `ev.source` identified the recipient.
@@ -451,11 +540,28 @@ async function openFrame(session: number, srcdoc: string): Promise<void> {
   });
 
   frames.set(session, iframe);
+
+  // The fragment for the state the frame was actually opened at — a plain
+  // launch ("") encodes just as well as a bookmarked one, so the URL always
+  // ends up naming this session once the frame is up, not only once the app
+  // has since called `route.set`. Not awaited: `open-frame` returning is
+  // what lets the visor record the session, and the first encode on a
+  // device also mints its route key and checkpoints — long enough that a
+  // frame which dies at mount (the hostile fixture) would report
+  // `session-ended` for a session the visor had not yet heard of.
+  encodeFragment(session, route);
 }
 
 function closeFrame(session: number): void {
   frames.get(session)?.remove();
   frames.delete(session);
+  const pending = routeDebounce.get(session);
+  if (pending !== undefined) {
+    clearTimeout(pending);
+    routeDebounce.delete(session);
+  }
+  routeSeq.delete(session);
+  clearFragment(session);
 }
 
 // ---------------------------------------------------------------------------
@@ -491,8 +597,8 @@ async function main(): Promise<void> {
     // `ComponentException` payload (M1 context "Value mapping"). A raw
     // rejection would be a host fault instead of the refusal the WIT
     // declares.
-    openFrame: (session: number) =>
-      openFrame(session, srcdoc).catch((err: unknown) => {
+    openFrame: (session: number, route: string) =>
+      openFrame(session, route, srcdoc).catch((err: unknown) => {
         throw new ComponentException({
           code: "failed",
           message: String((err as Error)?.message ?? err),
@@ -506,6 +612,14 @@ async function main(): Promise<void> {
     // return a promise.
     reload: () => {
       location.reload();
+    },
+    // Also sync (internal.wit `shell.fragment`). `""` and `"#"` both read as
+    // `undefined`: `location.hash` is `""` with none, and is `"#"` for a
+    // literal bare `#` — neither names a fragment `apps.route-decode` could
+    // ever accept, so there is nothing to hand it.
+    fragment: (): string | undefined => {
+      const hash = location.hash;
+      return hash === "" || hash === "#" ? undefined : hash.slice(1);
     },
     // Also sync. Re-anchoring is all this does — the worker is named after
     // the anchor, so the reload is what actually moves the tab to the other
