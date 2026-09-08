@@ -9,6 +9,7 @@
 import { artifactsFromEnvelope } from "@polyengine/runtime/embedder";
 import { ComponentException } from "@polyengine/protocol";
 
+import { attachVisorFocus } from "./focus.ts";
 import { mountProducer } from "./mount.ts";
 import { popupReturn } from "./oauth.ts";
 import { proxyInterfaces } from "./rpc.ts";
@@ -768,6 +769,12 @@ async function main(): Promise<void> {
     imports: { ...kernel, [I.shell]: shell },
     onError: (err) => fatal(String((err as Error)?.message ?? err)),
   });
+
+  // The visor's focus requests, and the app zone's inertness while the
+  // drawer covers it (web/focus.ts). Attached after the mount because the
+  // observer wants the element the producer will write into; the module's
+  // first pass runs at once, so nothing already committed is missed.
+  attachVisorFocus(el("visor"), el("app-zone"));
 
   // ...and one that arrived DURING the mount, which paints into the same
   // node. The mount had already claimed the element by then, so the text has

@@ -392,6 +392,286 @@ async function claimed(page: Page): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
+// The keyboard, and what is out of its reach
+//
+// The visor moves focus through markup (visor/src/ui.rs `FocusWant`,
+// web/focus.ts), so everything below asks the DOM what actually has the
+// caret rather than trusting either side's account of it.
+// ---------------------------------------------------------------------------
+
+/** What has the keyboard, named the way an assertion can read. */
+function focused(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const a = document.activeElement;
+    if (!(a instanceof HTMLElement)) return "<none>";
+    if (a.id !== "") return "#" + a.id;
+    const cls = String(a.className).trim();
+    return a.tagName.toLowerCase() +
+      (cls === "" ? "" : "." + cls.split(/\s+/)[0]);
+  });
+}
+
+/** Is the caret inside `selector`? */
+function focusIn(page: Page, selector: string): Promise<boolean> {
+  return page.evaluate((sel) => {
+    const host = document.querySelector(sel);
+    const a = document.activeElement;
+    return host !== null && a !== null && host.contains(a);
+  }, selector);
+}
+
+/** `inert` is a presence attribute: `inert="false"` is still inert, so this
+ * asks whether it is THERE rather than what it says (visor/src/ui.rs
+ * `flag`). */
+function inert(page: Page, selector: string): Promise<boolean> {
+  return page.evaluate(
+    (sel) => document.querySelector(sel)?.hasAttribute("inert") ?? false,
+    selector,
+  );
+}
+
+/** Press Tab `times` and report every place the caret landed. */
+async function tabTour(page: Page, times: number): Promise<string[]> {
+  const seen: string[] = [];
+  for (let i = 0; i < times; i++) {
+    await page.keyboard.press("Tab");
+    seen.push(await focused(page));
+    if (await focusIn(page, "#app-zone")) seen.push("!app-zone");
+  }
+  return seen;
+}
+
+/**
+ * The measured contrast of every piece of text on screen at one point on the
+ * hue wheel, as WCAG ratios keyed by a description of the element.
+ *
+ * Measured, not computed: the sheet states `oklch`, and what a ratio is
+ * depends on how Chromium maps that into sRGB. So every colour goes through
+ * a 1×1 canvas — the browser's own parser and gamut mapping — and the
+ * translucent layers are composited there before anything is measured.
+ *
+ * `hue` drives the stylesheet's two arms directly; which arm a real visor
+ * takes is the anchor rule, which `claimed()` tests.
+ */
+function inkContrast(
+  page: Page,
+  hue: number | "unclaimed",
+): Promise<Record<string, number>> {
+  return page.evaluate((h) => {
+    const root = document.querySelector("#visor-root") as HTMLElement;
+    if (h === "unclaimed") root.classList.add("unclaimed");
+    else {
+      root.classList.remove("unclaimed");
+      root.style.setProperty("--hue", String(h));
+    }
+
+    const cv = document.createElement("canvas");
+    cv.width = cv.height = 1;
+    const g = cv.getContext("2d", { willReadFrequently: true })!;
+    const px = (css: string): number[] => {
+      g.clearRect(0, 0, 1, 1);
+      g.fillStyle = "#000";
+      g.fillStyle = css;
+      g.fillRect(0, 0, 1, 1);
+      const d = g.getImageData(0, 0, 1, 1).data;
+      return [d[0], d[1], d[2], d[3] / 255];
+    };
+    const over = (fg: number[], bg: number[]): number[] =>
+      [0, 1, 2].map((i) => fg[i] * fg[3] + bg[i] * (1 - fg[3]));
+    const lum = (c: number[]): number => {
+      const [r, gg, b] = c.map((v) => {
+        const s = v / 255;
+        return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+      });
+      return 0.2126 * r + 0.7152 * gg + 0.0722 * b;
+    };
+    /** Everything painted under `el`, its own background included, flattened
+     * onto the page's white. */
+    const behind = (el: Element): number[] => {
+      const chain: Element[] = [];
+      for (let n: Element | null = el; n !== null; n = n.parentElement) {
+        chain.push(n);
+      }
+      let acc = [255, 255, 255];
+      for (const n of chain.reverse()) {
+        acc = over(px(getComputedStyle(n).backgroundColor), acc);
+      }
+      return acc;
+    };
+
+    const out: Record<string, number> = {};
+    for (
+      const el of document.querySelectorAll(
+        "#visor-root span, #visor-root q, #visor-root button, #visor-root div",
+      )
+    ) {
+      const text = (el.textContent ?? "").trim();
+      // Leaves only: a container's own `color` is not what is drawn.
+      if (text === "" || el.querySelector("*") !== null) continue;
+      if (el.closest("[inert]") !== null) continue;
+      if (el.getClientRects().length === 0) continue;
+      const style = getComputedStyle(el);
+      if (style.visibility === "hidden") continue;
+      const bg = behind(el);
+      const fg = over(px(style.color), bg);
+      const hi = Math.max(lum(fg), lum(bg)) + 0.05;
+      const lo = Math.min(lum(fg), lum(bg)) + 0.05;
+      const cls = String(el.className).trim() || "-";
+      out[`${el.tagName.toLowerCase()}.${cls} "${text.slice(0, 24)}"`] = hi /
+        lo;
+    }
+    return out;
+  }, hue);
+}
+
+/** Every control below the 44px touch floor, on either axis. */
+function undersizedControls(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const bad: string[] = [];
+    for (
+      const el of document.querySelectorAll<HTMLElement>(
+        "#visor-root button, #visor-root input",
+      )
+    ) {
+      if (el.closest("[inert]") !== null) continue;
+      const box = el.getBoundingClientRect();
+      if (box.height === 0) continue;
+      const what = el.tagName === "INPUT"
+        ? `input[${(el as HTMLInputElement).type}]`
+        : `"${(el.textContent ?? "").trim().slice(0, 20)}"`;
+      if (box.height < 44 || box.width < 44) {
+        bad.push(`${what} is ${box.width.toFixed(0)}×${box.height.toFixed(0)}`);
+      }
+    }
+    return bad;
+  });
+}
+
+/** Is every long machine identifier still wholly readable — one line high,
+ * scrollable to its own end, and reachable by keyboard to do it? Chromium
+ * focuses overflowing scroll containers without a `tabindex`, which is what
+ * makes the local scroll usable at all; recent enough to be worth checking
+ * rather than assuming. */
+function unreadableIdentifiers(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const bad: string[] = [];
+    for (
+      const el of document.querySelectorAll<HTMLElement>(
+        "#visor-root .endpoint-id",
+      )
+    ) {
+      const where = `${el.id || "a member/peer id"}`;
+      const style = getComputedStyle(el);
+      if (style.overflowX !== "auto") {
+        bad.push(`${where}: overflow-x is ${style.overflowX}`);
+      }
+      const lines = Math.round(
+        el.getBoundingClientRect().height / parseFloat(style.lineHeight),
+      );
+      if (lines !== 1) bad.push(`${where} is ${lines} lines high`);
+      if (el.scrollWidth <= el.clientWidth) continue; // nothing to scroll
+      el.scrollLeft = el.scrollWidth;
+      const end = el.scrollLeft + el.clientWidth;
+      if (end < el.scrollWidth - 1) {
+        bad.push(`${where} cannot be scrolled to its end`);
+      }
+      el.scrollLeft = 0;
+      el.focus({ preventScroll: true });
+      if (document.activeElement !== el) {
+        bad.push(`${where} takes no focus, so a keyboard cannot scroll it`);
+      }
+      el.blur();
+    }
+    return bad;
+  });
+}
+
+/** Two boxes that share pixels. What "the member id overlaps the status"
+ * looked like: a nowrap id that would not shrink, laid over the text
+ * beside it. */
+function overlappingRows(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const bad: string[] = [];
+    for (
+      const row of document.querySelectorAll(
+        "#visor-root .member-row, #visor-root .peer-row, " +
+          "#visor-root .device-row, #visor-root .app-row, #visor-root .sync-self",
+      )
+    ) {
+      const kids = [...row.children].map((k) => ({
+        text: (k.textContent ?? "").trim().slice(0, 16),
+        box: k.getBoundingClientRect(),
+      })).filter((k) => k.box.width > 0 && k.box.height > 0);
+      for (let i = 0; i < kids.length; i++) {
+        for (let j = i + 1; j < kids.length; j++) {
+          const a = kids[i].box, b = kids[j].box;
+          if (
+            a.left < b.right - 0.5 && b.left < a.right - 0.5 &&
+            a.top < b.bottom - 0.5 && b.top < a.bottom - 0.5
+          ) {
+            bad.push(`"${kids[i].text}" over "${kids[j].text}"`);
+          }
+        }
+      }
+    }
+    return bad;
+  });
+}
+
+/** Anything the visor is drawing wider than the screen. A long identifier
+ * gets its own local scroll; nothing gets the page's. An element whose
+ * ancestor clips it is not overflow — the strip's two lines are `nowrap`
+ * and ellipsised on purpose — so the clipping ancestor is what is measured
+ * instead, and it is in this same sweep. */
+function sidewaysOverflow(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const bad: string[] = [];
+    if (document.documentElement.scrollWidth > innerWidth) {
+      bad.push(
+        `the page scrolls sideways: ${document.documentElement.scrollWidth} > ${innerWidth}`,
+      );
+    }
+    const pane = document.querySelector<HTMLElement>("#visor-drawer .pane");
+    if (pane !== null && pane.scrollWidth > pane.clientWidth) {
+      bad.push(
+        `the drawer scrolls sideways: ${pane.scrollWidth} > ${pane.clientWidth}`,
+      );
+    }
+    const clipped = (el: Element): boolean => {
+      for (let n = el.parentElement; n !== null; n = n.parentElement) {
+        const s = getComputedStyle(n);
+        if (s.overflowX !== "visible" || s.overflowY !== "visible") return true;
+      }
+      return false;
+    };
+    for (const el of document.querySelectorAll<HTMLElement>("#visor-root *")) {
+      if (el.getClientRects().length === 0 || clipped(el)) continue;
+      const right = el.getBoundingClientRect().right;
+      if (right > innerWidth + 0.5) {
+        bad.push(
+          `${el.tagName.toLowerCase()}.${el.className} reaches ${
+            right.toFixed(0)
+          }`,
+        );
+      }
+    }
+    return bad;
+  });
+}
+
+/** Screenshots for a human, when `VISOR_SHOTS` asks for them. */
+async function shot(page: Page, name: string): Promise<void> {
+  const dir = Deno.env.get("VISOR_SHOTS");
+  if (dir === undefined) return;
+  // Long enough for the drawer's own open/close animation, which is not
+  // what `paneSettled` waits on: a shot taken mid-slide is a picture of an
+  // animation rather than of a layout.
+  await page.waitForTimeout(400);
+  await Deno.mkdir(dir, { recursive: true });
+  await page.screenshot({ path: join(dir, `${name}.png`) });
+}
+
+// ---------------------------------------------------------------------------
 // Devices, as these scenarios drive it
 //
 // Everything here is shaped by one fact about the visor: it holds no state
@@ -1868,6 +2148,442 @@ const scenarios: Scenario[] = [
         await page.locator("#visor-strip").count() === 1,
         "#visor-strip did not render",
       );
+    },
+  },
+
+  {
+    // The drawer by keyboard alone: a way OUT of an open pane, and a
+    // guarantee that Tab cannot walk under the scrim into the app.
+    name: "drawer-keyboard",
+    async run(ctx, origin) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+      await launchTodoMvc(page);
+      // The app has the screen: the drawer is gone and the zone is live.
+      await page.waitForFunction(
+        () => document.querySelector("#visor-drawer") === null,
+        undefined,
+        { timeout: 10_000 },
+      );
+      eq(await inert(page, "#app-zone"), false, "the app zone stayed inert");
+
+      // Raise the running app's sheet from the strip, by keyboard.
+      await appsButton(page).focus();
+      await page.keyboard.press("Enter");
+      await paneSettled(page);
+      check(
+        await focusIn(page, "#visor-drawer .pane"),
+        `opening a pane left the keyboard at ${await focused(page)}`,
+      );
+
+      // `inert` and not a `tabindex` sweep: the app zone holds a frame whose
+      // contents this side cannot enumerate.
+      eq(
+        await inert(page, "#app-zone"),
+        true,
+        "the app zone is reachable under the scrim",
+      );
+      const tour = await tabTour(page, 12);
+      check(
+        !tour.includes("!app-zone"),
+        `Tab reached the app under the scrim: ${tour.join(" → ")}`,
+      );
+      // ...and the strip is not walled off: an open pane is not a modal.
+      check(
+        tour.includes("#visor-app") || tour.includes("#visor-self"),
+        `an open pane trapped the keyboard away from the strip: ${
+          tour.join(" → ")
+        }`,
+      );
+
+      eq(
+        await drawer(page).locator(".pane-dismiss").textContent(),
+        "Return to app",
+        "the running app's sheet offered no way back to it",
+      );
+
+      // Escape is that button by another name, and the caret goes back to
+      // the half of the strip that raised the pane.
+      await page.keyboard.press("Escape");
+      await page.waitForFunction(
+        () => document.querySelector("#visor-drawer") === null,
+        undefined,
+        { timeout: 10_000 },
+      );
+      eq(await focused(page), "#visor-app", "the keyboard was left nowhere");
+      eq(
+        await inert(page, "#app-zone"),
+        false,
+        "the app stayed unreachable after the drawer closed",
+      );
+
+      // Reopen: the animation ran both ways and the pane still takes the
+      // caret — the case a one-shot focus would get wrong.
+      await page.keyboard.press("Enter");
+      await paneSettled(page);
+      check(
+        await focusIn(page, "#visor-drawer .pane"),
+        `reopening left the keyboard at ${await focused(page)}`,
+      );
+      await shot(page, "desktop-app-sheet");
+    },
+  },
+
+  {
+    // The same claims where the drawer is pinned (so "out" is the app list)
+    // and with the animations taken away: every close waits on
+    // `animationend`, and a zero-duration animation still has to fire one.
+    name: "drawer-keyboard-reduced-motion",
+    async run(_ctx, origin, browser) {
+      const ctx = await browser.newContext({ reducedMotion: "reduce" });
+      try {
+        const page = await open(ctx, origin);
+        await visorReady(page);
+        // Nothing behind the drawer, so it offers no way out at all.
+        await paneSettled(page);
+        eq(
+          await drawer(page).locator(".pane-dismiss").count(),
+          0,
+          "the resting app list offered a dismissal to nowhere",
+        );
+
+        await settingsButton(page).focus();
+        await page.keyboard.press("Enter");
+        await paneSettled(page);
+        eq(
+          await drawer(page).locator(".pane-dismiss").textContent(),
+          "Back to apps",
+          "a pinned settings sheet offered no way back",
+        );
+        check(
+          await focusIn(page, "#visor-drawer .pane"),
+          `opening settings left the keyboard at ${await focused(page)}`,
+        );
+
+        // Escape lands on the app list rather than shutting the drawer: the
+        // visor rests there (visor/src/state.rs `reduce`, pinned).
+        await page.keyboard.press("Escape");
+        await paneSettled(page);
+        check(
+          await drawer(page).locator(".app-row").count() > 0,
+          "Escape from a pinned sheet did not land on the app list",
+        );
+        check(
+          await focusIn(page, "#visor-drawer .pane"),
+          `the switch left the keyboard at ${await focused(page)}`,
+        );
+
+        // A launch is a close the user did not press, and it still has to
+        // hand the app zone back without the animation it waits on.
+        await launchTodoMvc(page);
+        await page.waitForFunction(
+          () => document.querySelector("#visor-drawer") === null,
+          undefined,
+          { timeout: 10_000 },
+        );
+        eq(
+          await inert(page, "#app-zone"),
+          false,
+          "the drawer left the app zone inert behind it",
+        );
+      } finally {
+        await ctx.close();
+      }
+    },
+  },
+
+  {
+    // The unsaved-changes dialog is the one modal thing in the visor: three
+    // answers, none safe to guess. So it is named, the caret is put in it,
+    // nothing outside it can be reached or pressed until it is answered, and
+    // every way of answering leaves the caret somewhere sensible.
+    name: "drawer-confirm-focus",
+    async run(ctx, origin) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+      await openSettingsSheet(page);
+      const field = drawer(page).locator("label").filter({
+        hasText: /^device petname$/,
+      }).locator("input");
+      const confirm = page.locator("#visor-confirm");
+
+      await field.fill("half typed");
+      await appsButton(page).click();
+      await confirm.waitFor({ timeout: 10_000 });
+
+      // Named, or a screen reader announces a dialog about nothing.
+      eq(await confirm.getAttribute("role"), "dialog", "the dialog's role");
+      eq(
+        await confirm.getAttribute("aria-label"),
+        "unsaved changes",
+        "the dialog's accessible name",
+      );
+      check(
+        await focusIn(page, "#visor-confirm"),
+        `the dialog did not take the keyboard; it is at ${await focused(page)}`,
+      );
+      eq(await inert(page, "#visor-strip"), true, "the strip under a dialog");
+      eq(await inert(page, "#visor-drawer"), true, "the drawer under a dialog");
+
+      // Escape cancels the DIALOG and nothing else: the draft is still the
+      // user's, the sheet has not moved, and the caret goes back where it
+      // was when the dialog appeared.
+      await page.keyboard.press("Escape");
+      await confirm.waitFor({ state: "detached", timeout: 10_000 });
+      eq(await field.inputValue(), "half typed", "Escape dropped the draft");
+      eq(
+        await inert(page, "#visor-strip"),
+        false,
+        "the strip stayed inert after the dialog went",
+      );
+      eq(
+        await focused(page),
+        "#visor-app",
+        "cancelling by Escape left the keyboard nowhere",
+      );
+      // The sheet the draft belongs to is still the one on screen.
+      eq(
+        await drawer(page).locator(".pane").getAttribute("aria-label"),
+        "settings",
+        "Escape took the transition it was asked about",
+      );
+
+      // Held: with everything else inert there is nowhere for Tab to go but
+      // the three answers. (Past the last it leaves for the browser's own
+      // chrome and comes back, which is not a way into the visor.)
+      await appsButton(page).click();
+      await confirm.waitFor({ timeout: 10_000 });
+      const tour = await tabTour(page, 8);
+      for (const where of ["#visor-app", "#visor-self", "!app-zone"]) {
+        check(
+          !tour.includes(where),
+          `Tab escaped the dialog to ${where}: ${tour.join(" → ")}`,
+        );
+      }
+
+      // Cancel, the button, means what Escape meant.
+      await confirm.getByRole("button", { name: "Cancel", exact: true })
+        .click();
+      await confirm.waitFor({ state: "detached", timeout: 10_000 });
+      eq(await field.inputValue(), "half typed", "Cancel dropped the draft");
+      eq(
+        await focused(page),
+        "#visor-app",
+        "Cancel left the keyboard nowhere",
+      );
+
+      // Revert answers the dialog AND takes the transition it was asking
+      // about — so the caret follows the transition rather than going back
+      // to a strip half the user has now left.
+      await appsButton(page).click();
+      await confirm.waitFor({ timeout: 10_000 });
+      await confirm.getByRole("button", { name: "Revert", exact: true })
+        .click();
+      await paneSettled(page);
+      check(
+        await drawer(page).locator(".app-row").count() > 0,
+        "Revert did not go on to the transition it was asked about",
+      );
+      check(
+        await focusIn(page, "#visor-drawer .pane"),
+        `Revert left the keyboard at ${await focused(page)}`,
+      );
+
+      // Save, likewise, and the kernel is the one that remembers it. The
+      // transition waits on the kernel here — `save_draft` calls one
+      // `set-*` per changed field and only then takes the parked action —
+      // so the caret rests on the strip half in the meantime and follows
+      // the pane when it finally arrives. Waiting on the app list rather
+      // than on `paneSettled`: the Settings pane is itself "settled" for
+      // as long as the save is in flight.
+      await openSettingsSheet(page);
+      await field.fill("the workbench");
+      await appsButton(page).click();
+      await confirm.waitFor({ timeout: 10_000 });
+      await confirm.getByRole("button", { name: "Save", exact: true }).click();
+      await drawer(page).locator(".app-row").first().waitFor({
+        timeout: 15_000,
+      });
+      await paneSettled(page);
+      check(
+        await focusIn(page, "#visor-drawer .pane"),
+        `Save left the keyboard at ${await focused(page)}`,
+      );
+      await strip(page).getByText("the workbench").waitFor({ timeout: 15_000 });
+
+      // With an app running there is a scrim as well, and it is a press
+      // target: pressing it while the dialog stands used to replace the
+      // parked transition, so "Revert" closed the drawer instead of opening
+      // the sheet the user had actually asked for.
+      await launchTodoMvc(page);
+      await openSettingsSheet(page);
+      await field.fill("typed over the app");
+      await appsButton(page).click();
+      await confirm.waitFor({ timeout: 10_000 });
+      eq(await inert(page, "#visor-scrim"), true, "the scrim under a dialog");
+      await page.locator("#visor-scrim").click({ force: true });
+      await page.waitForTimeout(300);
+      eq(
+        await page.locator("#visor-confirm").count(),
+        1,
+        "a scrim press answered the dialog",
+      );
+      await confirm.getByRole("button", { name: "Revert", exact: true })
+        .click();
+      await paneSettled(page);
+      eq(
+        await drawer(page).locator(".pane").getAttribute("aria-label"),
+        "the running app",
+        "the scrim press replaced the transition the dialog was asked about",
+      );
+    },
+  },
+
+  {
+    // Two handheld widths. The Devices section is long machine identifiers
+    // next to short framework-voice facts about them, which is the shape
+    // that used to lay one over the other. Nothing may be answered by
+    // hiding: the whole identifier stays readable, in its own local scroll,
+    // while neither the page nor the drawer scrolls sideways.
+    name: "visor-narrow-layout",
+    async run(ctx, origin) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+      // A person's own words, at the length people use.
+      await setDeviceName(page, "Ada's very own workbench in the back room");
+      await drawer(page).locator("label").filter({ hasText: /^your petname$/ })
+        .locator("input").fill("Ada Lovelace-Byron the Elder");
+      await saveDraft(page);
+
+      // The unnamed case is the one that overlapped: with no petname, a
+      // device is shown by its endpoint id — tens of characters of machine
+      // text beside "this device" and an age.
+      const id = await endpointId(page);
+      check(id.length > 20, `the endpoint id is implausibly short: ${id}`);
+      await waitInDevices(
+        page,
+        "this device in its own group",
+        async () => await devicesSheet(page).locator(".member-row").count() > 0,
+        { refresh: true },
+      );
+
+      // Where the long identifiers are, and so what the pictures show.
+      await devicesSheet(page).scrollIntoViewIfNeeded();
+      for (const width of [390, 320]) {
+        await page.setViewportSize({ width, height: 780 });
+        // A resize is a layout, not a render; give it one.
+        await page.waitForTimeout(300);
+        const over = await sidewaysOverflow(page);
+        check(over.length === 0, `at ${width}px: ${over.join("; ")}`);
+        const laid = await overlappingRows(page);
+        check(
+          laid.length === 0,
+          `at ${width}px rows overlap: ${laid.join("; ")}`,
+        );
+        // Every id on screen — this device's endpoint, and the same id
+        // again as the unnamed member row — is one line, whole, scrollable
+        // to its end, and focusable so a keyboard can do the scrolling.
+        const ids = await unreadableIdentifiers(page);
+        check(ids.length === 0, `at ${width}px: ${ids.join("; ")}`);
+        await shot(page, `mobile-${width}-settings`);
+      }
+
+      const shown = devicesSheet(page).locator("#visor-endpoint-id");
+      eq(await shown.textContent(), id, "the endpoint id was truncated");
+      check(
+        await shown.evaluate((el) => el.scrollWidth > el.clientWidth),
+        "at 320px the endpoint id fits, so this proves nothing about the " +
+          "local scroll it is supposed to have",
+      );
+      eq(
+        await devicesSheet(page).locator(".member-row .endpoint-id").count(),
+        1,
+        "no unnamed member id was on screen to check",
+      );
+    },
+  },
+
+  {
+    // The strip stays saturated by ruling, so its text carries the whole
+    // burden of being readable — at every hue a user can pick, and in the
+    // grey the visor wears before it is claimed.
+    name: "visor-contrast-and-touch",
+    async run(ctx, origin) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+      await page.setViewportSize({ width: 390, height: 780 });
+      await openSettingsSheet(page);
+      // Both halves of the strip are on screen at once, one pressed and one
+      // not: the pressed half is lightened by a translucent overlay, so it
+      // is a different background under the same ink.
+      const painted = await page.locator("#visor-root").getAttribute("style");
+
+      const worst = new Map<string, number>();
+      const wheel: Array<number | "unclaimed"> = ["unclaimed"];
+      for (let h = 0; h < 360; h++) wheel.push(h);
+      for (const hue of wheel) {
+        for (
+          const [what, ratio] of Object.entries(await inkContrast(page, hue))
+        ) {
+          const key = `${what} @${hue}`;
+          if (ratio < (worst.get(key) ?? Infinity)) worst.set(key, ratio);
+        }
+      }
+      check(worst.size > 20, `only ${worst.size} pieces of text were measured`);
+      const failing = [...worst].filter(([, r]) => r < 4.5)
+        .sort((a, b) => a[1] - b[1]);
+      check(
+        failing.length === 0,
+        `${failing.length} text(s) below 4.5:1, worst ${
+          failing.slice(0, 4).map(([k, r]) => `${k} = ${r.toFixed(2)}`).join(
+            "; ",
+          )
+        }`,
+      );
+      // Put the device's own colour back: the sweep drove the sheet
+      // directly, and the rest of this is about the real visor.
+      await page.locator("#visor-root").evaluate(
+        (el, style) => el.setAttribute("style", style ?? ""),
+        painted,
+      );
+
+      // The ring is drawn outside its control, so one colour works on the
+      // strip and in the drawer alike.
+      await page.keyboard.press("Tab");
+      const ring = await page.evaluate(() => {
+        const a = document.activeElement as HTMLElement;
+        const s = getComputedStyle(a);
+        return { style: s.outlineStyle, width: parseFloat(s.outlineWidth) };
+      });
+      check(
+        ring.style !== "none" && ring.width >= 2,
+        `the focus ring is ${JSON.stringify(ring)}`,
+      );
+
+      const small = await undersizedControls(page);
+      check(small.length === 0, `under the touch floor: ${small.join("; ")}`);
+      await shot(page, "mobile-390-settings-touch");
+
+      // Desktop: the same floor, and fields that stay a field's width
+      // rather than spanning the window.
+      await page.setViewportSize({ width: 1280, height: 800 });
+      await page.waitForTimeout(300);
+      const wide = await undersizedControls(page);
+      check(wide.length === 0, `under the touch floor: ${wide.join("; ")}`);
+      const stretched = await page.evaluate(() =>
+        [...document.querySelectorAll<HTMLInputElement>("#visor-root input")]
+          .filter((el) => el.getBoundingClientRect().width > 400)
+          .map((el) =>
+            `input[${el.type}] is ${
+              el.getBoundingClientRect().width.toFixed(0)
+            }px`
+          )
+      );
+      check(
+        stretched.length === 0,
+        `fields span the window: ${stretched.join("; ")}`,
+      );
+      await shot(page, "desktop-settings");
     },
   },
 ];
