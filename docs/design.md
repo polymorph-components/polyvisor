@@ -131,7 +131,8 @@ there.
 - An opaque-origin `srcdoc` document carrying its own `<meta>` CSP
   (`default-src 'none'`; `script-src` the loader's hash plus
   `'wasm-unsafe-eval'`; `style-src`/`img-src`/`font-src`/`media-src
-  blob:` — the asset stylesheet is a `blob:`). CSP
+  blob:` — the asset stylesheet is a `blob:`; `img-src` also `data:`, for
+  the stylesheet's inline SVG backgrounds, which fetch nothing). CSP
   policies compose with the embedder's header policy, so the frame is
   network-dead regardless. `sandbox="allow-scripts allow-forms"`;
   `form-action 'none'`. The loader is a constant; everything variable
