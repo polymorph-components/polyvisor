@@ -635,7 +635,6 @@ function closeFrame(session: number): void {
 interface InstallRequest {
   fragment: string;
   title: string;
-  glyph: string;
   hue: number;
 }
 
@@ -643,37 +642,6 @@ interface InstallRequest {
  * later install can revoke it. Never revokes a URL this glue did not mint —
  * there is none to inherit; `index.html` carries no such link. */
 let manifestBlobUrl: string | undefined;
-
-/** One 512×512 (or `size`, scaled) PNG of the app's glyph on the user's hue,
- * as a `blob:` URL. This is the one place the trusted pixels reach the
- * launcher (internal.wit `shell.install-app` docs) — an installed app's
- * icon is not app-controlled art, it is the visor's own paint of the
- * user's labels for it, exactly as the strip button beside it is. */
-function paintIcon(glyph: string, hue: number, size: number): Promise<string> {
-  const canvas = document.createElement("canvas");
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext("2d")!;
-  // Same formula as the strip's own hue paint (visor/src/style.rs
-  // `--strip: oklch(0.62 0.14 var(--hue))`), so an installed app's icon
-  // reads as the same colour as its button in the strip it came from.
-  ctx.fillStyle = `oklch(0.62 0.14 ${hue})`;
-  ctx.fillRect(0, 0, size, size);
-  ctx.fillStyle = "white";
-  ctx.font = `${Math.round(size * 0.6)}px system-ui, sans-serif`;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(glyph, size / 2, size / 2);
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob === null) {
-        reject(new Error("the browser refused to encode the app icon"));
-        return;
-      }
-      resolve(URL.createObjectURL(blob));
-    }, "image/png");
-  });
-}
 
 async function installApp(
   request: InstallRequest,
@@ -691,10 +659,8 @@ async function installApp(
   const scope = base.href;
   const id = new URL(request.fragment, base).href;
 
-  const [icon512, icon192] = await Promise.all([
-    paintIcon(request.glyph, request.hue, 512),
-    paintIcon(request.glyph, request.hue, 192),
-  ]);
+  // Same formula as the strip's own hue paint (visor/src/style.rs
+  // `--strip: oklch(0.62 0.14 var(--hue))`).
   const themeColor = `oklch(0.62 0.14 ${request.hue})`;
 
   const manifest = {
@@ -704,9 +670,20 @@ async function installApp(
     start_url: startUrl,
     scope,
     id,
+    // Static, on the home origin: Android's WebAPK server fetches icons by
+    // URL itself, so a blob: icon is unreachable to it and the install
+    // degrades to a shortcut. The glyph-on-hue icon is gone with that.
     icons: [
-      { src: icon512, sizes: "512x512", type: "image/png" },
-      { src: icon192, sizes: "192x192", type: "image/png" },
+      {
+        src: new URL("icon-512.png", base).href,
+        sizes: "512x512",
+        type: "image/png",
+      },
+      {
+        src: new URL("icon-192.png", base).href,
+        sizes: "192x192",
+        type: "image/png",
+      },
     ],
     theme_color: themeColor,
     background_color: "#ffffff",

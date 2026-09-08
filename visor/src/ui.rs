@@ -787,16 +787,14 @@ pub(crate) fn Visor() -> Element {
         apply.call(Action::Close);
     };
 
-    // Install the running app as its own OS-level app. `title`/`glyph`/
-    // `hue` are the user's own labels for it — the icon the launcher shows
-    // is drawn from them, the one place the trusted pixels can reach the
-    // launcher (docs/design.md "Routing", the `launch/` bullet) — so this
-    // is the visor's own act and not something the app or the glue could
-    // do unsupervised.
-    let install_as_app = move |app: App, glyph: String, hue: u16| async move {
+    // Install the running app as its own OS-level app: the visor's own act,
+    // since the fragment it opens at is the kernel's (`install-fragment`)
+    // and the name the launcher shows is composed by the glue from the
+    // app's title (docs/design.md "Routing", the `launch/` bullet).
+    let install_as_app = move |app: App, hue: u16| async move {
         let outcome = match kernel::install_fragment(&app.id).await {
             Ok(fragment) => {
-                kernel::install_app(fragment, app.title.expose().to_string(), glyph, hue).await
+                kernel::install_app(fragment, app.title.expose().to_string(), hue).await
             }
             Err(e) => Err(e),
         };
@@ -1092,20 +1090,14 @@ pub(crate) fn Visor() -> Element {
                                 "Close app"
                             }
                             // Only offered for a live session: the fragment
-                            // is `install-fragment`'s (this app's `launch/`
-                            // route), and the icon is drawn from the
-                            // user's own glyph and hue — the launcher shows
-                            // a mark only this device's user chose, not a
-                            // publisher's (docs/design.md "Routing", the
-                            // `launch/` bullet).
+                            // is `install-fragment`'s, this app's `launch/`
+                            // route (docs/design.md "Routing").
                             button {
                                 onclick: {
                                     let live = live.clone();
-                                    let glyph = info_glyph.clone();
                                     move |_| {
                                         let app = live.clone().unwrap().1;
-                                        let glyph = glyph.clone();
-                                        async move { install_as_app(app, glyph, hue).await }
+                                        async move { install_as_app(app, hue).await }
                                     }
                                 },
                                 "Install as app"
