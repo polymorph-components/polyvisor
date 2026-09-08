@@ -20,7 +20,7 @@ pub(crate) enum Voice {
 
 impl Voice {
     /// Every voice's rendering lives in exactly one CSS rule, named by this
-    /// class. [`crate::style::CSS`] is checked against these in a test.
+    /// class.
     pub(crate) const fn class(self) -> &'static str {
         match self {
             Voice::Framework => "framework",
@@ -29,7 +29,7 @@ impl Voice {
         }
     }
 
-    /// Used by the stylesheet test to prove no voice lacks a rule.
+    /// Every voice, so a test can cover the whole set.
     #[cfg(test)]
     pub(crate) const ALL: [Voice; 3] = [Voice::Framework, Voice::User, Voice::App];
 }
