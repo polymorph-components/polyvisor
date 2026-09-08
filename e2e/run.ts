@@ -2982,9 +2982,80 @@ const scenarios: Scenario[] = [
       await visorReady(page);
       await page.setViewportSize({ width: 390, height: 780 });
       await openSettingsSheet(page);
-      // Both halves of the strip are on screen at once, one pressed and one
-      // not: the pressed half is lightened by a translucent overlay, so it
-      // is a different background under the same ink.
+      // A glyph, saved: with no glyph the circle has no text, and the
+      // contrast sweep below only measures leaves with some — the circle
+      // must carry one to be in scope for it at all.
+      await drawer(page).locator("label").filter({ hasText: /^your glyph$/ })
+        .locator("input").fill("A");
+      await saveDraft(page);
+      await page.waitForFunction(
+        () => document.querySelector("#visor-circle")?.textContent === "A",
+      );
+      const circleStyle = await page.locator("#visor-circle").evaluate(
+        (el) => {
+          const s = getComputedStyle(el);
+          return {
+            w: s.width,
+            h: s.height,
+            fontSize: s.fontSize,
+            lineHeight: s.lineHeight,
+            fontWeight: s.fontWeight,
+          };
+        },
+      );
+      eq(
+        circleStyle,
+        {
+          w: "32px",
+          h: "32px",
+          fontSize: "20px",
+          lineHeight: "20px",
+          fontWeight: "600",
+        },
+        "the circle's fixed geometry drifted",
+      );
+      // Self is selected right now (the settings sheet is open): dark inset
+      // outline, no light fill — unlike the app half's own pressed dress.
+      const selfPressed = await page.locator("#visor-self").evaluate((el) => {
+        const s = getComputedStyle(el);
+        return { bg: s.backgroundColor, shadow: s.boxShadow };
+      });
+      check(
+        selfPressed.bg === "rgba(0, 0, 0, 0)" ||
+          selfPressed.bg === "transparent",
+        `self selected must have no fill, got ${selfPressed.bg}`,
+      );
+      check(
+        selfPressed.shadow.includes("inset") &&
+          selfPressed.shadow.includes("2px"),
+        `self selected must show a 2px inset outline, got ${selfPressed.shadow}`,
+      );
+      // The circle itself does not change with selection: same read
+      // whether settings is open or not.
+      const circleSelected = await page.locator("#visor-circle").evaluate(
+        (el) => getComputedStyle(el).backgroundColor,
+      );
+      await openApps(page);
+      const circleUnselected = await page.locator("#visor-circle").evaluate(
+        (el) => getComputedStyle(el).backgroundColor,
+      );
+      eq(
+        circleSelected,
+        circleUnselected,
+        "the identity circle changed when settings opened",
+      );
+      // App selected keeps the existing light fill.
+      const appPressed = await page.locator("#visor-app").evaluate((el) =>
+        getComputedStyle(el).backgroundColor
+      );
+      check(
+        appPressed !== "rgba(0, 0, 0, 0)" && appPressed !== "transparent",
+        `app selected must keep its light fill, got ${appPressed}`,
+      );
+      await openSettingsSheet(page);
+      // Both halves of the strip are on screen at once, self selected: the
+      // ink above is unaffected by that, which is what the sweep below
+      // relies on to speak for both halves alike.
       const painted = await page.locator("#visor-root").getAttribute("style");
 
       const worst = new Map<string, number>();

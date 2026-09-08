@@ -97,10 +97,10 @@ pub(crate) const CSS: &str = r#"
   padding: 4px 8px; text-align: left;
 }
 #visor-root #visor-self { flex-direction: row-reverse; text-align: right; }
-/* `box-shadow: none`: the drawer's pressed dress is an inset outline, which
-   on a half the width of the strip reads as a stray box. Here the lightening
-   is the whole of it. */
-#visor-root #visor-app[aria-pressed="true"], #visor-root #visor-self[aria-pressed="true"] { background: oklch(1 0 0 / 0.18); box-shadow: none; }
+/* The light fill is reserved for app selection; self uses an inset dark
+   border instead (below), since it sits beside the already-dark circle. */
+#visor-root #visor-app[aria-pressed="true"] { background: oklch(1 0 0 / 0.18); box-shadow: none; }
+#visor-root #visor-self[aria-pressed="true"] { background: none; box-shadow: inset 0 0 0 2px var(--strip-ink); }
 #visor-divider { width: 1px; align-self: stretch; margin: 5px; background: var(--strip-edge); }
 #visor-app-glyph, #visor-circle {
   flex: none;
@@ -108,8 +108,13 @@ pub(crate) const CSS: &str = r#"
 }
 /* The app's mark is the glyph itself, unboxed and large. */
 #visor-app-glyph { width: 40px; height: 40px; font-size: 28px; border-radius: 6px; }
-/* The plate: a light mark on the saturated strip. */
-#visor-circle { width: 28px; height: 28px; border-radius: 50%; background: var(--plate); color: var(--plate-ink); }
+/* Text glyphs take `color`; emoji retain their own artwork regardless. Fixed
+   regardless of press state — the circle is who you are, not the selection. */
+#visor-circle {
+  width: 32px; height: 32px; border-radius: 50%;
+  font-size: 20px; line-height: 1; font-weight: 600;
+  background: var(--strip-ink); color: var(--accent-ink);
+}
 #visor-root .stack { flex: 1; min-width: 0; }
 #visor-root .stack .top, #visor-root .stack .bottom { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #visor-root .stack .bottom { font-size: 12px; }
