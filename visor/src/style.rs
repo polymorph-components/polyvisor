@@ -20,26 +20,33 @@ pub(crate) const CSS: &str = r#"
 #visor-root {
   position: relative;
   font: 14px/1.4 system-ui, sans-serif;
-  color: oklch(0.2 0.02 var(--hue));
+  color: oklch(0.22 0.02 var(--hue));
+  /* The strip is saturated on purpose: it is the line between trusted and
+     untrusted pixels, and should read as one. Everything behind it is a
+     pale tint of the same hue, with the chroma spent on the accent alone. */
   --strip: oklch(0.62 0.14 var(--hue));
-  --drawer: oklch(0.7 0.11 var(--hue));
-  --accent: oklch(0.71 0.16 var(--hue));
-  --edge: oklch(0.45 0.09 var(--hue));
-  --quiet: oklch(0.38 0.05 var(--hue));
-  --plate: oklch(0.93 0.03 var(--hue));
-  --plate-ink: oklch(0.25 0.06 var(--hue));
-  --field: oklch(0.88 0.04 var(--hue));
+  --strip-edge: oklch(0.45 0.09 var(--hue));
+  --drawer: oklch(0.95 0.02 var(--hue));
+  --accent: oklch(0.52 0.12 var(--hue));
+  --accent-ink: oklch(0.98 0.01 var(--hue));
+  --edge: oklch(0.8 0.04 var(--hue));
+  --quiet: oklch(0.45 0.04 var(--hue));
+  --plate: oklch(0.99 0.005 var(--hue));
+  --plate-ink: oklch(0.3 0.06 var(--hue));
+  --field: oklch(0.99 0.005 var(--hue));
 }
 #visor-root.unclaimed {
-  color: oklch(0.2 0 0);
+  color: oklch(0.22 0 0);
   --strip: oklch(0.62 0 0);
-  --drawer: oklch(0.7 0 0);
-  --accent: oklch(0.71 0 0);
-  --edge: oklch(0.45 0 0);
-  --quiet: oklch(0.38 0 0);
-  --plate: oklch(0.93 0 0);
-  --plate-ink: oklch(0.25 0 0);
-  --field: oklch(0.88 0 0);
+  --strip-edge: oklch(0.45 0 0);
+  --drawer: oklch(0.95 0 0);
+  --accent: oklch(0.52 0 0);
+  --accent-ink: oklch(0.98 0 0);
+  --edge: oklch(0.8 0 0);
+  --quiet: oklch(0.45 0 0);
+  --plate: oklch(0.99 0 0);
+  --plate-ink: oklch(0.3 0 0);
+  --field: oklch(0.99 0 0);
 }
 
 /* Fixed height on all three axes so no content can push the anchor
@@ -51,8 +58,11 @@ pub(crate) const CSS: &str = r#"
   padding: 0 8px;
   position: relative; z-index: 3;
   background: var(--strip);
-  border-bottom: 1px solid var(--edge);
+  border-bottom: 1px solid var(--strip-edge);
+  /* Light on the saturated strip; the pale drawer keeps the dark ink. */
+  color: var(--accent-ink);
 }
+#visor-strip .framework { color: inherit; opacity: 0.8; }
 
 /* The two halves. Each is a whole button so the target is the half, not
    the glyph: one is "what is running", the other "who this is". */
@@ -63,7 +73,7 @@ pub(crate) const CSS: &str = r#"
   padding: 4px 8px; text-align: left;
 }
 #visor-self { flex-direction: row-reverse; text-align: right; }
-#visor-app[aria-pressed="true"], #visor-self[aria-pressed="true"] { background: var(--drawer); }
+#visor-app[aria-pressed="true"], #visor-self[aria-pressed="true"] { background: oklch(1 0 0 / 0.18); }
 #visor-divider { width: 1px; align-self: stretch; margin: 5px; background: var(--edge); }
 #visor-app-glyph, #visor-circle {
   flex: none;
@@ -71,8 +81,7 @@ pub(crate) const CSS: &str = r#"
 }
 /* The app's mark is the glyph itself, unboxed and large. */
 #visor-app-glyph { width: 40px; height: 40px; font-size: 28px; border-radius: 6px; }
-/* The plate, not the drawer colour: a pressed half wears the drawer
-   colour, and a glyph the same colour as its half vanishes. */
+/* The plate: a light mark on the saturated strip. */
 #visor-circle { width: 28px; height: 28px; border-radius: 50%; background: var(--plate); color: var(--plate-ink); }
 .stack { flex: 1; min-width: 0; }
 .stack .top, .stack .bottom { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -139,23 +148,24 @@ pub(crate) const CSS: &str = r#"
   #visor-root * { animation-duration: 0s !important; }
 }
 
-/* Unsaved changes, over the drawer: the only thing in this tree that takes
-   the press away from what raised it. */
+/* Unsaved changes, resting on the strip: the only thing in this tree that
+   takes the press away from what raised it, so it sits where the eye
+   already is — at the line, not at the top of the screen. */
 #visor-confirm {
-  position: absolute; top: 0; left: 0; right: 0; z-index: 4;
+  position: absolute; bottom: 56px; left: 0; right: 0; z-index: 4;
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
   padding: 12px;
   box-sizing: border-box;
   background: var(--drawer);
-  border-bottom: 1px solid var(--edge);
+  border-top: 1px solid var(--edge);
 }
 
 /* The line at the top of every pane. Only the pane that is staying
    carries the id — during a slide there are two of these on screen. */
 .notice { margin-bottom: 8px; min-height: 1.4em; }
 
-button { font: inherit; color: inherit; background: var(--accent); border: 1px solid var(--edge); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
-button[aria-pressed="true"] { border-color: var(--plate-ink); }
+button { font: inherit; color: var(--accent-ink); background: var(--accent); border: 1px solid var(--accent); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+button[aria-pressed="true"] { border-color: var(--plate-ink); box-shadow: inset 0 0 0 1px var(--accent-ink); }
 button[disabled] { opacity: 0.5; cursor: default; }
 input[type="text"], input[type="password"] { font: inherit; color: inherit; background: var(--field); border: 1px solid var(--edge); border-radius: 6px; padding: 6px 8px; }
 label { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
@@ -230,7 +240,8 @@ label { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
 .app {
   font-family: ui-monospace, monospace;
   background: var(--plate); color: var(--plate-ink);
-  border-radius: 4px; padding: 2px 6px;
+  border: 1px solid var(--edge);
+  border-radius: 4px; padding: 1px 5px;
   quotes: '"' '"';
 }
 "#;
