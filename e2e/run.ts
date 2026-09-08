@@ -3055,6 +3055,145 @@ const scenarios: Scenario[] = [
       await shot(page, "desktop-settings");
     },
   },
+
+  {
+    // The drawer sizes itself in `svh`, capped so the app zone keeps room
+    // below the strip on a handheld — see visor/src/style.rs #visor-drawer.
+    // Playwright's mobile emulation never collapses a toolbar, so the CSSOM
+    // check below is what this asserts about the *rule*, not the emulator.
+    name: "android-visor-band",
+    async run(_ctx, origin, browser) {
+      const ctx = await browser.newContext({
+        isMobile: true,
+        hasTouch: true,
+        viewport: { width: 390, height: 844 },
+      });
+      try {
+        const page = await open(ctx, origin);
+        await visorReady(page);
+        await paneSettled(page);
+
+        const rules = await page.evaluate(() => {
+          const out: string[] = [];
+          for (const sheet of Array.from(document.styleSheets)) {
+            for (const rule of Array.from(sheet.cssRules)) {
+              if (
+                rule instanceof CSSStyleRule &&
+                rule.selectorText === "#visor-drawer"
+              ) out.push(rule.cssText);
+              if (
+                rule instanceof CSSMediaRule &&
+                rule.conditionText.includes("600px")
+              ) {
+                for (const inner of Array.from(rule.cssRules)) {
+                  out.push(inner.cssText);
+                }
+              }
+            }
+          }
+          return out;
+        });
+        check(
+          rules.length === 2,
+          `expected 2 drawer rules, found ${rules.length}: ${
+            rules.join(" | ")
+          }`,
+        );
+        for (const rule of rules) {
+          check(
+            rule.includes("svh") && !/(?<!s)vh\b/.test(rule),
+            `drawer rule does not size itself in svh: ${rule}`,
+          );
+        }
+        const paneOverflowY = await page.evaluate(() =>
+          getComputedStyle(document.querySelector("#visor-drawer .pane")!)
+            .overflowY
+        );
+        eq(paneOverflowY, "auto", "the pane does not scroll its own content");
+
+        await launchTodoMvc(page);
+
+        for (
+          const [width, height] of [
+            [390, 844],
+            [360, 640],
+            [320, 480],
+            [844, 390], // Short landscape.
+          ]
+        ) {
+          await page.setViewportSize({ width, height });
+          // Idempotent: pressing the strip's app half is never a toggle
+          // (visor/src/state.rs `Action::Show`), so this opens the drawer
+          // on the app's own sheet the first time and re-settles it after
+          // each resize.
+          await toAppSheet(page);
+          await paneSettled(page);
+          await page.waitForFunction(
+            () =>
+              document.getAnimations().every((a) => a.playState === "finished"),
+            undefined,
+            { timeout: 10_000 },
+          );
+
+          const strip = await page.locator("#visor-strip").boundingBox();
+          check(strip !== null, `${width}x${height}: #visor-strip has no box`);
+          eq(strip.height, 56, `${width}x${height}: #visor-strip height`);
+
+          const zone = await page.locator("#app-zone").boundingBox();
+          check(zone !== null, `${width}x${height}: #app-zone has no box`);
+          check(
+            Math.abs(zone.y + zone.height - height) <= 1,
+            `${width}x${height}: #app-zone bottom is ${
+              zone.y + zone.height
+            }, want ${height}`,
+          );
+          if (height >= 152) {
+            check(
+              zone.height >= 96,
+              `${width}x${height}: only ${
+                zone.height.toFixed(0)
+              }px below the strip`,
+            );
+          }
+
+          const overflowed = await page.evaluate(
+            () =>
+              document.documentElement.scrollHeight >
+                document.documentElement.clientHeight,
+          );
+          check(
+            !overflowed,
+            `${width}x${height}: the shell scrolls vertically`,
+          );
+
+          // Short landscape is where the drawer's cap bites hardest: prove
+          // the pane actually scrolls a real control into view, not merely
+          // that its computed style says it could.
+          if (width === 844 && height === 390) {
+            const install = drawer(page).getByRole("button", {
+              name: "Install as app",
+            });
+            await install.scrollIntoViewIfNeeded();
+            const box = await install.boundingBox();
+            const pane = await drawer(page).locator(".pane").boundingBox();
+            check(box !== null && pane !== null, "no box to check scroll");
+            check(
+              box.y >= pane.y && box.y + box.height <= pane.y + pane.height,
+              `"Install as app" did not scroll into the pane: ${
+                JSON.stringify({ box, pane })
+              }`,
+            );
+          }
+
+          if (width === 320 || width === 390) {
+            await shot(page, `android-band-${width}x${height}`);
+          }
+        }
+      } finally {
+        await ctx.close();
+      }
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
