@@ -489,6 +489,32 @@ interprets.
   devices hold the key; another device answers "this link is not one
   this device can open". A future shareable form is a different `kind`
   with its own envelope and its own policy, not a relaxation of `app/`.
+- **The second kind, `launch/<app-id>`, is for installed apps.** A web
+  app manifest's `start_url` is written once into the OS's app registry
+  and replayed unchanged for months, and it names an app the launcher
+  displays by name and icon anyway. The `app/` token fits that badly
+  twice over: its opacity hides what the taskbar shows, and its key
+  binding turns a route-key convergence — an engine event the user never
+  sees — into an installed app that opens to a refusal. So an install
+  opens at `launch/<package>`: plaintext, keyless, resolved by
+  `route-decode` to this user's install of the package at route "". It
+  carries no app-controlled data, so the residual channel of `app/` does
+  not exist for it, and it *is* shareable — another user's visor opens
+  their own copy — which is the correct meaning of "open this app" and
+  the sharing `app/` refuses. Once the frame is up the bar switches to
+  `app/` as for any launch. Each package installs as its own app
+  (`shell.install-app`): the manifest's `id`, `start_url` and `scope`
+  are written absolute against the page's base (`new URL(".",
+  location.href)`, the same base the OAuth return uses — never `/`,
+  which on a project Pages site is somebody else's page), so a `blob:`
+  manifest resolves nothing relative to itself and the same package on
+  the same origin is the same installed app on every device. The icon is
+  the user's glyph on the user's hue, composed by the visor: the one
+  place the trusted pixels can reach the launcher. Chromium only; iOS
+  partitions storage per home-screen app, so a per-app install there
+  would be a device of its own. Unverified and to be probed: that the
+  fragment survives in `start_url` (a `?launch=` query is an acceptable
+  fallback for this kind exactly because the package id is public).
 - **Struck: pairing codes in the fragment.** A code is either short
   enough to type or key material that does not belong in a URL at all;
   the fragment was a transport looking for a route.

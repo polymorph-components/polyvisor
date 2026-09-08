@@ -394,6 +394,15 @@ interface apps {
     /// user's device; `unknown-app` when it names an app no longer
     /// installed.
     route-decode: async func(fragment: string) -> result<route-target, error>;
+    /// The fragment an installed app's window opens at: `launch/<app-id>`,
+    /// the second kind (docs/design.md "Routing"). Plaintext and keyless
+    /// on purpose — a `start_url` is written once into the OS's app
+    /// registry and replayed for months, so it must outlive route-key
+    /// convergence; and it names a package the launcher already displays,
+    /// so there is nothing to hide. `route-decode` resolves it to this
+    /// user's install of the package, at route "". `unknown-app` if the
+    /// package is not installed.
+    install-fragment: async func(app: app-id) -> result<string, error>;
     /// Start an instance. The glue binds a port to the returned session;
     /// the visor opens a frame for it through `shell.open-frame`, and the
     /// frame fetches `component`/`assets`/`asset` over that port, which
@@ -511,6 +520,37 @@ interface shell {
     /// the ceremony's browser half lives here and the kernel never sees a
     /// window.
     open-popup: async func(url: string) -> option<tuple<string, string>>;
+
+    /// What the visor asks the page to install an app as: the fields of a
+    /// web app manifest the glue cannot know. `title` is app voice, shown
+    /// by the OS launcher unplated, so the glue composes the manifest name
+    /// from it and the framework's own; `glyph` and `hue` are the user's
+    /// labels for the app, drawn into the icon — the one place the trusted
+    /// pixels can reach the launcher.
+    record install-request {
+        /// From `apps.install-fragment`: what the installed window opens at.
+        fragment: string,
+        title: string,
+        glyph: string,
+        hue: u16,
+    }
+
+    /// How an install request ended on the page.
+    enum install-outcome {
+        /// The browser's install prompt was shown; whatever the user chose
+        /// there is the browser's business.
+        prompted,
+        /// The manifest is in place but the browser offered no prompt to
+        /// call: the user installs from the browser's own menu.
+        manual,
+    }
+
+    /// Install `request`'s app as its own installed web app: the glue mints
+    /// a manifest for it — `id`, `start_url` and `scope` written absolute
+    /// against the page's own base, so a `blob:` manifest resolves nothing
+    /// relative to itself — points the document's manifest link at it, and
+    /// calls the install prompt the browser offered earlier, if any.
+    install-app: async func(request: install-request) -> result<install-outcome, error>;
 }
 
 // ---------------------------------------------------------------------------
