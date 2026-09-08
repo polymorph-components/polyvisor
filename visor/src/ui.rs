@@ -26,6 +26,7 @@
 //! colour, so the hue reaches the DOM through exactly one expression, and
 //! that expression is unreachable unless `device.status` said `open`.
 
+use dioxus::html::Key;
 use dioxus::prelude::*;
 
 use crate::kernel::{
@@ -178,6 +179,74 @@ async fn read_app_meta(id: String, mut app_meta: Signal<Meta>, mut notice: Signa
 enum Notice {
     Plain(String),
     Ended { app: AppText, reason: String },
+}
+
+/// Where the visor is asking the browser to put the keyboard.
+///
+/// The visor cannot move focus itself: the pinned stream-dom receiver's
+/// `MountedData` is `()` with `set_focus` unsupported. So focus is markup —
+/// one element carries `data-visor-focus` with a generation number, and
+/// `web/focus.ts` obeys it when that number advances. Rust keeps the
+/// decision (which element, and whether a transition is worth a move at
+/// all); the glue keeps the `.focus()` call and the one fact only a DOM
+/// has, namely whether the caret is still the visor's to move.
+///
+/// The generation is what keeps ordinary work quiet: a status read landing,
+/// a keystroke, an animation ending all re-render with the same number.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum FocusWant {
+    /// Not asking — the state at boot, so a page load leaves the caret
+    /// wherever the browser put it.
+    #[default]
+    Nowhere,
+    Pane,
+    /// The half of the strip the drawer was raised from, because it closed.
+    Strip {
+        self_half: bool,
+    },
+    Confirm,
+}
+
+/// Which half of the strip a tenant belongs to, and so which half the
+/// keyboard returns to when its drawer closes: `Devices` is reached from
+/// `Settings` (the right half's) and `AppInfo` from the app list.
+fn raised_by_self_half(t: Tenant) -> bool {
+    matches!(t, Tenant::Settings | Tenant::Unseal | Tenant::Devices)
+}
+
+/// The way out of a pane, in words — a scrim press is a mouse gesture and
+/// the strip is not a toggle, so without this a keyboard cannot leave an
+/// open drawer. `None` for the two panes with nowhere to go: the app list
+/// with nothing running (where the visor rests) and the unseal ceremony
+/// (every other kernel call is `unavailable` until it succeeds).
+fn dismissal(t: Tenant, running: bool) -> Option<(&'static str, Action)> {
+    if running {
+        Some(("Return to app", Action::Close))
+    } else if t == Tenant::Apps || t == Tenant::Unseal {
+        None
+    } else {
+        Some(("Back to apps", Action::Show(Tenant::Apps)))
+    }
+}
+
+/// What a pane is, for a screen reader that has just been moved into one.
+fn pane_label(t: Tenant) -> &'static str {
+    match t {
+        Tenant::Apps => "apps",
+        Tenant::AppInfo => "the running app",
+        Tenant::Settings => "settings",
+        Tenant::Unseal => "unseal this device",
+        Tenant::Devices => "other devices",
+    }
+}
+
+// CONTRACT: `inert` is a presence attribute — `inert="false"` is still
+// inert — and stream-dom-dioxus writes `AttributeValue::Bool(false)` as the
+// string "false", removing an attribute only for `AttributeValue::None`
+// (writer.rs:738 and :724; its `is_bool_attr` list does not include
+// `inert`). So every `inert` here is an `Option<&str>`, never a `bool`.
+fn flag(yes: bool) -> Option<&'static str> {
+    yes.then_some("")
 }
 
 /// Launch `app` and give its frame the screen, with `route` as what the
@@ -507,6 +576,13 @@ pub(crate) fn Visor() -> Element {
     let mut closing = use_signal(|| false);
     // The tenant sliding out under the new one, and whether it goes left.
     let mut leaving = use_signal(|| None::<(Tenant, bool)>);
+    // Where the keyboard should be, and a generation that advances only
+    // when the visor itself caused the move (see [`FocusWant`]).
+    let mut focus = use_signal(|| (0u32, FocusWant::default()));
+    let ask_focus = use_callback(move |want: FocusWant| {
+        let next = focus.peek().0.wrapping_add(1);
+        focus.set((next, want));
+    });
 
     // Two orderings, both between a spawned read and a user's write. They
     // are `CopyValue` rather than `Signal` on purpose: a generation is
@@ -592,21 +668,28 @@ pub(crate) fn Visor() -> Element {
         let from = drawer().tenant();
         let next = drawer().reduce(action, pinned);
         match (from, next.tenant()) {
-            (Some(_), None) => {
+            (Some(t), None) => {
                 leaving.set(None);
                 closing.set(true);
+                ask_focus.call(FocusWant::Strip {
+                    self_half: raised_by_self_half(t),
+                });
             }
             (Some(a), Some(b)) if a != b => {
                 closing.set(false);
                 leaving.set(Some((a, b.ordinal() > a.ordinal())));
                 drawer.set(next);
+                ask_focus.call(FocusWant::Pane);
             }
             (None, Some(_)) => {
                 closing.set(false);
                 drawer.set(next);
+                ask_focus.call(FocusWant::Pane);
             }
             // The tenant showing is the one asked for. Still cancels a
             // close in flight: pressing the half you just left reopens it.
+            // No focus move: a press that changes nothing must not take the
+            // caret off whatever the user was in.
             _ => closing.set(false),
         }
         if from == next.tenant() {
@@ -644,8 +727,18 @@ pub(crate) fn Visor() -> Element {
     // did not ask for and cannot be asked about, so a dirty draft is simply
     // dropped there.
     let request = use_callback(move |action: Action| {
+        // While the dialog stands it is the only thing that may act. A press
+        // that arrives now is input queued before it appeared — a scrim
+        // click, a strip press already in flight — and taking it would
+        // silently replace the transition the dialog is asking about.
+        if pending().is_some() {
+            return;
+        }
         if draft() != seed() {
             pending.set(Some(action));
+            // Everything else is inert under the dialog, so the keyboard has
+            // to be put inside it or there is nothing focusable on screen.
+            ask_focus.call(FocusWant::Confirm);
         } else {
             apply.call(action);
         }
@@ -971,6 +1064,26 @@ pub(crate) fn Visor() -> Element {
         None => "pane",
     };
 
+    // At most one element carries `data-visor-focus`, so the glue never has
+    // to choose; its value is the generation `web/focus.ts` acts on.
+    let (focus_gen, focus_want) = focus();
+    let focus_tag = |want: FocusWant| (focus_want == want).then(|| focus_gen.to_string());
+    let focus_pane = focus_tag(FocusWant::Pane);
+    let focus_confirm = focus_tag(FocusWant::Confirm);
+    let focus_app_half = focus_tag(FocusWant::Strip { self_half: false });
+    let focus_self_half = focus_tag(FocusWant::Strip { self_half: true });
+
+    // `inert` is the whole of the dialog's trap: with strip, scrim and
+    // drawer inert there is nowhere for Tab to go but its three answers. An
+    // ordinary open pane is not a modal and traps nothing.
+    let confirming = pending().is_some();
+    // The app zone is the page's element, not this tree's, so the glue
+    // mirrors this marker onto it (`web/focus.ts`). True throughout the
+    // drawer's open and close animations, since it is on screen for both.
+    let app_inert = flag(tenant.is_some() || confirming);
+    // The exit the pane offers, which Escape is the keyboard spelling of.
+    let escape = tenant.and_then(|t| dismissal(t, running)).map(|(_, a)| a);
+
     // One pane's worth of drawer. Rendered twice while a switch is
     // animating — the tenant coming in and the one going out — so it is a
     // closure rather than an arm inlined in the tree. `current` is which of
@@ -1007,7 +1120,20 @@ pub(crate) fn Visor() -> Element {
             )
         };
 
+        // Only the pane that is staying offers the way out; the one sliding
+        // away is inert and about to be gone.
+        let exit = if current { dismissal(t, running) } else { None };
+
         rsx! {
+            // First in the pane, so it is the first thing Tab reaches.
+            if let Some((label, action)) = exit {
+                button {
+                    class: "pane-dismiss",
+                    onclick: move |_| request.call(action),
+                    "{label}"
+                }
+            }
+
             // Whatever happened that the user did not ask for. It lives at
             // the top of every pane because the strip has no room to say
             // it any more and no business moving to make some.
@@ -1151,7 +1277,36 @@ pub(crate) fn Visor() -> Element {
         // on the visor's side of that line — above the strip — and pushes
         // the strip, and the app zone under it, down rather than covering
         // it.
-        div { id: "visor-root", class: "{root_class}", style: painted,
+        div {
+            id: "visor-root",
+            class: "{root_class}",
+            style: painted,
+            "data-visor-app-inert": app_inert,
+            // One listener for the whole tree, and not a document one: the
+            // visor's world grants no page-level key capability, and a key
+            // pressed with the caret in an app's frame is that app's. The
+            // drawer moves the caret into its pane as it opens, so by the
+            // time there is something to dismiss the focus is in here.
+            // Residue: a caret tabbed right out of the visor into browser
+            // chrome is out of reach until it comes back.
+            onkeydown: move |e: KeyboardEvent| {
+                if e.key() != Key::Escape {
+                    return;
+                }
+                // In the dialog, Escape cancels the dialog ALONE: the parked
+                // transition is not taken and the draft is untouched.
+                if pending().is_some() {
+                    e.stop_propagation();
+                    pending.set(None);
+                    return;
+                }
+                // Otherwise it is the dismissal button by another name, and
+                // takes the same dirty-draft guard.
+                if let Some(action) = escape {
+                    e.stop_propagation();
+                    request.call(action);
+                }
+            },
             // The trusted pixels depend on nothing the page provides, so
             // the visor ships its own stylesheet as part of its own tree.
             style { "{CSS}" }
@@ -1162,11 +1317,20 @@ pub(crate) fn Visor() -> Element {
                 // where the visor rests, and a scrim over an empty app
                 // zone would be a dismissal to nowhere.
                 if running {
-                    div { id: "visor-scrim", onclick: move |_| request.call(Action::Close) }
+                    div {
+                        id: "visor-scrim",
+                        // A press target as much as the strip is, so it goes
+                        // inert under the dialog with everything else.
+                        inert: flag(confirming),
+                        onclick: move |_| request.call(Action::Close),
+                    }
                 }
                 div {
                     id: "visor-drawer",
                     class: "{drawer_class}",
+                    // Under the dialog, or shut but still sliding: Tab must
+                    // not walk into a pane that is leaving.
+                    inert: flag(confirming || shutting),
                     onanimationend: move |_| {
                         // `closing` is the whole discriminator: the bridge
                         // reports no animation name, and the close path
@@ -1182,15 +1346,32 @@ pub(crate) fn Visor() -> Element {
                         div {
                             key: "{from:?}",
                             class: if forward { "pane leave-to-left" } else { "pane leave-to-right" },
+                            // Still painted, no longer part of the page.
+                            inert: flag(true),
                             onanimationend: move |_| leaving.set(None),
                             {sheet_for(from, false)}
                         }
                     }
-                    div { key: "{t:?}", class: "{entering}", {sheet_for(t, true)} }
+                    // `tabindex="-1"`: the caret can be put here without the
+                    // pane becoming a tab stop; the name is what a screen
+                    // reader announces on arrival.
+                    div {
+                        key: "{t:?}",
+                        class: "{entering}",
+                        tabindex: "-1",
+                        role: "group",
+                        aria_label: pane_label(t),
+                        "data-visor-focus": focus_pane,
+                        {sheet_for(t, true)}
+                    }
                 }
             }
 
-            div { id: "visor-strip",
+            div {
+                id: "visor-strip",
+                // Under the dialog only: an open pane is not a modal, so the
+                // strip stays reachable from one.
+                inert: flag(confirming),
                 // Left half: what is running. Both halves need a kernel
                 // that answers, so neither is offered before the seal
                 // opens; the ceremony the boot raised is what the user has
@@ -1199,6 +1380,7 @@ pub(crate) fn Visor() -> Element {
                     id: "visor-app",
                     disabled: "{locked}",
                     aria_pressed: "{on_apps}",
+                    "data-visor-focus": focus_app_half,
                     onclick: move |_| {
                         request.call(Action::Show(if running { Tenant::AppInfo } else { Tenant::Apps }))
                     },
@@ -1227,6 +1409,7 @@ pub(crate) fn Visor() -> Element {
                     id: "visor-self",
                     disabled: "{locked}",
                     aria_pressed: "{on_self}",
+                    "data-visor-focus": focus_self_half,
                     onclick: move |_| request.call(Action::Show(Tenant::Settings)),
                     div { id: "visor-circle", "{user_glyph}" }
                     div { class: "stack",
@@ -1255,7 +1438,15 @@ pub(crate) fn Visor() -> Element {
             // answers are the three things a user could mean, and none of
             // them is "lose it quietly".
             if let Some(action) = pending() {
-                div { id: "visor-confirm", role: "dialog",
+                div {
+                    id: "visor-confirm",
+                    role: "dialog",
+                    aria_modal: "true",
+                    aria_label: "unsaved changes",
+                    // Focusable, so the caret lands on the dialog rather than
+                    // on one of three answers none of which is safe to guess.
+                    tabindex: "-1",
+                    "data-visor-focus": focus_confirm,
                     span { class: "{Voice::Framework.class()}", "unsaved changes" }
                     button {
                         onclick: move |_| {

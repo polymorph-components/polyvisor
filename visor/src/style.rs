@@ -11,6 +11,12 @@
 //! (docs/design.md "Devices"). So the palette cascades — strip, drawer,
 //! buttons and voices all shift together — while the fact that decides
 //! whether anything is painted at all stays one expression in one place.
+//!
+//! Two rules the e2e gates measure rather than this file asserting them:
+//! every selector is under `#visor-root`, because the `<style>` element
+//! lands in the page's own document and a bare `button {}` would dress the
+//! host page; and text states an opaque colour rather than fading, so its
+//! contrast does not depend on what happens to be behind it.
 
 pub(crate) const CSS: &str = r#"
 /* The two arms of the anchor rule, and the only place either is spelled.
@@ -19,15 +25,20 @@ pub(crate) const CSS: &str = r#"
    shape in grey rather than a second design. */
 #visor-root {
   position: relative;
-  font: 14px/1.4 system-ui, sans-serif;
+  font: 14px/1.5 system-ui, sans-serif;
   color: oklch(0.22 0.02 var(--hue));
+  max-width: 100%;
   /* The strip is saturated on purpose: it is the line between trusted and
      untrusted pixels, and should read as one. Everything behind it is a
      pale tint of the same hue, with the chroma spent on the accent alone. */
   --strip: oklch(0.62 0.14 var(--hue));
   --strip-edge: oklch(0.45 0.09 var(--hue));
+  /* Dark ink is what lets the strip keep its saturated colour: light ink on
+     a mid-lightness plate falls near 3:1 at some hues, this holds above
+     4.5:1 at every one of them, pressed half or not. */
+  --strip-ink: oklch(0.16 0.04 var(--hue));
   --drawer: oklch(0.95 0.02 var(--hue));
-  --accent: oklch(0.52 0.12 var(--hue));
+  --accent: oklch(0.48 0.12 var(--hue));
   --accent-ink: oklch(0.98 0.01 var(--hue));
   --edge: oklch(0.8 0.04 var(--hue));
   --quiet: oklch(0.45 0.04 var(--hue));
@@ -39,14 +50,23 @@ pub(crate) const CSS: &str = r#"
   color: oklch(0.22 0 0);
   --strip: oklch(0.62 0 0);
   --strip-edge: oklch(0.45 0 0);
+  --strip-ink: oklch(0.16 0 0);
   --drawer: oklch(0.95 0 0);
-  --accent: oklch(0.52 0 0);
+  --accent: oklch(0.48 0 0);
   --accent-ink: oklch(0.98 0 0);
   --edge: oklch(0.8 0 0);
   --quiet: oklch(0.45 0 0);
   --plate: oklch(0.99 0 0);
   --plate-ink: oklch(0.3 0 0);
   --field: oklch(0.99 0 0);
+}
+
+/* The ring sits OUTSIDE its control, so it is drawn against the strip or the
+   drawer rather than against a button's own fill — which is what lets one
+   colour be visible on all of them. */
+#visor-root :focus-visible {
+  outline: 3px solid var(--strip-ink);
+  outline-offset: 2px;
 }
 
 /* Fixed height on all three axes so no content can push the anchor
@@ -59,22 +79,29 @@ pub(crate) const CSS: &str = r#"
   position: relative; z-index: 3;
   background: var(--strip);
   border-bottom: 1px solid var(--strip-edge);
-  /* Light on the saturated strip; the pale drawer keeps the dark ink. */
-  color: var(--accent-ink);
+  color: var(--strip-ink);
 }
-#visor-strip .framework { color: inherit; opacity: 0.8; }
+/* Italic, not faded. Two ids on purpose: the voice rules at the foot of the
+   sheet are `#visor-root .framework` — equal specificity and later in source
+   order — so an override of equal weight would silently lose. */
+#visor-root #visor-strip .framework { color: inherit; }
 
-/* The two halves. Each is a whole button so the target is the half, not
-   the glyph: one is "what is running", the other "who this is". */
-#visor-app, #visor-self {
+/* The two halves. Each is a whole button so the target is the half, not the
+   glyph. Two ids again: `#visor-root button` (an id and an element) outranks
+   a bare `#visor-app`, and the halves are not drawer buttons. */
+#visor-root #visor-app, #visor-root #visor-self {
   flex: 1; min-width: 0;
   display: flex; align-items: center; gap: 8px;
+  color: var(--strip-ink);
   background: none; border: 0; border-radius: 8px;
   padding: 4px 8px; text-align: left;
 }
-#visor-self { flex-direction: row-reverse; text-align: right; }
-#visor-app[aria-pressed="true"], #visor-self[aria-pressed="true"] { background: oklch(1 0 0 / 0.18); }
-#visor-divider { width: 1px; align-self: stretch; margin: 5px; background: var(--edge); }
+#visor-root #visor-self { flex-direction: row-reverse; text-align: right; }
+/* `box-shadow: none`: the drawer's pressed dress is an inset outline, which
+   on a half the width of the strip reads as a stray box. Here the lightening
+   is the whole of it. */
+#visor-root #visor-app[aria-pressed="true"], #visor-root #visor-self[aria-pressed="true"] { background: oklch(1 0 0 / 0.18); box-shadow: none; }
+#visor-divider { width: 1px; align-self: stretch; margin: 5px; background: var(--strip-edge); }
 #visor-app-glyph, #visor-circle {
   flex: none;
   display: flex; align-items: center; justify-content: center;
@@ -83,9 +110,9 @@ pub(crate) const CSS: &str = r#"
 #visor-app-glyph { width: 40px; height: 40px; font-size: 28px; border-radius: 6px; }
 /* The plate: a light mark on the saturated strip. */
 #visor-circle { width: 28px; height: 28px; border-radius: 50%; background: var(--plate); color: var(--plate-ink); }
-.stack { flex: 1; min-width: 0; }
-.stack .top, .stack .bottom { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.stack .bottom { font-size: 12px; }
+#visor-root .stack { flex: 1; min-width: 0; }
+#visor-root .stack .top, #visor-root .stack .bottom { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#visor-root .stack .bottom { font-size: 12px; }
 
 /* The drawer is in normal flow, above the strip: it pushes the strip (and
    the app zone under it) down when it opens rather than covering the app.
@@ -110,15 +137,19 @@ pub(crate) const CSS: &str = r#"
    slides out. The drawer's height is fixed and the pane scrolls inside it,
    so no sheet's length can move anything.
 
+   `overflow-x: hidden`: the long machine texts each carry their own local
+   horizontal scroll, so nothing may make the drawer or the page scroll
+   sideways.
+
    The four backgrounds are the local/scroll shadow technique: the first two
    are drawer-coloured covers pinned to the content (`local`), the second
    two are shadows pinned to the viewport (`scroll`). Where there is more
    content above or below, the cover has scrolled away and the shadow shows
    — so "there is more" is visible without a scrollbar being trusted to say
    it. */
-.pane {
+#visor-root .pane {
   position: absolute; inset: 0;
-  overflow-y: auto;
+  overflow-y: auto; overflow-x: hidden;
   padding: 12px;
   box-sizing: border-box;
   background:
@@ -130,10 +161,12 @@ pub(crate) const CSS: &str = r#"
   background-attachment: local, local, scroll, scroll;
   background-color: var(--drawer);
 }
-.pane.enter-from-right { animation: visor-enter-right 200ms ease-out; }
-.pane.enter-from-left { animation: visor-enter-left 200ms ease-out; }
-.pane.leave-to-left { animation: visor-leave-left 200ms ease-in forwards; }
-.pane.leave-to-right { animation: visor-leave-right 200ms ease-in forwards; }
+/* Where the caret lands when a pane opens; quiet, since it is a container. */
+#visor-root .pane:focus-visible { outline: 2px dashed var(--quiet); outline-offset: -6px; }
+#visor-root .pane.enter-from-right { animation: visor-enter-right 200ms ease-out; }
+#visor-root .pane.enter-from-left { animation: visor-enter-left 200ms ease-out; }
+#visor-root .pane.leave-to-left { animation: visor-leave-left 200ms ease-in forwards; }
+#visor-root .pane.leave-to-right { animation: visor-leave-right 200ms ease-in forwards; }
 
 @keyframes visor-drawer-open { from { height: 0; } }
 @keyframes visor-drawer-close { to { height: 0; } }
@@ -157,53 +190,102 @@ pub(crate) const CSS: &str = r#"
   padding: 12px;
   box-sizing: border-box;
   background: var(--drawer);
-  border-top: 1px solid var(--edge);
+  border-top: 2px solid var(--strip-ink);
 }
+#visor-confirm:focus { outline: none; }
+#visor-confirm .framework { font-weight: 600; font-size: 16px; flex: 1 1 100%; }
 
 /* The line at the top of every pane. Only the pane that is staying
    carries the id — during a slide there are two of these on screen. */
-.notice { margin-bottom: 8px; min-height: 1.4em; }
+#visor-root .notice { margin-bottom: 8px; min-height: 1.4em; overflow-wrap: break-word; }
 
-button { font: inherit; color: var(--accent-ink); background: var(--accent); border: 1px solid var(--accent); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
-button[aria-pressed="true"] { border-color: var(--plate-ink); box-shadow: inset 0 0 0 1px var(--accent-ink); }
-button[disabled] { opacity: 0.5; cursor: default; }
+/* Controls are at least 44px on both axes; the strip's pinned 56px is
+   unaffected, its halves being taller than that already. */
+#visor-root button {
+  font: inherit; color: var(--accent-ink); background: var(--accent);
+  border: 1px solid var(--accent); border-radius: 6px;
+  padding: 8px 12px; min-height: 44px;
+  cursor: pointer;
+  max-width: 100%;
+}
+/* After the base rule, not before: an exit is not the thing to do here, and
+   these declarations have to be the ones that win. */
+#visor-root .pane-dismiss {
+  margin-bottom: 12px;
+  background: var(--plate); color: var(--plate-ink);
+  border-color: var(--edge);
+}
+#visor-root button[aria-pressed="true"] { border-color: var(--plate-ink); box-shadow: inset 0 0 0 1px var(--accent-ink); }
+/* Disabled is said with the fill and the cursor rather than with an opacity. */
+#visor-root button[disabled] { background: var(--edge); color: var(--plate-ink); border-color: var(--edge); cursor: default; }
 /* The colour slider is the hue wheel itself, unrolled: a gradient
    interpolated in oklch around the long way so it visits every hue once at
    the strip's lightness/chroma, and the thumb sits on the one chosen. It
    names hues 0 and 360 — every hue, which is why it reveals none (see the
-   stylesheet test). */
-input[type="range"] {
+   stylesheet test).
+
+   The control is 44px tall while the track it paints stays a 14px band
+   centred in it: `background-size` separates the target from the
+   decoration. */
+#visor-root input[type="range"] {
   appearance: none; -webkit-appearance: none;
-  flex: 1; min-width: 120px; max-width: 320px; height: 14px; margin: 0;
-  border-radius: 7px; border: 1px solid var(--edge);
-  background: linear-gradient(to right in oklch longer hue, oklch(0.62 0.14 0), oklch(0.62 0.14 360));
+  flex: 1 1 12ch; min-width: 120px; max-width: 320px;
+  height: 44px; margin: 0;
+  border: 0; background-color: transparent;
+  background-image: linear-gradient(to right in oklch longer hue, oklch(0.62 0.14 0), oklch(0.62 0.14 360));
+  background-repeat: no-repeat;
+  background-position: center center;
+  background-size: 100% 14px;
   accent-color: var(--accent);
 }
-input[type="range"]::-webkit-slider-thumb {
+#visor-root input[type="range"]::-webkit-slider-thumb {
   appearance: none; -webkit-appearance: none;
-  width: 22px; height: 22px; border-radius: 50%;
+  width: 24px; height: 24px; border-radius: 50%;
   background: var(--strip); border: 2px solid var(--plate);
   box-shadow: 0 0 0 1px var(--strip-edge);
 }
-input[type="range"]::-moz-range-thumb {
-  width: 18px; height: 18px; border-radius: 50%;
+#visor-root input[type="range"]::-moz-range-thumb {
+  width: 20px; height: 20px; border-radius: 50%;
   background: var(--strip); border: 2px solid var(--plate);
   box-shadow: 0 0 0 1px var(--strip-edge);
 }
-input[type="text"], input[type="password"] { font: inherit; color: inherit; background: var(--field); border: 1px solid var(--edge); border-radius: 6px; padding: 6px 8px; }
-label { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+#visor-root input[type="text"], #visor-root input[type="password"] {
+  font: inherit; color: inherit; background: var(--field);
+  border: 1px solid var(--edge); border-radius: 6px;
+  padding: 8px; min-height: 44px; box-sizing: border-box;
+  /* Shrinks to nothing rather than pushing a row wider than the drawer, and
+     stops growing at a field's worth: a petname box spanning a 1280px window
+     is harder to read, not easier. */
+  min-width: 0; max-width: min(24rem, 100%);
+}
+#visor-root label input { flex: 1 1 16ch; }
+#visor-root .sheet > input { align-self: stretch; }
+#visor-root label {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  margin-bottom: 12px;
+  align-self: stretch;
+}
+#visor-root label > span:first-child { flex: 0 0 auto; }
 
-.app-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
-.app-row-title { flex: 1; min-width: 0; }
+/* Rows wrap rather than overlap: a name and some framework-voice facts about
+   it do not fit on one 320px line, so the facts follow under the name. */
+#visor-root .app-row, #visor-root .device-row,
+#visor-root .member-row, #visor-root .peer-row, #visor-root .sync-self {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  align-self: stretch; padding: 6px 0;
+}
+#visor-root .app-row-title, #visor-root .device-row-name, #visor-root .member-row-name {
+  flex: 1 1 12ch; min-width: 0;
+}
 
-/* The device ceremonies: unseal, keep, the entry picker, erase. Minimal
-   on purpose — this chrome is slated for a redesign. */
-.sheet { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; padding: 8px 0; border-top: 1px solid var(--edge); }
-.sheet-head { margin-bottom: 4px; }
-.sheet-error { margin-top: 2px; }
-.choice { display: flex; gap: 8px; }
-.device-row { display: flex; align-items: center; gap: 8px; align-self: stretch; }
-.device-row-name { flex: 1; min-width: 0; }
+/* The device ceremonies: unseal, keep, the entry picker, erase. */
+#visor-root .sheet { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; padding: 12px 0; border-top: 1px solid var(--edge); }
+/* Larger and weighted, and still in whichever voice the sentence belongs to:
+   the framework's italic is not traded away for a heading style. */
+#visor-root .sheet-head { font-size: 16px; margin-bottom: 4px; }
+#visor-root .sheet-head .framework, #visor-root .sheet-head .user { font-weight: 600; }
+#visor-root .sheet-error { margin-top: 2px; }
+#visor-root .choice { display: flex; flex-wrap: wrap; gap: 8px; }
 
 /* Sync. An endpoint id is machine text, not a voice: monospace so it can be
    read off a screen character by character, and `user-select: all` so one
@@ -216,27 +298,34 @@ label { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
    has open. A wrapping id would be one line as a placeholder and two or
    three as an id, and everything below it in the drawer — "Other devices",
    erase — would jump under the pointer at an arbitrary moment. One line
-   either way makes that swap layout-neutral. `user-select: all` still takes
-   the whole id, scrolled or not. */
-.sync-self { display: flex; align-items: center; gap: 8px; }
-.endpoint-id {
+   either way makes that swap layout-neutral.
+
+   `min-width: 0` and `max-width: 100%` are what make the scroll local:
+   without them the nowrap text sets the row's minimum width and pushes the
+   drawer sideways at 320px instead of scrolling inside its own box.
+   `tabindex="0"` on the element itself is not needed — Chromium focuses
+   overflowing scroll containers for the keyboard — but the e2e gate checks
+   that, since it is a recent behaviour. */
+#visor-root .endpoint-id {
   font-family: ui-monospace, monospace;
   user-select: all;
   white-space: nowrap;
   overflow-x: auto;
+  overscroll-behavior-x: contain;
+  display: block;
+  flex: 1 1 12ch;
+  min-width: 0; max-width: 100%;
 }
-.peer-row { display: flex; align-items: center; gap: 8px; align-self: stretch; }
-.member-row { display: flex; align-items: center; gap: 8px; align-self: stretch; }
-.member-row-name { flex: 1; min-width: 0; }
 
 /* Pairing. The code is 79 characters shown in groups of four: monospace so
    the groups line up, selectable as a whole, and wrapped at the spaces
    between groups (the only place it may break — a group broken mid-way is
    a group read wrong). */
-.pairing-code {
+#visor-root .pairing-code {
   font-family: ui-monospace, monospace;
   user-select: all;
   align-self: stretch;
+  max-width: 100%;
   line-height: 1.6;
 }
 
@@ -245,26 +334,29 @@ label { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
    off this screen and another agreeing they match, so they are sized to be
    read across a desk, spaced so no two digits run together, and selectable
    like every other machine text here. */
-.pairing-sas {
+#visor-root .pairing-sas {
   font-family: ui-monospace, monospace;
   font-size: 40px;
   letter-spacing: 6px;
   user-select: all;
+  max-width: 100%;
 }
 
 /* The three voices. polyvisor speaking. */
-.framework { color: var(--quiet); font-style: italic; }
-/* The user's own words, echoed: upright, weighted, never quoted. */
-.user { font-weight: 600; font-style: normal; color: inherit; }
+#visor-root .framework { color: var(--quiet); font-style: italic; overflow-wrap: break-word; }
+/* The user's own words, echoed: upright, weighted, never quoted. A long name
+   wraps rather than being truncated or laid over the facts beside it. */
+#visor-root .user { font-weight: 600; font-style: normal; color: inherit; overflow-wrap: break-word; }
 /* A publisher's words: plated, monospace, quoted, so foreign text is
    visibly foreign wherever it lands. The plate is derived from the hue
    like everything else, but far lighter than the drawer it sits on, so it
    stays a plate at every hue. */
-.app {
+#visor-root .app {
   font-family: ui-monospace, monospace;
   background: var(--plate); color: var(--plate-ink);
   border: 1px solid var(--edge);
   border-radius: 4px; padding: 1px 5px;
+  overflow-wrap: break-word;
   quotes: '"' '"';
 }
 "#;
@@ -326,10 +418,14 @@ mod tests {
             );
         }
         assert!(chromatic > 0, "the stylesheet paints nothing from the hue");
-        // The palette both arms of the rule define, spelled once each.
+        // The palette both arms of the rule define, spelled once each — the
+        // strip's ink included, since a strip that kept its colour and lost
+        // its ink would be unreadable in exactly one of them.
         assert!(CSS.contains("#visor-root.unclaimed"));
         assert!(CSS.contains("--strip: oklch(0.62 0.14 var(--hue));"));
         assert!(CSS.contains("--strip: oklch(0.62 0 0);"));
+        assert!(CSS.contains("--strip-ink: oklch(0.16 0.04 var(--hue));"));
+        assert!(CSS.contains("--strip-ink: oklch(0.16 0 0);"));
         // No second colour syntax to smuggle a hue through.
         assert!(!CSS.contains("hsl("));
     }
