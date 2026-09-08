@@ -400,6 +400,20 @@ the handshake.
 - **Switching devices is a reload** (`shell.switch-device`): the anchor
   changes and the page restarts against another worker. Erase destroys
   the namespace and the index row, then switches to a fresh device.
+- **A tab with no anchor adopts the last kept device.** The anchor is
+  per tab, and a fresh tab — a typed URL, a bookmark, an installed app's
+  window — has none; minting a new device there made "new tab, new
+  stranger" the default, and which tabs shared a device turned on how
+  the tab had been opened (Chromium copies `sessionStorage` on duplicate
+  and `window.open`, on nothing else). So the glue keeps one more
+  pointer, in `localStorage`: the id of the last device this profile saw
+  as *durable*, written whenever `device.status` reports that tier and
+  never for an ephemeral (they are swept). A tab with no anchor takes it;
+  only a profile with no kept device — or an explicit
+  `switch-device(none)`, which clears the pointer too — mints. The
+  pointer names a worker and grants nothing: a passphrase device still
+  opens sealed, and a rests-open one was already the profile's. Several
+  devices in one profile remain possible; they stop being an accident.
 
 ## Visor and apps render through stream-dom
 
