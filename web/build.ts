@@ -190,6 +190,12 @@ await bundle("boot.ts", "boot.js");
 await bundle("worker.ts", "worker.js");
 await bundle("frame.ts", "frame.js");
 await copy(join(ROOT, "web", "index.html"), join(DIST, "index.html"));
+// Launcher icons at real https: URLs: Android's WebAPK server fetches a
+// manifest's icons itself, so a blob: icon can never mint an installed app
+// (docs/design.md "Routing", the `launch/` bullet).
+for (const icon of ["icon-512.png", "icon-192.png"]) {
+  await copy(join(ROOT, "web", icon), join(DIST, icon), { overwrite: true });
+}
 
 await component(
   "polyvisor_runtime",

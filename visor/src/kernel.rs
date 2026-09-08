@@ -367,20 +367,16 @@ pub(crate) async fn install_fragment(app: &str) -> Result<String, String> {
 /// branch on.
 pub(crate) type InstallOutcome = api::shell::InstallOutcome;
 
-/// Install `app` as its own installed web app. `title`/`glyph`/`hue` are
-/// the user's own labels — the icon the OS launcher shows is drawn from
-/// them, the one place the trusted pixels can reach the launcher
-/// (docs/design.md "Routing", the `launch/` bullet).
+/// Install `app` as its own installed web app (internal.wit
+/// `shell.install-app`).
 pub(crate) async fn install_app(
     fragment: String,
     title: String,
-    glyph: String,
     hue: u16,
 ) -> Result<InstallOutcome, String> {
     api::shell::install_app(api::shell::InstallRequest {
         fragment,
         title,
-        glyph,
         hue,
     })
     .await

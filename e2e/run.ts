@@ -1301,10 +1301,17 @@ const scenarios: Scenario[] = [
       check(
         Array.isArray(manifest.icons) && manifest.icons.length === 2 &&
           manifest.icons.every((i: { src: string }) =>
-            i.src.startsWith("blob:")
+            i.src.startsWith(new URL(".", page.url()).href) &&
+            i.src.endsWith(".png")
           ),
-        "manifest must carry two blob: icons",
+        "manifest must carry two https: icons under the page's base",
       );
+      // ...and the icons must actually be there: a WebAPK server fetches
+      // them by URL.
+      for (const icon of manifest.icons as { src: string }[]) {
+        const res = await page.request.get(icon.src);
+        check(res.ok(), `icon ${icon.src} is not served`);
+      }
       // The Pages rule (docs/design.md "Routing"): nothing in the manifest
       // may be root-absolute, which on a project Pages site names somebody
       // else's page.

@@ -509,8 +509,16 @@ interprets.
   which on a project Pages site is somebody else's page), so a `blob:`
   manifest resolves nothing relative to itself and the same package on
   the same origin is the same installed app on every device. The icon is
-  the user's glyph on the user's hue, composed by the visor: the one
-  place the trusted pixels can reach the launcher. Chromium only; iOS
+  the framework's own, at a static URL: Android installs are WebAPKs,
+  minted by a server that fetches the manifest's icons itself, so an icon
+  painted on the client (the user's glyph on the user's hue was the
+  plan) can never reach the launcher; the composed name is what does.
+  Whether that server also re-fetches the *manifest* by URL — which would
+  rule out a `blob:` manifest too, and leave a service worker on the home
+  origin as the only way to serve one per install — is the open probe;
+  apps distributed off the home origin will need that answer, and a
+  global app identity, before `launch/` can name anything but a
+  registry id. Chromium only; iOS
   partitions storage per home-screen app, so a per-app install there
   would be a device of its own. Unverified and to be probed: that the
   fragment survives in `start_url` (a `?launch=` query is an acceptable

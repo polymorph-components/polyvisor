@@ -524,14 +524,14 @@ interface shell {
     /// What the visor asks the page to install an app as: the fields of a
     /// web app manifest the glue cannot know. `title` is app voice, shown
     /// by the OS launcher unplated, so the glue composes the manifest name
-    /// from it and the framework's own; `glyph` and `hue` are the user's
-    /// labels for the app, drawn into the icon — the one place the trusted
-    /// pixels can reach the launcher.
+    /// from it and the framework's own; `hue` is the user's, for the
+    /// window's theme colour. The icon is the framework's own static one:
+    /// Android's WebAPK server fetches icons by URL, so nothing painted on
+    /// the client can be a launcher icon (docs/design.md "Routing").
     record install-request {
         /// From `apps.install-fragment`: what the installed window opens at.
         fragment: string,
         title: string,
-        glyph: string,
         hue: u16,
     }
 
