@@ -350,6 +350,49 @@ async function saveDraft(page: Page): Promise<void> {
 }
 
 /**
+ * Raise the running app's own sheet, from wherever the drawer is.
+ *
+ * Not by pressing the strip's app half from another pane. With a session
+ * running, every pane offers "Return to app" and that is the supported way
+ * out (visor/src/ui.rs `dismissal`); pressing the half for the tenant
+ * already on screen is worse than useless, since a dirty draft parks the
+ * transition and the dialog that raises makes the strip `inert` — after
+ * which no press can land at all.
+ */
+async function toAppSheet(page: Page): Promise<void> {
+  // Settled first. A drawer in mid-close is `inert`, and so is one under
+  // the dialog (visor/src/ui.rs, `flag(confirming || shutting)`): its
+  // buttons take no press and the scrim behind takes it instead.
+  await page.waitForFunction(
+    () => {
+      const d = document.querySelector("#visor-drawer");
+      return d === null || !d.hasAttribute("inert");
+    },
+    undefined,
+    { timeout: 15_000 },
+  );
+  const back = drawer(page).getByRole("button", {
+    name: "Return to app",
+    exact: true,
+  });
+  if (await back.count() > 0) {
+    await back.click();
+    // `data-visor-app-inert` is the visor's own statement that the strip is
+    // not to be pressed, and it outlives the closing animation
+    // (visor/src/ui.rs `app_inert`).
+    await page.waitForFunction(
+      () =>
+        document.querySelector("#visor-root")?.hasAttribute(
+          "data-visor-app-inert",
+        ) === false,
+      undefined,
+      { timeout: 10_000 },
+    );
+  }
+  await openApps(page);
+}
+
+/**
  * The running app's own glyph (`device.meta`, `meta-scope.app`), typed and
  * SAVED — which is the value an install is allowed to paint with.
  *
@@ -361,7 +404,7 @@ async function saveDraft(page: Page): Promise<void> {
  * that installs next is installing against a saved map, not a draft.
  */
 async function setAppGlyph(page: Page, glyph: string): Promise<void> {
-  await openApps(page);
+  await toAppSheet(page);
   // `^glyph$`: the settings sheet's field is "your glyph", and this is the
   // app sheet's.
   const field = drawer(page).locator("label").filter({ hasText: /^glyph$/ })
@@ -388,9 +431,18 @@ async function setAppGlyph(page: Page, glyph: string): Promise<void> {
   const confirm = page.locator("#visor-confirm");
   await confirm.waitFor({ timeout: 10_000 });
   await confirm.getByRole("button", { name: "Save", exact: true }).click();
+  // The dialog clears the moment it is answered, but the save it asked for
+  // is async and the parked transition is taken only once that save lands
+  // (visor/src/ui.rs `save_now`). The settings pane the dialog was guarding
+  // is therefore the observable that says the kernel has the glyph:
+  // navigating on the dialog's disappearance alone races the save, finds
+  // the draft still dirty, and parks the next transition behind a second
+  // dialog that nothing can then dismiss.
   await confirm.waitFor({ state: "detached", timeout: 15_000 });
+  await drawer(page).locator("label").filter({ hasText: /^device petname$/ })
+    .waitFor({ timeout: 15_000 });
   await paneSettled(page);
-  await openApps(page);
+  await toAppSheet(page);
   await page.waitForFunction(
     (want) => {
       const label = Array.from(
@@ -415,7 +467,7 @@ async function installAndReadManifest(
   page: Page,
   // deno-lint-ignore no-explicit-any
 ): Promise<any> {
-  await openApps(page);
+  await toAppSheet(page);
   const before = await page.evaluate(() =>
     document.querySelector<HTMLLinkElement>("link[rel=manifest]")?.href ?? ""
   );
