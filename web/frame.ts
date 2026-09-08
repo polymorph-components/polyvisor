@@ -22,6 +22,7 @@ import { proxyInterfaces } from "./rpc.ts";
 const I = {
   tasks: "polyvisor:app/tasks@0.1.0",
   apps: "polyvisor:internal/apps@0.1.0",
+  route: "polyvisor:app/route@0.1.0",
 } as const;
 
 interface AssetInfo {
@@ -40,6 +41,14 @@ let mounted: MountedProducer | undefined;
  * exists an await later, which is not a guard. */
 let mounting = false;
 
+/** `polyvisor:app/route.get`'s answer: the route the mount message carried
+ * ("" for a plain launch), fixed for this frame's lifetime — `wit/app.wit`
+ * `route`: "the route the app was launched at". Served locally, never over
+ * the session port: the port answers `tasks`/`apps`, and route is a
+ * page-URL concern the glue owns on the other side of `postMessage`, not a
+ * kernel call (internal.wit `shell.open-frame` docs). */
+let route = "";
+
 function teardown(message: string): void {
   mounted?.dispose();
   mounted = undefined;
@@ -53,6 +62,19 @@ async function mount(
   port: MessagePort,
 ): Promise<void> {
   const imports = proxyInterfaces(port, [I.tasks]);
+  // `route` is local, not proxied over `port`: `get` reads the value the
+  // mount message carried and `set` relays to the parent, which is the one
+  // side that can touch `location` at all (internal.wit `shell.open-frame`:
+  // "the glue also writes the page fragment ... on every `route.set` the
+  // frame relays"). Same shape as a proxied interface — a record of
+  // camelCase methods, keyed by the verbatim WIT interface id — so it merges
+  // into `imports` exactly where a proxy would have gone.
+  imports[I.route] = {
+    get: () => route,
+    set: (r: string) => {
+      parent.postMessage({ t: "route", route: r }, "*");
+    },
+  };
   const appsClient = proxyInterfaces(port, [I.apps])[I.apps] as {
     assets(): Promise<AssetInfo[]>;
     asset(handle: Uint8Array): Promise<Uint8Array>;
@@ -99,7 +121,12 @@ globalThis.addEventListener("message", (ev: MessageEvent) => {
   if ((data as { t?: string }).t !== "mount") return;
   if (mounting) return; // one mount per frame
   mounting = true;
-  const { wasm, plan } = data as { wasm: Uint8Array; plan: string };
+  const { wasm, plan, route: launchRoute } = data as {
+    wasm: Uint8Array;
+    plan: string;
+    route: string;
+  };
+  route = launchRoute;
   const port = ev.ports[0];
   mount(wasm, plan, port).catch((err: unknown) =>
     teardown(String((err as Error)?.message ?? err))

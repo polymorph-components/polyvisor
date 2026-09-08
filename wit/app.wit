@@ -48,10 +48,31 @@ interface tasks {
     remove: async func(id: string) -> result<_, string>;
 }
 
+/// The app's place in the visor's bookmarkable URL.
+///
+/// The visor's page fragment names the running app and carries one opaque
+/// string the app chose: its route. The visor seals the pair under a key
+/// only this user's devices hold before it reaches the URL bar, so the
+/// route is never readable off the page, and a route this app is handed
+/// is one it wrote itself on one of the user's own devices — not
+/// attacker-typed input. What the app puts in it is its own business
+/// (TodoMVC: its filter). Bounded: the framework refuses a route over its
+/// cap (a few hundred bytes) and the URL does not move.
+///
+/// `set` replaces the URL; it never pushes history. The back button is
+/// the visor's, not the app's.
+interface route {
+    /// The route the app was launched at: "" for a plain launch.
+    get: func() -> string;
+    /// Replace the route in the page's URL. Fire-and-forget.
+    set: func(route: string);
+}
+
 /// An application. Renders through the stream-dom producer contract into
 /// a receiver the framework owns (a sandboxed frame under a vocabulary
 /// policy); everything else it can reach is an import listed here.
 world app {
     include polymorph:stream-dom/producer@0.1.0;
     import tasks;
+    import route;
 }

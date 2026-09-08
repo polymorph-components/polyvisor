@@ -460,6 +460,15 @@ self.onconnect = (ev: MessageEvent) => {
     [I.apps]: {
       installed: async () => (await ready)[I.apps].installed(),
       launch: async (app: string) => (await ready)[I.apps].launch(app),
+      // Control port only, both: `route-encode` names a session the tab's
+      // glue owns the URL bar for, and `route-decode` resolves a fragment
+      // the visor read off the page (internal.wit `apps`). A session port
+      // gets neither — an app reaches the URL through `route.set`, which
+      // the frame relays and the glue encodes on its behalf.
+      routeEncode: async (s: number, route: string) =>
+        (await ready)[I.apps].routeEncode(s, route),
+      routeDecode: async (fragment: string) =>
+        (await ready)[I.apps].routeDecode(fragment),
       sessionApp: async (s: number) => (await ready)[I.apps].sessionApp(s),
       component: async (s: number) => (await ready)[I.apps].component(s),
       assets: async (s: number) => (await ready)[I.apps].assets(s),

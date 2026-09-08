@@ -414,6 +414,70 @@ floor; predicates become bools at the WIT boundary; a Dioxus component
 that writes a signal it never reads renders once forever — invisible to
 native tests, so browser gates are mandatory for every visor change.
 
+## Routing
+
+The page URL gains one thing: a fragment, `#app/<token>`, naming a
+running app and a route the app chose, so "this app, here" can be
+bookmarked. The fragment is the only place for it — it never reaches the
+server, and it is the one part of the URL an app frame's `href` policy
+already treats as same-document (`web/policy.ts`). Two parts, two
+owners: the visor owns the grammar (`<kind>/<rest>`, `app` the only kind
+today; anything else is refused by `route-decode` exactly as an
+unreadable token is), and the app owns the
+text inside `route`, which the visor carries byte-for-byte and never
+interprets.
+
+- **The token is ciphertext, and deterministic.** `install-id ‖ route`,
+  zero-padded to 256 bytes, sealed under a *user* route key with
+  AES-256-GCM and a synthetic nonce (`HMAC(k_siv, plaintext)`), so equal
+  state is equal text: bookmarks dedupe, `replaceState` does not churn
+  the bar, and browser history sees one entry per state rather than one
+  per keystroke (`runtime/crates/kernel/src/route.rs`). What this buys
+  is both directions of the trust problem at once. Inbound, a route
+  that decrypts is one this user's visor wrote for this install — the
+  app is handed its own prior output, not attacker-typed input.
+  Outbound, the app never holds the key, so the URL bar, history sync,
+  screenshots and "recently closed" learn nothing of the route. The
+  fixed length closes the length channel; what remains is *that* an
+  update happened, when, and whether state changed — a bit or two per
+  update, to a reader who already holds the user's browser account. That
+  is the accepted residue, and it applies only to apps that import
+  `route` at all.
+- **The key is user-level and lives sealed.** Bookmarks made on one
+  device should open on the user's others, so the key cannot be
+  device-derived; and the group document `us` is plaintext to relays by
+  ruling (`engine/src/vault.rs`), so it cannot live there. It lives in a
+  visor-owned document that rides the app-document machinery under the
+  reserved id `polyvisor:visor` (`engine/src/visor.rs`) — keyhive-sealed,
+  synced and checkpointed like any app tree, for free. The same
+  document holds the **install table**: a random 16-byte id per (user,
+  app), minted on first launch. The URL names the install, not the
+  package, so the concept of "an install" exists before installs are a
+  user-visible act; two devices that mint before pairing converge on one
+  key by automerge's last-writer-wins, and the loser's pre-pairing
+  bookmarks stop opening — stated, not fixed.
+- **The glue owns the URL bar.** `shell.open-frame` writes the fragment
+  for the one open session, `close-frame` clears it, and an app's
+  `route.set` is relayed by the frame to the glue, debounced, encoded by
+  the kernel, and written with `history.replaceState` — never
+  `pushState`. The back button is the visor's; an app gets no history
+  entry. Routes over the cap (238 bytes) are refused and the bar does not
+  move.
+- **Consumed once, after unseal.** The visor reads `shell.fragment`
+  exactly once per page load, at the first identity read that finds the
+  device open, and hands it to `apps.route-decode`; a sealed device
+  consumes it after the unseal ceremony. Nothing about the fragment runs
+  before the hue is painted, so a URL cannot influence the
+  grey-until-unseal sequence. `hashchange` is ignored: there is one
+  launch path.
+- **Sharing is foreclosed here, by construction.** Only this user's
+  devices hold the key; another device answers "this link is not one
+  this device can open". A future shareable form is a different `kind`
+  with its own envelope and its own policy, not a relaxation of `app/`.
+- **Struck: pairing codes in the fragment.** A code is either short
+  enough to type or key material that does not belong in a URL at all;
+  the fragment was a transport looking for a route.
+
 ## Pins, with reasons
 
 | Dependency | Pin | Reason |

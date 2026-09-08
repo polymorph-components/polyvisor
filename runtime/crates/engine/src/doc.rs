@@ -78,6 +78,13 @@ impl AppDoc {
         self.core.tree()
     }
 
+    /// The automerge machinery under this document, for a schema that is not
+    /// the tasks one: `crate::visor` writes its own keys at the same ROOT of
+    /// its own (reserved-id) app document.
+    pub(crate) const fn document(&mut self) -> &mut Document {
+        &mut self.core
+    }
+
     pub fn save(&self) -> Vec<u8> {
         self.core.save()
     }
