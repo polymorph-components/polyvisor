@@ -45,6 +45,10 @@ pub(crate) const CSS: &str = r#"
   --plate: oklch(0.99 0.005 var(--hue));
   --plate-ink: oklch(0.3 0.06 var(--hue));
   --field: oklch(0.99 0.005 var(--hue));
+  /* Wide views centre content to ~720px via inline padding; `vw` so nested
+     surfaces don't compound a `%`. `max(12px, …)` keeps this sheet's old
+     small-screen gutter (the strip's own is narrower, set where it's used). */
+  --visor-gutter: max(12px, calc((100vw - 720px) / 2));
 }
 #visor-root.unclaimed {
   color: oklch(0.22 0 0);
@@ -75,7 +79,7 @@ pub(crate) const CSS: &str = r#"
   box-sizing: border-box;
   height: 56px; min-height: 56px; max-height: 56px;
   display: flex; align-items: center;
-  padding: 0 8px;
+  padding: 0 max(8px, calc((100vw - 720px) / 2));
   position: relative; z-index: 3;
   background: var(--strip);
   border-bottom: 1px solid var(--strip-edge);
@@ -164,7 +168,7 @@ pub(crate) const CSS: &str = r#"
 #visor-root .pane {
   position: absolute; inset: 0;
   overflow-y: auto; overflow-x: hidden;
-  padding: 12px;
+  padding: 12px var(--visor-gutter);
   box-sizing: border-box;
   background:
     linear-gradient(var(--drawer) 30%, transparent) center top / 100% 32px,
@@ -204,7 +208,7 @@ pub(crate) const CSS: &str = r#"
 #visor-confirm {
   position: absolute; bottom: 56px; left: 0; right: 0; z-index: 4;
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
-  padding: 12px;
+  padding: 12px var(--visor-gutter);
   box-sizing: border-box;
   background: var(--drawer);
   border-top: 2px solid var(--strip-ink);
@@ -219,7 +223,7 @@ pub(crate) const CSS: &str = r#"
 #visor-actions {
   flex: none;
   display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px;
-  padding: 8px 12px;
+  padding: 8px var(--visor-gutter);
   box-sizing: border-box;
   background: var(--drawer);
   border-top: 1px solid var(--edge);
@@ -328,8 +332,16 @@ pub(crate) const CSS: &str = r#"
   flex: 1 1 12ch; min-width: 0;
 }
 
-/* The device ceremonies: unseal, keep, the entry picker, erase. */
-#visor-root .sheet { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; padding: 12px 0; border-top: 1px solid var(--edge); }
+/* The device ceremonies: unseal, keep, the entry picker, erase. The
+   negative margin cancels `.pane`'s own gutter (viewport-relative, so it
+   doesn't compound), making the separator full-bleed under the column. */
+#visor-root .sheet {
+  display: flex; flex-direction: column; gap: 8px; align-items: flex-start;
+  padding: 12px var(--visor-gutter);
+  margin: 0 calc(-1 * var(--visor-gutter));
+  box-sizing: border-box;
+  border-top: 1px solid var(--edge);
+}
 /* Larger and weighted, and still in whichever voice the sentence belongs to:
    the framework's italic is not traded away for a heading style. */
 #visor-root .sheet-head { font-size: 16px; margin-bottom: 4px; }
