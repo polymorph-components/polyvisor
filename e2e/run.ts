@@ -410,7 +410,7 @@ async function toAppSheet(page: Page): Promise<void> {
 }
 
 /**
- * The running app's own glyph (`device.meta`, `meta-scope.app`), typed and
+ * The running app's own glyph (`device.meta`, `meta-scope.app`), selected and
  * SAVED — which is the value an install is allowed to paint with.
  *
  * The app sheet uses the same action bar as device settings. Save there and
@@ -422,39 +422,41 @@ async function setAppGlyph(
   expected = glyph,
 ): Promise<void> {
   await toAppSheet(page);
-  // `^glyph$`: the settings sheet's field is "your glyph", and this is the
-  // app sheet's.
-  const field = drawer(page).locator("label").filter({ hasText: /^glyph$/ })
-    .locator("input");
-  await field.waitFor({ timeout: 10_000 });
-  // Typed until it stays typed. Unlike the settings sheet, the app sheet
+  const tile = drawer(page).getByRole("button", {
+    name: "Choose glyph",
+    exact: true,
+  });
+  await tile.waitFor({ timeout: 10_000 });
+  // Selected until it stays selected. Unlike the settings sheet, the app sheet
   // seeds its draft from a kernel read that lands AFTER the pane is on
   // screen (visor/src/ui.rs: the `AppInfo` arm spawns `read_app_meta` and
-  // calls `seed_draft` only when it comes back), so a glyph typed the
+  // calls `seed_draft` only when it comes back), so a choice made the
   // instant the pane settles can be wiped by that seed arriving — leaving a
   // clean draft, no "unsaved changes" dialog, and nothing saved. The seed
   // happens once per transition, so this converges immediately.
   const deadline = performance.now() + 15_000;
   for (;;) {
-    await field.fill(glyph);
+    await tile.click();
+    const picker = drawer(page).locator(".glyph-picker");
+    const search = picker.getByRole("searchbox", {
+      name: "Enter glyph or search",
+    });
+    await search.fill(glyph);
+    await picker.getByRole("button", { name: `Use ${expected}`, exact: true })
+      .click();
     await page.waitForTimeout(300);
-    if (await field.inputValue() === expected) break;
+    if ((await tile.textContent()) === expected) break;
     check(
       performance.now() < deadline,
-      "the app sheet's glyph field would not hold a value",
+      "the app sheet's glyph tile would not hold a value",
     );
   }
   await saveDraft(page);
   await page.waitForFunction(
-    (want) => {
-      const label = Array.from(
-        document.querySelectorAll("#visor-drawer label"),
-      ).find((l) => l.querySelector("span")?.textContent === "glyph");
-      const input = label?.querySelector("input") as
-        | HTMLInputElement
-        | undefined;
-      return input?.value === want;
-    },
+    (want) =>
+      document.querySelector('button[aria-label="Choose glyph"]')
+        ?.textContent ===
+        want,
     expected,
     { timeout: 15_000 },
   );
@@ -1741,17 +1743,24 @@ const scenarios: Scenario[] = [
       // only a draft: installing before Save must still use static icons,
       // and Revert must clear it.
       await toAppSheet(page);
-      const appGlyph = drawer(page).locator("label").filter({
-        hasText: /^glyph$/,
-      }).locator("input");
-      await drawer(page).getByRole("button", { name: "Choose emoji" }).click();
+      const appGlyph = drawer(page).getByRole("button", {
+        name: "Choose glyph",
+        exact: true,
+      });
+      await appGlyph.click();
       const appPicker = drawer(page).locator(".glyph-picker");
-      await appPicker.getByRole("searchbox", { name: "Search emoji" }).fill(
+      await appPicker.getByRole("searchbox", {
+        name: "Enter glyph or search",
+      }).fill(
         "rocket",
       );
       await appPicker.getByRole("button", { name: "rocket", exact: true })
         .click();
-      eq(await appGlyph.inputValue(), "🚀", "app picker chose the wrong glyph");
+      eq(
+        await appGlyph.textContent(),
+        "🚀",
+        "app picker chose the wrong glyph",
+      );
       check(
         (await drawer(page).locator("#visor-actions").textContent())?.includes(
           "Save",
@@ -1760,7 +1769,7 @@ const scenarios: Scenario[] = [
       );
       await drawer(page).getByRole("button", { name: "Revert", exact: true })
         .click();
-      eq(await appGlyph.inputValue(), "", "Revert kept an app picker choice");
+      eq(await appGlyph.textContent(), "", "Revert kept an app picker choice");
 
       // A combining sequence and not an emoji: a colour emoji font ignores
       // the white fill the pixel checks below look for. Rust keeps the whole
@@ -2684,35 +2693,43 @@ const scenarios: Scenario[] = [
         hasText: /^your petname$/,
       }).locator("input");
       await userPetname.fill("ada");
-      const glyph = drawer(page).locator("label").filter({
-        hasText: /^your glyph$/,
-      }).locator("input");
-      await glyph.fill("  👩🏽‍💻x");
-      eq(await glyph.inputValue(), "👩🏽‍💻", "paste was not normalized");
-      // The normalized draft is already this value. A controlled input must
-      // still rewrite the DOM when another pasted suffix normalizes to it.
-      await glyph.evaluate((input) => {
-        (input as HTMLInputElement).value = "👩🏽‍💻suffix";
-        input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      const glyph = drawer(page).getByRole("button", {
+        name: "Choose your glyph",
+        exact: true,
       });
+      await glyph.click();
+      const picker = drawer(page).locator(".glyph-picker");
+      const search = picker.getByRole("searchbox", {
+        name: "Enter glyph or search",
+      });
+      await page.waitForFunction(() =>
+        document.activeElement?.getAttribute("type") === "search"
+      );
+      const actionsBeforeQuery = await drawer(page).locator("#visor-actions")
+        .textContent();
+
+      // Search is not a draft mutation. Its raw value stays intact while
+      // only the direct candidate strips leading Unicode whitespace and a
+      // trailing suffix from the first extended grapheme.
+      const compoundQuery = " \u00a0👩🏽‍💻tail";
+      await search.fill(compoundQuery);
+      eq(await search.inputValue(), compoundQuery, "glyph query was rewritten");
+      const results = picker.locator(".glyph-results button");
       eq(
-        await glyph.inputValue(),
-        "👩🏽‍💻",
-        "an unchanged signal left a pasted suffix in the DOM",
+        await results.first().getAttribute("aria-label"),
+        "Use 👩🏽‍💻",
+        "compound direct candidate was not first",
       );
-      check(
-        await glyph.evaluate((input) => input === document.activeElement),
-        "normalizing an unchanged glyph moved focus",
-      );
-      await glyph.press("ControlOrMeta+A");
-      await glyph.pressSequentially("Z");
+      await shot(page, "desktop-glyph-compound-query");
       eq(
-        await glyph.inputValue(),
-        "Z",
-        "typing did not continue after normalization",
+        await drawer(page).locator("#visor-actions").textContent(),
+        actionsBeforeQuery,
+        "a glyph query changed the draft state",
       );
-      // Composition owns its incomplete text until compositionend commits.
-      await glyph.evaluate((input) => {
+
+      // Composition owns its incomplete query: no partial direct candidate
+      // is offered until compositionend, while emoji search remains query-only.
+      await search.evaluate((input) => {
         input.dispatchEvent(
           new CompositionEvent("compositionstart", {
             bubbles: true,
@@ -2727,61 +2744,89 @@ const scenarios: Scenario[] = [
           }),
         );
       });
-      eq(await glyph.inputValue(), "e", "composition was changed early");
-      await glyph.dispatchEvent("compositionend");
-      await glyph.evaluate((input) => {
-        // Browsers commonly send the final input after compositionend.
+      eq(await search.inputValue(), "e", "composition query was changed early");
+      eq(
+        await picker.getByRole("button", { name: "Use e", exact: true })
+          .count(),
+        0,
+        "partial composition exposed a direct candidate",
+      );
+      await search.dispatchEvent("compositionend");
+      await search.evaluate((input) => {
         (input as HTMLInputElement).value = "e\u0301x";
         input.dispatchEvent(new InputEvent("input", { bubbles: true }));
       });
       eq(
-        await glyph.inputValue(),
-        "é",
-        "composition was not normalized at end",
+        await search.inputValue(),
+        "éx",
+        "composition changed the raw query",
+      );
+      eq(
+        await results.first().getAttribute("aria-label"),
+        "Use é",
+        "complete combining grapheme was not the first candidate",
       );
 
-      // Picker choices are drafts too: browse by shortcode, select a
-      // modifier, then prove neither selection nor Revert persisted it.
-      await drawer(page).getByRole("button", { name: "Choose emoji" }).click();
-      const picker = drawer(page).locator(".glyph-picker");
-      await page.waitForFunction(() =>
-        document.activeElement?.getAttribute("type") === "search"
+      // Trimmed whole-query emoji search follows the direct candidate while
+      // the field keeps its raw spaces: "cat" first offers c, then matching
+      // named/shortcode emoji.
+      await search.fill("  cat ");
+      eq(
+        await search.inputValue(),
+        "  cat ",
+        "spaced letter search query was rewritten",
       );
-      await picker.getByRole("searchbox", { name: "Search emoji" }).fill(
-        "technologist",
+      eq(
+        await results.first().getAttribute("aria-label"),
+        "Use c",
+        "direct letter was not first",
+      );
+      check(await results.count() > 1, "cat search returned no emoji matches");
+      check(
+        await picker.getByRole("button", { name: /cat/i }).count() > 0,
+        "spaced cat search returned no named cat emoji",
+      );
+      await search.press("ControlOrMeta+A");
+      await search.pressSequentially("cat");
+      eq(
+        await search.inputValue(),
+        "cat",
+        "select-all did not replace the glyph query",
       );
       await shot(page, "desktop-glyph-picker");
-      await picker.getByRole("button", {
-        name: "woman technologist: medium skin tone",
-      })
-        .click();
-      eq(await glyph.inputValue(), "👩🏽‍💻", "picker chose the wrong grapheme");
+      await results.first().click();
+      eq(
+        await glyph.textContent(),
+        "c",
+        "direct candidate chose the wrong glyph",
+      );
       check(
-        await glyph.evaluate((input) => input === document.activeElement),
-        "picker selection did not return focus to the glyph input",
+        await glyph.evaluate((button) => button === document.activeElement),
+        "picker selection did not return focus to the glyph tile",
       );
       await drawer(page).getByRole("button", { name: "Revert", exact: true })
         .click();
-      eq(await glyph.inputValue(), "", "Revert kept a picker choice");
+      eq(await glyph.textContent(), "", "Revert kept a picker choice");
       // Revert covered the whole draft, including the sibling petname.
       await userPetname.fill("ada");
 
       // Escape closes the inline chooser, not its drawer.
-      await drawer(page).getByRole("button", { name: "Choose emoji" }).click();
-      await picker.getByRole("searchbox", { name: "Search emoji" }).press(
-        "Escape",
-      );
+      await glyph.click();
+      eq(await search.inputValue(), "", "reopened picker retained its query");
+      await search.press("Escape");
       eq(await picker.count(), 0, "Escape kept the glyph picker open");
       check(
-        await glyph.evaluate((input) => input === document.activeElement),
-        "Escape did not return focus to the glyph input",
+        await glyph.evaluate((button) => button === document.activeElement),
+        "Escape did not return focus to the glyph tile",
       );
       eq(
         await drawer(page).locator(".pane").getAttribute("aria-label"),
         "settings",
         "Escape closed the drawer with the picker",
       );
-      await glyph.fill("  👩🏽‍💻x");
+      await glyph.click();
+      await search.fill(compoundQuery);
+      await results.first().click();
       await saveDraft(page);
       await page.waitForFunction(
         () => document.querySelector("#visor-circle")?.textContent === "👩🏽‍💻",
@@ -2798,8 +2843,50 @@ const scenarios: Scenario[] = [
       );
       await page.setViewportSize({ width: 390, height: 780 });
       await openSettingsSheet(page);
-      await drawer(page).getByRole("button", { name: "Choose emoji" }).click();
+      const mobileTile = drawer(page).getByRole("button", {
+        name: "Choose your glyph",
+        exact: true,
+      });
+      await mobileTile.click();
+      const mobileSearch = picker.getByRole("searchbox", {
+        name: "Enter glyph or search",
+      });
+      await mobileSearch.fill("cat");
       await shot(page, "mobile-glyph-picker");
+
+      // Escape and selecting the already-saved glyph are both clean acts.
+      await mobileSearch.press("Escape");
+      eq(
+        await mobileTile.textContent(),
+        "👩🏽‍💻",
+        "Escape changed the saved glyph",
+      );
+      await mobileTile.click();
+      await mobileSearch.fill(compoundQuery);
+      await picker.getByRole("button", { name: "Use 👩🏽‍💻", exact: true })
+        .click();
+      eq(
+        (await drawer(page).locator("#visor-actions").textContent())?.trim(),
+        "Close",
+        "selecting the saved glyph dirtied the draft",
+      );
+
+      // Clearing is available only inside the picker and remains a draft.
+      await mobileTile.click();
+      await picker.getByRole("button", { name: "Clear glyph", exact: true })
+        .click();
+      eq(
+        await mobileTile.textContent(),
+        "",
+        "Clear glyph did not clear the draft",
+      );
+      await drawer(page).getByRole("button", { name: "Revert", exact: true })
+        .click();
+      eq(
+        await mobileTile.textContent(),
+        "👩🏽‍💻",
+        "Revert did not restore cleared glyph",
+      );
     },
   },
 
@@ -3232,8 +3319,16 @@ const scenarios: Scenario[] = [
       await visorReady(page);
       await page.setViewportSize({ width: 390, height: 780 });
       await openSettingsSheet(page);
-      await drawer(page).locator("label").filter({ hasText: /^your glyph$/ })
-        .locator("input").fill("A");
+      const glyphTile = drawer(page).getByRole("button", {
+        name: "Choose your glyph",
+        exact: true,
+      });
+      await glyphTile.click();
+      const picker = drawer(page).locator(".glyph-picker");
+      await picker.getByRole("searchbox", {
+        name: "Enter glyph or search",
+      }).fill("A");
+      await picker.getByRole("button", { name: "Use A", exact: true }).click();
       await saveDraft(page);
       await page.waitForFunction(
         () => document.querySelector("#visor-circle")?.textContent === "A",

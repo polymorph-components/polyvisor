@@ -1228,7 +1228,7 @@ pub(crate) fn Visor() -> Element {
                                 },
                             }
                         }
-                        GlyphInput {
+                        GlyphPicker {
                             label: "glyph",
                             value: info_glyph,
                             focus_return: current.then(|| focus_glyph.clone()).flatten(),
@@ -1441,7 +1441,7 @@ pub(crate) fn Visor() -> Element {
                     onclick: move |_| {
                         request.call(Action::Show(if running { Tenant::AppInfo } else { Tenant::Apps }))
                     },
-                    div { id: "visor-app-glyph", "{app_glyph}" }
+                    div { id: "visor-app-glyph", class: "glyph-tile-face", "{app_glyph}" }
                     div { class: "stack",
                         div { class: "top",
                             match session.read().as_ref() {
@@ -2203,16 +2203,14 @@ fn EraseControl() -> Element {
 
 const GLYPH_PAGE: usize = 96;
 
-/// Free text plus the bundled, searchable Unicode emoji catalogue.
+/// One glyph tile plus the bundled, searchable Unicode emoji catalogue.
 ///
-/// Composition events are supported by Dioxus 0.7.10
-/// (`dioxus-html/src/events/generated.rs:33`). While one is active the DOM's
-/// in-progress text is left alone; the first complete grapheme is committed
-/// at composition end. Ordinary input is normalized immediately, including
-/// paste, so a controlled field also removes a suffix when the normalized
-/// signal value happens to be unchanged.
+/// The search field is deliberately not a glyph input: its complete, raw
+/// value remains available to emoji name/shortcode search. `normalize_glyph`
+/// is applied only to make the explicit first result, and selecting that
+/// result is the act that changes the draft.
 #[component]
-fn GlyphInput(
+fn GlyphPicker(
     label: &'static str,
     value: String,
     onchange: EventHandler<String>,
@@ -2225,22 +2223,10 @@ fn GlyphInput(
     let mut query = use_signal(String::new);
     let mut limit = use_signal(|| GLYPH_PAGE);
     let mut composing = use_signal(|| false);
-    let mut raw = use_signal(|| value.clone());
-    // A changing ordinary attribute makes Dioxus revisit this controlled
-    // input even when normalization produces the existing value. Unlike a
-    // keyed replacement, this keeps the same DOM node, focus and selection.
-    let mut input_revision = use_signal(|| 0u32);
-    if !composing() && raw.peek().as_str() != value.as_str() {
-        raw.set(value.clone());
-    }
-
-    let commit = use_callback(move |text: String| {
-        let normalized = normalize_glyph(&text).to_string();
-        raw.set(normalized.clone());
-        onchange.call(normalized);
-        input_revision += 1;
-    });
     let needle = query().trim().to_lowercase();
+    let direct = (!composing())
+        .then(|| normalize_glyph(&query()).to_string())
+        .filter(|glyph| !glyph.is_empty());
     let mut matches = Vec::new();
     let cap = limit().saturating_add(1);
     'emoji: for emoji in emojis::iter().take_while(|_| open()) {
@@ -2268,11 +2254,11 @@ fn GlyphInput(
     }
     let more = matches.len() > limit();
     matches.truncate(limit());
-    let empty = matches.is_empty();
+    let empty = matches.is_empty() && direct.is_none();
 
     rsx! {
         div {
-            class: "glyph-input",
+            class: "glyph-control",
             onkeydown: move |e: KeyboardEvent| {
                 if open() && e.key() == Key::Escape {
                     e.stop_propagation();
@@ -2281,56 +2267,38 @@ fn GlyphInput(
                 }
             },
             div { class: "glyph-control-row",
-                label {
-                    span { class: "{Voice::Framework.class()}", "{label}" }
-                    input {
-                        r#type: "text",
-                        value: "{raw}",
-                        "data-glyph-revision": "{input_revision}",
-                        "data-visor-focus": focus_return,
-                        oncompositionstart: move |_| composing.set(true),
-                        oncompositionend: move |_| {
-                            composing.set(false);
-                            commit.call(raw());
-                        },
-                        oninput: move |e| {
-                            raw.set(e.value());
-                            if !composing() {
-                                commit.call(e.value());
-                            }
-                        },
-                        onblur: move |_| {
-                            if composing() {
-                                composing.set(false);
-                                commit.call(raw());
-                            }
-                        },
-                    }
-                }
+                span { class: "{Voice::Framework.class()}", "{label}" }
                 button {
                     r#type: "button",
+                    class: "glyph-tile-button",
+                    aria_label: "Choose {label}",
                     aria_expanded: "{open}",
+                    "data-visor-focus": focus_return,
                     onclick: move |_| {
                         if open() {
                             open.set(false);
                             onreturn.call(());
                         } else {
+                            query.set(String::new());
+                            composing.set(false);
                             open.set(true);
                             limit.set(GLYPH_PAGE);
                             onsearch.call(());
                         }
                     },
-                    "Choose emoji"
+                    span { class: "glyph-tile-face", "{value}" }
                 }
             }
             if open() {
                 div { class: "glyph-picker",
                     label {
-                        span { class: "{Voice::Framework.class()}", "Search emoji" }
+                        span { class: "{Voice::Framework.class()}", "Enter glyph or search" }
                         input {
                             r#type: "search",
                             value: "{query}",
                             "data-visor-focus": focus_search,
+                            oncompositionstart: move |_| composing.set(true),
+                            oncompositionend: move |_| composing.set(false),
                             oninput: move |e| {
                                 query.set(e.value());
                                 limit.set(GLYPH_PAGE);
@@ -2338,13 +2306,26 @@ fn GlyphInput(
                         }
                     }
                     div { class: "glyph-results",
+                        if let Some(glyph) = direct {
+                            button {
+                                r#type: "button",
+                                title: "Use {glyph}",
+                                aria_label: "Use {glyph}",
+                                onclick: move |_| {
+                                    onchange.call(glyph.clone());
+                                    open.set(false);
+                                    onreturn.call(());
+                                },
+                                "{glyph}"
+                            }
+                        }
                         for emoji in matches {
                             button {
                                 r#type: "button",
                                 title: "{emoji.name()}",
                                 aria_label: "{emoji.name()}",
                                 onclick: move |_| {
-                                    commit.call(emoji.as_str().to_string());
+                                    onchange.call(emoji.as_str().to_string());
                                     open.set(false);
                                     onreturn.call(());
                                 },
@@ -2361,6 +2342,18 @@ fn GlyphInput(
                     }
                     if empty {
                         span { class: "{Voice::Framework.class()}", "no emoji found" }
+                    }
+                    if !value.is_empty() {
+                        button {
+                            r#type: "button",
+                            class: "glyph-clear",
+                            onclick: move |_| {
+                                onchange.call(String::new());
+                                open.set(false);
+                                onreturn.call(());
+                            },
+                            "Clear glyph"
+                        }
                     }
                 }
             }
@@ -2449,7 +2442,7 @@ fn SettingsSheet(
                 },
             }
         }
-        GlyphInput {
+        GlyphPicker {
             label: "your glyph",
             value: user_glyph,
             focus_return: focus_glyph,
