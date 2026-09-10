@@ -99,7 +99,7 @@ pub(crate) const CSS: &str = r#"
 #visor-root #visor-self { flex-direction: row-reverse; text-align: right; }
 #visor-root #visor-app[aria-pressed="true"], #visor-root #visor-self[aria-pressed="true"] { background: oklch(1 0 0 / 0.18); box-shadow: none; }
 #visor-divider { width: 1px; align-self: stretch; margin: 5px; background: var(--strip-edge); }
-#visor-app-glyph, #visor-circle {
+#visor-root .glyph-tile-face, #visor-circle {
   flex: none;
   display: flex;
   align-items: center;
@@ -109,7 +109,7 @@ pub(crate) const CSS: &str = r#"
   font-size: 28px; line-height: 1; font-weight: 600;
   width: 36px; height: 36px; 
 }
-#visor-app-glyph {
+#visor-root .glyph-tile-face {
    border-radius: 6px; 
 }
 #visor-circle {
@@ -292,13 +292,17 @@ pub(crate) const CSS: &str = r#"
   align-self: stretch;
 }
 #visor-root label > span:first-child { flex: 0 0 auto; }
-#visor-root .glyph-input {
+#visor-root .glyph-control {
   display: flex; flex-direction: column; align-items: stretch; gap: 8px;
   align-self: flex-start; width: min(32rem, 100%); margin-bottom: 12px;
 }
 #visor-root .glyph-control-row { display: flex; align-items: center; gap: 8px; }
-#visor-root .glyph-control-row > label { flex: 1 1 auto; margin: 0; min-width: 0; }
-#visor-root .glyph-control-row > button { flex: none; }
+#visor-root .glyph-control-row > span { flex: none; }
+#visor-root .glyph-tile-button {
+  flex: none; padding: 4px; min-width: 44px; min-height: 44px;
+  border: 0; background: transparent;
+}
+#visor-root .glyph-tile-button .glyph-tile-face { pointer-events: none; }
 #visor-root .glyph-picker {
   display: flex; flex-direction: column; align-items: stretch; gap: 8px;
   padding: 8px; border: 1px solid var(--edge);
@@ -310,6 +314,7 @@ pub(crate) const CSS: &str = r#"
   gap: 4px; max-height: min(16rem, 36vh); overflow-y: auto;
 }
 #visor-root .glyph-results button { padding: 4px; font-size: 24px; }
+#visor-root .glyph-picker .glyph-clear { align-self: flex-start; font-size: inherit; }
 
 /* Rows wrap rather than overlap: a name and some framework-voice facts about
    it do not fit on one 320px line, so the facts follow under the name. */
