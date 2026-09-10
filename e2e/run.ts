@@ -347,8 +347,8 @@ async function launchTodoMvc(page: Page): Promise<void> {
 /**
  * Press `Save` in the settings sheet and wait for the draft to be clean.
  *
- * The button disables itself exactly when `draft == seed`, and the seed
- * only catches up once every kernel call the save made has come back
+ * Save disappears and clean `Close` replaces it when `draft == seed`; the
+ * seed only catches up once every kernel call the save made has come back
  * (visor/src/ui.rs `save_draft`) — so this is the one observable that says
  * the device, and not merely the screen, has the new value. Reloading
  * without it races the checkpoint.
@@ -358,10 +358,8 @@ async function saveDraft(page: Page): Promise<void> {
     .click();
   await page.waitForFunction(
     () => {
-      const save = Array.from(
-        document.querySelectorAll("#visor-drawer button"),
-      ).find((b) => b.textContent === "Save") as HTMLButtonElement | undefined;
-      return save !== undefined && save.disabled;
+      return document.querySelector("#visor-actions")?.textContent?.trim() ===
+        "Close";
     },
     undefined,
     { timeout: 15_000 },
@@ -372,7 +370,7 @@ async function saveDraft(page: Page): Promise<void> {
  * Raise the running app's own sheet, from wherever the drawer is.
  *
  * Not by pressing the strip's app half from another pane. With a session
- * running, every pane offers "Return to app" and that is the supported way
+ * running, every clean pane offers `Close` and that is the supported way
  * out (visor/src/ui.rs `dismissal`); pressing the half for the tenant
  * already on screen is worse than useless, since a dirty draft parks the
  * transition and the dialog that raises makes the strip `inert` — after
@@ -391,7 +389,7 @@ async function toAppSheet(page: Page): Promise<void> {
     { timeout: 15_000 },
   );
   const back = drawer(page).getByRole("button", {
-    name: "Return to app",
+    name: "Close",
     exact: true,
   });
   if (await back.count() > 0) {
@@ -415,12 +413,8 @@ async function toAppSheet(page: Page): Promise<void> {
  * The running app's own glyph (`device.meta`, `meta-scope.app`), typed and
  * SAVED — which is the value an install is allowed to paint with.
  *
- * The app sheet carries no `Save` of its own: the draft it writes into is
- * the same one the settings sheet saves, so the save here is the "unsaved
- * changes" dialog that guards the transition away from a dirty sheet
- * (visor/src/ui.rs `#visor-confirm`). Returns once the app sheet, reopened,
- * shows the value read back off the kernel (`read_app_meta`) — so a caller
- * that installs next is installing against a saved map, not a draft.
+ * The app sheet uses the same action bar as device settings. Save there and
+ * wait for the clean Close action, which means the kernel accepted the map.
  */
 async function setAppGlyph(page: Page, glyph: string): Promise<void> {
   await toAppSheet(page);
@@ -446,22 +440,7 @@ async function setAppGlyph(page: Page, glyph: string): Promise<void> {
       "the app sheet's glyph field would not hold a value",
     );
   }
-  await settingsButton(page).click();
-  const confirm = page.locator("#visor-confirm");
-  await confirm.waitFor({ timeout: 10_000 });
-  await confirm.getByRole("button", { name: "Save", exact: true }).click();
-  // The dialog clears the moment it is answered, but the save it asked for
-  // is async and the parked transition is taken only once that save lands
-  // (visor/src/ui.rs `save_now`). The settings pane the dialog was guarding
-  // is therefore the observable that says the kernel has the glyph:
-  // navigating on the dialog's disappearance alone races the save, finds
-  // the draft still dirty, and parks the next transition behind a second
-  // dialog that nothing can then dismiss.
-  await confirm.waitFor({ state: "detached", timeout: 15_000 });
-  await drawer(page).locator("label").filter({ hasText: /^device petname$/ })
-    .waitFor({ timeout: 15_000 });
-  await paneSettled(page);
-  await toAppSheet(page);
+  await saveDraft(page);
   await page.waitForFunction(
     (want) => {
       const label = Array.from(
@@ -654,18 +633,8 @@ async function tabTour(page: Page, times: number): Promise<string[]> {
   return seen;
 }
 
-/**
- * The measured contrast of every piece of text on screen at one point on the
- * hue wheel, as WCAG ratios keyed by a description of the element.
- *
- * Measured, not computed: the sheet states `oklch`, and what a ratio is
- * depends on how Chromium maps that into sRGB. So every colour goes through
- * a 1×1 canvas — the browser's own parser and gamut mapping — and the
- * translucent layers are composited there before anything is measured.
- *
- * `hue` drives the stylesheet's two arms directly; which arm a real visor
- * takes is the anchor rule, which `claimed()` tests.
- */
+/** Measured WCAG contrast for every visible text leaf at one hue. Chromium
+ * does the oklch parsing, gamut mapping, and translucent compositing. */
 function inkContrast(
   page: Page,
   hue: number | "unclaimed",
@@ -677,7 +646,6 @@ function inkContrast(
       root.classList.remove("unclaimed");
       root.style.setProperty("--hue", String(h));
     }
-
     const cv = document.createElement("canvas");
     cv.width = cv.height = 1;
     const g = cv.getContext("2d", { willReadFrequently: true })!;
@@ -698,8 +666,6 @@ function inkContrast(
       });
       return 0.2126 * r + 0.7152 * gg + 0.0722 * b;
     };
-    /** Everything painted under `el`, its own background included, flattened
-     * onto the page's white. */
     const behind = (el: Element): number[] => {
       const chain: Element[] = [];
       for (let n: Element | null = el; n !== null; n = n.parentElement) {
@@ -711,7 +677,6 @@ function inkContrast(
       }
       return acc;
     };
-
     const out: Record<string, number> = {};
     for (
       const el of document.querySelectorAll(
@@ -719,10 +684,8 @@ function inkContrast(
       )
     ) {
       const text = (el.textContent ?? "").trim();
-      // Leaves only: a container's own `color` is not what is drawn.
       if (text === "" || el.querySelector("*") !== null) continue;
-      if (el.closest("[inert]") !== null) continue;
-      if (el.getClientRects().length === 0) continue;
+      if (el.closest("[inert]") !== null || el.getClientRects().length === 0) continue;
       const style = getComputedStyle(el);
       if (style.visibility === "hidden") continue;
       const bg = behind(el);
@@ -730,14 +693,13 @@ function inkContrast(
       const hi = Math.max(lum(fg), lum(bg)) + 0.05;
       const lo = Math.min(lum(fg), lum(bg)) + 0.05;
       const cls = String(el.className).trim() || "-";
-      out[`${el.tagName.toLowerCase()}.${cls} "${text.slice(0, 24)}"`] = hi /
-        lo;
+      out[`${el.tagName.toLowerCase()}.${cls} "${text.slice(0, 24)}"`] = hi / lo;
     }
     return out;
   }, hue);
 }
 
-/** Every control below the 44px touch floor, on either axis. */
+/** Every active control below the retained 44px accessibility floor. */
 function undersizedControls(page: Page): Promise<string[]> {
   return page.evaluate(() => {
     const bad: string[] = [];
@@ -2045,6 +2007,11 @@ const scenarios: Scenario[] = [
       const unseal = sheet(page, "is sealed");
       await unseal.waitFor({ timeout: 15_000 });
       check(!await claimed(page), "a sealed boot painted an identity");
+      eq(
+        await drawer(page).locator("#visor-actions").count(),
+        0,
+        "the pinned Unseal ceremony offered Close",
+      );
 
       const field = unseal.locator("input[type=password]");
       const press = unseal.getByRole("button", { name: "Unseal", exact: true });
@@ -2530,6 +2497,29 @@ const scenarios: Scenario[] = [
       }).locator("input");
       const confirm = page.locator("#visor-confirm");
 
+      eq(
+        (await drawer(page).locator("#visor-actions").textContent())?.trim(),
+        "Close",
+        "a clean editable sheet did not offer Close",
+      );
+      await field.fill("half typed");
+      eq(
+        (await drawer(page).locator("#visor-actions").textContent())?.trim(),
+        "SaveRevert",
+        "a dirty sheet did not offer Save and Revert",
+      );
+      await shot(page, "desktop-action-bar-dirty");
+
+      await drawer(page).getByRole("button", { name: "Revert", exact: true })
+        .click();
+      eq(await field.inputValue(), "", "bar Revert kept the abandoned draft");
+      check(
+        await focusIn(page, "#visor-actions") &&
+          await drawer(page).getByRole("button", { name: "Close", exact: true })
+              .count() === 1,
+        `bar Revert did not focus its replacement Close; focus is ${await focused(page)}`,
+      );
+      await shot(page, "desktop-action-bar-clean");
       await field.fill("half typed");
 
       // Leaving a dirty sheet asks. Cancel means "I was not done": the
@@ -2560,13 +2550,54 @@ const scenarios: Scenario[] = [
       // draft at all, and reads the name back off the device.
       await field.fill("the workbench");
       await saveDraft(page);
+      check(
+        await focusIn(page, "#visor-actions") &&
+          await drawer(page).getByRole("button", { name: "Close", exact: true })
+              .count() === 1,
+        `bar Save did not focus its replacement Close; focus is ${await focused(page)}`,
+      );
+
+      // Same-task input makes this deterministic without a permanent mock:
+      // Save captures "first snapshot", then newer typing and two navigation
+      // attempts arrive while that async persistence call is in flight.
+      await field.fill("first snapshot");
+      await field.evaluate((input) => {
+        const save = document.querySelector<HTMLButtonElement>(
+          "#visor-actions button",
+        )!;
+        save.focus();
+        save.click();
+        (input as HTMLInputElement).value = "newer text";
+        input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+        document.querySelector<HTMLButtonElement>("#visor-app")!.click();
+        document.querySelector("#visor-root")!.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+        );
+      });
+      await page.waitForFunction(
+        () => document.querySelector("#visor-actions")?.textContent?.includes("Save"),
+      );
+      eq(
+        await drawer(page).locator(".pane").getAttribute("aria-label"),
+        "settings",
+        "navigation escaped while Save was in flight",
+      );
+      eq(await confirm.count(), 0, "navigation opened confirmation during Save");
+      eq(await field.inputValue(), "newer text", "Save lost newer field text");
+      await drawer(page).getByRole("button", { name: "Revert", exact: true })
+        .click();
+      eq(
+        await field.inputValue(),
+        "first snapshot",
+        "Revert did not return to the snapshot the kernel accepted",
+      );
       await page.reload();
       await visorReady(page);
-      await strip(page).getByText("the workbench").waitFor({ timeout: 15_000 });
+      await strip(page).getByText("first snapshot").waitFor({ timeout: 15_000 });
       await openSettingsSheet(page);
       eq(
         await field.inputValue(),
-        "the workbench",
+        "first snapshot",
         "the saved device petname did not survive a reload",
       );
 
@@ -2677,8 +2708,8 @@ const scenarios: Scenario[] = [
       );
 
       eq(
-        await drawer(page).locator(".pane-dismiss").textContent(),
-        "Return to app",
+        await drawer(page).locator("#visor-actions").textContent(),
+        "Close",
         "the running app's sheet offered no way back to it",
       );
 
@@ -2722,7 +2753,7 @@ const scenarios: Scenario[] = [
         // Nothing behind the drawer, so it offers no way out at all.
         await paneSettled(page);
         eq(
-          await drawer(page).locator(".pane-dismiss").count(),
+          await drawer(page).locator("#visor-actions").count(),
           0,
           "the resting app list offered a dismissal to nowhere",
         );
@@ -2731,8 +2762,8 @@ const scenarios: Scenario[] = [
         await page.keyboard.press("Enter");
         await paneSettled(page);
         eq(
-          await drawer(page).locator(".pane-dismiss").textContent(),
-          "Back to apps",
+          await drawer(page).locator("#visor-actions").textContent(),
+          "Close",
           "a pinned settings sheet offered no way back",
         );
         check(
@@ -2949,6 +2980,17 @@ const scenarios: Scenario[] = [
 
       // Where the long identifiers are, and so what the pictures show.
       await devicesSheet(page).scrollIntoViewIfNeeded();
+      await drawer(page).locator(".pane").evaluate((el) =>
+        el.scrollTo(0, el.scrollHeight)
+      );
+      const actionBox = await drawer(page).locator("#visor-actions")
+        .boundingBox();
+      const stripBox = await strip(page).boundingBox();
+      check(
+        actionBox !== null && stripBox !== null &&
+          Math.abs(actionBox.y + actionBox.height - stripBox.y) <= 1,
+        "the action bar did not stay attached to the strip after scrolling",
+      );
       for (const width of [390, 320]) {
         await page.setViewportSize({ width, height: 780 });
         // A resize is a layout, not a render; give it one.
@@ -2966,6 +3008,25 @@ const scenarios: Scenario[] = [
         const ids = await unreadableIdentifiers(page);
         check(ids.length === 0, `at ${width}px: ${ids.join("; ")}`);
         await shot(page, `mobile-${width}-settings`);
+        if (width === 390) {
+          const name = drawer(page).locator("label").filter({
+            hasText: /^device petname$/,
+          }).locator("input");
+          await name.fill("mobile draft");
+          await shot(page, "mobile-action-bar-dirty");
+          await drawer(page).getByRole("button", {
+            name: "Revert",
+            exact: true,
+          }).click();
+          await shot(page, "mobile-action-bar-clean");
+        }
+        const action = await drawer(page).locator("#visor-actions").boundingBox();
+        const anchor = await strip(page).boundingBox();
+        check(
+          action !== null && anchor !== null &&
+            Math.abs(action.y + action.height - anchor.y) <= 1,
+          `at ${width}px the action bar detached from the strip`,
+        );
       }
 
       const shown = devicesSheet(page).locator("#visor-endpoint-id");
@@ -2979,38 +3040,26 @@ const scenarios: Scenario[] = [
   },
 
   {
-    // The strip stays saturated by ruling, so its text carries the whole
-    // burden of being readable — at every hue a user can pick, and in the
-    // grey the visor wears before it is claimed.
+    // Retained accessibility contracts: readable text at every selectable
+    // hue and active controls at least 44px on both axes.
     name: "visor-contrast-and-touch",
     async run(ctx, origin) {
       const page = await open(ctx, origin);
       await visorReady(page);
       await page.setViewportSize({ width: 390, height: 780 });
       await openSettingsSheet(page);
-      // A glyph, saved: with no glyph the circle has no text, and the
-      // contrast sweep below only measures leaves with some — the circle
-      // must carry one to be in scope for it at all. Which is the point of
-      // saving it here: the circle is a medium-dark plate under light ink
-      // (visor/src/style.rs `#visor-circle`, `--strip-edge`), so the sweep
-      // has to answer for that pairing at every hue like any other text.
       await drawer(page).locator("label").filter({ hasText: /^your glyph$/ })
         .locator("input").fill("A");
       await saveDraft(page);
       await page.waitForFunction(
         () => document.querySelector("#visor-circle")?.textContent === "A",
       );
-      // The device's own colour, to put back after the sweep drives the
-      // sheet directly.
       const painted = await page.locator("#visor-root").getAttribute("style");
-
       const worst = new Map<string, number>();
       const wheel: Array<number | "unclaimed"> = ["unclaimed"];
       for (let h = 0; h < 360; h++) wheel.push(h);
       for (const hue of wheel) {
-        for (
-          const [what, ratio] of Object.entries(await inkContrast(page, hue))
-        ) {
+        for (const [what, ratio] of Object.entries(await inkContrast(page, hue))) {
           const key = `${what} @${hue}`;
           if (ratio < (worst.get(key) ?? Infinity)) worst.set(key, ratio);
         }
@@ -3021,28 +3070,19 @@ const scenarios: Scenario[] = [
       check(
         failing.length === 0,
         `${failing.length} text(s) below 4.5:1, worst ${
-          failing.slice(0, 4).map(([k, r]) => `${k} = ${r.toFixed(2)}`).join(
-            "; ",
-          )
+          failing.slice(0, 4).map(([k, r]) => `${k} = ${r.toFixed(2)}`).join("; ")
         }`,
       );
-      // Put the device's own colour back: the sweep drove the sheet
-      // directly, and the rest of this is about the real visor.
       await page.locator("#visor-root").evaluate(
         (el, style) => el.setAttribute("style", style ?? ""),
         painted,
       );
-
-      const small = await undersizedControls(page);
-      check(small.length === 0, `under the touch floor: ${small.join("; ")}`);
-      await shot(page, "mobile-390-settings-touch");
-
-      // Desktop: the same floor.
+      let small = await undersizedControls(page);
+      check(small.length === 0, `mobile under touch floor: ${small.join("; ")}`);
       await page.setViewportSize({ width: 1280, height: 800 });
       await page.waitForTimeout(300);
-      const wide = await undersizedControls(page);
-      check(wide.length === 0, `under the touch floor: ${wide.join("; ")}`);
-      await shot(page, "desktop-settings");
+      small = await undersizedControls(page);
+      check(small.length === 0, `desktop under touch floor: ${small.join("; ")}`);
     },
   },
 
