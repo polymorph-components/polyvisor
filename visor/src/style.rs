@@ -114,6 +114,7 @@ pub(crate) const CSS: &str = r#"
 }
 #visor-circle {
   border-radius: 50%;
+  overflow: clip;
 }
 #visor-root .stack { flex: 1; min-width: 0; }
 #visor-root .stack .top, #visor-root .stack .bottom { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
