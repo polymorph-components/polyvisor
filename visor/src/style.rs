@@ -131,6 +131,7 @@ pub(crate) const CSS: &str = r#"
    screens too short to have that room at all). */
 #visor-drawer {
   position: relative; z-index: 2;
+  display: flex; flex-direction: column;
   box-sizing: border-box;
   height: min(60svh, 480px);
   max-height: max(0px, calc(100svh - 56px - 96px));
@@ -158,6 +159,7 @@ pub(crate) const CSS: &str = r#"
    content above or below, the cover has scrolled away and the shadow shows
    — so "there is more" is visible without a scrollbar being trusted to say
    it. */
+#visor-root .pane-host { position: relative; flex: 1 1 auto; min-height: 0; overflow: hidden; }
 #visor-root .pane {
   position: absolute; inset: 0;
   overflow-y: auto; overflow-x: hidden;
@@ -209,6 +211,19 @@ pub(crate) const CSS: &str = r#"
 #visor-confirm:focus { outline: none; }
 #visor-confirm .framework { font-weight: 600; font-size: 16px; flex: 1 1 100%; }
 
+/* The drawer's non-scrolling last row. Its own content determines its
+   height, so the pane gives up exactly that much room without a duplicated
+   offset. The confirmation dialog is positioned at this same strip edge and
+   the drawer is inert beneath it. */
+#visor-actions {
+  flex: none;
+  display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px;
+  padding: 8px 12px;
+  box-sizing: border-box;
+  background: var(--drawer);
+  border-top: 1px solid var(--edge);
+}
+
 /* The line at the top of every pane. Only the pane that is staying
    carries the id — during a slide there are two of these on screen. */
 #visor-root .notice { margin-bottom: 8px; min-height: 1.4em; overflow-wrap: break-word; }
@@ -221,13 +236,6 @@ pub(crate) const CSS: &str = r#"
   padding: 8px 12px; min-height: 44px;
   cursor: pointer;
   max-width: 100%;
-}
-/* After the base rule, not before: an exit is not the thing to do here, and
-   these declarations have to be the ones that win. */
-#visor-root .pane-dismiss {
-  margin-bottom: 12px;
-  background: var(--plate); color: var(--plate-ink);
-  border-color: var(--edge);
 }
 #visor-root button[aria-pressed="true"] { border-color: var(--plate-ink); box-shadow: inset 0 0 0 1px var(--accent-ink); }
 /* Disabled is said with the fill and the cursor rather than with an opacity. */

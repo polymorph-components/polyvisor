@@ -111,7 +111,7 @@ async fn save_draft(
     mut notice: Signal<Option<Notice>>,
     app_id: Option<String>,
     mut status_gate: CopyValue<Gate>,
-) {
+) -> bool {
     let (was, now) = (seed(), draft());
     status_gate.write().bump();
     let mut failed = false;
@@ -160,6 +160,7 @@ async fn save_draft(
     if !failed {
         seed.set(now);
     }
+    !failed
 }
 
 /// One app's labels (internal.wit `device.meta`, `meta-scope.app`). Read
@@ -200,6 +201,8 @@ enum FocusWant {
     #[default]
     Nowhere,
     Pane,
+    /// The clean action replacing Save/Revert after a bar invocation.
+    Bar,
     /// The half of the strip the drawer was raised from, because it closed.
     Strip {
         self_half: bool,
@@ -219,13 +222,13 @@ fn raised_by_self_half(t: Tenant) -> bool {
 /// open drawer. `None` for the two panes with nowhere to go: the app list
 /// with nothing running (where the visor rests) and the unseal ceremony
 /// (every other kernel call is `unavailable` until it succeeds).
-fn dismissal(t: Tenant, running: bool) -> Option<(&'static str, Action)> {
+fn dismissal(t: Tenant, running: bool) -> Option<Action> {
     if running {
-        Some(("Return to app", Action::Close))
+        Some(Action::Close)
     } else if t == Tenant::Apps || t == Tenant::Unseal {
         None
     } else {
-        Some(("Back to apps", Action::Show(Tenant::Apps)))
+        Some(Action::Show(Tenant::Apps))
     }
 }
 
@@ -570,6 +573,11 @@ pub(crate) fn Visor() -> Element {
     // A transition the user asked for while the draft was dirty. It waits
     // on `#visor-confirm` rather than happening.
     let mut pending = use_signal(|| None::<Action>);
+    let mut saving = use_signal(|| false);
+    // Whether the async bar Save still owns focus. A user who moves back to
+    // a field while it is in flight keeps the caret there, even if their
+    // newer text happens to equal the captured snapshot when it lands.
+    let mut bar_save_focused = use_signal(|| false);
     // Shut, but still on screen playing its close animation. The drawer
     // stays `Open(t)` throughout — this is what says the tenant showing is
     // the one on its way out — and `onanimationend` is what finally closes.
@@ -731,7 +739,7 @@ pub(crate) fn Visor() -> Element {
         // that arrives now is input queued before it appeared — a scrim
         // click, a strip press already in flight — and taking it would
         // silently replace the transition the dialog is asking about.
-        if pending().is_some() {
+        if pending().is_some() || saving() {
             return;
         }
         if draft() != seed() {
@@ -744,13 +752,17 @@ pub(crate) fn Visor() -> Element {
         }
     });
 
-    let save_now = use_callback(move |after: Option<Action>| {
+    let save_now = use_callback(move |(after, from_bar): (Option<Action>, bool)| {
+        if saving() {
+            return;
+        }
+        saving.set(true);
         let app_id = session
             .read()
             .as_ref()
             .map(|(_, a): &(SessionId, App)| a.id.clone());
         spawn(async move {
-            save_draft(
+            let saved = save_draft(
                 draft,
                 seed,
                 status,
@@ -761,16 +773,30 @@ pub(crate) fn Visor() -> Element {
                 status_gate,
             )
             .await;
-            if let Some(action) = after {
-                apply.call(action);
+            saving.set(false);
+            if saved {
+                if let Some(action) = after {
+                    // Text typed after the captured snapshot stays in this
+                    // sheet; it has not been answered by the earlier Save.
+                    if draft() == seed() {
+                        apply.call(action);
+                    }
+                } else if from_bar && bar_save_focused() && draft() == seed() {
+                    ask_focus.call(FocusWant::Bar);
+                }
             }
         });
     });
 
-    let revert_now = use_callback(move |after: Option<Action>| {
+    let revert_now = use_callback(move |(after, from_bar): (Option<Action>, bool)| {
+        if saving() {
+            return;
+        }
         draft.set(seed());
         if let Some(action) = after {
             apply.call(action);
+        } else if from_bar {
+            ask_focus.call(FocusWant::Bar);
         }
     });
 
@@ -996,9 +1022,6 @@ pub(crate) fn Visor() -> Element {
         });
     });
 
-    let on_save = use_callback(move |()| save_now.call(None));
-    let on_revert = use_callback(move |()| revert_now.call(None));
-
     let running = session.read().is_some();
     let tenant = drawer().tenant();
     let ident = Ident::of(&status.read());
@@ -1075,6 +1098,7 @@ pub(crate) fn Visor() -> Element {
     let (focus_gen, focus_want) = focus();
     let focus_tag = |want: FocusWant| (focus_want == want).then(|| focus_gen.to_string());
     let focus_pane = focus_tag(FocusWant::Pane);
+    let focus_bar = focus_tag(FocusWant::Bar);
     let focus_confirm = focus_tag(FocusWant::Confirm);
     let focus_app_half = focus_tag(FocusWant::Strip { self_half: false });
     let focus_self_half = focus_tag(FocusWant::Strip { self_half: true });
@@ -1088,7 +1112,7 @@ pub(crate) fn Visor() -> Element {
     // drawer's open and close animations, since it is on screen for both.
     let app_inert = flag(tenant.is_some() || confirming);
     // The exit the pane offers, which Escape is the keyboard spelling of.
-    let escape = tenant.and_then(|t| dismissal(t, running)).map(|(_, a)| a);
+    let escape = tenant.and_then(|t| dismissal(t, running));
 
     // One pane's worth of drawer. Rendered twice while a switch is
     // animating — the tenant coming in and the one going out — so it is a
@@ -1126,20 +1150,7 @@ pub(crate) fn Visor() -> Element {
             )
         };
 
-        // Only the pane that is staying offers the way out; the one sliding
-        // away is inert and about to be gone.
-        let exit = if current { dismissal(t, running) } else { None };
-
         rsx! {
-            // First in the pane, so it is the first thing Tab reaches.
-            if let Some((label, action)) = exit {
-                button {
-                    class: "pane-dismiss",
-                    onclick: move |_| request.call(action),
-                    "{label}"
-                }
-            }
-
             // Whatever happened that the user did not ask for. It lives at
             // the top of every pane because the strip has no room to say
             // it any more and no business moving to make some.
@@ -1256,7 +1267,6 @@ pub(crate) fn Visor() -> Element {
                 Tenant::Settings => rsx! {
                     SettingsSheet {
                         draft,
-                        seed,
                         word: word.clone(),
                         tier,
                         petname: petname.clone(),
@@ -1271,8 +1281,6 @@ pub(crate) fn Visor() -> Element {
                         on_refresh_devices: refresh_devices,
                         on_kept,
                         on_devices: show_devices,
-                        on_save,
-                        on_revert,
                     }
                 },
             }
@@ -1351,27 +1359,50 @@ pub(crate) fn Visor() -> Element {
                             drawer.set(Drawer::Closed);
                         }
                     },
-                    if let Some((from, forward)) = leaving() {
+                    div { class: "pane-host",
+                        if let Some((from, forward)) = leaving() {
+                            div {
+                                key: "{from:?}",
+                                class: if forward { "pane leave-to-left" } else { "pane leave-to-right" },
+                                inert: flag(true),
+                                onanimationend: move |_| leaving.set(None),
+                                {sheet_for(from, false)}
+                            }
+                        }
                         div {
-                            key: "{from:?}",
-                            class: if forward { "pane leave-to-left" } else { "pane leave-to-right" },
-                            // Still painted, no longer part of the page.
-                            inert: flag(true),
-                            onanimationend: move |_| leaving.set(None),
-                            {sheet_for(from, false)}
+                            key: "{t:?}",
+                            class: "{entering}",
+                            tabindex: "-1",
+                            role: "group",
+                            aria_label: pane_label(t),
+                            "data-visor-focus": focus_pane,
+                            {sheet_for(t, true)}
                         }
                     }
-                    // `tabindex="-1"`: the caret can be put here without the
-                    // pane becoming a tab stop; the name is what a screen
-                    // reader announces on arrival.
-                    div {
-                        key: "{t:?}",
-                        class: "{entering}",
-                        tabindex: "-1",
-                        role: "group",
-                        aria_label: pane_label(t),
-                        "data-visor-focus": focus_pane,
-                        {sheet_for(t, true)}
+
+                    if matches!(t, Tenant::Settings | Tenant::AppInfo) && draft() != seed() {
+                        div { id: "visor-actions",
+                            button {
+                                aria_disabled: "{saving()}",
+                                onfocus: move |_| bar_save_focused.set(true),
+                                onblur: move |_| bar_save_focused.set(false),
+                                onclick: move |_| save_now.call((None, true)),
+                                "Save"
+                            }
+                            button {
+                                disabled: "{saving()}",
+                                onclick: move |_| revert_now.call((None, true)),
+                                "Revert"
+                            }
+                        }
+                    } else if let Some(action) = dismissal(t, running) {
+                        div { id: "visor-actions",
+                            button {
+                                "data-visor-focus": focus_bar,
+                                onclick: move |_| request.call(action),
+                                "Close"
+                            }
+                        }
                     }
                 }
             }
@@ -1460,14 +1491,14 @@ pub(crate) fn Visor() -> Element {
                     button {
                         onclick: move |_| {
                             pending.set(None);
-                            save_now.call(Some(action));
+                            save_now.call((Some(action), false));
                         },
                         "Save"
                     }
                     button {
                         onclick: move |_| {
                             pending.set(None);
-                            revert_now.call(Some(action));
+                            revert_now.call((Some(action), false));
                         },
                         "Revert"
                     }
@@ -2166,7 +2197,6 @@ fn EraseControl() -> Element {
 #[allow(clippy::too_many_arguments)]
 fn SettingsSheet(
     draft: Signal<Draft>,
-    seed: Signal<Draft>,
     word: String,
     tier: Tier,
     petname: String,
@@ -2181,8 +2211,6 @@ fn SettingsSheet(
     on_refresh_devices: EventHandler<()>,
     on_kept: EventHandler<bool>,
     on_devices: EventHandler<()>,
-    on_save: EventHandler<()>,
-    on_revert: EventHandler<()>,
 ) -> Element {
     let mut draft = draft;
     // Read out rather than held: the field values are wanted here, and a
@@ -2197,8 +2225,6 @@ fn SettingsSheet(
             d.user.get(GLYPH).cloned().unwrap_or_default(),
         )
     };
-    let clean = draft() == seed();
-
     rsx! {
         label {
             span { class: "{Voice::Framework.class()}", "device petname" }
@@ -2246,11 +2272,6 @@ fn SettingsSheet(
                 },
             }
         }
-        div { class: "choice",
-            button { disabled: "{clean}", onclick: move |_| on_save.call(()), "Save" }
-            button { onclick: move |_| on_revert.call(()), "Revert" }
-        }
-
         label {
             span { class: "{Voice::Framework.class()}", "word" }
             span { class: "{Voice::Framework.class()}", "{word}" }
