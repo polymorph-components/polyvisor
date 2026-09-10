@@ -13,6 +13,8 @@
 // tests — the UI that uses them in earnest is wasm-only — so dead-code
 // analysis has nothing to see there.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(crate) mod glyph;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) mod state;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) mod style;

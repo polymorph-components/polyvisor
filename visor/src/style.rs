@@ -279,6 +279,11 @@ pub(crate) const CSS: &str = r#"
      is harder to read, not easier. */
   min-width: 0; max-width: min(24rem, 100%);
 }
+#visor-root input[type="search"] {
+  font: inherit; color: inherit; background: var(--field);
+  border: 1px solid var(--edge); border-radius: 6px;
+  padding: 8px; min-height: 44px; min-width: 0; box-sizing: border-box;
+}
 #visor-root label input { flex: 1 1 16ch; }
 #visor-root .sheet > input { align-self: stretch; }
 #visor-root label {
@@ -287,6 +292,24 @@ pub(crate) const CSS: &str = r#"
   align-self: stretch;
 }
 #visor-root label > span:first-child { flex: 0 0 auto; }
+#visor-root .glyph-input {
+  display: flex; flex-direction: column; align-items: stretch; gap: 8px;
+  align-self: flex-start; width: min(32rem, 100%); margin-bottom: 12px;
+}
+#visor-root .glyph-control-row { display: flex; align-items: center; gap: 8px; }
+#visor-root .glyph-control-row > label { flex: 1 1 auto; margin: 0; min-width: 0; }
+#visor-root .glyph-control-row > button { flex: none; }
+#visor-root .glyph-picker {
+  display: flex; flex-direction: column; align-items: stretch; gap: 8px;
+  padding: 8px; border: 1px solid var(--edge);
+  border-radius: 6px; background: var(--field);
+}
+#visor-root .glyph-picker label { margin: 0; }
+#visor-root .glyph-results {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(44px, 1fr));
+  gap: 4px; max-height: min(16rem, 36vh); overflow-y: auto;
+}
+#visor-root .glyph-results button { padding: 4px; font-size: 24px; }
 
 /* Rows wrap rather than overlap: a name and some framework-voice facts about
    it do not fit on one 320px line, so the facts follow under the name. */

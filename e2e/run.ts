@@ -416,7 +416,11 @@ async function toAppSheet(page: Page): Promise<void> {
  * The app sheet uses the same action bar as device settings. Save there and
  * wait for the clean Close action, which means the kernel accepted the map.
  */
-async function setAppGlyph(page: Page, glyph: string): Promise<void> {
+async function setAppGlyph(
+  page: Page,
+  glyph: string,
+  expected = glyph,
+): Promise<void> {
   await toAppSheet(page);
   // `^glyph$`: the settings sheet's field is "your glyph", and this is the
   // app sheet's.
@@ -434,7 +438,7 @@ async function setAppGlyph(page: Page, glyph: string): Promise<void> {
   for (;;) {
     await field.fill(glyph);
     await page.waitForTimeout(300);
-    if (await field.inputValue() === glyph) break;
+    if (await field.inputValue() === expected) break;
     check(
       performance.now() < deadline,
       "the app sheet's glyph field would not hold a value",
@@ -451,7 +455,7 @@ async function setAppGlyph(page: Page, glyph: string): Promise<void> {
         | undefined;
       return input?.value === want;
     },
-    glyph,
+    expected,
     { timeout: 15_000 },
   );
 }
@@ -504,7 +508,14 @@ async function probeIcon(page: Page, src: string): Promise<{
     const type = res.headers.get("content-type");
     const none = [0, 0, 0] as [number, number, number];
     if (!res.ok) {
-      return { status: res.status, type, width: 0, height: 0, ink: 0, corner: none };
+      return {
+        status: res.status,
+        type,
+        width: 0,
+        height: 0,
+        ink: 0,
+        corner: none,
+      };
     }
     const bitmap = await createImageBitmap(await res.blob());
     const canvas = document.createElement("canvas");
@@ -685,7 +696,9 @@ function inkContrast(
     ) {
       const text = (el.textContent ?? "").trim();
       if (text === "" || el.querySelector("*") !== null) continue;
-      if (el.closest("[inert]") !== null || el.getClientRects().length === 0) continue;
+      if (el.closest("[inert]") !== null || el.getClientRects().length === 0) {
+        continue;
+      }
       const style = getComputedStyle(el);
       if (style.visibility === "hidden") continue;
       const bg = behind(el);
@@ -693,7 +706,8 @@ function inkContrast(
       const hi = Math.max(lum(fg), lum(bg)) + 0.05;
       const lo = Math.min(lum(fg), lum(bg)) + 0.05;
       const cls = String(el.className).trim() || "-";
-      out[`${el.tagName.toLowerCase()}.${cls} "${text.slice(0, 24)}"`] = hi / lo;
+      out[`${el.tagName.toLowerCase()}.${cls} "${text.slice(0, 24)}"`] = hi /
+        lo;
     }
     return out;
   }, hue);
@@ -1723,11 +1737,48 @@ const scenarios: Scenario[] = [
         check(res.ok(), `static icon ${icon.src} is not served`);
       }
 
-      // "★" and not an emoji: a colour emoji font ignores the white fill
-      // the pixel checks below look for. Two typed, one drawn — the icon
-      // must agree with the strip's first-`char` rule.
-      await setAppGlyph(page, "★x");
+      // The reusable picker is also the app glyph control. Its selection is
+      // only a draft: installing before Save must still use static icons,
+      // and Revert must clear it.
+      await toAppSheet(page);
+      const appGlyph = drawer(page).locator("label").filter({
+        hasText: /^glyph$/,
+      }).locator("input");
+      await drawer(page).getByRole("button", { name: "Choose emoji" }).click();
+      const appPicker = drawer(page).locator(".glyph-picker");
+      await appPicker.getByRole("searchbox", { name: "Search emoji" }).fill(
+        "rocket",
+      );
+      await appPicker.getByRole("button", { name: "rocket", exact: true })
+        .click();
+      eq(await appGlyph.inputValue(), "🚀", "app picker chose the wrong glyph");
+      check(
+        (await drawer(page).locator("#visor-actions").textContent())?.includes(
+          "Save",
+        ),
+        "an app picker choice did not remain an unsaved draft",
+      );
+      await drawer(page).getByRole("button", { name: "Revert", exact: true })
+        .click();
+      eq(await appGlyph.inputValue(), "", "Revert kept an app picker choice");
 
+      // A combining sequence and not an emoji: a colour emoji font ignores
+      // the white fill the pixel checks below look for. Rust keeps the whole
+      // grapheme and drops the following suffix.
+      const paintedGlyph = "e\u0301";
+      await setAppGlyph(page, paintedGlyph + "x", paintedGlyph);
+
+      await page.evaluate(() => {
+        const proto = CanvasRenderingContext2D.prototype;
+        const original = proto.fillText;
+        (globalThis as Record<string, unknown>).__paintedGlyphs = [];
+        proto.fillText = function (text, x, y, maxWidth) {
+          ((globalThis as Record<string, unknown>).__paintedGlyphs as string[])
+            .push(String(text));
+          if (maxWidth === undefined) original.call(this, text, x, y);
+          else original.call(this, text, x, y, maxWidth);
+        };
+      });
       const manifest = await installAndReadManifest(page);
       const startUrl = await page.evaluate(
         (b) => new URL("#launch/todomvc", b).href,
@@ -1770,11 +1821,23 @@ const scenarios: Scenario[] = [
         "the manifest must name both launcher sizes",
       );
       check(
-        !icons.some((i) => i.src.includes("★")),
+        !icons.some((i) => i.src.includes(paintedGlyph)),
         "the glyph must not appear literally in an icon URL",
       );
 
       const bySize = new Map(icons.map((i) => [i.sizes, i.src]));
+      // Pixel ink only proves that something rendered; this proves the
+      // complete Rust-normalized grapheme crossed the TypeScript glue.
+      const paintedText = await page.evaluate(() =>
+        (globalThis as Record<string, unknown>).__paintedGlyphs
+      ) as string[];
+      check(
+        paintedText.length === 2 &&
+          paintedText.every((g) => g === paintedGlyph),
+        `canvas received ${
+          JSON.stringify(paintedText)
+        }, not the whole grapheme`,
+      );
       const big = await probeIcon(page, bySize.get("512x512")!);
       const small = await probeIcon(page, bySize.get("192x192")!);
       eq(
@@ -2517,7 +2580,9 @@ const scenarios: Scenario[] = [
         await focusIn(page, "#visor-actions") &&
           await drawer(page).getByRole("button", { name: "Close", exact: true })
               .count() === 1,
-        `bar Revert did not focus its replacement Close; focus is ${await focused(page)}`,
+        `bar Revert did not focus its replacement Close; focus is ${await focused(
+          page,
+        )}`,
       );
       await shot(page, "desktop-action-bar-clean");
       await field.fill("half typed");
@@ -2554,7 +2619,9 @@ const scenarios: Scenario[] = [
         await focusIn(page, "#visor-actions") &&
           await drawer(page).getByRole("button", { name: "Close", exact: true })
               .count() === 1,
-        `bar Save did not focus its replacement Close; focus is ${await focused(page)}`,
+        `bar Save did not focus its replacement Close; focus is ${await focused(
+          page,
+        )}`,
       );
 
       // Same-task input makes this deterministic without a permanent mock:
@@ -2575,14 +2642,21 @@ const scenarios: Scenario[] = [
         );
       });
       await page.waitForFunction(
-        () => document.querySelector("#visor-actions")?.textContent?.includes("Save"),
+        () =>
+          document.querySelector("#visor-actions")?.textContent?.includes(
+            "Save",
+          ),
       );
       eq(
         await drawer(page).locator(".pane").getAttribute("aria-label"),
         "settings",
         "navigation escaped while Save was in flight",
       );
-      eq(await confirm.count(), 0, "navigation opened confirmation during Save");
+      eq(
+        await confirm.count(),
+        0,
+        "navigation opened confirmation during Save",
+      );
       eq(await field.inputValue(), "newer text", "Save lost newer field text");
       await drawer(page).getByRole("button", { name: "Revert", exact: true })
         .click();
@@ -2593,7 +2667,9 @@ const scenarios: Scenario[] = [
       );
       await page.reload();
       await visorReady(page);
-      await strip(page).getByText("first snapshot").waitFor({ timeout: 15_000 });
+      await strip(page).getByText("first snapshot").waitFor({
+        timeout: 15_000,
+      });
       await openSettingsSheet(page);
       eq(
         await field.inputValue(),
@@ -2602,21 +2678,128 @@ const scenarios: Scenario[] = [
       );
 
       // The user's own labels ride in the same draft and land on the strip:
-      // the petname in the right half's top line, and the glyph — of which
-      // only the first character is ever drawn — in the circle.
-      await drawer(page).locator("label").filter({ hasText: /^your petname$/ })
-        .locator("input").fill("ada");
-      await drawer(page).locator("label").filter({ hasText: /^your glyph$/ })
-        .locator("input").fill("🜁x");
+      // the petname in the right half's top line, and one whole extended
+      // grapheme in the circle.
+      const userPetname = drawer(page).locator("label").filter({
+        hasText: /^your petname$/,
+      }).locator("input");
+      await userPetname.fill("ada");
+      const glyph = drawer(page).locator("label").filter({
+        hasText: /^your glyph$/,
+      }).locator("input");
+      await glyph.fill("  👩🏽‍💻x");
+      eq(await glyph.inputValue(), "👩🏽‍💻", "paste was not normalized");
+      // The normalized draft is already this value. A controlled input must
+      // still rewrite the DOM when another pasted suffix normalizes to it.
+      await glyph.evaluate((input) => {
+        (input as HTMLInputElement).value = "👩🏽‍💻suffix";
+        input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      });
+      eq(
+        await glyph.inputValue(),
+        "👩🏽‍💻",
+        "an unchanged signal left a pasted suffix in the DOM",
+      );
+      check(
+        await glyph.evaluate((input) => input === document.activeElement),
+        "normalizing an unchanged glyph moved focus",
+      );
+      await glyph.press("ControlOrMeta+A");
+      await glyph.pressSequentially("Z");
+      eq(
+        await glyph.inputValue(),
+        "Z",
+        "typing did not continue after normalization",
+      );
+      // Composition owns its incomplete text until compositionend commits.
+      await glyph.evaluate((input) => {
+        input.dispatchEvent(
+          new CompositionEvent("compositionstart", {
+            bubbles: true,
+          }),
+        );
+        // An IME may expose only a partial grapheme while composing.
+        (input as HTMLInputElement).value = "e";
+        input.dispatchEvent(
+          new InputEvent("input", {
+            bubbles: true,
+            isComposing: true,
+          }),
+        );
+      });
+      eq(await glyph.inputValue(), "e", "composition was changed early");
+      await glyph.dispatchEvent("compositionend");
+      await glyph.evaluate((input) => {
+        // Browsers commonly send the final input after compositionend.
+        (input as HTMLInputElement).value = "e\u0301x";
+        input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      });
+      eq(
+        await glyph.inputValue(),
+        "é",
+        "composition was not normalized at end",
+      );
+
+      // Picker choices are drafts too: browse by shortcode, select a
+      // modifier, then prove neither selection nor Revert persisted it.
+      await drawer(page).getByRole("button", { name: "Choose emoji" }).click();
+      const picker = drawer(page).locator(".glyph-picker");
+      await page.waitForFunction(() =>
+        document.activeElement?.getAttribute("type") === "search"
+      );
+      await picker.getByRole("searchbox", { name: "Search emoji" }).fill(
+        "technologist",
+      );
+      await shot(page, "desktop-glyph-picker");
+      await picker.getByRole("button", {
+        name: "woman technologist: medium skin tone",
+      })
+        .click();
+      eq(await glyph.inputValue(), "👩🏽‍💻", "picker chose the wrong grapheme");
+      check(
+        await glyph.evaluate((input) => input === document.activeElement),
+        "picker selection did not return focus to the glyph input",
+      );
+      await drawer(page).getByRole("button", { name: "Revert", exact: true })
+        .click();
+      eq(await glyph.inputValue(), "", "Revert kept a picker choice");
+      // Revert covered the whole draft, including the sibling petname.
+      await userPetname.fill("ada");
+
+      // Escape closes the inline chooser, not its drawer.
+      await drawer(page).getByRole("button", { name: "Choose emoji" }).click();
+      await picker.getByRole("searchbox", { name: "Search emoji" }).press(
+        "Escape",
+      );
+      eq(await picker.count(), 0, "Escape kept the glyph picker open");
+      check(
+        await glyph.evaluate((input) => input === document.activeElement),
+        "Escape did not return focus to the glyph input",
+      );
+      eq(
+        await drawer(page).locator(".pane").getAttribute("aria-label"),
+        "settings",
+        "Escape closed the drawer with the picker",
+      );
+      await glyph.fill("  👩🏽‍💻x");
       await saveDraft(page);
       await page.waitForFunction(
-        () => document.querySelector("#visor-circle")?.textContent === "🜁",
+        () => document.querySelector("#visor-circle")?.textContent === "👩🏽‍💻",
         undefined,
         { timeout: 10_000 },
       );
       await page.locator("#visor-self").getByText("ada").waitFor({
         timeout: 10_000,
       });
+      await page.reload();
+      await visorReady(page);
+      await page.waitForFunction(
+        () => document.querySelector("#visor-circle")?.textContent === "👩🏽‍💻",
+      );
+      await page.setViewportSize({ width: 390, height: 780 });
+      await openSettingsSheet(page);
+      await drawer(page).getByRole("button", { name: "Choose emoji" }).click();
+      await shot(page, "mobile-glyph-picker");
     },
   },
 
@@ -3020,7 +3203,8 @@ const scenarios: Scenario[] = [
           }).click();
           await shot(page, "mobile-action-bar-clean");
         }
-        const action = await drawer(page).locator("#visor-actions").boundingBox();
+        const action = await drawer(page).locator("#visor-actions")
+          .boundingBox();
         const anchor = await strip(page).boundingBox();
         check(
           action !== null && anchor !== null &&
@@ -3059,7 +3243,9 @@ const scenarios: Scenario[] = [
       const wheel: Array<number | "unclaimed"> = ["unclaimed"];
       for (let h = 0; h < 360; h++) wheel.push(h);
       for (const hue of wheel) {
-        for (const [what, ratio] of Object.entries(await inkContrast(page, hue))) {
+        for (
+          const [what, ratio] of Object.entries(await inkContrast(page, hue))
+        ) {
           const key = `${what} @${hue}`;
           if (ratio < (worst.get(key) ?? Infinity)) worst.set(key, ratio);
         }
@@ -3070,7 +3256,9 @@ const scenarios: Scenario[] = [
       check(
         failing.length === 0,
         `${failing.length} text(s) below 4.5:1, worst ${
-          failing.slice(0, 4).map(([k, r]) => `${k} = ${r.toFixed(2)}`).join("; ")
+          failing.slice(0, 4).map(([k, r]) => `${k} = ${r.toFixed(2)}`).join(
+            "; ",
+          )
         }`,
       );
       await page.locator("#visor-root").evaluate(
@@ -3078,11 +3266,17 @@ const scenarios: Scenario[] = [
         painted,
       );
       let small = await undersizedControls(page);
-      check(small.length === 0, `mobile under touch floor: ${small.join("; ")}`);
+      check(
+        small.length === 0,
+        `mobile under touch floor: ${small.join("; ")}`,
+      );
       await page.setViewportSize({ width: 1280, height: 800 });
       await page.waitForTimeout(300);
       small = await undersizedControls(page);
-      check(small.length === 0, `desktop under touch floor: ${small.join("; ")}`);
+      check(
+        small.length === 0,
+        `desktop under touch floor: ${small.join("; ")}`,
+      );
     },
   },
 

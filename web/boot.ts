@@ -740,9 +740,10 @@ async function paintIcon(
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.font = `${Math.round(size * 0.62)}px system-ui, sans-serif`;
-  // The first `char` only, as the strip draws it (visor/src/ui.rs
-  // `glyph_of`).
-  ctx.fillText([...glyph][0] ?? "", size / 2, size / 2);
+  // Rust has already reduced this to one extended grapheme. Keep the page
+  // glue byte-for-byte passive; a second segmentation algorithm here would
+  // eventually disagree with the visor.
+  ctx.fillText(glyph, size / 2, size / 2);
   const blob = await new Promise<Blob | null>((resolve) =>
     canvas.toBlob(resolve, "image/png")
   );
