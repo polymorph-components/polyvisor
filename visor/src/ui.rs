@@ -29,6 +29,7 @@
 use dioxus::html::Key;
 use dioxus::prelude::*;
 
+use crate::glyph::normalize_glyph;
 use crate::kernel::{
     self, App, Binding, Entry, Event, InstallOutcome, Member, Meta, MetaScope, Peer, SessionId,
     Status,
@@ -46,15 +47,16 @@ use crate::voice::{AppText, AppVoice, Voice, coarse_age};
 const PETNAME: &str = "petname";
 const GLYPH: &str = "glyph";
 
-/// A glyph as the strip draws it: the first `char` of the field, or
-/// nothing. `chars().next()` and not a byte slice — the field is free text
-/// and an emoji is the likely case, so slicing would panic on exactly what
-/// users type.
 fn glyph_of(meta: &Meta) -> String {
     meta.get(GLYPH)
-        .and_then(|s| s.chars().next())
-        .map(String::from)
+        .map(|s| normalize_glyph(s).to_string())
         .unwrap_or_default()
+}
+
+fn normalize_meta_glyph(meta: &mut Meta) {
+    if let Some(value) = meta.get(GLYPH) {
+        set_field(meta, GLYPH, normalize_glyph(value).to_string());
+    }
 }
 
 fn petname_of(meta: &Meta) -> String {
@@ -103,7 +105,7 @@ struct Draft {
 /// notice, not a silent revert.
 #[allow(clippy::too_many_arguments)]
 async fn save_draft(
-    draft: Signal<Draft>,
+    mut draft: Signal<Draft>,
     mut seed: Signal<Draft>,
     mut status: Signal<Option<Status>>,
     mut user_meta: Signal<Meta>,
@@ -112,7 +114,11 @@ async fn save_draft(
     app_id: Option<String>,
     mut status_gate: CopyValue<Gate>,
 ) -> bool {
-    let (was, now) = (seed(), draft());
+    let was = seed();
+    let mut now = draft();
+    normalize_meta_glyph(&mut now.user);
+    normalize_meta_glyph(&mut now.app);
+    draft.set(now.clone());
     status_gate.write().bump();
     let mut failed = false;
     let mut fail = |e: String, failed: &mut bool| {
@@ -208,6 +214,8 @@ enum FocusWant {
         self_half: bool,
     },
     Confirm,
+    Glyph,
+    GlyphSearch,
 }
 
 /// Which half of the strip a tenant belongs to, and so which half the
@@ -637,7 +645,7 @@ pub(crate) fn Visor() -> Element {
     // half-typed field is never taken away from the user who typed it.
     let seed_draft = use_callback(move |()| {
         let identity = status.read();
-        let next = Draft {
+        let mut next = Draft {
             name: identity
                 .as_ref()
                 .map(|s| s.name.clone())
@@ -646,6 +654,8 @@ pub(crate) fn Visor() -> Element {
             user: user_meta(),
             app: app_meta(),
         };
+        normalize_meta_glyph(&mut next.user);
+        normalize_meta_glyph(&mut next.app);
         drop(identity);
         seed.set(next.clone());
         draft.set(next);
@@ -1100,6 +1110,8 @@ pub(crate) fn Visor() -> Element {
     let focus_pane = focus_tag(FocusWant::Pane);
     let focus_bar = focus_tag(FocusWant::Bar);
     let focus_confirm = focus_tag(FocusWant::Confirm);
+    let focus_glyph = focus_tag(FocusWant::Glyph);
+    let focus_glyph_search = focus_tag(FocusWant::GlyphSearch);
     let focus_app_half = focus_tag(FocusWant::Strip { self_half: false });
     let focus_self_half = focus_tag(FocusWant::Strip { self_half: true });
 
@@ -1216,16 +1228,17 @@ pub(crate) fn Visor() -> Element {
                                 },
                             }
                         }
-                        label {
-                            span { class: "{Voice::Framework.class()}", "glyph" }
-                            input {
-                                r#type: "text",
-                                value: "{info_glyph}",
-                                oninput: move |e| {
-                                    let mut d = draft.write();
-                                    set_field(&mut d.app, GLYPH, e.value());
-                                },
-                            }
+                        GlyphInput {
+                            label: "glyph",
+                            value: info_glyph,
+                            focus_return: current.then(|| focus_glyph.clone()).flatten(),
+                            focus_search: current.then(|| focus_glyph_search.clone()).flatten(),
+                            onchange: move |value| {
+                                let mut d = draft.write();
+                                set_field(&mut d.app, GLYPH, value);
+                            },
+                            onreturn: move |_| ask_focus.call(FocusWant::Glyph),
+                            onsearch: move |_| ask_focus.call(FocusWant::GlyphSearch),
                         }
                         if let Some(id) = live_id {
                             button {
@@ -1281,6 +1294,10 @@ pub(crate) fn Visor() -> Element {
                         on_refresh_devices: refresh_devices,
                         on_kept,
                         on_devices: show_devices,
+                        focus_glyph: current.then(|| focus_glyph.clone()).flatten(),
+                        focus_glyph_search: current.then(|| focus_glyph_search.clone()).flatten(),
+                        on_glyph_return: move |_| ask_focus.call(FocusWant::Glyph),
+                        on_glyph_search: move |_| ask_focus.call(FocusWant::GlyphSearch),
                     }
                 },
             }
@@ -2184,6 +2201,173 @@ fn EraseControl() -> Element {
     }
 }
 
+const GLYPH_PAGE: usize = 96;
+
+/// Free text plus the bundled, searchable Unicode emoji catalogue.
+///
+/// Composition events are supported by Dioxus 0.7.10
+/// (`dioxus-html/src/events/generated.rs:33`). While one is active the DOM's
+/// in-progress text is left alone; the first complete grapheme is committed
+/// at composition end. Ordinary input is normalized immediately, including
+/// paste, so a controlled field also removes a suffix when the normalized
+/// signal value happens to be unchanged.
+#[component]
+fn GlyphInput(
+    label: &'static str,
+    value: String,
+    onchange: EventHandler<String>,
+    focus_return: Option<String>,
+    focus_search: Option<String>,
+    onreturn: EventHandler<()>,
+    onsearch: EventHandler<()>,
+) -> Element {
+    let mut open = use_signal(|| false);
+    let mut query = use_signal(String::new);
+    let mut limit = use_signal(|| GLYPH_PAGE);
+    let mut composing = use_signal(|| false);
+    let mut raw = use_signal(|| value.clone());
+    // A changing ordinary attribute makes Dioxus revisit this controlled
+    // input even when normalization produces the existing value. Unlike a
+    // keyed replacement, this keeps the same DOM node, focus and selection.
+    let mut input_revision = use_signal(|| 0u32);
+    if !composing() && raw.peek().as_str() != value.as_str() {
+        raw.set(value.clone());
+    }
+
+    let commit = use_callback(move |text: String| {
+        let normalized = normalize_glyph(&text).to_string();
+        raw.set(normalized.clone());
+        onchange.call(normalized);
+        input_revision += 1;
+    });
+    let needle = query().trim().to_lowercase();
+    let mut matches = Vec::new();
+    let cap = limit().saturating_add(1);
+    'emoji: for emoji in emojis::iter().take_while(|_| open()) {
+        let base_found = needle.is_empty()
+            || emoji.name().contains(&needle)
+            || emoji.shortcodes().any(|code| code.contains(&needle));
+        if let Some(tones) = emoji.skin_tones() {
+            for variant in tones {
+                let found = base_found
+                    || variant.name().contains(&needle)
+                    || variant.shortcodes().any(|code| code.contains(&needle));
+                if found {
+                    matches.push(variant);
+                }
+                if matches.len() == cap {
+                    break 'emoji;
+                }
+            }
+        } else if base_found {
+            matches.push(emoji);
+            if matches.len() == cap {
+                break;
+            }
+        }
+    }
+    let more = matches.len() > limit();
+    matches.truncate(limit());
+    let empty = matches.is_empty();
+
+    rsx! {
+        div {
+            class: "glyph-input",
+            onkeydown: move |e: KeyboardEvent| {
+                if open() && e.key() == Key::Escape {
+                    e.stop_propagation();
+                    open.set(false);
+                    onreturn.call(());
+                }
+            },
+            div { class: "glyph-control-row",
+                label {
+                    span { class: "{Voice::Framework.class()}", "{label}" }
+                    input {
+                        r#type: "text",
+                        value: "{raw}",
+                        "data-glyph-revision": "{input_revision}",
+                        "data-visor-focus": focus_return,
+                        oncompositionstart: move |_| composing.set(true),
+                        oncompositionend: move |_| {
+                            composing.set(false);
+                            commit.call(raw());
+                        },
+                        oninput: move |e| {
+                            raw.set(e.value());
+                            if !composing() {
+                                commit.call(e.value());
+                            }
+                        },
+                        onblur: move |_| {
+                            if composing() {
+                                composing.set(false);
+                                commit.call(raw());
+                            }
+                        },
+                    }
+                }
+                button {
+                    r#type: "button",
+                    aria_expanded: "{open}",
+                    onclick: move |_| {
+                        if open() {
+                            open.set(false);
+                            onreturn.call(());
+                        } else {
+                            open.set(true);
+                            limit.set(GLYPH_PAGE);
+                            onsearch.call(());
+                        }
+                    },
+                    "Choose emoji"
+                }
+            }
+            if open() {
+                div { class: "glyph-picker",
+                    label {
+                        span { class: "{Voice::Framework.class()}", "Search emoji" }
+                        input {
+                            r#type: "search",
+                            value: "{query}",
+                            "data-visor-focus": focus_search,
+                            oninput: move |e| {
+                                query.set(e.value());
+                                limit.set(GLYPH_PAGE);
+                            },
+                        }
+                    }
+                    div { class: "glyph-results",
+                        for emoji in matches {
+                            button {
+                                r#type: "button",
+                                title: "{emoji.name()}",
+                                aria_label: "{emoji.name()}",
+                                onclick: move |_| {
+                                    commit.call(emoji.as_str().to_string());
+                                    open.set(false);
+                                    onreturn.call(());
+                                },
+                                "{emoji.as_str()}"
+                            }
+                        }
+                    }
+                    if more {
+                        button {
+                            r#type: "button",
+                            onclick: move |_| limit += GLYPH_PAGE,
+                            "Show more"
+                        }
+                    }
+                    if empty {
+                        span { class: "{Voice::Framework.class()}", "no emoji found" }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Everything about this device, and the user, that is a field rather
 /// than a ceremony.
 ///
@@ -2211,6 +2395,10 @@ fn SettingsSheet(
     on_refresh_devices: EventHandler<()>,
     on_kept: EventHandler<bool>,
     on_devices: EventHandler<()>,
+    focus_glyph: Option<String>,
+    focus_glyph_search: Option<String>,
+    on_glyph_return: EventHandler<()>,
+    on_glyph_search: EventHandler<()>,
 ) -> Element {
     let mut draft = draft;
     // Read out rather than held: the field values are wanted here, and a
@@ -2261,16 +2449,17 @@ fn SettingsSheet(
                 },
             }
         }
-        label {
-            span { class: "{Voice::Framework.class()}", "your glyph" }
-            input {
-                r#type: "text",
-                value: "{user_glyph}",
-                oninput: move |e| {
-                    let mut d = draft.write();
-                    set_field(&mut d.user, GLYPH, e.value());
-                },
-            }
+        GlyphInput {
+            label: "your glyph",
+            value: user_glyph,
+            focus_return: focus_glyph,
+            focus_search: focus_glyph_search,
+            onchange: move |value| {
+                let mut d = draft.write();
+                set_field(&mut d.user, GLYPH, value);
+            },
+            onreturn: move |_| on_glyph_return.call(()),
+            onsearch: move |_| on_glyph_search.call(()),
         }
         label {
             span { class: "{Voice::Framework.class()}", "word" }

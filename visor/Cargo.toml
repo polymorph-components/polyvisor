@@ -15,6 +15,8 @@ crate-type = ["cdylib"]
 # "hooks" on top of the workspace features: the visor's UI is signal-based
 # (m1-context.md "Rust facts").
 dioxus = { workspace = true, features = ["hooks"] }
+emojis = "0.9"
 stream-dom-dioxus.workspace = true
 stream-dom-guest.workspace = true
+unicode-segmentation = "1.13"
 wit-bindgen.workspace = true
