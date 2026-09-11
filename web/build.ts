@@ -203,6 +203,14 @@ await copy(join(ROOT, "web", "index.html"), join(DIST, "index.html"));
 for (const icon of ["icon-512.png", "icon-192.png"]) {
   await copy(join(ROOT, "web", icon), join(DIST, icon), { overwrite: true });
 }
+// The visor's last-resort animal face. Keep this local: glyph rendering must
+// not acquire a runtime network dependency.
+await ensureDir(join(DIST, "fonts"));
+for (const file of ["noto-emoji-animals.woff2", "OFL.txt", "README.md"]) {
+  await copy(join(ROOT, "web", "fonts", file), join(DIST, "fonts", file), {
+    overwrite: true,
+  });
+}
 
 await component(
   "polyvisor_runtime",

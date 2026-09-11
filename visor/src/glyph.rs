@@ -2,6 +2,33 @@
 
 use unicode_segmentation::UnicodeSegmentation;
 
+const ANIMAL_FIRST: u32 = 0x1f400;
+const ANIMAL_COUNT: u32 = 64;
+
+/// Choose one of the 64 animal characters U+1F400..U+1F43F.
+///
+/// When `previous` is in that range, map over the other 63 rather than
+/// retrying: a roll is synchronous and is guaranteed to change.
+pub(crate) fn roll_animal(random: u32, previous: &str) -> String {
+    let previous = previous
+        .chars()
+        .next()
+        .filter(|_| previous.chars().count() == 1)
+        .map(u32::from)
+        .filter(|code| (ANIMAL_FIRST..ANIMAL_FIRST + ANIMAL_COUNT).contains(code));
+    let offset = match previous {
+        Some(code) => {
+            let previous_offset = code - ANIMAL_FIRST;
+            let candidate = random % (ANIMAL_COUNT - 1);
+            candidate + u32::from(candidate >= previous_offset)
+        }
+        None => random % ANIMAL_COUNT,
+    };
+    char::from_u32(ANIMAL_FIRST + offset)
+        .expect("the animal emoji range contains Unicode scalar values")
+        .to_string()
+}
+
 /// Strip leading Unicode whitespace and retain one extended grapheme.
 ///
 /// There is deliberately no normalization and no trailing trim: the first
@@ -12,7 +39,27 @@ pub(crate) fn normalize_glyph(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_glyph;
+    use super::{normalize_glyph, roll_animal};
+
+    #[test]
+    fn animal_roll_covers_range_boundaries_and_skips_previous() {
+        assert_eq!(roll_animal(0, ""), "\u{1f400}");
+        assert_eq!(roll_animal(63, ""), "\u{1f43f}");
+        assert_eq!(roll_animal(64, ""), "\u{1f400}");
+        assert_eq!(roll_animal(0, "\u{1f400}"), "\u{1f401}");
+        assert_eq!(roll_animal(62, "\u{1f43f}"), "\u{1f43e}");
+        for previous in 0..64 {
+            let old = char::from_u32(0x1f400 + previous).unwrap().to_string();
+            let rolls: std::collections::BTreeSet<_> =
+                (0..63).map(|random| roll_animal(random, &old)).collect();
+            assert_eq!(rolls.len(), 63);
+            assert!(!rolls.contains(&old));
+            assert!(rolls.iter().all(|glyph| {
+                let code = u32::from(glyph.chars().next().unwrap());
+                (0x1f400..=0x1f43f).contains(&code)
+            }));
+        }
+    }
 
     #[test]
     fn keeps_one_extended_grapheme_after_leading_space() {

@@ -2196,6 +2196,55 @@ const scenarios: Scenario[] = [
   },
 
   {
+    name: "animal-glyph-font",
+    async run(ctx, origin) {
+      const page = await open(ctx, `${origin}${SUBPATH}`);
+      await visorReady(page);
+      const animals = Array.from(
+        { length: 64 },
+        (_, offset) => String.fromCodePoint(0x1f400 + offset),
+      ).join("");
+      const covered = "🎲" + animals;
+      await page.evaluate(async (text) => {
+        const probe = document.createElement("div");
+        probe.id = "animal-font-probe";
+        probe.style.cssText =
+          "font:400 32px 'Polyvisor Noto Emoji';display:grid;position:fixed;" +
+          "inset:0;z-index:999;background:white;align-content:center;justify-content:center;" +
+          "grid-template-columns:repeat(8,40px);line-height:40px;";
+        for (const glyph of text) {
+          const cell = document.createElement("span");
+          cell.textContent = glyph;
+          probe.append(cell);
+        }
+        document.body.append(probe);
+        await document.fonts.load("400 32px 'Polyvisor Noto Emoji'", text);
+      }, covered);
+      const fontResponse = await page.request.get(
+        `${origin}${SUBPATH}fonts/noto-emoji-animals.woff2`,
+      );
+      check(fontResponse.ok(), "subpath animal fallback font was not served");
+      const cdp = await ctx.newCDPSession(page);
+      await cdp.send("DOM.enable");
+      await cdp.send("CSS.enable");
+      const { root } = await cdp.send("DOM.getDocument");
+      const { nodeId } = await cdp.send("DOM.querySelector", {
+        nodeId: root.nodeId,
+        selector: "#animal-font-probe",
+      });
+      const { fonts } = await cdp.send("CSS.getPlatformFontsForNode", { nodeId });
+      const custom = fonts.filter((font) => font.isCustomFont);
+      check(custom.length === 1, `expected one custom animal font, got ${JSON.stringify(fonts)}`);
+      eq(custom[0].glyphCount, 65, "bundled font did not render the die and all 64 animal glyphs");
+      check(
+        fonts.every((font) => font.isCustomFont || font.glyphCount === 0),
+        `an installed fallback rendered part of the controlled grid: ${JSON.stringify(fonts)}`,
+      );
+      await shot(page, "animal-font-grid");
+    },
+  },
+
+  {
     name: "petname-dice",
     async run(ctx, origin, browser) {
       const page = await open(ctx, origin);
@@ -2208,6 +2257,9 @@ const scenarios: Scenario[] = [
       const device = field(/^device petname$/);
       const userDie = drawer(page).getByRole("button", { name: "Re-roll user petname" });
       const deviceDie = drawer(page).getByRole("button", { name: "Re-roll device petname" });
+      const userGlyphButton = drawer(page).getByRole("button", { name: "Choose your glyph" });
+      const userGlyphDie = drawer(page).getByRole("button", { name: "Re-roll user glyph" });
+      const glyphValue = (button: Locator) => button.locator(".glyph-tile-face").textContent();
 
       const assertDieGap = async (input: Locator, die: Locator, where: string) => {
         const inputBox = await input.boundingBox();
@@ -2242,18 +2294,47 @@ const scenarios: Scenario[] = [
         await die.click();
         await waitForInputToDiffer(input, first);
       }
-      await shot(page, "desktop-petname-roll");
+
+      eq(await userGlyphDie.getAttribute("aria-disabled"), null, "blank user glyph die was disabled");
+      await userGlyphDie.click();
+      const firstUserGlyph = await glyphValue(userGlyphButton);
+      check(firstUserGlyph !== null && /^[\u{1f400}-\u{1f43f}]$/u.test(firstUserGlyph), "user glyph roll left the animal range");
+      await userGlyphDie.click();
+      const secondUserGlyph = await glyphValue(userGlyphButton);
+      check(secondUserGlyph !== firstUserGlyph, "user glyph repeated its previous roll");
+      await userGlyphButton.click();
+      let glyphPicker = drawer(page).locator(".glyph-picker");
+      await glyphPicker.getByRole("searchbox", { name: "Enter glyph or search" }).fill("★");
+      await glyphPicker.getByRole("button", { name: "Use ★" }).click();
+      eq(await userGlyphDie.getAttribute("aria-disabled"), "true", "manual user glyph remained rerollable");
+      await userGlyphButton.click();
+      glyphPicker = drawer(page).locator(".glyph-picker");
+      await glyphPicker.getByRole("button", { name: "Clear glyph" }).click();
+      eq(await userGlyphDie.getAttribute("aria-disabled"), null, "cleared user glyph die was disabled");
+      await userGlyphDie.click();
+      const savedUserGlyph = await glyphValue(userGlyphButton);
+      await shot(page, "desktop-animal-glyph-roll");
       await saveDraft(page);
       await appsButton(page).click();
       await paneSettled(page);
       await openSettingsSheet(page);
       eq(await drawer(page).getByRole("button", { name: "Re-roll user petname" }).getAttribute("aria-disabled"), null, "saved roll lost eligibility on reopen");
+      eq(await drawer(page).getByRole("button", { name: "Re-roll user glyph" }).getAttribute("aria-disabled"), null, "saved glyph roll lost eligibility on reopen");
+      eq(await glyphValue(drawer(page).getByRole("button", { name: "Choose your glyph" })), savedUserGlyph, "saved user glyph changed on reopen");
 
       await launchTodoMvc(page);
       await toAppSheet(page);
       const app = field(/^petname$/);
       const appDie = drawer(page).getByRole("button", { name: "Re-roll app petname" });
+      const appGlyphButton = drawer(page).getByRole("button", { name: "Choose glyph", exact: true });
+      const appGlyphDie = drawer(page).getByRole("button", { name: "Re-roll app glyph" });
       eq(await appDie.getAttribute("aria-disabled"), "true", "generated app default was rerollable");
+      eq(await appGlyphDie.getAttribute("aria-disabled"), null, "blank app glyph die was disabled");
+      await appGlyphDie.click();
+      const firstAppGlyph = await glyphValue(appGlyphButton);
+      check(firstAppGlyph !== null && /^[\u{1f400}-\u{1f43f}]$/u.test(firstAppGlyph), "app glyph roll left the animal range");
+      await appGlyphDie.click();
+      check(await glyphValue(appGlyphButton) !== firstAppGlyph, "app glyph repeated its previous roll");
       await app.fill("");
       await appDie.click();
       await page.waitForFunction(() => {
@@ -2261,6 +2342,14 @@ const scenarios: Scenario[] = [
         return (label?.querySelector("input") as HTMLInputElement | null)?.value.length;
       });
       await drawer(page).getByRole("button", { name: "Revert", exact: true }).click();
+      await appGlyphDie.click();
+      const savedAppGlyph = await glyphValue(appGlyphButton);
+      await saveDraft(page);
+      await openSettingsSheet(page);
+      await paneSettled(page);
+      await toAppSheet(page);
+      eq(await glyphValue(drawer(page).getByRole("button", { name: "Choose glyph", exact: true })), savedAppGlyph, "saved app glyph changed on reopen");
+      eq(await drawer(page).getByRole("button", { name: "Re-roll app glyph" }).getAttribute("aria-disabled"), null, "saved app glyph roll lost eligibility on reopen");
       await pageCleanDrawer(page);
       await page.reload();
       await visorReady(page);
@@ -2268,6 +2357,7 @@ const scenarios: Scenario[] = [
       await page.waitForFunction(() => document.querySelector("#visor-drawer") === null);
       await openSettingsSheet(page);
       eq(await drawer(page).getByRole("button", { name: "Re-roll user petname" }).getAttribute("aria-disabled"), "true", "reload retained roll eligibility");
+      eq(await drawer(page).getByRole("button", { name: "Re-roll user glyph" }).getAttribute("aria-disabled"), "true", "reload retained glyph roll eligibility");
       check(await drawer(page).getByText("word", { exact: true }).count() === 0, "obsolete word field is still rendered");
 
       const reloadedUser = field(/^your petname$/);
@@ -2279,6 +2369,8 @@ const scenarios: Scenario[] = [
       check((await reloadedDevice.inputValue()).length > 0, "blank device save was not normalized");
 
       await toAppSheet(page);
+      eq(await glyphValue(drawer(page).getByRole("button", { name: "Choose glyph", exact: true })), savedAppGlyph, "app glyph did not survive reload");
+      eq(await drawer(page).getByRole("button", { name: "Re-roll app glyph" }).getAttribute("aria-disabled"), "true", "reload retained app glyph roll eligibility");
       const savedApp = field(/^petname$/);
       await savedApp.fill("");
       await saveDraft(page);
@@ -2286,7 +2378,7 @@ const scenarios: Scenario[] = [
 
       await page.setViewportSize({ width: 390, height: 844 });
       await assertDieGap(field(/^petname$/), drawer(page).getByRole("button", { name: "Re-roll app petname" }), "mobile app");
-      await shot(page, "mobile-petname-roll");
+      await shot(page, "mobile-animal-glyph-roll");
       const touch = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true });
       try {
         const mobile = await open(touch, origin);
@@ -3138,6 +3230,7 @@ const scenarios: Scenario[] = [
 
       // Escape is that button by another name, and the caret goes back to
       // the half of the strip that raised the pane.
+      await drawer(page).locator(".pane").focus();
       await page.keyboard.press("Escape");
       await page.waitForFunction(
         () => document.querySelector("#visor-drawer") === null,

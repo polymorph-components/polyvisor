@@ -30,7 +30,7 @@ use dioxus::html::Key;
 use dioxus::prelude::*;
 
 use crate::draft::{RollState, RollTarget, rebase_map};
-use crate::glyph::normalize_glyph;
+use crate::glyph::{normalize_glyph, roll_animal};
 use crate::kernel::{
     self, App, Binding, Entry, Event, InstallOutcome, Member, Meta, MetaScope, Peer, SessionId,
     Status,
@@ -130,6 +130,36 @@ fn roll_petname(
         RollTarget::User => set_field(&mut d.user, PETNAME, value),
         RollTarget::App(_) => set_field(&mut d.app, PETNAME, value),
         RollTarget::Picker => {}
+        RollTarget::UserGlyph | RollTarget::AppGlyph(_) => {
+            unreachable!("petname rolls have only petname targets")
+        }
+    }
+    draft.set(d);
+}
+
+fn roll_glyph(
+    target: RollTarget,
+    previous: String,
+    mut rolls: CopyValue<RollState>,
+    mut draft: Signal<Draft>,
+    session: Signal<Option<(SessionId, App)>>,
+) {
+    if let RollTarget::AppGlyph(expected) = &target
+        && session.read().as_ref().map(|(_, app)| &app.id) != Some(expected)
+    {
+        return;
+    }
+    let bytes = crate::component::wasi::random::random::get_random_bytes(4);
+    let value = roll_animal(
+        u32::from_le_bytes(bytes.try_into().expect("wasi:random returned four bytes")),
+        &previous,
+    );
+    rolls.write().activate(target.clone(), value.clone());
+    let mut d = draft();
+    match target {
+        RollTarget::UserGlyph => set_field(&mut d.user, GLYPH, value),
+        RollTarget::AppGlyph(_) => set_field(&mut d.app, GLYPH, value),
+        _ => unreachable!("glyph rolls have only glyph targets"),
     }
     draft.set(d);
 }
@@ -1263,6 +1293,9 @@ pub(crate) fn Visor() -> Element {
         };
         let live = session.read().as_ref().map(|(id, app)| (*id, app.clone()));
         let live_id = live.as_ref().map(|(id, _)| *id);
+        let app_glyph_target = live
+            .as_ref()
+            .map(|(_, app)| RollTarget::AppGlyph(app.id.clone()));
         let (info_petname, info_glyph) = {
             let d = draft.read();
             (
@@ -1363,9 +1396,16 @@ pub(crate) fn Visor() -> Element {
                         GlyphPicker {
                             label: "glyph",
                             value: info_glyph,
+                            roll_target: app_glyph_target.clone(),
+                            rolls,
+                            draft,
+                            session,
                             focus_return: current.then(|| focus_glyph.clone()).flatten(),
                             focus_search: current.then(|| focus_glyph_search.clone()).flatten(),
                             onchange: move |value| {
+                                if let Some(target) = app_glyph_target.as_ref() {
+                                    rolls.write().invalidate(target);
+                                }
                                 let mut d = draft.write();
                                 set_field(&mut d.app, GLYPH, value);
                             },
@@ -1814,20 +1854,12 @@ fn RollButton(label: &'static str, enabled: bool, onclick: EventHandler<()>) -> 
                 onblur: move |_| explain.set(false),
                 onmouseenter: move |_| if !enabled { explain.set(true) },
                 onmouseleave: move |_| explain.set(false),
-                onkeydown: move |event| if event.key() == Key::Escape {
+                onkeydown: move |event| if !enabled && event.key() == Key::Escape {
                     event.stop_propagation();
                     explain.set(false)
                 },
                 onclick: move |_| if enabled { onclick.call(()) } else { explain.set(true) },
-                svg {
-                    "aria-hidden": "true", view_box: "0 0 24 24", width: "20", height: "20",
-                    rect { x: "2", y: "2", width: "20", height: "20", rx: "3", fill: "none", stroke: "currentColor", stroke_width: "2" }
-                    circle { cx: "7", cy: "7", r: "1.5", fill: "currentColor" }
-                    circle { cx: "17", cy: "7", r: "1.5", fill: "currentColor" }
-                    circle { cx: "12", cy: "12", r: "1.5", fill: "currentColor" }
-                    circle { cx: "7", cy: "17", r: "1.5", fill: "currentColor" }
-                    circle { cx: "17", cy: "17", r: "1.5", fill: "currentColor" }
-                }
+                span { class: "roll-glyph", "aria-hidden": "true", "🎲" }
             }
             if explain() && !enabled {
                 span { id: tooltip_id.as_str(), class: "roll-tooltip", role: "tooltip", "clear to re-roll" }
@@ -2415,6 +2447,10 @@ const GLYPH_PAGE: usize = 96;
 fn GlyphPicker(
     label: &'static str,
     value: String,
+    roll_target: Option<RollTarget>,
+    rolls: CopyValue<RollState>,
+    draft: Signal<Draft>,
+    session: Signal<Option<(SessionId, App)>>,
     onchange: EventHandler<String>,
     focus_return: Option<String>,
     focus_search: Option<String>,
@@ -2457,6 +2493,11 @@ fn GlyphPicker(
     let more = matches.len() > limit();
     matches.truncate(limit());
     let empty = matches.is_empty() && direct.is_none();
+    let roll_label: &'static str = if matches!(roll_target, Some(RollTarget::UserGlyph)) {
+        "Re-roll user glyph"
+    } else {
+        "Re-roll app glyph"
+    };
 
     rsx! {
         div {
@@ -2490,6 +2531,21 @@ fn GlyphPicker(
                     },
                     span { class: "glyph-tile-face", "{value}" }
                 }
+                if let Some(target) = roll_target.as_ref() {
+                    RollButton {
+                        label: roll_label,
+                        enabled: value.is_empty() || rolls.read().is_active(target, &value),
+                        onclick: {
+                            let target = target.clone();
+                            let previous = value.clone();
+                            move |_| {
+                                if previous.is_empty() || rolls.read().is_active(&target, &previous) {
+                                    roll_glyph(target.clone(), previous.clone(), rolls, draft, session);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             if open() {
                 div { class: "glyph-picker",
@@ -2518,7 +2574,7 @@ fn GlyphPicker(
                                     open.set(false);
                                     onreturn.call(());
                                 },
-                                "{glyph}"
+                                span { class: "glyph-face", "{glyph}" }
                             }
                         }
                         for emoji in matches {
@@ -2531,7 +2587,7 @@ fn GlyphPicker(
                                     open.set(false);
                                     onreturn.call(());
                                 },
-                                "{emoji.as_str()}"
+                                span { class: "glyph-face", "{emoji.as_str()}" }
                             }
                         }
                     }
@@ -2686,9 +2742,14 @@ fn SettingsSheet(
         GlyphPicker {
             label: "your glyph",
             value: user_glyph,
+            roll_target: Some(RollTarget::UserGlyph),
+            rolls,
+            draft,
+            session,
             focus_return: focus_glyph,
             focus_search: focus_glyph_search,
             onchange: move |value| {
+                rolls.write().invalidate(&RollTarget::UserGlyph);
                 let mut d = draft.write();
                 set_field(&mut d.user, GLYPH, value);
             },

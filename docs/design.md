@@ -487,9 +487,12 @@ interprets.
   user labels and per-app labels. User and device petnames are generated at
   founding/device creation; an app petname is generated before its first
   launch. Explicitly saving an empty petname generates and persists a
-  replacement. Draft re-rolls happen synchronously in the visor from the same
-  EFF generator using its own `wasi:random` import; no naming policy crosses
-  the internal API. They are root scalar
+  replacement. Draft petname re-rolls happen synchronously in the visor from
+  the same EFF generator using its own `wasi:random` import; glyph re-rolls
+  similarly choose from exactly U+1F400..U+1F43F and exclude the current
+  character. Native emoji fonts remain preferred, with a self-hosted
+  monochrome Noto Emoji subset as the reliable fallback. No naming or glyph
+  policy crosses the internal API. They are root scalar
   keys in collision-safe namespaces (`identity:`, `user:`, `app:`), so edits
   to different fields do not replace a nested map. Device labels remain
   member records keyed by endpoint public key in plaintext `us`; the local
