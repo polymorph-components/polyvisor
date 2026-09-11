@@ -1,5 +1,4 @@
-//! The keyhive instance this device seals its app content with
-//! (docs/design.md, Milestones **M3c**).
+//! The keyhive instance this device seals its app content with.
 //!
 //! ## What is enveloped, and what is not
 //!
@@ -36,13 +35,11 @@
 //!
 //! BeeKEM gives a member the *current* epoch key when it is added; content
 //! sealed before that is not derivable from it. A device that has just been
-//! paired would therefore see the group's history as undecryptable noise. The
-//! fix, taken from the archived engine's PAIRING.md §4b ("causal-key
-//! read-back"), is to seal each commit's plaintext together with the keys of
-//! its parents, so a reader that can open any commit can walk backwards from
-//! it. The container is keyhive's own [`Envelope`] and the walk is keyhive's
-//! own `CiphertextStoreExt::try_causal_decrypt` — PAIRING.md §4b is explicit
-//! that this must not be a parallel format, and it is right: the walk
+//! paired would therefore see the group's history as undecryptable noise.
+//! Causal-key read-back seals each commit's plaintext together with the keys
+//! of its parents, so a reader that can open any commit can walk backwards
+//! from it. The container is keyhive's own [`Envelope`] and the walk is
+//! keyhive's own `CiphertextStoreExt::try_causal_decrypt`: the walk
 //! `bincode`-deserializes an `Envelope` out of every plaintext it opens
 //! (keyhive_core store/ciphertext.rs:189), so a look-alike struct with a
 //! different `ancestors` encoding would fail on every non-genesis commit.
@@ -114,11 +111,7 @@ pub struct VaultState {
     /// (`design/causal_encryption.md` §"Decryption Head"). Secret, and sealed
     /// with the rest of the checkpoint.
     ///
-    /// `alias`: an M3c checkpoint wrote the whole key map under `chunk_keys`.
-    /// Loading one is harmless — the full map is a superset of the head set,
-    /// and the extra entries are pruned the first time their descendants are
-    /// opened or sealed.
-    #[serde(alias = "chunk_keys", default)]
+    #[serde(default)]
     pub heads: Vec<(Cref, [u8; 32])>,
 }
 
@@ -307,8 +300,8 @@ impl Vault {
             )
             .await
             .map_err(|e| format!("keyhive add_member: {e:?}"))?;
-        // Forced key rotation at the enrollment boundary (PAIRING.md §2). The
-        // next seal would advance the epoch anyway, but "anyway" is not a
+        // Force key rotation at the enrollment boundary. The next seal would
+        // advance the epoch anyway, but "anyway" is not a
         // boundary: doing it here means the joiner's first readable epoch
         // begins at the moment it was admitted rather than at whenever someone
         // next happened to write.

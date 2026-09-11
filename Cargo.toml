@@ -22,8 +22,7 @@ publish = false
 # KEK derivation behind a passphrase. Both with default features off: the
 # `getrandom` default would pull a second randomness source into a component
 # that already has one seam for it (`Rng` over `wasi:random`), and
-# `password-hash` (PHC strings) is unused — the kernel stores its own
-# parameter record.
+# `password-hash` (PHC strings) is unused.
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 # docs/design.md "Sync engine: subduction sans-IO": the engine drives
@@ -85,19 +84,19 @@ stream-dom-guest = { git = "https://github.com/polymorph-components/polymorph-st
 # on `digest` 0.10, which is `sha2` 0.10's — a newer hmac would pull a second
 # `digest` into the graph and not accept this `Sha256` at all.
 hmac = { version = "0.12", default-features = false }
-# The pairing code's alphabet (PAIRING.md §1): `BASE32_NOPAD_VISUAL` is the
+# The pairing code's alphabet: `BASE32_NOPAD_VISUAL` is the
 # confusable-free base32 variant, which is what makes a 79-character code
 # something a person can read off one screen and type into another.
 # `default-features = false` + `alloc`: the `std` default buys only `Error`
 # impls this never surfaces.
 data-encoding = { version = "2.11", default-features = false, features = ["alloc"] }
-# The pairing ceremony's hash (PAIRING.md §2): BLAKE3 for the nonce
+# The pairing ceremony's hash: BLAKE3 for the nonce
 # commitment and for the SAS transcript, byte-for-byte as the contract
 # spells it. Not sha2 — the contract names BLAKE3 and two devices must
 # derive the same six digits. `default-features = false` keeps it `no_std`
 # and portable-Rust, so the wasm32-wasip2 build needs no C toolchain.
 blake3 = { version = "1.8", default-features = false }
-# docs/design.md Milestones M3c: every app-tree commit blob crosses the wire
+# docs/design.md "Read-back and partitions": every app-tree commit blob crosses the wire
 # and rests in storage as a keyhive envelope, so a relay or a store holds
 # ciphertext only. Pinned by full sha (unreleased, moving) at the rev the
 # design was written against. All three crates are pure Rust — ed25519-dalek,

@@ -193,12 +193,12 @@ interface device {
     set-hue: async func(hue: u16) -> result<_, error>;
     reroll-word: async func() -> result<string, error>;
 
-    /// The user's own labels for themself, this device, and each installed
-    /// app — petname, glyph, whatever the visor settles on. Free-form while
+    /// The user's own labels for themself and each installed app — petname,
+    /// glyph, whatever the visor settles on. Free-form while
     /// the field set is in flux: keys are the visor's vocabulary, values are
     /// user voice. Personal: rides in the sealed checkpoint with name/hue/
     /// word, so `unavailable` while sealed.
-    variant meta-scope { user, device, app(string) }
+    variant meta-scope { user, app(string) }
     meta: async func(scope: meta-scope) -> result<list<tuple<string, string>>, error>;
     /// Replaces the whole map for `scope`.
     set-meta: async func(scope: meta-scope, entries: list<tuple<string, string>>) -> result<_, error>;
@@ -408,9 +408,6 @@ interface apps {
     /// frame fetches `component`/`assets`/`asset` over that port, which
     /// the glue answers with the session already filled in.
     launch: async func(app: app-id) -> result<session-id, error>;
-    /// Which app a session runs (the frame shows nothing of its own; the
-    /// visor's strip plates this title).
-    session-app: async func(session: session-id) -> result<app-info, error>;
     component: async func(session: session-id) -> result<component-artifacts, error>;
     assets: async func(session: session-id) -> result<list<asset-info>, error>;
     asset: async func(session: session-id, handle: list<u8>) -> result<list<u8>, error>;
@@ -466,7 +463,6 @@ interface app-services {
     use types.{session-id};
     use polyvisor:app/tasks@0.1.0.{snapshot};
 
-    tasks-revision: async func(session: session-id) -> result<u64, string>;
     tasks-items: async func(session: session-id) -> result<snapshot, string>;
     tasks-add: async func(session: session-id, title: string) -> result<string, string>;
     tasks-set-completed: async func(session: session-id, id: string, completed: bool) -> result<_, string>;
@@ -503,8 +499,6 @@ interface shell {
     /// Read once per page load by the visor, after unseal, and handed to
     /// `apps.route-decode`; the visor never parses it.
     fragment: func() -> option<string>;
-    /// `location.reload()`.
-    reload: func();
     /// Re-anchor this tab to another device (or, with `none`, to a fresh
     /// one) and reload: the anchor is the tab's sessionStorage pointer and
     /// the worker is named after it, so a device switch is a page reload.

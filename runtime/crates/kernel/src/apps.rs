@@ -32,6 +32,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
+use data_encoding::HEXLOWER;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -276,11 +277,5 @@ fn failed(url: &str, reason: &str) -> Error {
 /// Hex to bytes. `None` for anything that is not exactly a sha256 digest's
 /// worth of hex digits.
 fn unhex(text: &str) -> Option<Vec<u8>> {
-    if text.len() != 64 {
-        return None;
-    }
-    text.as_bytes()
-        .chunks(2)
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
-        .collect()
+    (text.len() == 64).then(|| HEXLOWER.decode(text.as_bytes()).ok())?
 }

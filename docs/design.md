@@ -1,9 +1,7 @@
 # polyvisor — design record
 
-Rulings for the rebooted tree. Each entry states what is decided and why,
-so later work argues with the reason instead of re-deriving it. Nothing
-here is a compatibility promise: **the whole framework is unstable until
-declared otherwise.** Open questions live in the issue tracker.
+Current architecture and constraints. Open questions live in the issue
+tracker; implementation history lives in Git.
 
 ## Project maturity and tradeoffs
 
@@ -108,10 +106,7 @@ Rules for `polyvisor:internal`:
    `events.next` import from that queue. So an event born of network
    activity alone — the other device confirming a pairing, an enrollment
    landing, a peer closing — reaches the screen with nothing pressed on
-   this device. (This was briefly a non-parking `event-source.drain`
-   while polyengine#292 stood; 0.6.6 fixed it and 0.6.7 fixes the lift
-   regression that fix introduced, polyengine#312.) No callbacks, no
-   second mechanism. What the glue itself observes (a frame torn down by
+    this device. What the glue itself observes (a frame torn down by
    the receiver) enters the same path through `apps.abort`, so the visor
    has one source of truth for session endings; `apps.close` — the
    visor's own act — emits nothing.
@@ -124,38 +119,16 @@ providers by semver track (`@0.3`), so both resolve to one host.
 
 ## No JSPI
 
-Verified against polyengine's source: `NeedsJspi` is raised only for
-(a) a sync-typed import whose host returns a Promise (requires a
-`suspending()` mark), (b) a stackful async lift, (c) a sync lower onto an
-unresolved subtask, (d) blocking built-ins from a frame that cannot
-return a code. The callback ABI — what wit-bindgen emits — needs none of
-it. The old tree required JSPI for one reason: `std::fs` in the engine's
-checkpoint path bound `wasi:filesystem@0.2` (sync WIT) over OPFS
-(Promise-only).
+Every embedder forces `jspi: false`; the browser floor is wasm
+multi-memory. Use wit-bindgen's callback ABI and async host imports.
+Filesystem operations use generated `wasi:filesystem@0.3` bindings,
+not `std::fs` (whose synchronous imports cannot host OPFS promises).
 
-Ruling: the runtime uses `wasi:filesystem@0.3` (async in WIT) through
-generated bindings, not `std::fs`; every glue-implemented import is
-async in WIT; every embedder forces `jspi: false`, so a regression
-anywhere fails loudly.
-
-**No realm is an exception.** The worker was one through M3a: the composed
-iroh endpoint authenticates its QUIC connections with rustls, whose
-`Signer::sign` is synchronous, and an identity built from platform key
-handles (`polymorph:iroh/identity-from-keys`) reaches its key through an
-async import — a sync lower of an async import, which is exactly what JSPI
-exists for, so the accept side of every connection needed it (with
-`jspi: false` the acceptor stalled in `CertificateVerify`). The general
-fact stands: a platform-held, non-extractable key as the TLS identity
-implies JSPI in a browser. polymorph-iroh's `identity-from-seed` (behind
-the `guest-ed25519-signing` feature) takes the other side of that: the
-identity holds its private key in the endpoint component's memory and
-signs there with ed25519-dalek. So every realm is `jspi: false` and the
-browser floor is wasm multi-memory alone. The trade, recorded: identity
-signatures run in wasm rather than in the platform's native crypto, and
-the device seed rests in the endpoint's memory for the endpoint's
-lifetime — it was already in the kernel's, and passed through guest memory
-at every bind, so this widens where it rests and not whether it is
-there.
+The iroh endpoint uses `identity-from-seed`, enabled by
+`guest-ed25519-signing`. Its synchronous TLS signer runs in guest memory;
+a platform-held key requiring an async host call would need JSPI. The
+trade is wasm signing and a copy of the device seed in the endpoint for
+its lifetime, alongside the kernel's copy.
 
 ## The app frame
 
@@ -170,19 +143,10 @@ there.
   (component bytes, port) arrives by `postMessage`.
 - **The app component runs in the frame's main thread.** The stream-dom
   receiver binds to the frame's own DOM same-realm.
-- **No worker inside the frame.** Dedicated workers must be same-origin
-  with their creator and an opaque origin matches nothing in practice
-  (`blob:` workers fail in sandboxed frames; a `data:` worker is the one
-  variant that could work and is not planned). When apps move off the
-  main thread (#45, honest `worker.terminate()`), the design is the
-  stream-dom worker tier laid out across the sandbox: the component runs
-  in a dedicated Worker spawned by the visor on the home origin; the
-  frame holds only the receiver, the policy and the asset resolver, fed
-  frames over a port. Recorded trade: a polyengine bug that let guest
-  code escape to JS would land on the home origin rather than a
-  storage-less, network-less one. The component's own authority is
-  unchanged either way. `web/frame.ts` keeps its polyengine use behind
-  one seam so that move is a deletion.
+- **No worker inside the frame.** Dedicated workers require a matching
+  origin; the sandbox has an opaque origin. Moving execution into a
+  home-origin worker is deferred (#45) and would weaken containment of a
+  guest-to-JS escape while enabling `worker.terminate()`.
 - **Policy** is stream-dom's `Policy` object: pinned to the receiver's
   `PROTOCOL_VERSION`, `check(op)` over a table-driven allowlist (tags,
   attributes per tag, properties — never `innerHTML` — event names, URL
@@ -198,8 +162,8 @@ there.
   frame fetches every asset over its session port (`apps.asset`) before
   the producer runs and mints one `blob:` URL per handle. Asset `href` is
   legal only on `<link>`; an `<a href>` is a fragment. The kernel is the
-  only fetcher and re-hashes what it serves; until installation lands
-  (M2) it fetches bundles from the home origin over `wasi:http`.
+  only fetcher and re-hashes what it serves. Bundles currently come from
+  the home origin over `wasi:http`.
 
 ## The kernel is one component
 
@@ -221,25 +185,22 @@ form. Polyvisor owns five implementations:
 | Trait | Implementation |
 |---|---|
 | `Transport` | one per connection over `polymorph:iroh` streams, relay-only: WebRTC is off in the worker because a SharedWorker has no `RTCPeerConnection` (the host backend never resolves there). Framing per `subduction_iroh` (u32 BE length prefix) so native subduction peers interoperate |
-| `Storage` | M3a: an in-memory item store serialized into the sealed checkpoint with the automerge docs. Items in their own files under the state root is the follow-up once checkpoint size matters |
+| `Storage` | an in-memory item store serialized into the sealed checkpoint with the automerge docs |
 | `Policy` | group membership, read off the user-system document (`polyvisor:us`): a remote peer may read/write exactly while its key is a member. App-tree envelopes are keyhive's (M3c, `engine/src/vault.rs`) |
-| `Signer` / `NodeEffect::Sign` | M3a: `ed25519-dalek` over a seed held in the sealed checkpoint (the seed posture; the same seed builds the iroh identity, through `polymorph:iroh/identity-from-seed`). Later: a non-extractable platform key — signing is an effect with external custody, which is exactly what that needs |
+| `Signer` / `NodeEffect::Sign` | `ed25519-dalek` over the sealed device seed, also used by the iroh identity |
 | `Clock` | `wasi:clocks@0.3` |
 
-Why the branch rather than the released crates: one driver loop the
-checkpoint can stop the world against (the legacy core spawned its own
-tasks and slept on Rust channels — the source of a whole class of old
-wedges), signing as an effect (the legacy `Signer` was infallible, so a
-platform key could only trap), and a wire that is byte-compatible with
-legacy by design. Cost: an unreleased tree with moving APIs; the five
-trait impls are the whole exposure, and every rev bump is its own PR
-behind the interop gate. `subduction_iroh` itself is native-only (upstream
-iroh + tokio) and cannot be used in a component; its conventions are the
-reference, not its code.
+The sans-IO branch provides one driver loop that checkpointing can pause
+and explicit signing effects. `subduction_iroh` is native-only; its wire
+conventions are the reference, not its implementation. Native-peer
+interop is deferred until a native peer exists.
 
-keyhive is pinned to git `main` for the CGKA transitive-authority fix
-(66a6632: relay access no longer grants CGKA membership) that the
-released 0.5.0 lacks; the pull ≠ read tier separation depends on it.
+App trees are keyhive-sealed. Two system trees remain plaintext:
+`polyvisor:us` (group membership: endpoint public keys and petnames), and
+the keyhive-events tree (signed, content-free operations). Keyhive's git
+pin includes the transitive-authority fix separating relay access from
+group membership. Pairing enrolls a device with the group's current
+decryption heads, allowing it to read the group's history.
 
 ## Read-back and partitions
 
@@ -373,9 +334,6 @@ handing out handles.
   does not. The one silent case, a user closing the popup mid-flow, is
   covered by a ten-minute bound on the waiting side; provider codes do
   not outlive that.
-- **No kernel change.** The pending ceremony in the kernel is replaced
-  by the next `oauth-start`; its state is random and its code one-shot,
-  so a stale one costs nothing.
 - **COOP `same-origin` on the home origin is the general form** of all
   of this: the browsing-context-group swap makes a null opener actually
   mean "no handle", and it covers windows we never opened. It is an
@@ -413,13 +371,11 @@ the handshake.
   `argon2`) with the key as bytes: a non-extractable WebCrypto handle
   persisted in IndexedDB would rest under the same profile protection,
   so it buys nothing at this tier. The signing identity is a seed in the
-  same sealed checkpoint (M3a); platform-held keys enter with the passkey
-  PRF rung (M5); the transport's TLS signer is in-guest instead (see
-  "No JSPI").
+  same sealed checkpoint; the transport's TLS signer is in-guest (see
+  "No JSPI"). Passkey unseal is deferred.
 - **Checkpoints** are AES-GCM over the kernel's serialized state, written
   to `/<id>/gen-<n>/` on the OPFS root through `wasi:filesystem@0.3` after
-  every mutation (state is small until the engine lands; a debounce is a
-  later optimization). Commit protocol: state, then MANIFEST (generation +
+  every mutation. Commit protocol: state, then MANIFEST (generation +
   digest), then the generation pointer in `kv` — the pointer is the commit
   point, a failed write never advances it, and a load falls back one
   generation. The kernel never lists a directory: `read-directory` is one
@@ -431,20 +387,12 @@ the handshake.
 - **Switching devices is a reload** (`shell.switch-device`): the anchor
   changes and the page restarts against another worker. Erase destroys
   the namespace and the index row, then switches to a fresh device.
-- **A tab with no anchor adopts the last kept device.** The anchor is
-  per tab, and a fresh tab — a typed URL, a bookmark, an installed app's
-  window — has none; minting a new device there made "new tab, new
-  stranger" the default, and which tabs shared a device turned on how
-  the tab had been opened (Chromium copies `sessionStorage` on duplicate
-  and `window.open`, on nothing else). So the glue keeps one more
-  pointer, in `localStorage`: the id of the last device this profile saw
-  as *durable*, written whenever `device.status` reports that tier and
-  never for an ephemeral (they are swept). A tab with no anchor takes it;
-  only a profile with no kept device — or an explicit
-  `switch-device(none)`, which clears the pointer too — mints. The
-  pointer names a worker and grants nothing: a passphrase device still
-  opens sealed, and a rests-open one was already the profile's. Several
-  devices in one profile remain possible; they stop being an accident.
+- **A tab with no anchor adopts the last kept device.** The glue keeps
+  its id in `localStorage`, updated when `device.status` reports a durable
+  device. Without this pointer, or after `switch-device(none)` clears it,
+  a fresh tab mints a device. The pointer grants no authority: passphrase
+  devices still open sealed. Explicit switching supports multiple devices
+  in one profile.
 
 ## Visor and apps render through stream-dom
 
@@ -455,10 +403,9 @@ trust table and boot cache are kernel state served over `device`/`apps`,
 so the visor has no persistence import of its own and the same component
 runs under a native shell.
 
-Known costs carried from the visor-dioxus spike: ~400 KB gzipped
-floor; predicates become bools at the WIT boundary; a Dioxus component
-that writes a signal it never reads renders once forever — invisible to
-native tests, so browser gates are mandatory for every visor change.
+A Dioxus component that writes a signal it never reads does not subscribe
+to updates. Native tests cannot catch the resulting frozen UI, so visor
+changes require browser verification.
 
 ## Routing
 
@@ -467,9 +414,8 @@ running app and a route the app chose, so "this app, here" can be
 bookmarked. The fragment is the only place for it — it never reaches the
 server, and it is the one part of the URL an app frame's `href` policy
 already treats as same-document (`web/policy.ts`). Two parts, two
-owners: the visor owns the grammar (`<kind>/<rest>`, `app` the only kind
-today; anything else is refused by `route-decode` exactly as an
-unreadable token is), and the app owns the
+owners: the visor owns the grammar (`app/<token>` or `launch/<app-id>`;
+unknown kinds are refused by `route-decode`), and the app owns the
 text inside `route`, which the visor carries byte-for-byte and never
 interprets.
 
@@ -574,100 +520,38 @@ interprets.
   would be a device of its own. Unverified and to be probed: that the
   fragment survives in `start_url` (a `?launch=` query is an acceptable
   fallback for this kind exactly because the package id is public).
-- **Struck: pairing codes in the fragment.** A code is either short
-  enough to type or key material that does not belong in a URL at all;
-  the fragment was a transport looking for a route.
 
 ## Pins, with reasons
 
-| Dependency | Pin | Reason |
-|---|---|---|
-| Rust | 1.98.1 | current stable; satisfies stream-dom (1.98), subduction (1.91), keyhive (1.90) |
-| `wit-bindgen` | `=0.60.0`, workspace-wide | must equal stream-dom's pin: `StreamReader<u8>` (a wit-bindgen runtime type) crosses the delegation from our world's `run` into `stream_dom_dioxus::driver::run`. Different wit-bindgen versions *can* coexist in one component (the `wasip3_task_set` weak-symbol ABI exists for exactly that), but not across a shared runtime type. Bumps follow stream-dom's. `generate!` never sets `async: true`: that lowers sync WIT functions (resource constructors) async, which the canonical ABI forbids and only the translator catches; WIT's own `async func` annotations are the source of truth |
-| `@polyengine/*` | 0.6.7, one version across the graph | first release where an async export may park on a guest waker (#292) without the 0.6.6 lift regression (#312); brand symbols are per-version, so a partial upgrade fails at `instanceof` |
-| `dioxus` | `=0.7.10` | dioxus-core state is shared with `stream-dom-dioxus`; skew breaks the build |
-| polymorph-stream-dom | git rev (see Cargo.toml / deno.json) | unpublished, moving; policy object and asset handles landed in #15; the Dioxus `asset:<hex>` attribute spelling landed in #19 |
-| subduction | git `sansio` rev | above |
-| keyhive | git rev `a509a2d` | `keyhive_core` / `keyhive_crypto` / `beekem`, unreleased and moving. The sealed plaintext is keyhive's own `Envelope` and the read-back walk is keyhive's own `try_causal_decrypt`, so a rev bump is a wire-format change for every stored blob: its own PR |
-| `@polymorph/*` | 0.6.1 (webcrypto, websocket), 0.6.2 (webrtc-datachannels) | the cuts current at the polyengine 0.6.7 pin; taken within the `^0.6` range |
-| polymorph-iroh | git rev `8ca991e` | the endpoint component is built from source, not taken from the jsr package: the runtime binds its identity through `identity-from-seed`, which the package gates behind the cargo feature `guest-ed25519-signing` and its published artifact excludes. `just endpoint` clones and builds the pin; the vendored `runtime/wit/deps/polymorph-iroh/iroh.wit` is that revision's |
-| `wasi:*` WIT | 0.3.1 (consolidated WASI release) | what `@polyengine/wasi` serves on the `@0.3` track |
+Versions live in the manifests, lockfiles, `rust-toolchain.toml`, and
+`justfile`. Constraints on changing them:
+
+- `wit-bindgen` and Dioxus must match stream-dom's versions: Rust types
+  cross their shared boundary. WIT's `async func` annotations control
+  lowering; never blanket-enable `generate!`'s `async: true` for sync
+  resource constructors.
+- Polyengine packages sharing branded runtime values must resolve to the
+  same version. The tree consumes releases from JSR; dependency age is
+  zero so fixes can be tested immediately.
+- Keyhive owns the stored envelope format; upgrading it may change that
+  format. Subduction's sans-IO APIs are also unreleased and moving.
+- The iroh endpoint is built from the revision in `justfile` with
+  `guest-ed25519-signing`; the published artifact omits that feature.
+  Its vendored WIT must match the source revision.
 
 ## Delivery
 
-- Same repository; the pre-reboot tree is tag `pre-reboot` / branch
-  `archive/v0`. Nothing carries verbatim; it is mined by reading.
-- One embedding: one device per page, the runtime in a SharedWorker.
-  Multi-device and multi-user scenarios are several browser contexts
-  against one relay.
-- Rust producers only (Dioxus). A JS producer on-ramp waits for a
-  stream-dom JS adapter.
+- Rust producers (Dioxus), browser embedding. One SharedWorker per device;
+  tabs may share a device. Multi-device tests use isolated browser contexts
+  against a local relay and fake Drive.
 - Gates: `cargo test` (native, per crate), `deno test` (glue), and
   Playwright on real Chromium for every claim about pixels or realms.
   The archive's scenarios are reference material, not a parity obligation;
   retain coverage for current claims rather than historical scenario names.
 
-### Milestones
+### Deferred scope
 
-- **M0** archive, skeleton, this record, both WIT packages, CI.
-- **M1** three realms, one TodoMVC: stub kernel with in-memory `tasks`;
-  visor strip + settings sheet; frame loader under policy; ports.
-  Gates: app renders in the opaque frame; zero network requests from
-  the frame; `jspi: false`;
-  the frame policy's unit tests. (The frame-teardown integration test
-  waits for a hostile fixture component — M2. The path was exercised
-  anyway: the policy caught the TodoMVC example's outbound `href`.)
-- **M2** devices survive: the index, namespaces, the two tiers of rest,
-  checkpoint/resume on OPFS, locks and the sweep, entry/keep/unseal/erase
-  in the visor, and the hostile-fixture frame-teardown scenario. Reload
-  survival with worker respawn as the normal case.
-- **M3a** the engine in the loop: `tasks` becomes an automerge document
-  from the start, the sans-IO subduction driver with polyvisor's trait
-  implementations, an iroh transport over the composed endpoint
-  component, manual dial by endpoint id, two devices converging over a
-  local relay in e2e. Policy is allow-all until M3b. Wire compatibility
-  with native subduction peers is a gate only when a native peer exists
-  (headless, parked). **M3b** pairing (code + commit/reveal SAS + dual
-  confirm), the device group as the user-system document, sync policy =
-  group membership, reconnect at boot. **M3c** keyhive/BeeKEM: envelope
-  encryption of every *app* tree, so relays and stores hold app content
-  as ciphertext only; the group's keyhive membership derived from the
-  user-system document. Two trees stay plaintext by ruling:
-  `polyvisor:us`, because it is what tells a device which group — and so
-  which keyhive document — it belongs to, and it carries only endpoint
-  public keys and petnames a relay already sees; and the keyhive-events
-  tree, keyhive's own signed, content-free operation log. Enrollment is
-  total read-back: the adder hands the joiner every content key it holds
-  over the SAS-authenticated pairing connection, so a new device reads
-  the group's entire history; the read-back window for shared documents
-  is an open policy item, and shared documents do not exist yet.
-  Sequenced after M3b because device↔device sync already runs inside
-  authenticated QUIC — content encryption is what untrusted *storage*
-  (M4) needs, and building the group first gives keyhive a membership
-  to key.
-- **M4** storage: Google Drive as the first (and, for now, only) dumb
-  store — user-only, keyed object names, the OAuth ceremony split
-  between kernel (PKCE, exchange, sealed tokens) and shell (the popup),
-  push and pull after every local change, at boot, and on demand; a fake
-  Drive in e2e. Provider-as-component (the `provider` world, per-
-  destination egress, the picker) waits for a second provider: one
-  backend does not justify a boundary. S3 is deferred; Drive is what a
-  person has.
-- Parked, as issues: the passkey PRF unseal rung (#166), recovery kits
-  (#167); app worker (above); native shell; JS producers; S3 and the
-  provider component boundary (a second provider).
-
-## polyengine is consumed from JSR
-
-Found in M1: an import awaited from a Dioxus event handler never resumed
-until the next event. Root cause (polyengine, fixed upstream in #289): a
-`driveAsync` loop parked on `Promise.race([...pendingHostCalls, ...])`
-holds a snapshot; an export entered through the synchronous `drive` path
-fires no driver-arrival, so a host call registered during it is
-invisible to the parked race, and the settlement pump stands down while
-the parked driver counts. A stream-dom producer is the routine victim —
-its `readDirect` session keeps a driver parked whenever one long poll
-is outstanding. The fix shipped in polyengine 0.6.4; the tree consumes
-it at a caret JSR pin. `deno.json` sets `minimumDependencyAge` to zero:
-polyengine releases are cut minutes before this tree takes them, and
-Deno's 24 h age gate would otherwise refuse them.
+Passkey unseal (#166), recovery kits (#167), app worker (#45), native
+shell, JS producers, and additional stores. Drive is the only provider;
+a provider-component abstraction waits for a second one. Shared-document
+history policy is undecided; shared documents do not exist yet.

@@ -1,8 +1,8 @@
 /// polyvisor:app — the public contract: everything code from outside this
 /// repository links against. Apps target `world app`; data services and
-/// providers target the worlds added beside it. This package is versioned
-/// deliberately and grows only additively; `runtime/wit` (polyvisor:internal)
-/// is the private half and changes freely.
+/// providers target the worlds added beside it. This package is public but
+/// unstable: it changes with known consumers while the project has no users.
+/// `runtime/wit` (polyvisor:internal) is the private half.
 ///
 /// An app's authority is its import set. The framework links each import
 /// according to the user's grants: an import the user has not granted is
@@ -16,9 +16,6 @@ package polyvisor:app@0.1.0;
 /// data — its schema, policy and migrations — and any number of apps
 /// project it. Apps never see documents; they see this.
 ///
-/// Poll-shaped on purpose: `revision` is a cheap monotonic probe and
-/// `items` a full snapshot. A change feed is the expected additive next
-/// step once apps have an event path that wants one.
 interface tasks {
     record todo-item {
         /// Stable, opaque, unique within the partition.
@@ -29,16 +26,10 @@ interface tasks {
 
     /// A consistent view of the partition.
     record snapshot {
-        /// Advances whenever a local or synced change is applied. Equal
-        /// revisions on one replica imply an unchanged snapshot; not
-        /// comparable across replicas.
-        revision: u64,
-        /// Items in stable (id) order.
+        /// Items ordered by creation position, then id to break concurrent ties.
         items: list<todo-item>,
     }
 
-    /// Apply any newly synced changes, then report the revision.
-    revision: async func() -> result<u64, string>;
     /// Apply any newly synced changes, then snapshot.
     items: async func() -> result<snapshot, string>;
     /// Create a task; returns its id.

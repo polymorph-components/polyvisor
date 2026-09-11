@@ -38,20 +38,15 @@ use subduction_runtime::storage::{FetchedItems, Storage};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub apps: Vec<AppState>,
-    /// The user-system document and its tree. `#[serde(default)]` because
-    /// checkpoints written before the group existed have no such field, and
-    /// a device must still boot from one.
-    #[serde(default)]
+    /// The user-system document and its tree.
     pub us: Option<TreeState>,
     /// The keyhive-events tree (`crate::keyhive_tree`): the membership and
     /// CGKA operations that let this device's peers open its envelopes. It has
     /// no automerge document — `TreeState::doc` is empty — because its commits
     /// *are* the state.
-    #[serde(default)]
     pub keyhive: Option<TreeState>,
     /// This device's keyhive itself, including secrets. Sealed with the rest
     /// of the checkpoint.
-    #[serde(default)]
     pub vault: Option<crate::vault::VaultState>,
     /// The group's store-name key (docs/design.md M4, the Drive record): the
     /// 32 bytes every name in the user's own store is HMAC'd under, so two
@@ -60,10 +55,7 @@ pub struct Snapshot {
     /// which is why it rests here rather than being derived from the seed:
     /// it belongs to the *group*, and the seed is one device's.
     ///
-    /// `Option` because a checkpoint written before M4 has no such field, and
-    /// because a device that has never opened its group document has no group
-    /// to have a key for.
-    #[serde(default)]
+    /// `None` while a device has not opened its group document.
     pub name_key: Option<[u8; 32]>,
 }
 
@@ -89,11 +81,10 @@ pub struct TreeState {
 /// The store is names plus opaque bytes, but the two item kinds decode into
 /// different envelopes (`Signed<LooseCommit>` vs `Signed<Fragment>`) and are
 /// checked differently, so the record has to say which it is.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ItemKind {
     /// One automerge change.
-    #[default]
     Commit,
     /// A roll-up of a commit range: one automerge bundle.
     Fragment,
@@ -120,10 +111,6 @@ pub struct StoreItem {
     pub commit: [u8; 32],
     pub signed: Vec<u8>,
     pub blob: Vec<u8>,
-    /// `#[serde(default)]` — `Commit` — because objects written before
-    /// fragments existed carry no such field, and a device must still read
-    /// its group's older objects.
-    #[serde(default)]
     pub kind: ItemKind,
 }
 

@@ -195,9 +195,7 @@ impl UsDoc {
         found
     }
 
-    /// The keyhive group and document ids this group seals its app content
-    /// to, if the document names them. A group founded before M3c has no such
-    /// entry; the founder writes one on its next boot.
+    /// The keyhive group and document ids this group seals its app content to.
     pub fn keyhive(&self) -> Option<([u8; 32], [u8; 32])> {
         let doc = self.core.read();
         let (_value, keyhive) = doc.get(ROOT, KEYHIVE).ok().flatten()?;

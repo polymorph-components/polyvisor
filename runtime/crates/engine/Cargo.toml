@@ -35,8 +35,3 @@ subduction_runtime.workspace = true
 
 [dev-dependencies]
 futures = { workspace = true, features = ["executor"] }
-future_form.workspace = true
-# The fragment-identity test decodes a checkpoint's `Signed<Fragment>` to
-# compare head and boundary; both are already dependencies of the library.
-sedimentree_core.workspace = true
-subduction_crypto.workspace = true

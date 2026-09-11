@@ -34,13 +34,13 @@ confinement.
 | `e2e/` | Playwright scenarios |
 | `docs/` | `design.md`, the authority for everything above |
 
-`docs/design.md` is the authority for rulings, contracts and milestones;
+`docs/design.md` is the authority for architecture and contracts;
 read it before arguing with anything here.
 
 Run `just --list` for the available recipes; `just e2e` runs the Playwright
 suite against a local iroh relay.
 
-**Status (M0–M4 landed):** three realms with TodoMVC; devices with two
+**Implemented:** three realms with TodoMVC; devices with two
 tiers of rest, sealed OPFS checkpoints and a swept index; `tasks` as an
 automerge document synced between devices over subduction and the iroh
 relay; pairing by code + SAS into a device group that is the sync policy;

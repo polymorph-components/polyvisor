@@ -1468,7 +1468,7 @@ fn meta_persists_across_a_reload_and_is_unavailable_while_sealed() {
         "meta rides in the sealed checkpoint: unavailable while sealed"
     );
     assert_eq!(
-        block_on(reread.set_meta(MetaScope::Device, BTreeMap::new()))
+        block_on(reread.set_meta(MetaScope::App("app-1".into()), BTreeMap::new()))
             .unwrap_err()
             .code,
         ErrorCode::Unavailable
@@ -1494,7 +1494,7 @@ fn tasks_survive_a_reload_but_sessions_do_not() {
     let kernel = world.boot();
     // The old session id is gone with the worker that minted it.
     assert_eq!(
-        block_on(kernel.tasks_revision(1)),
+        block_on(kernel.tasks_items(1)),
         Err("unknown session".into()),
         "sessions are not persisted: a reload ends them"
     );
@@ -2050,11 +2050,10 @@ fn sessions_are_monotonic_and_close_is_idempotent() {
     let a = session(&kernel);
     let b = session(&kernel);
     assert_eq!((a, b), (1, 2));
-    assert_eq!(kernel.session_app(a).unwrap().id, "todomvc");
 
     kernel.close(a);
     assert_eq!(
-        kernel.session_app(a).unwrap_err().code,
+        kernel.assets(a).unwrap_err().code,
         ErrorCode::UnknownSession
     );
     kernel.close(a); // idempotent per internal.wit
@@ -2112,10 +2111,6 @@ fn an_asset_that_does_not_hash_to_its_handle_is_rejected() {
 fn unknown_sessions_are_rejected_everywhere() {
     let kernel = boot();
     assert_eq!(
-        kernel.session_app(99).unwrap_err().code,
-        ErrorCode::UnknownSession
-    );
-    assert_eq!(
         block_on(kernel.component(99)).unwrap_err().code,
         ErrorCode::UnknownSession
     );
@@ -2128,7 +2123,7 @@ fn unknown_sessions_are_rejected_everywhere() {
         ErrorCode::UnknownSession
     );
     assert_eq!(
-        block_on(kernel.tasks_revision(99)),
+        block_on(kernel.tasks_items(99)),
         Err("unknown session".into())
     );
 }
@@ -2158,10 +2153,9 @@ fn tasks_are_shared_by_every_session_of_one_app() {
 }
 
 #[test]
-fn every_mutation_advances_the_revision_and_ids_order_the_items() {
+fn mutations_update_items_and_ids_preserve_creation_order() {
     let kernel = boot();
     let s = session(&kernel);
-    assert_eq!(block_on(kernel.tasks_revision(s)).unwrap(), 0);
 
     let first = block_on(kernel.tasks_add(s, "milk".into())).unwrap();
     let second = block_on(kernel.tasks_add(s, "bread".into())).unwrap();
@@ -2169,12 +2163,9 @@ fn every_mutation_advances_the_revision_and_ids_order_the_items() {
     // shared counter is not safe across two authors. The document records
     // each item's place instead, and `items` comes back in that order.
     assert_ne!(first, second);
-    assert_eq!(block_on(kernel.tasks_revision(s)).unwrap(), 2);
-
     block_on(kernel.tasks_set_completed(s, &first, true)).unwrap();
     block_on(kernel.tasks_set_title(s, &second, "rye".into())).unwrap();
     let snapshot = block_on(kernel.tasks_items(s)).unwrap();
-    assert_eq!(snapshot.revision, 4);
     assert_eq!(
         snapshot
             .items
@@ -2187,13 +2178,15 @@ fn every_mutation_advances_the_revision_and_ids_order_the_items() {
     assert_eq!(snapshot.items[1].title, "rye");
 
     block_on(kernel.tasks_remove(s, &first)).unwrap();
-    assert_eq!(block_on(kernel.tasks_revision(s)).unwrap(), 5);
     assert_eq!(block_on(kernel.tasks_items(s)).unwrap().items.len(), 1);
 
     // A failed mutation is not a mutation.
     assert!(block_on(kernel.tasks_remove(s, &first)).is_err());
     assert!(block_on(kernel.tasks_set_title(s, "nope", "x".into())).is_err());
-    assert_eq!(block_on(kernel.tasks_revision(s)).unwrap(), 5);
+    let items = block_on(kernel.tasks_items(s)).unwrap().items;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, second);
+    assert_eq!(items[0].title, "rye");
 }
 
 // -- events ------------------------------------------------------------------
@@ -2289,7 +2282,7 @@ fn abort_ends_the_session_and_announces_it_once() {
     kernel.abort(s, "the app's frame was closed: policy".into());
 
     assert_eq!(
-        kernel.session_app(s).unwrap_err().code,
+        kernel.assets(s).unwrap_err().code,
         ErrorCode::UnknownSession,
         "the session is no longer live"
     );
@@ -2767,8 +2760,8 @@ fn pairing_enrolls_the_joiner_and_the_two_devices_then_sync() {
 
 #[test]
 fn a_second_claim_is_refused_and_burns_the_ceremony_it_interrupted() {
-    // PAIRING.md §1: the token is single-claim. A code that reached a second
-    // party has leaked, so the second claim is refused *and* the bound
+    // The token is single-claim. A code that reached a second party has
+    // leaked, so the second claim is refused *and* the bound
     // session dies — both users start over rather than one of them finishing
     // a ceremony an eavesdropper watched.
     let here = World::default();
@@ -2918,8 +2911,8 @@ fn a_cancel_before_the_confirm_tells_the_other_side() {
 
 #[test]
 fn an_offer_expires_after_two_minutes() {
-    // PAIRING.md §1: the offer stands 120 s. After that the code is dead on
-    // both sides — the joiner says so, and a claim that arrives late is
+    // The offer stands 120 s. After that the code is dead on both sides —
+    // the joiner says so, and a claim that arrives late is
     // refused rather than quietly honoured.
     let here = World::default();
     let there = here.peer();

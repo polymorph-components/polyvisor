@@ -257,8 +257,6 @@ pub(crate) async fn reroll_word() -> Result<String, String> {
 }
 
 /// Which map `meta`/`set_meta` reads or replaces (internal.wit `meta-scope`).
-/// The `device` scope exists in the contract but nothing in the visor edits
-/// it yet, so it has no variant here.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum MetaScope {
     User,
@@ -274,8 +272,7 @@ fn meta_scope(scope: MetaScope) -> api::device::MetaScope {
 
 pub(crate) type Meta = std::collections::BTreeMap<String, String>;
 
-/// The user's own labels for themself, this device, and one app
-/// (internal.wit `device.meta`).
+/// The user's own labels for themself or one app (internal.wit `device.meta`).
 pub(crate) async fn meta(scope: MetaScope) -> Result<Meta, String> {
     Ok(api::device::meta(meta_scope(scope))
         .await

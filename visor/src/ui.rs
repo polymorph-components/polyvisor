@@ -40,10 +40,7 @@ use crate::state::{
 use crate::style::CSS;
 use crate::voice::{AppText, AppVoice, Voice, coarse_age};
 
-/// The two keys this visor writes into every meta map. internal.wit
-/// `device.meta` leaves the vocabulary to the visor ("keys are the visor's
-/// vocabulary, values are user voice"), so these two names are the whole
-/// of it, and they mean the same thing in all three scopes.
+/// Visor-owned keys, with the same meaning in user and app metadata.
 const PETNAME: &str = "petname";
 const GLYPH: &str = "glyph";
 
@@ -169,9 +166,7 @@ async fn save_draft(
     !failed
 }
 
-/// One app's labels (internal.wit `device.meta`, `meta-scope.app`). Read
-/// when a session opens — the strip's left half speaks for the running app
-/// — and again when its sheet is opened.
+/// Load the running app's labels when its session opens.
 async fn read_app_meta(id: String, mut app_meta: Signal<Meta>, mut notice: Signal<Option<Notice>>) {
     match kernel::meta(MetaScope::App(id)).await {
         Ok(m) => app_meta.set(m),
@@ -719,20 +714,10 @@ pub(crate) fn Visor() -> Element {
                 refresh_devices.call(());
                 refresh_storage.call(());
             }
-            // The sheet is about the running app, so its labels are read
-            // before they are seeded — the strip has them already, but a
-            // second device of the group may have relabelled it since.
+            // Seed synchronously before the pane can accept input; a later
+            // seed could overwrite a glyph selected while a read was in flight.
             Some(Tenant::AppInfo) => {
-                let id = session
-                    .read()
-                    .as_ref()
-                    .map(|(_, a): &(SessionId, App)| a.id.clone());
-                spawn(async move {
-                    if let Some(id) = id {
-                        read_app_meta(id, app_meta, notice).await;
-                    }
-                    seed_draft.call(());
-                });
+                seed_draft.call(());
             }
             _ => {}
         }

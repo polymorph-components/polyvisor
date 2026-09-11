@@ -1,5 +1,5 @@
 // A fake Google Drive: exactly the requests the kernel's store makes, and
-// nothing else (m4-context.md "Fake Drive").
+// nothing else.
 //
 // WHAT THIS IS NOT: a Drive emulator. It implements the OAuth half the
 // ceremony needs (`/auth`'s headless consent, `/token`'s two grants) and

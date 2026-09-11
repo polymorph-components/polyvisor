@@ -4,10 +4,8 @@
 //! and the drawer into its mount root, driving the kernel through the
 //! `device`/`apps`/`events` imports and the page through `shell`.
 //!
-//! Split for the same reason as the runtime component: everything with a
-//! testable answer — the voices, the drawer state machine, the stylesheet —
-//! is plain Rust and runs under a host `cargo test`, while the bindings and
-//! the UI that calls them are behind the wasm cfg.
+//! Plain state and presentation modules remain available to native tests;
+//! bindings and UI imports compile only for the component target.
 
 // Off the component target these modules' only consumers are their own
 // tests — the UI that uses them in earnest is wasm-only — so dead-code

@@ -77,34 +77,12 @@ impl Dek {
 }
 
 /// The record written to `dev/<id>/dek-wrapped` when a device rests under a
-/// passphrase. Everything needed to re-derive the KEK, and nothing else: the
-/// parameters travel with the ciphertext so a later runtime raising the cost
-/// can still open an older device.
+/// passphrase.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WrappedDek {
-    v: u32,
     pub salt: Vec<u8>,
     pub nonce: Vec<u8>,
     pub ct: Vec<u8>,
-    pub params: Argon2Params,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Argon2Params {
-    /// Memory cost in KiB.
-    pub m_cost: u32,
-    pub t_cost: u32,
-    pub p_cost: u32,
-}
-
-impl Default for Argon2Params {
-    fn default() -> Self {
-        Argon2Params {
-            m_cost: ARGON2_M_COST_KIB,
-            t_cost: ARGON2_T_COST,
-            p_cost: ARGON2_P_COST,
-        }
-    }
 }
 
 impl WrappedDek {
@@ -116,45 +94,31 @@ impl WrappedDek {
         rng.fill(&mut salt);
         let mut nonce = [0u8; NONCE_LEN];
         rng.fill(&mut nonce);
-        let params = Argon2Params::default();
-        let kek = derive_kek(passphrase, &salt, &params)?;
+        let kek = derive_kek(passphrase, &salt)?;
         let ct = encrypt(&kek, &nonce, &dek.0, id.as_bytes())?;
         Ok(WrappedDek {
-            v: crate::device::SCHEMA,
             salt: salt.to_vec(),
             nonce: nonce.to_vec(),
             ct,
-            params,
         })
     }
 
     /// The login. A wrong passphrase is indistinguishable from a corrupt
     /// record here; the caller turns both into `refused`.
     pub fn unwrap_with(&self, passphrase: &str, id: &str) -> Result<Dek, Error> {
-        let kek = derive_kek(passphrase, &self.salt, &self.params)?;
+        let kek = derive_kek(passphrase, &self.salt)?;
         let nonce: [u8; NONCE_LEN] = self.nonce.as_slice().try_into().map_err(|_| unreadable())?;
         let plain = decrypt(&kek, &nonce, &self.ct, id.as_bytes())?;
         Dek::decode(&plain)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<WrappedDek, Error> {
-        let record: WrappedDek = serde_json::from_slice(bytes).map_err(|e| {
+        serde_json::from_slice(bytes).map_err(|e| {
             Error::new(
                 ErrorCode::Failed,
                 format!("the wrapped data key could not be read: {e}"),
             )
-        })?;
-        if record.v != crate::device::SCHEMA {
-            return Err(Error::new(
-                ErrorCode::Failed,
-                format!(
-                    "the wrapped data key is version {}; this runtime speaks {}",
-                    record.v,
-                    crate::device::SCHEMA
-                ),
-            ));
-        }
-        Ok(record)
+        })
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
@@ -167,18 +131,19 @@ impl WrappedDek {
     }
 }
 
-fn derive_kek(
-    passphrase: &str,
-    salt: &[u8],
-    params: &Argon2Params,
-) -> Result<[u8; DEK_LEN], Error> {
-    let params = argon2::Params::new(params.m_cost, params.t_cost, params.p_cost, Some(DEK_LEN))
-        .map_err(|e| {
-            Error::new(
-                ErrorCode::Failed,
-                format!("the key derivation parameters are not usable: {e}"),
-            )
-        })?;
+fn derive_kek(passphrase: &str, salt: &[u8]) -> Result<[u8; DEK_LEN], Error> {
+    let params = argon2::Params::new(
+        ARGON2_M_COST_KIB,
+        ARGON2_T_COST,
+        ARGON2_P_COST,
+        Some(DEK_LEN),
+    )
+    .map_err(|e| {
+        Error::new(
+            ErrorCode::Failed,
+            format!("the key derivation parameters are not usable: {e}"),
+        )
+    })?;
     let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut kek = [0u8; DEK_LEN];
     argon

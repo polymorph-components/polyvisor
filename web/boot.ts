@@ -927,12 +927,7 @@ async function main(): Promise<void> {
       closeFrame(session);
       return Promise.resolve();
     },
-    // `shell.reload` is the one sync func in internal.wit: it must not
-    // return a promise.
-    reload: () => {
-      location.reload();
-    },
-    // Also sync (internal.wit `shell.fragment`). `""` and `"#"` both read as
+    // Sync (internal.wit `shell.fragment`). `""` and `"#"` both read as
     // `undefined`: `location.hash` is `""` with none, and is `"#"` for a
     // literal bare `#` — neither names a fragment `apps.route-decode` could
     // ever accept, so there is nothing to hand it.

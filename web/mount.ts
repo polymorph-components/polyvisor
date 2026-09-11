@@ -1,18 +1,6 @@
-// Mount a `polymorph:stream-dom` producer with extra WIT imports.
-//
-// `@polymorph/stream-dom-receiver`'s own `mount()` has no way to add imports,
-// and both producers here need some: the visor imports the kernel interfaces
-// and `shell`, the app imports `polyvisor:app/tasks`. So this is that
-// module's component-glue half — `createDriver` + `instantiate` + the
-// readDirect loop — copied from receiver/src/mount.ts at the pinned rev
-// (deno.json's import map) with `imports` merged in and the transports,
-// recording tap and remote backend dropped: nothing here uses them.
-//
-// JSPI is not an option this repository takes (docs/design.md "No JSPI"):
-// every realm-crossing import is `async func` and suspends through the
-// component model's async ABI, so a Promise from a sync-typed import is a
-// bug and the embedder should refuse it loudly. Hence `jspi: false` on the
-// `instantiate` below — pinned for every call site by web/jspi_test.ts.
+// Mount stream-dom producers with their additional WIT imports. This is the
+// receiver's createDriver/instantiate/readDirect path, with unused transports
+// omitted. JSPI stays explicitly disabled by design.
 
 import { instantiate } from "@polyengine/runtime/embedder";
 import type { InstantiateSource } from "@polyengine/runtime/embedder";

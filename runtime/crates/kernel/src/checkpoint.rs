@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! /<id>/gen-<n>/state      nonce || AES-256-GCM(DEK, aad = <id>) over JSON
-//! /<id>/gen-<n>/MANIFEST   { v, generation: n, sha256: hex(state bytes) }
+//! /<id>/gen-<n>/MANIFEST   { generation: n, sha256: hex(state bytes) }
 //! kv  dev/<id>/gen         n — the pointer, and the commit point
 //! ```
 //!
@@ -37,10 +37,11 @@
 //! write is `n + 1` while the torn `n` and the loaded `n - 1` are both still
 //! on disk, and only removing both collects them.
 
+use data_encoding::HEXLOWER;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::device::{Device, SCHEMA};
+use crate::device::Device;
 use crate::seal::Dek;
 use crate::{Error, ErrorCode, Files, Platform, Rng};
 
@@ -49,7 +50,6 @@ use crate::{Error, ErrorCode, Files, Platform, Rng};
 /// session no frame is attached to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
-    v: u32,
     pub device: Device,
     /// The device's Ed25519 seed. Sealed like everything else here: it is the
     /// whole of the device's identity to its peers, and to iroh.
@@ -60,15 +60,12 @@ pub struct Snapshot {
     pub engine: Option<polyvisor_engine::Snapshot>,
     /// The durable store's binding: the sealed OAuth tokens and how the last
     /// sync went (`crate::drive`). Sealed like everything else here, which is
-    /// the whole reason a bearer never crosses the port. `#[serde(default)]`
-    /// because a checkpoint written before M4 has no such field.
-    #[serde(default)]
+    /// the whole reason a bearer never crosses the port.
     pub storage: Option<crate::drive::Sealed>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ManifestJson {
-    v: u32,
     generation: u64,
     /// Lowercase hex sha256 of the `state` file's bytes exactly as written.
     sha256: String,
@@ -141,9 +138,8 @@ pub async fn write(
     })?;
     let state = dek.seal(rng, &plain, id.as_bytes())?;
     let manifest = serde_json::to_vec(&ManifestJson {
-        v: SCHEMA,
         generation,
-        sha256: hex(&Sha256::digest(&state)),
+        sha256: HEXLOWER.encode(&Sha256::digest(&state)),
     })
     .map_err(|e| {
         Error::new(
@@ -221,16 +217,15 @@ async fn read_generation(
     let dir = gen_dir(id, generation);
     let manifest = files.read(format!("{dir}/MANIFEST")).await?;
     let manifest: ManifestJson = serde_json::from_slice(&manifest).ok()?;
-    if manifest.v != SCHEMA || manifest.generation != generation {
+    if manifest.generation != generation {
         return None;
     }
     let state = files.read(format!("{dir}/state")).await?;
-    if hex(&Sha256::digest(&state)) != manifest.sha256 {
+    if HEXLOWER.encode(&Sha256::digest(&state)) != manifest.sha256 {
         return None;
     }
     let plain = dek.open(&state, id.as_bytes()).ok()?;
-    let snapshot: Snapshot = serde_json::from_slice(&plain).ok()?;
-    (snapshot.v == SCHEMA).then_some(snapshot)
+    serde_json::from_slice(&plain).ok()
 }
 
 impl Snapshot {
@@ -241,15 +236,10 @@ impl Snapshot {
         storage: Option<crate::drive::Sealed>,
     ) -> Snapshot {
         Snapshot {
-            v: SCHEMA,
             device,
             seed,
             engine,
             storage,
         }
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

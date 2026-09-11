@@ -1,25 +1,7 @@
-// `wasi:sockets/types@0.3.0` — the UDP direct path, which this deployment
-// does not have.
-//
-// The endpoint component links this interface for its direct (UDP) path and
-// therefore names it as an import whether or not a deployment can serve it
-// (runtime/wit/deps/polymorph-iroh/iroh.wit, `world iroh-endpoint`). A
-// browser has no UDP socket, so the endpoint binds with `udp-bind-addr`
-// unset — "unset binds no socket" — and nothing here is ever called. What it
-// has to be is present and honest: every entry point answers
-// `error-code.not-supported`, which is what a browser host would answer.
-//
-// Vendored rather than imported. The upstream module is
-// `jsr:@polymorph/iroh@0.6.0`'s `src/sockets.ts`, but the package's only
-// export is its root, whose module graph statically pulls
-// `@polyengine/translator` — and a realm that ships the translator is
-// exactly what this repository's build is built to prevent (web/build.ts:
-// "so no realm ever loads the translator"). The upstream file's test
-// bookkeeping (a call log the endpoint exam asserts on) is dropped; what
-// remains is the resource and the refusal. `ComponentException` comes from
-// this repository's pinned `@polyengine/protocol`, which is the copy the
-// worker's runtime uses — a branded throw from a second copy would not be
-// recognized as one.
+// Browser host for the endpoint's linked UDP interface. Browsers provide no
+// UDP, so every operation returns WIT `not-supported`. This is local rather
+// than imported because the upstream package root pulls the translator into
+// worker.js; the branded exception must also use this runtime's protocol copy.
 
 import { ComponentException } from "@polyengine/protocol";
 
@@ -36,10 +18,7 @@ export type IpSocketAddress =
 type NotSupported = { kind: "not-supported" };
 
 function refuse(what: string): never {
-  // A host import signals a WIT `err` by throwing a BRANDED
-  // `ComponentException`: an unbranded throw becomes a trap naming the
-  // import instead of a guest-visible `err`, and the guest's own answer to
-  // "no UDP here" is to carry on over the relay.
+  // Unbranded throws become traps rather than the WIT error arm.
   const payload: NotSupported = { kind: "not-supported" };
   throw new ComponentException(
     payload,

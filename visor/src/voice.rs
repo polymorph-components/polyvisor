@@ -64,18 +64,8 @@ pub(crate) fn AppVoice(text: AppText) -> Element {
     }
 }
 
-/// How long ago, coarsely, in the framework's own voice.
-///
-/// Deliberately not a locale-formatted date. The entry picker runs before
-/// any seal opens, so this text sits next to a petname on a screen that is
-/// otherwise anonymous: an exact timestamp would be both a needless detail
-/// and a fingerprintable one, and a locale-formatted one would drag a
-/// formatting dependency into the trusted pixels. Coarse and English is
-/// what the sheet needs to tell two devices apart.
-///
-/// Both arguments are epoch milliseconds (`store.entry.last-used`). A
-/// timestamp in the future — clock skew, a row written by another tab —
-/// reads as "just now" rather than as nonsense.
+/// A coarse, non-identifying age for the pre-unseal device picker. Both
+/// arguments are epoch milliseconds; future timestamps clamp to "just now".
 pub(crate) fn coarse_age(now_ms: u64, then_ms: u64) -> String {
     let secs = now_ms.saturating_sub(then_ms) / 1_000;
     let mins = secs / 60;
