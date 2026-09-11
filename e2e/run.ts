@@ -2245,7 +2245,7 @@ const scenarios: Scenario[] = [
   },
 
   {
-    name: "petname-dice",
+    name: "petname-dice-and-glyph-random",
     async run(ctx, origin, browser) {
       const page = await open(ctx, origin);
       await visorReady(page);
@@ -2257,8 +2257,6 @@ const scenarios: Scenario[] = [
       const device = field(/^device petname$/);
       const userDie = drawer(page).getByRole("button", { name: "Re-roll user petname" });
       const deviceDie = drawer(page).getByRole("button", { name: "Re-roll device petname" });
-      const userGlyphButton = drawer(page).getByRole("button", { name: "Choose your glyph" });
-      const userGlyphDie = drawer(page).getByRole("button", { name: "Re-roll user glyph" });
       const glyphValue = (button: Locator) => button.locator(".glyph-tile-face").textContent();
 
       const assertDieGap = async (input: Locator, die: Locator, where: string) => {
@@ -2294,47 +2292,57 @@ const scenarios: Scenario[] = [
         await die.click();
         await waitForInputToDiffer(input, first);
       }
+      await saveDraft(page);
 
-      eq(await userGlyphDie.getAttribute("aria-disabled"), null, "blank user glyph die was disabled");
-      await userGlyphDie.click();
+      const userGlyphButton = drawer(page).getByRole("button", { name: "Choose your glyph", exact: true });
+      eq(await drawer(page).getByRole("button", { name: "Re-roll user glyph", exact: true }).count(), 0, "settings kept an exterior glyph die");
+      await userGlyphButton.click();
+      const userPicker = drawer(page).locator(".glyph-picker");
+      eq(await userPicker.getByRole("button", { name: "Clear glyph", exact: true }).count(), 0, "user picker kept Clear glyph");
+      const userRandom = userPicker.getByRole("button", { name: "Random", exact: true });
+      check(await userRandom.isEnabled(), "user Random was disabled for a blank glyph");
+      await userRandom.click();
       const firstUserGlyph = await glyphValue(userGlyphButton);
-      check(firstUserGlyph !== null && /^[\u{1f400}-\u{1f43f}]$/u.test(firstUserGlyph), "user glyph roll left the animal range");
-      await userGlyphDie.click();
+      check(firstUserGlyph !== null && /^[\u{1f400}-\u{1f43f}]$/u.test(firstUserGlyph), "user Random left the animal range");
+      check(await userGlyphButton.evaluate((button) => button === document.activeElement), "user Random did not return focus to the tile");
+      await userGlyphButton.click();
+      check(await userRandom.isEnabled(), "user Random was disabled for an animal glyph");
+      await shot(page, "desktop-glyph-random-picker");
+      await userRandom.click();
       const secondUserGlyph = await glyphValue(userGlyphButton);
-      check(secondUserGlyph !== firstUserGlyph, "user glyph repeated its previous roll");
+      check(secondUserGlyph !== firstUserGlyph, "user Random repeated its selected animal");
+      await drawer(page).getByRole("button", { name: "Revert", exact: true }).click();
+      eq(await glyphValue(userGlyphButton), "", "Revert kept a random user glyph");
       await userGlyphButton.click();
-      let glyphPicker = drawer(page).locator(".glyph-picker");
-      await glyphPicker.getByRole("searchbox", { name: "Enter glyph or search" }).fill("★");
-      await glyphPicker.getByRole("button", { name: "Use ★" }).click();
-      eq(await userGlyphDie.getAttribute("aria-disabled"), "true", "manual user glyph remained rerollable");
-      await userGlyphButton.click();
-      glyphPicker = drawer(page).locator(".glyph-picker");
-      await glyphPicker.getByRole("button", { name: "Clear glyph" }).click();
-      eq(await userGlyphDie.getAttribute("aria-disabled"), null, "cleared user glyph die was disabled");
-      await userGlyphDie.click();
+      await userRandom.click();
       const savedUserGlyph = await glyphValue(userGlyphButton);
-      await shot(page, "desktop-animal-glyph-roll");
       await saveDraft(page);
       await appsButton(page).click();
       await paneSettled(page);
       await openSettingsSheet(page);
       eq(await drawer(page).getByRole("button", { name: "Re-roll user petname" }).getAttribute("aria-disabled"), null, "saved roll lost eligibility on reopen");
-      eq(await drawer(page).getByRole("button", { name: "Re-roll user glyph" }).getAttribute("aria-disabled"), null, "saved glyph roll lost eligibility on reopen");
-      eq(await glyphValue(drawer(page).getByRole("button", { name: "Choose your glyph" })), savedUserGlyph, "saved user glyph changed on reopen");
+      eq(await glyphValue(drawer(page).getByRole("button", { name: "Choose your glyph", exact: true })), savedUserGlyph, "saved user glyph changed on reopen");
 
       await launchTodoMvc(page);
       await toAppSheet(page);
       const app = field(/^petname$/);
       const appDie = drawer(page).getByRole("button", { name: "Re-roll app petname" });
       const appGlyphButton = drawer(page).getByRole("button", { name: "Choose glyph", exact: true });
-      const appGlyphDie = drawer(page).getByRole("button", { name: "Re-roll app glyph" });
       eq(await appDie.getAttribute("aria-disabled"), "true", "generated app default was rerollable");
-      eq(await appGlyphDie.getAttribute("aria-disabled"), null, "blank app glyph die was disabled");
-      await appGlyphDie.click();
+      eq(await drawer(page).getByRole("button", { name: /app glyph/i }).count(), 0, "app sheet kept an exterior glyph die");
+      await appGlyphButton.click();
+      const appPicker = drawer(page).locator(".glyph-picker");
+      eq(await appPicker.getByRole("button", { name: "Clear glyph", exact: true }).count(), 0, "app picker kept Clear glyph");
+      const appRandom = appPicker.getByRole("button", { name: "Random", exact: true });
+      check(await appRandom.isEnabled(), "app Random was disabled for a blank glyph");
+      await appRandom.click();
       const firstAppGlyph = await glyphValue(appGlyphButton);
-      check(firstAppGlyph !== null && /^[\u{1f400}-\u{1f43f}]$/u.test(firstAppGlyph), "app glyph roll left the animal range");
-      await appGlyphDie.click();
-      check(await glyphValue(appGlyphButton) !== firstAppGlyph, "app glyph repeated its previous roll");
+      check(firstAppGlyph !== null && /^[\u{1f400}-\u{1f43f}]$/u.test(firstAppGlyph), "app Random left the animal range");
+      check(await appGlyphButton.evaluate((button) => button === document.activeElement), "app Random did not return focus to the tile");
+      await appGlyphButton.click();
+      check(await appRandom.isEnabled(), "app Random was disabled for an animal glyph");
+      await appRandom.click();
+      check(await glyphValue(appGlyphButton) !== firstAppGlyph, "app Random repeated its selected animal");
       await app.fill("");
       await appDie.click();
       await page.waitForFunction(() => {
@@ -2342,14 +2350,14 @@ const scenarios: Scenario[] = [
         return (label?.querySelector("input") as HTMLInputElement | null)?.value.length;
       });
       await drawer(page).getByRole("button", { name: "Revert", exact: true }).click();
-      await appGlyphDie.click();
+      await appGlyphButton.click();
+      await appRandom.click();
       const savedAppGlyph = await glyphValue(appGlyphButton);
       await saveDraft(page);
       await openSettingsSheet(page);
       await paneSettled(page);
       await toAppSheet(page);
       eq(await glyphValue(drawer(page).getByRole("button", { name: "Choose glyph", exact: true })), savedAppGlyph, "saved app glyph changed on reopen");
-      eq(await drawer(page).getByRole("button", { name: "Re-roll app glyph" }).getAttribute("aria-disabled"), null, "saved app glyph roll lost eligibility on reopen");
       await pageCleanDrawer(page);
       await page.reload();
       await visorReady(page);
@@ -2357,7 +2365,7 @@ const scenarios: Scenario[] = [
       await page.waitForFunction(() => document.querySelector("#visor-drawer") === null);
       await openSettingsSheet(page);
       eq(await drawer(page).getByRole("button", { name: "Re-roll user petname" }).getAttribute("aria-disabled"), "true", "reload retained roll eligibility");
-      eq(await drawer(page).getByRole("button", { name: "Re-roll user glyph" }).getAttribute("aria-disabled"), "true", "reload retained glyph roll eligibility");
+      eq(await glyphValue(drawer(page).getByRole("button", { name: "Choose your glyph", exact: true })), savedUserGlyph, "user glyph did not survive reload");
       check(await drawer(page).getByText("word", { exact: true }).count() === 0, "obsolete word field is still rendered");
 
       const reloadedUser = field(/^your petname$/);
@@ -2370,7 +2378,6 @@ const scenarios: Scenario[] = [
 
       await toAppSheet(page);
       eq(await glyphValue(drawer(page).getByRole("button", { name: "Choose glyph", exact: true })), savedAppGlyph, "app glyph did not survive reload");
-      eq(await drawer(page).getByRole("button", { name: "Re-roll app glyph" }).getAttribute("aria-disabled"), "true", "reload retained app glyph roll eligibility");
       const savedApp = field(/^petname$/);
       await savedApp.fill("");
       await saveDraft(page);
@@ -2378,7 +2385,10 @@ const scenarios: Scenario[] = [
 
       await page.setViewportSize({ width: 390, height: 844 });
       await assertDieGap(field(/^petname$/), drawer(page).getByRole("button", { name: "Re-roll app petname" }), "mobile app");
-      await shot(page, "mobile-animal-glyph-roll");
+      const mobileAppGlyph = drawer(page).getByRole("button", { name: "Choose glyph", exact: true });
+      await mobileAppGlyph.click();
+      await shot(page, "mobile-glyph-random-picker");
+      await drawer(page).locator(".glyph-picker").getByRole("searchbox", { name: "Enter glyph or search" }).press("Escape");
       const touch = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true });
       try {
         const mobile = await open(touch, origin);
@@ -2390,6 +2400,18 @@ const scenarios: Scenario[] = [
         await mobileDie.tap({ force: true });
         eq(await mobileUser.inputValue(), before, "disabled touch die changed the draft");
         await drawer(mobile).getByRole("tooltip", { name: "clear to re-roll" }).waitFor();
+        const mobileGlyph = drawer(mobile).getByRole("button", { name: "Choose your glyph", exact: true });
+        const beforeGlyph = await mobileGlyph.textContent();
+        await mobileGlyph.tap();
+        const mobileDialog = drawer(mobile).locator("dialog.glyph-dialog");
+        await mobile.waitForFunction(() => document.querySelector("dialog.glyph-dialog")?.matches(":modal"));
+        const underlyingApp = await mobile.locator("#visor-app").boundingBox();
+        check(underlyingApp !== null, "underlying app button has no touch geometry");
+        await mobile.touchscreen.tap(underlyingApp.x + 8, underlyingApp.y + underlyingApp.height / 2);
+        eq(await mobileDialog.count(), 0, "touch outside kept the glyph modal open");
+        eq(await mobileGlyph.textContent(), beforeGlyph, "touch outside changed the draft glyph");
+        check(await mobileGlyph.evaluate((button) => button === document.activeElement), "touch outside did not return focus to the glyph tile");
+        eq(await drawer(mobile).locator(".pane").getAttribute("aria-label"), "settings", "touch outside activated the underlying self button");
       } finally {
         await touch.close();
       }
@@ -2947,12 +2969,46 @@ const scenarios: Scenario[] = [
       });
       await glyph.click();
       const picker = drawer(page).locator(".glyph-picker");
+      const glyphDialog = drawer(page).locator("dialog.glyph-dialog");
+      await page.waitForFunction(() =>
+        document.querySelector("dialog.glyph-dialog")?.matches(":modal")
+      );
+      eq(await drawer(page).locator("dialog:modal").count(), 1, "picker did not open as the only modal dialog");
+      eq(await glyphDialog.getAttribute("aria-label"), "Choose your glyph", "glyph dialog has the wrong accessible name");
+      const desktopPanel = await picker.boundingBox();
+      const desktopViewport = page.viewportSize();
+      check(desktopPanel !== null && desktopViewport !== null && desktopPanel.width <= 512 && Math.abs(desktopPanel.x + desktopPanel.width / 2 - desktopViewport.width / 2) <= 1, "desktop glyph modal was not centred at a moderate width");
+      eq(await drawer(page).getByRole("button", { name: "Re-roll user glyph", exact: true }).count(), 0, "picker test found an exterior glyph die");
+      eq(await picker.getByRole("button", { name: "Clear glyph", exact: true }).count(), 0, "picker test found Clear glyph");
+      check(await picker.getByRole("button", { name: "Random", exact: true }).isEnabled(), "Random was not enabled");
       const search = picker.getByRole("searchbox", {
         name: "Enter glyph or search",
       });
       await page.waitForFunction(() =>
         document.activeElement?.getAttribute("type") === "search"
       );
+      await search.press("Shift+Tab");
+      eq(await page.locator(":focus").textContent(), "Random", "Shift+Tab escaped the modal instead of reaching Random");
+      await page.keyboard.press("Shift+Tab");
+      check(await glyphDialog.evaluate((dialog) => dialog === document.activeElement), "backward Tab escaped the modal");
+      await page.keyboard.press("Tab");
+      eq(await page.locator(":focus").textContent(), "Random", "forward Tab did not wrap inside the modal");
+      await search.click();
+      await picker.locator("label").click({ position: { x: 4, y: 4 } });
+      check(await glyphDialog.evaluate((dialog) => dialog.matches(":modal")), "an inside click dismissed the modal");
+      const glyphBeforeDismiss = await glyph.textContent();
+      const underlyingApp = await appsButton(page).boundingBox();
+      check(underlyingApp !== null, "underlying app button has no geometry");
+      await page.mouse.click(underlyingApp.x + 8, underlyingApp.y + underlyingApp.height / 2);
+      eq(await glyphDialog.count(), 0, "an outside click kept the glyph modal open");
+      eq(await glyph.textContent(), glyphBeforeDismiss, "outside dismissal changed the draft glyph");
+      check(await glyph.evaluate((button) => button === document.activeElement), "outside dismissal did not return focus to the glyph tile");
+      eq(await drawer(page).locator(".pane").getAttribute("aria-label"), "settings", "outside dismissal closed the drawer");
+      await glyph.click();
+      await picker.getByRole("button", { name: "Close", exact: true }).click();
+      eq(await glyph.textContent(), glyphBeforeDismiss, "Close changed the draft glyph");
+      check(await glyph.evaluate((button) => button === document.activeElement), "Close did not return focus to the glyph tile");
+      await glyph.click();
       const actionsBeforeQuery = await drawer(page).locator("#visor-actions")
         .textContent();
 
@@ -3089,7 +3145,7 @@ const scenarios: Scenario[] = [
       await page.waitForFunction(
         () => document.querySelector("#visor-circle")?.textContent === "👩🏽‍💻",
       );
-      await page.setViewportSize({ width: 390, height: 780 });
+      await page.setViewportSize({ width: 390, height: 400 });
       await openSettingsSheet(page);
       const mobileTile = drawer(page).getByRole("button", {
         name: "Choose your glyph",
@@ -3099,6 +3155,18 @@ const scenarios: Scenario[] = [
       const mobileSearch = picker.getByRole("searchbox", {
         name: "Enter glyph or search",
       });
+      const mobilePanel = await picker.boundingBox();
+      check(mobilePanel !== null && mobilePanel.x >= 12 && mobilePanel.x + mobilePanel.width <= 378 && mobilePanel.y >= 12 && mobilePanel.y + mobilePanel.height <= 388, `short mobile glyph modal escaped the viewport gutter: ${JSON.stringify(mobilePanel)}`);
+      console.log(`  short mobile glyph modal bounds: ${JSON.stringify(mobilePanel)}`);
+      check(await picker.locator(".glyph-results").evaluate((results) => results.scrollHeight > results.clientHeight), "mobile glyph results were not internally scrollable");
+      for (const control of [
+        picker.getByRole("button", { name: "Random", exact: true }),
+        mobileSearch,
+        picker.getByRole("button", { name: "Close", exact: true }),
+      ]) {
+        const box = await control.boundingBox();
+        check(box !== null && box.y >= 0 && box.y + box.height <= 400, `short mobile modal put a fixed control offscreen: ${JSON.stringify(box)}`);
+      }
       await mobileSearch.fill("cat");
       await shot(page, "mobile-glyph-picker");
 
@@ -3119,21 +3187,22 @@ const scenarios: Scenario[] = [
         "selecting the saved glyph dirtied the draft",
       );
 
-      // Clearing is available only inside the picker and remains a draft.
+      // Random remains available for a manually selected saved glyph and is
+      // an ordinary draft change that Revert restores.
       await mobileTile.click();
-      await picker.getByRole("button", { name: "Clear glyph", exact: true })
-        .click();
-      eq(
-        await mobileTile.textContent(),
-        "",
-        "Clear glyph did not clear the draft",
-      );
+      const previousGlyph = await mobileTile.textContent();
+      const random = picker.getByRole("button", { name: "Random", exact: true });
+      check(await random.isEnabled(), "Random was disabled for a saved manual glyph");
+      await random.click();
+      const randomGlyph = await mobileTile.textContent();
+      check(randomGlyph !== previousGlyph && randomGlyph !== null && /^[\u{1f400}-\u{1f43f}]$/u.test(randomGlyph), "Random did not replace a saved manual glyph with a different animal");
+      check(await mobileTile.evaluate((button) => button === document.activeElement), "Random did not return focus to the glyph tile");
       await drawer(page).getByRole("button", { name: "Revert", exact: true })
         .click();
       eq(
         await mobileTile.textContent(),
         "👩🏽‍💻",
-        "Revert did not restore cleared glyph",
+        "Revert did not restore the saved glyph after Random",
       );
     },
   },

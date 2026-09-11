@@ -130,36 +130,6 @@ fn roll_petname(
         RollTarget::User => set_field(&mut d.user, PETNAME, value),
         RollTarget::App(_) => set_field(&mut d.app, PETNAME, value),
         RollTarget::Picker => {}
-        RollTarget::UserGlyph | RollTarget::AppGlyph(_) => {
-            unreachable!("petname rolls have only petname targets")
-        }
-    }
-    draft.set(d);
-}
-
-fn roll_glyph(
-    target: RollTarget,
-    previous: String,
-    mut rolls: CopyValue<RollState>,
-    mut draft: Signal<Draft>,
-    session: Signal<Option<(SessionId, App)>>,
-) {
-    if let RollTarget::AppGlyph(expected) = &target
-        && session.read().as_ref().map(|(_, app)| &app.id) != Some(expected)
-    {
-        return;
-    }
-    let bytes = crate::component::wasi::random::random::get_random_bytes(4);
-    let value = roll_animal(
-        u32::from_le_bytes(bytes.try_into().expect("wasi:random returned four bytes")),
-        &previous,
-    );
-    rolls.write().activate(target.clone(), value.clone());
-    let mut d = draft();
-    match target {
-        RollTarget::UserGlyph => set_field(&mut d.user, GLYPH, value),
-        RollTarget::AppGlyph(_) => set_field(&mut d.app, GLYPH, value),
-        _ => unreachable!("glyph rolls have only glyph targets"),
     }
     draft.set(d);
 }
@@ -1293,9 +1263,6 @@ pub(crate) fn Visor() -> Element {
         };
         let live = session.read().as_ref().map(|(id, app)| (*id, app.clone()));
         let live_id = live.as_ref().map(|(id, _)| *id);
-        let app_glyph_target = live
-            .as_ref()
-            .map(|(_, app)| RollTarget::AppGlyph(app.id.clone()));
         let (info_petname, info_glyph) = {
             let d = draft.read();
             (
@@ -1396,16 +1363,9 @@ pub(crate) fn Visor() -> Element {
                         GlyphPicker {
                             label: "glyph",
                             value: info_glyph,
-                            roll_target: app_glyph_target.clone(),
-                            rolls,
-                            draft,
-                            session,
                             focus_return: current.then(|| focus_glyph.clone()).flatten(),
                             focus_search: current.then(|| focus_glyph_search.clone()).flatten(),
                             onchange: move |value| {
-                                if let Some(target) = app_glyph_target.as_ref() {
-                                    rolls.write().invalidate(target);
-                                }
                                 let mut d = draft.write();
                                 set_field(&mut d.app, GLYPH, value);
                             },
@@ -2447,10 +2407,6 @@ const GLYPH_PAGE: usize = 96;
 fn GlyphPicker(
     label: &'static str,
     value: String,
-    roll_target: Option<RollTarget>,
-    rolls: CopyValue<RollState>,
-    draft: Signal<Draft>,
-    session: Signal<Option<(SessionId, App)>>,
     onchange: EventHandler<String>,
     focus_return: Option<String>,
     focus_search: Option<String>,
@@ -2493,11 +2449,6 @@ fn GlyphPicker(
     let more = matches.len() > limit();
     matches.truncate(limit());
     let empty = matches.is_empty() && direct.is_none();
-    let roll_label: &'static str = if matches!(roll_target, Some(RollTarget::UserGlyph)) {
-        "Re-roll user glyph"
-    } else {
-        "Re-roll app glyph"
-    };
 
     rsx! {
         div {
@@ -2531,86 +2482,100 @@ fn GlyphPicker(
                     },
                     span { class: "glyph-tile-face", "{value}" }
                 }
-                if let Some(target) = roll_target.as_ref() {
-                    RollButton {
-                        label: roll_label,
-                        enabled: value.is_empty() || rolls.read().is_active(target, &value),
-                        onclick: {
-                            let target = target.clone();
-                            let previous = value.clone();
-                            move |_| {
-                                if previous.is_empty() || rolls.read().is_active(&target, &previous) {
-                                    roll_glyph(target.clone(), previous.clone(), rolls, draft, session);
+            }
+            if open() {
+                dialog {
+                    class: "glyph-dialog",
+                    aria_label: "Choose {label}",
+                    tabindex: "0",
+                    "data-visor-modal": "",
+                    onclick: move |_| {
+                        open.set(false);
+                        onreturn.call(());
+                    },
+                    oncancel: move |e| {
+                        e.prevent_default();
+                        open.set(false);
+                        onreturn.call(());
+                    },
+                    div {
+                        class: "glyph-picker",
+                        onclick: move |e| e.stop_propagation(),
+                        button {
+                            r#type: "button",
+                            onclick: {
+                                let previous = value.clone();
+                                move |_| {
+                                    let bytes = crate::component::wasi::random::random::get_random_bytes(4);
+                                    let random = u32::from_le_bytes(
+                                        bytes.try_into().expect("wasi:random returned four bytes"),
+                                    );
+                                    onchange.call(roll_animal(random, &previous));
+                                    open.set(false);
+                                    onreturn.call(());
+                                }
+                            },
+                            "Random"
+                        }
+                        label {
+                            span { class: "{Voice::Framework.class()}", "Enter glyph or search" }
+                            input {
+                                r#type: "search",
+                                value: "{query}",
+                                "data-visor-focus": focus_search,
+                                oncompositionstart: move |_| composing.set(true),
+                                oncompositionend: move |_| composing.set(false),
+                                oninput: move |e| {
+                                    query.set(e.value());
+                                    limit.set(GLYPH_PAGE);
+                                },
+                            }
+                        }
+                        div { class: "glyph-results",
+                            if let Some(glyph) = direct {
+                                button {
+                                    r#type: "button",
+                                    title: "Use {glyph}",
+                                    aria_label: "Use {glyph}",
+                                    onclick: move |_| {
+                                        onchange.call(glyph.clone());
+                                        open.set(false);
+                                        onreturn.call(());
+                                    },
+                                    span { class: "glyph-face", "{glyph}" }
+                                }
+                            }
+                            for emoji in matches {
+                                button {
+                                    r#type: "button",
+                                    title: "{emoji.name()}",
+                                    aria_label: "{emoji.name()}",
+                                    onclick: move |_| {
+                                        onchange.call(emoji.as_str().to_string());
+                                        open.set(false);
+                                        onreturn.call(());
+                                    },
+                                    span { class: "glyph-face", "{emoji.as_str()}" }
                                 }
                             }
                         }
-                    }
-                }
-            }
-            if open() {
-                div { class: "glyph-picker",
-                    label {
-                        span { class: "{Voice::Framework.class()}", "Enter glyph or search" }
-                        input {
-                            r#type: "search",
-                            value: "{query}",
-                            "data-visor-focus": focus_search,
-                            oncompositionstart: move |_| composing.set(true),
-                            oncompositionend: move |_| composing.set(false),
-                            oninput: move |e| {
-                                query.set(e.value());
-                                limit.set(GLYPH_PAGE);
-                            },
-                        }
-                    }
-                    div { class: "glyph-results",
-                        if let Some(glyph) = direct {
+                        if more {
                             button {
                                 r#type: "button",
-                                title: "Use {glyph}",
-                                aria_label: "Use {glyph}",
-                                onclick: move |_| {
-                                    onchange.call(glyph.clone());
-                                    open.set(false);
-                                    onreturn.call(());
-                                },
-                                span { class: "glyph-face", "{glyph}" }
+                                onclick: move |_| limit += GLYPH_PAGE,
+                                "Show more"
                             }
                         }
-                        for emoji in matches {
-                            button {
-                                r#type: "button",
-                                title: "{emoji.name()}",
-                                aria_label: "{emoji.name()}",
-                                onclick: move |_| {
-                                    onchange.call(emoji.as_str().to_string());
-                                    open.set(false);
-                                    onreturn.call(());
-                                },
-                                span { class: "glyph-face", "{emoji.as_str()}" }
-                            }
+                        if empty {
+                            span { class: "{Voice::Framework.class()}", "no emoji found" }
                         }
-                    }
-                    if more {
                         button {
                             r#type: "button",
-                            onclick: move |_| limit += GLYPH_PAGE,
-                            "Show more"
-                        }
-                    }
-                    if empty {
-                        span { class: "{Voice::Framework.class()}", "no emoji found" }
-                    }
-                    if !value.is_empty() {
-                        button {
-                            r#type: "button",
-                            class: "glyph-clear",
                             onclick: move |_| {
-                                onchange.call(String::new());
                                 open.set(false);
                                 onreturn.call(());
                             },
-                            "Clear glyph"
+                            "Close"
                         }
                     }
                 }
@@ -2742,14 +2707,9 @@ fn SettingsSheet(
         GlyphPicker {
             label: "your glyph",
             value: user_glyph,
-            roll_target: Some(RollTarget::UserGlyph),
-            rolls,
-            draft,
-            session,
             focus_return: focus_glyph,
             focus_search: focus_glyph_search,
             onchange: move |value| {
-                rolls.write().invalidate(&RollTarget::UserGlyph);
                 let mut d = draft.write();
                 set_field(&mut d.user, GLYPH, value);
             },

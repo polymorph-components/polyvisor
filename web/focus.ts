@@ -3,12 +3,14 @@
 // The visor is a stream-dom producer and cannot move focus itself: the
 // pinned receiver's `MountedData` is `()` with `set_focus` unsupported. So
 // the visor states its intent in markup and this module carries it out.
-// Two attributes, both written by visor/src/ui.rs:
+// Three attributes, all written by visor/src/ui.rs:
 //
 //   * `data-visor-focus` on at most one element, valued with a generation
 //     number that advances only when the visor itself caused a transition
 //     worth moving the caret for. Anything else re-renders with the same
 //     number and moves nothing.
+//   * `data-visor-modal` on a native dialog that must enter the top layer.
+//     The producer can describe that state but cannot call `showModal()`.
 //   * `data-visor-app-inert` on `#visor-root`, mirrored onto `#app-zone` —
 //     the app zone is the page's element, not the visor's tree, so the
 //     visor cannot mark it itself, and something has to or Tab walks out of
@@ -61,6 +63,20 @@ export function attachVisorFocus(
       "inert",
       root?.hasAttribute("data-visor-app-inert") ?? false,
     );
+
+    // Modal promotion has to precede the focus request below: focusing a
+    // dialog descendant before showModal() would leave the browser free to
+    // move focus again while establishing the modal focus scope.
+    const picker = visor.querySelector<HTMLDialogElement>(
+      "dialog[data-visor-modal]",
+    );
+    if (picker !== null && !picker.open) {
+      picker.showModal();
+      // Chromium performs its own initial-focus step during showModal(). Let
+      // that finish before serving the visor's more specific search request.
+      queueMicrotask(settle);
+      return;
+    }
 
     const dialog = visor.querySelector<HTMLElement>("#visor-confirm");
     if (dialog !== null && !dialogUp) {
