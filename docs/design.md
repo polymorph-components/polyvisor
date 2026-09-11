@@ -5,6 +5,36 @@ so later work argues with the reason instead of re-deriving it. Nothing
 here is a compatibility promise: **the whole framework is unstable until
 declared otherwise.** Open questions live in the issue tracker.
 
+## Project maturity and tradeoffs
+
+**This is an exploratory project with no users.** Architecture, APIs,
+storage formats, and UI are unstable. Optimize for learning and cheap
+revision, not production completeness. Existing implementation and tests
+do not establish a requirement to preserve their behavior.
+
+- Prefer the smallest implementation that establishes the requested
+  behavior. Deletion, replacement, and narrower scope are valid outcomes.
+  New abstractions, dependencies, configuration, and recovery machinery
+  need a current requirement or demonstrated problem, not a possible
+  future consumer or failure mode.
+- Breaking changes are acceptable, including to public WIT and persisted
+  formats. Update known consumers together; do not add compatibility
+  layers or migrations unless a concrete consumer or data-preservation
+  requirement is identified.
+- Keep the stated correctness and confinement invariants. Where meeting
+  them would require disproportionate machinery, narrow the feature or
+  raise the tradeoff rather than silently weakening the invariant.
+- Tests should buy confidence in a current claim at reasonable maintenance
+  cost. Use the narrowest boundary that establishes it, with representative
+  full-path coverage for integration. Real Chromium remains required for
+  claims about pixels or browser realms; that does not require every
+  runtime edge case to navigate the UI. Separate harnesses and mocks also
+  have a cost: add them only when they simplify concrete testing needs.
+- Fix races rather than teaching tests to repeat lost user actions. Revise
+  or remove tests of superseded behavior instead of preserving it for the
+  suite. Run relevant gates; scenario count and historical parity are not
+  goals in themselves.
+
 ## What this is
 
 A framework for PWAs that inverts the usual architecture: applications
@@ -51,7 +81,8 @@ Two WIT packages, one per audience.
 - `wit/` — **`polyvisor:app`**, public. What code from outside this
   repository links against: the `app` world (stream-dom `producer` +
   granted services), data services (`tasks` first), later providers and
-  panels. Versioned deliberately; grows additively.
+  panels. Versioned deliberately; breaking changes are allowed under the
+  maturity policy above. Public describes the audience, not stability.
 - `runtime/wit/` — **`polyvisor:internal`**, private. Platform
   interfaces the glue implements (`kv`, later locks), kernel interfaces
   the runtime exports and the visor imports (`lifecycle`, `device`,
@@ -573,8 +604,8 @@ interprets.
   stream-dom JS adapter.
 - Gates: `cargo test` (native, per crate), `deno test` (glue), and
   Playwright on real Chromium for every claim about pixels or realms.
-  The archive's 38 e2e scenario names are the parity checklist; each
-  milestone re-derives its slice as new scenarios against the new build.
+  The archive's scenarios are reference material, not a parity obligation;
+  retain coverage for current claims rather than historical scenario names.
 
 ### Milestones
 
