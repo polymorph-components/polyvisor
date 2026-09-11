@@ -14,6 +14,8 @@ blake3.workspace = true
 data-encoding.workspace = true
 hmac.workspace = true
 polyvisor-engine = { path = "../engine" }
+polyvisor-todo-model = { path = "../todo-model" }
+polyvisor-visor-model = { path = "../visor-model" }
 futures.workspace = true
 subduction_protocol.workspace = true
 argon2.workspace = true

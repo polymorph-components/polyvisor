@@ -282,7 +282,7 @@ impl Kernel {
     #[must_use]
     pub fn fragments_held(&self, app: Option<&str>) -> usize {
         let tree = match app {
-            Some(app) => *polyvisor_engine::tasks_tree(app).as_bytes(),
+            Some(app) => *polyvisor_engine::document_tree(app).as_bytes(),
             None => *polyvisor_engine::us_tree().as_bytes(),
         };
         self.engine().map_or(0, |engine| {

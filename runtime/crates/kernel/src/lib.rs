@@ -30,9 +30,8 @@ pub use device::{DeviceStatus, IndexRow, MetaScope, Rest, State, Tier};
 pub use drive::{Binding, HttpResponse};
 pub use events::Event;
 pub use pairing::Phase;
-/// The task types are the engine's: the kernel no longer holds a list of its
-/// own, it holds an automerge document per app inside the engine.
-pub use polyvisor_engine::{EngineTransport, TaskSnapshot as Snapshot, TodoItem};
+pub use polyvisor_engine::EngineTransport;
+pub use polyvisor_todo_model::{Snapshot, TodoItem};
 pub use store::LEASE_TTL_MS;
 pub use sync::{Member, Peer};
 
@@ -53,6 +52,7 @@ use seal::{Dek, WrappedDek};
 
 use futures::future::LocalBoxFuture;
 use polyvisor_engine::{DynTransport, Engine};
+use polyvisor_visor_model as visor_model;
 
 /// A future that borrows its owner and is never sent between threads.
 pub type LocalFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
@@ -566,8 +566,7 @@ impl Kernel {
                 format!("hue must be below 360 degrees; got {hue}"),
             ));
         }
-        self.engine()?
-            .set_visor_personalization(Some(Some(hue)), None, Vec::new())
+        self.set_shared_personalization(Some(Some(hue)), None, Vec::new())
             .await
             .map_err(engine_failed)?;
         self.with_device(|d| {
@@ -608,8 +607,7 @@ impl Kernel {
             .into_iter()
             .map(|(key, value)| (app.clone(), key, value))
             .collect();
-        self.engine()?
-            .set_visor_personalization(None, None, patch)
+        self.set_shared_personalization(None, None, patch)
             .await
             .map_err(engine_failed)?;
         self.refresh_personalization().await?;
@@ -626,8 +624,7 @@ impl Kernel {
             let device = state.device.as_ref().expect("open implies a device");
             device.reroll(self.seams.rng.as_ref())
         };
-        self.engine()?
-            .set_visor_personalization(None, Some(Some(word.clone())), Vec::new())
+        self.set_shared_personalization(None, Some(Some(word.clone())), Vec::new())
             .await
             .map_err(engine_failed)?;
         self.with_device(|d| {
@@ -1096,6 +1093,43 @@ impl Kernel {
 
     // -- routes --------------------------------------------------------------
 
+    async fn visor_route_key(&self) -> Result<([u8; 32], bool), String> {
+        let engine = self.engine().map_err(|e| e.message)?;
+        let seed = self.state.borrow().seed;
+        let entropy = engine.model_entropy();
+        engine
+            .document_mutate(visor_model::VISOR_APP, move |doc| {
+                visor_model::route_key_or_create(doc, seed, entropy)
+            })
+            .await
+    }
+
+    async fn visor_install(&self, app: &str) -> Result<([u8; 16], bool), String> {
+        let engine = self.engine().map_err(|e| e.message)?;
+        let seed = self.state.borrow().seed;
+        let entropy = engine.model_entropy();
+        let app = app.to_string();
+        engine
+            .document_mutate(visor_model::VISOR_APP, move |doc| {
+                visor_model::install_or_create(doc, seed, entropy, &app)
+            })
+            .await
+    }
+
+    async fn set_shared_personalization(
+        &self,
+        hue: Option<Option<u16>>,
+        word: Option<Option<String>>,
+        fields: Vec<(Option<String>, String, Option<String>)>,
+    ) -> Result<(), String> {
+        self.engine()
+            .map_err(|e| e.message)?
+            .document_mutate(visor_model::VISOR_APP, move |doc| {
+                visor_model::set_personalization(doc, hue, word, fields)
+            })
+            .await
+    }
+
     /// The fragment text (`app/<token>`, no `#`) for this session's app at
     /// `route` — internal.wit `apps.route-encode`. The app never sees the key
     /// and never sees the token's construction; it says where it is and the
@@ -1106,9 +1140,8 @@ impl Kernel {
         // Cloned out of the cell before the first await: nothing may hold a
         // borrow of ours across a suspension point, because the host can
         // re-enter while one is in flight (see `write_checkpoint`).
-        let engine = self.engine()?;
-        let (install, install_wrote) = engine.visor_install(&app).await.map_err(engine_failed)?;
-        let (key, key_wrote) = engine.visor_route_key().await.map_err(engine_failed)?;
+        let (install, install_wrote) = self.visor_install(&app).await.map_err(engine_failed)?;
+        let (key, key_wrote) = self.visor_route_key().await.map_err(engine_failed)?;
         // Both calls mint on first use, and a minted install id or route key
         // that no checkpoint carries is a bookmark that stops resolving after
         // a reload — same reason every `tasks_*` mutation checkpoints.
@@ -1146,23 +1179,25 @@ impl Kernel {
                     "that link names an app that is not installed",
                 )
             })?;
-            let engine = self.engine()?;
             // Minted here so a later `route-encode` for this session's
             // window agrees with this install id (same reason `route_encode`
             // mints one).
-            let (_, wrote) = engine.visor_install(app).await.map_err(engine_failed)?;
+            let (_, wrote) = self.visor_install(app).await.map_err(engine_failed)?;
             if wrote {
                 self.checkpoint().await?;
             }
             return Ok((info, String::new()));
         }
         let engine = self.engine()?;
-        let (key, wrote) = engine.visor_route_key().await.map_err(engine_failed)?;
+        let (key, wrote) = self.visor_route_key().await.map_err(engine_failed)?;
         if wrote {
             self.checkpoint().await?;
         }
         let (install, route) = route::decode(&key, &fragment).map_err(|_| unopenable_link())?;
-        let installs = engine.visor_installs().await.map_err(engine_failed)?;
+        let installs = engine
+            .document_read(visor_model::VISOR_APP, visor_model::installs)
+            .await
+            .map_err(engine_failed)?;
         // An install id this device's visor document has never held decrypted
         // under our key, so it is ours — but from a state we have not synced.
         // That is the same "cannot open this" as a foreign link.
@@ -1198,14 +1233,18 @@ impl Kernel {
 
     pub async fn tasks_items(&self, session: SessionId) -> Result<Snapshot, String> {
         let (app, engine) = self.app_engine(session)?;
-        engine.tasks_items(&app).await
+        engine
+            .document_read(&app, polyvisor_todo_model::snapshot)
+            .await
     }
 
     pub async fn tasks_watch(&self, session: SessionId, after: u64) -> Result<Snapshot, String> {
         let (app, engine) = self.app_engine(session)?;
         // Opens/absorbs before registration. The poll below then compares and
         // registers without an await, closing the lost-wakeup window.
-        let first = engine.tasks_items(&app).await?;
+        let first = engine
+            .document_read(&app, polyvisor_todo_model::snapshot)
+            .await?;
         if first.revision != after {
             if self.sessions.borrow().get(&session) != Some(&app) {
                 return Err("unknown session".to_string());
@@ -1231,7 +1270,7 @@ impl Kernel {
             if self.sessions.borrow().get(&session) != Some(&app) {
                 return Poll::Ready(Err("unknown session".to_string()));
             }
-            if engine.tasks_revision_open(&app) != Some(after) {
+            if engine.document_revision_open(&app) != Some(after) {
                 return Poll::Ready(Ok(()));
             }
             self.task_waiters
@@ -1241,7 +1280,9 @@ impl Kernel {
         })
         .await?;
         drop(guard);
-        let snapshot = engine.tasks_items(&app).await?;
+        let snapshot = engine
+            .document_read(&app, polyvisor_todo_model::snapshot)
+            .await?;
         if self.sessions.borrow().get(&session) != Some(&app) {
             return Err("unknown session".to_string());
         }
@@ -1251,7 +1292,7 @@ impl Kernel {
     pub(crate) async fn refresh_personalization(&self) -> Result<(), Error> {
         let shared = self
             .engine()?
-            .visor_personalization()
+            .document_read(visor_model::VISOR_APP, visor_model::personalization)
             .await
             .map_err(engine_failed)?;
         let (Some(hue), Some(word)) = (shared.hue, shared.word) else {
@@ -1285,7 +1326,7 @@ impl Kernel {
         let am_founder = members.first().is_none_or(|member| member.key == me);
         let shared = self
             .engine()?
-            .visor_personalization()
+            .document_read(visor_model::VISOR_APP, visor_model::personalization)
             .await
             .map_err(engine_failed)?;
         let wrote = shared.hue.is_none() && shared.word.is_none() && am_founder;
@@ -1299,8 +1340,7 @@ impl Kernel {
                     fields.push((Some(app.clone()), key, Some(value)));
                 }
             }
-            self.engine()?
-                .set_visor_personalization(Some(Some(hue)), Some(Some(word)), fields)
+            self.set_shared_personalization(Some(Some(hue)), Some(Some(word)), fields)
                 .await
                 .map_err(engine_failed)?;
         }
@@ -1310,7 +1350,9 @@ impl Kernel {
 
     pub async fn tasks_add(&self, session: SessionId, title: String) -> Result<String, String> {
         let (app, engine) = self.app_engine(session)?;
-        let id = engine.tasks_add(&app, title).await?;
+        let id = engine
+            .document_mutate(&app, move |doc| polyvisor_todo_model::add(doc, title))
+            .await?;
         self.checkpoint_service().await?;
         self.wake_tasks(&app);
         Ok(id)
@@ -1323,7 +1365,12 @@ impl Kernel {
         completed: bool,
     ) -> Result<(), String> {
         let (app, engine) = self.app_engine(session)?;
-        engine.tasks_set_completed(&app, id, completed).await?;
+        let id = id.to_string();
+        engine
+            .document_mutate(&app, move |doc| {
+                polyvisor_todo_model::set_completed(doc, &id, completed)
+            })
+            .await?;
         self.checkpoint_service().await?;
         self.wake_tasks(&app);
         Ok(())
@@ -1336,7 +1383,12 @@ impl Kernel {
         title: String,
     ) -> Result<(), String> {
         let (app, engine) = self.app_engine(session)?;
-        engine.tasks_set_title(&app, id, title).await?;
+        let id = id.to_string();
+        engine
+            .document_mutate(&app, move |doc| {
+                polyvisor_todo_model::set_title(doc, &id, title)
+            })
+            .await?;
         self.checkpoint_service().await?;
         self.wake_tasks(&app);
         Ok(())
@@ -1344,7 +1396,10 @@ impl Kernel {
 
     pub async fn tasks_remove(&self, session: SessionId, id: &str) -> Result<(), String> {
         let (app, engine) = self.app_engine(session)?;
-        engine.tasks_remove(&app, id).await?;
+        let id = id.to_string();
+        engine
+            .document_mutate(&app, move |doc| polyvisor_todo_model::remove(doc, &id))
+            .await?;
         self.checkpoint_service().await?;
         self.wake_tasks(&app);
         Ok(())

@@ -1,0 +1,14 @@
+[package]
+name = "polyvisor-visor-model"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+automerge.workspace = true
+polyvisor-document-history = { path = "../document-history" }
+sha2 = "0.10"
+
+[dev-dependencies]
+sedimentree_core.workspace = true

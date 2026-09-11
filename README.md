@@ -27,7 +27,7 @@ confinement.
 |---|---|
 | `wit/` | `polyvisor:app` — the public contract, versioned deliberately |
 | `runtime/wit/` | `polyvisor:internal` — the private contract between this repo's own components and glue |
-| `runtime/` | the `runtime` component: `crates/kernel` (devices, sealing, checkpoints, pairing, sessions), `crates/engine` (automerge over subduction's sans-IO node), `component/` (the world, the iroh transport) |
+| `runtime/` | the `runtime` component: `crates/kernel` (devices, sealing, checkpoints, pairing, sessions), `crates/engine` (history sync over subduction's sans-IO node), `crates/document-history` (shared Automerge adapter), `crates/todo-model` and `crates/visor-model` (domain schemas), `component/` (the world, the iroh transport) |
 | `visor/` | the `visor` component (trusted pixels) |
 | `apps/` | example/reference apps (`todomvc`) |
 | `web/` | glue TypeScript |

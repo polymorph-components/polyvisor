@@ -1,4 +1,4 @@
-//! The polyvisor sync engine: an automerge task document per app, carried by
+//! The polyvisor sync engine: encrypted document histories carried by
 //! [`subduction_protocol`]'s sans-IO node through [`subduction_runtime`]'s
 //! capability traits (docs/design.md "Sync engine: subduction sans-IO").
 //!
@@ -18,18 +18,15 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 mod clock;
-mod doc;
-mod document;
 mod policy;
 mod storage;
 mod transport;
 mod us;
 mod vault;
-mod visor;
 
 pub use clock::EngineClock;
-pub use doc::{TaskSnapshot, TodoItem};
 pub use ed25519_dalek::VerifyingKey;
+pub use polyvisor_document_history::Document;
 pub use storage::{AppState, Item, ItemKind, Snapshot, StoreItem, TreeState};
 pub use subduction_protocol::peer_id::PeerId;
 pub use transport::{DynTransport, EngineTransport};
@@ -37,8 +34,8 @@ pub use us::{Member, us_tree};
 pub use vault::VaultState;
 
 use clock::ClockAdapter;
-use doc::AppDoc;
 use policy::{GroupPolicy, Members};
+use polyvisor_document_history::actor;
 use storage::SnapshotStorage;
 use us::UsDoc;
 use vault::Vault;
@@ -88,15 +85,15 @@ pub type EngineNotify = Rc<dyn Fn(EngineEvent) -> LocalBoxFuture<'static, ()>>;
 /// that connection's handshake, which the read loop is what makes progress.
 pub type Spawner = Rc<dyn Fn(LocalBoxFuture<'static, ()>)>;
 
-/// The sedimentree every device keeps an app's tasks in.
+/// The sedimentree every device keeps a document partition in.
 ///
 /// Derived from the app id alone, so two devices that dial each other
 /// converge with no naming step; M3b replaces this with keyhive partitions.
 #[must_use]
-pub fn tasks_tree(app: &str) -> SedimentreeId {
+pub fn document_tree(partition: &str) -> SedimentreeId {
     let mut hasher = Sha256::new();
     hasher.update(b"polyvisor:tasks:");
-    hasher.update(app.as_bytes());
+    hasher.update(partition.as_bytes());
     SedimentreeId::new(hasher.finalize().into())
 }
 
@@ -135,7 +132,7 @@ pub struct Engine<T: Transport<Local> + 'static> {
     storage: Rc<SnapshotStorage>,
     spawn: Spawner,
     /// One automerge document per app id, keyed by app id.
-    apps: RefCell<BTreeMap<String, AppDoc>>,
+    documents: RefCell<BTreeMap<String, Document>>,
     /// The user-system document — this device's group. `None` until it is
     /// opened, which [`Engine::open_us`] does on the first touch and on
     /// every `connect`.
@@ -166,14 +163,9 @@ pub struct Engine<T: Transport<Local> + 'static> {
     /// `Rng` at every start (see [`Engine::new`]) — and this is that draw,
     /// kept until the group document is first opened.
     name_key_seed: [u8; 32],
-    /// This boot's fresh entropy, kept for the visor document's minting
-    /// (`crate::visor`): the route key is `mix(b"polyvisor:route-key", seed,
-    /// entropy)` and an install id is `sha256(b"polyvisor:install" ‖ seed ‖
-    /// entropy ‖ app)`. The raw draw rather than one mixed value, because the
-    /// two formulas consume it differently; like `name_key_seed` it is only
-    /// ever read on the branch that mints, so a restored document keeps the
-    /// value it was founded with.
-    visor_entropy: [u8; 32],
+    /// This boot's fresh entropy, available to trusted in-process models that
+    /// must mint values independently on each device.
+    model_entropy: [u8; 32],
     /// Restored-but-not-yet-hydrated state. `Engine::new` cannot talk to its
     /// own driver — the caller has not spawned it yet — so a restored
     /// snapshot's trees are handed to the driver on the first async call.
@@ -213,7 +205,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         if let Some(state) = storage_state {
             name_key = state.name_key;
             for app in state.apps {
-                let tree = tasks_tree(&app.app);
+                let tree = document_tree(&app.app);
                 storage.restore(tree, app.state.commits, app.state.fragments);
                 hydrate.push(tree);
                 // The document and its tree are checkpointed together, but a
@@ -221,7 +213,11 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 // being saved leaves the tree ahead. Closing that gap is
                 // `hydrate`'s job now rather than this one: an app tree's
                 // blobs are keyhive envelopes, and opening them is async.
-                let doc = AppDoc::restore(&app.app, tree, &app.state.doc, seed);
+                let doc = Document::load(
+                    &app.state.doc,
+                    actor(b"polyvisor:actor:", seed, app.app.as_bytes()),
+                    tree,
+                );
                 let _replaced = apps.insert(app.app.clone(), doc);
             }
             if let Some(state) = state.us {
@@ -267,14 +263,14 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             handle,
             storage,
             spawn,
-            apps: RefCell::new(apps),
+            documents: RefCell::new(apps),
             vault: RefCell::new(None),
             pending_vault: RefCell::new(pending_vault),
             vault_rng_seed: mix(b"polyvisor:keyhive-rng", &seed, &entropy),
             us: RefCell::new(us),
             name_key: RefCell::new(name_key),
             name_key_seed: mix(b"polyvisor:name-key", &seed, &entropy),
-            visor_entropy: entropy,
+            model_entropy: entropy,
             members,
             conns: RefCell::new(Vec::new()),
             pending_hydration: RefCell::new((!hydrate.is_empty()).then_some(hydrate)),
@@ -295,181 +291,71 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         SigningKey::from_bytes(&self.seed).verifying_key()
     }
 
-    // -- tasks ---------------------------------------------------------------
+    // -- synchronized document histories ------------------------------------
 
-    /// The app's tasks in stable order, with the document's revision.
-    pub async fn tasks_items(&self, app: &str) -> Result<TaskSnapshot, String> {
-        self.open_app(app).await?;
-        self.with_app(app, |doc| Ok(doc.snapshot()))
-    }
-
-    /// The app document's revision: the number of changes in its history, so
-    /// it advances on a remote change exactly as it does on a local one.
-    pub async fn tasks_revision(&self, app: &str) -> Result<u64, String> {
-        self.open_app(app).await?;
-        self.with_app(app, |doc| Ok(doc.revision()))
-    }
-
-    /// Revision after the caller has opened the document. Synchronous so a
-    /// kernel watch can compare and register its waker in one poll turn.
-    pub fn tasks_revision_open(&self, app: &str) -> Option<u64> {
-        self.apps.borrow().get(app).map(AppDoc::revision)
-    }
-
-    /// Append a task, returning the id the document gave it.
-    pub async fn tasks_add(&self, app: &str, title: String) -> Result<String, String> {
-        self.mutate(app, move |doc| doc.add(title)).await
-    }
-
-    pub async fn tasks_set_completed(
+    /// Read the partition's currently applied history. Remote history is
+    /// applied asynchronously by the event pump. The closure is synchronous:
+    /// its `RefCell` guard is always released before any engine await.
+    pub async fn document_read<R>(
         &self,
-        app: &str,
-        id: &str,
-        completed: bool,
-    ) -> Result<(), String> {
-        let id = id.to_string();
-        self.mutate(app, move |doc| doc.set_completed(&id, completed))
-            .await
+        partition: &str,
+        read: impl FnOnce(&Document) -> R,
+    ) -> Result<R, String> {
+        self.open_document(partition).await?;
+        self.with_document(partition, |doc| Ok(read(doc)))
     }
 
-    pub async fn tasks_set_title(&self, app: &str, id: &str, title: String) -> Result<(), String> {
-        let id = id.to_string();
-        self.mutate(app, move |doc| doc.set_title(&id, title)).await
-    }
-
-    pub async fn tasks_remove(&self, app: &str, id: &str) -> Result<(), String> {
-        let id = id.to_string();
-        self.mutate(app, move |doc| doc.remove(&id)).await
-    }
-
-    // -- the visor document ---------------------------------------------------
-
-    /// The user's route key, minted on first use. `wrote` says a local commit
-    /// was authored, which is the kernel's cue to checkpoint.
-    ///
-    /// Read and mint inside one mutation: the read that decides whether to
-    /// mint may not be separated from the write by an await, or two callers
-    /// racing the first use would mint twice and the second would overwrite
-    /// the first (see `crate::visor` on last-writer-wins).
-    pub async fn visor_route_key(&self) -> Result<([u8; 32], bool), String> {
-        let minted = mix(b"polyvisor:route-key", &self.seed, &self.visor_entropy);
-        self.mutate(visor::VISOR_APP, move |doc| {
-            Ok(match visor::route_key(doc) {
-                Some(key) => (key, false),
-                None => {
-                    visor::set_route_key(doc, minted)?;
-                    (minted, true)
-                }
-            })
-        })
-        .await
-    }
-
-    /// The install id for `app` — the existing one, or a fresh one.
-    ///
-    /// Existing wins, and where two unpaired devices each minted one it is the
-    /// smallest that wins: both entries survive the merge, so the choice has
-    /// to be a rule both devices apply identically (`crate::visor`).
-    pub async fn visor_install(&self, app: &str) -> Result<([u8; 16], bool), String> {
-        let mut hasher = Sha256::new();
-        hasher.update(b"polyvisor:install");
-        hasher.update(self.seed);
-        hasher.update(self.visor_entropy);
-        hasher.update(app.as_bytes());
-        let digest = hasher.finalize();
-        let mut minted = [0u8; 16];
-        minted.copy_from_slice(&digest[..16]);
-        let app = app.to_string();
-        self.mutate(visor::VISOR_APP, move |doc| {
-            if let Some((id, _)) = visor::installs(doc)
-                .into_iter()
-                .find(|(_, held)| *held == app)
-            {
-                return Ok((id, false));
-            }
-            visor::add_install(doc, minted, &app)?;
-            Ok((minted, true))
-        })
-        .await
-    }
-
-    /// Every (install id, app id) the visor document holds.
-    pub async fn visor_installs(&self) -> Result<Vec<([u8; 16], String)>, String> {
-        self.open_app(visor::VISOR_APP).await?;
-        self.with_app(visor::VISOR_APP, |doc| Ok(visor::installs(doc)))
-    }
-
-    pub async fn visor_personalization(&self) -> Result<visor::Personalization, String> {
-        self.open_app(visor::VISOR_APP).await?;
-        self.with_app(visor::VISOR_APP, |doc| Ok(visor::personalization(doc)))
-    }
-
-    pub async fn set_visor_personalization(
+    /// Mutate the authoritative live document and publish every transaction
+    /// the callback authors, in order. Each transaction is independently
+    /// committed: if the callback later returns a domain error, earlier
+    /// transactions are still published before that error is returned.
+    /// Success means acceptance into the engine's in-memory history storage;
+    /// the kernel schedules persistence to its OPFS checkpoint separately.
+    pub async fn document_mutate<R>(
         &self,
-        hue: Option<Option<u16>>,
-        word: Option<Option<String>>,
-        fields: Vec<(Option<String>, String, Option<String>)>,
+        partition: &str,
+        change: impl FnOnce(&mut Document) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.mutate(partition, change).await
+    }
+
+    pub fn document_revision_open(&self, partition: &str) -> Option<u64> {
+        self.documents
+            .borrow()
+            .get(partition)
+            .map(Document::revision)
+    }
+
+    pub fn model_entropy(&self) -> [u8; 32] {
+        self.model_entropy
+    }
+
+    pub async fn document_save(&self, partition: &str) -> Result<Vec<u8>, String> {
+        self.document_read(partition, Document::save).await
+    }
+
+    pub async fn document_adopt(
+        &self,
+        partition: &str,
+        bytes: &[u8],
+        adopt: impl FnOnce(&mut Document, &Document) -> Result<(), String>,
     ) -> Result<(), String> {
-        self.mutate(visor::VISOR_APP, move |doc| {
-            visor::set_personalization(doc, hue, word, fields)
-        })
-        .await
-    }
-
-    pub async fn visor_save(&self) -> Result<Vec<u8>, String> {
-        self.open_app(visor::VISOR_APP).await?;
-        self.with_app(visor::VISOR_APP, |doc| Ok(doc.save()))
-    }
-
-    /// Merge the established visor history (preserving route/install entries),
-    /// then author one causally-later field patch that makes its personalization
-    /// authoritative over the joiner's pre-pairing values.
-    pub async fn adopt_visor(&self, bytes: &[u8]) -> Result<(), String> {
         self.hydrate().await?;
-        let app = visor::VISOR_APP;
-        let tree = tasks_tree(app);
-        let mut source = AppDoc::try_restore(app, tree, bytes, self.seed)?;
-        let wanted = visor::personalization(&mut source);
-        if wanted.hue.is_none() || wanted.word.as_deref().is_none_or(str::is_empty) {
-            return Err("that device sent incomplete personalization".to_string());
-        }
-        self.open_app(app).await?;
-        self.mutate(app, move |doc| {
-            let current = visor::personalization(doc);
-            doc.merge_snapshot(bytes)?;
-            let mut fields = Vec::new();
-            let mut user_keys: BTreeSet<String> = current.user.keys().cloned().collect();
-            user_keys.extend(wanted.user.keys().cloned());
-            for key in user_keys {
-                fields.push((None, key.clone(), wanted.user.get(&key).cloned()));
-            }
-            let mut app_ids: BTreeSet<String> = current.apps.keys().cloned().collect();
-            app_ids.extend(wanted.apps.keys().cloned());
-            for app_id in app_ids {
-                let before = current.apps.get(&app_id);
-                let after = wanted.apps.get(&app_id);
-                let mut keys: BTreeSet<String> =
-                    before.into_iter().flat_map(|m| m.keys()).cloned().collect();
-                keys.extend(after.into_iter().flat_map(|m| m.keys()).cloned());
-                for key in keys {
-                    fields.push((
-                        Some(app_id.clone()),
-                        key.clone(),
-                        after.and_then(|m| m.get(&key)).cloned(),
-                    ));
-                }
-            }
-            visor::set_personalization(doc, Some(wanted.hue), Some(wanted.word), fields)
-        })
-        .await?;
-        self.adopt_app_fragment(app).await
+        let source = Document::try_load(
+            bytes,
+            actor(b"polyvisor:actor:", self.seed, partition.as_bytes()),
+            document_tree(partition),
+        )?;
+        self.open_document(partition).await?;
+        self.mutate(partition, |doc| adopt(doc, &source)).await?;
+        self.adopt_app_fragment(partition).await
     }
 
     async fn adopt_app_fragment(&self, app: &str) -> Result<(), String> {
-        let tree = tasks_tree(app);
-        let heads = self.with_app(app, |doc| Ok(doc.heads()))?;
+        let tree = document_tree(app);
+        let heads = self.with_document(app, |doc| Ok(doc.heads()))?;
         if heads.len() > 1 {
-            let anchor = self.with_app(app, |doc| Ok(doc.merge_anchor()))?;
+            let anchor = self.with_document(app, |doc| Ok(doc.merge_anchor()))?;
             if let Some(anchor) = anchor {
                 let (anchor, sealed) = self.seal(anchor).await?;
                 self.handle
@@ -484,7 +370,8 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 self.require_vault()?.confirm(&sealed);
             }
         }
-        let (heads, members) = self.with_app(app, |doc| Ok((doc.heads(), doc.change_hashes())))?;
+        let (heads, members) =
+            self.with_document(app, |doc| Ok((doc.heads(), doc.change_hashes())))?;
         let (Some(head), 1) = (heads.first().copied(), heads.len()) else {
             return Ok(());
         };
@@ -500,10 +387,10 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             members,
         };
         let bundle = self
-            .with_app(app, |doc| {
+            .with_document(app, |doc| {
                 Ok(doc.bundle(vec![fragment.clone()]).into_iter().next())
             })?
-            .ok_or_else(|| "the adopted personalization could not be bundled".to_string())?;
+            .ok_or_else(|| "the adopted document could not be bundled".to_string())?;
         self.install_fragment(tree, &fragment, bundle, true).await
     }
 
@@ -582,7 +469,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             .await?;
         self.publish_keyhive().await?;
         // Everything already in storage was unopenable a moment ago.
-        let apps: Vec<String> = self.apps.borrow().keys().cloned().collect();
+        let apps: Vec<String> = self.documents.borrow().keys().cloned().collect();
         for app in apps {
             let _landed = self.absorb_app(&app).await;
         }
@@ -706,7 +593,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                     .ok_or_else(|| "this device has no group document".to_string())?;
                 doc.merge_anchor()
             };
-            self.push_us_commit(anchor).await?;
+            self.push_us_commits(anchor.into_iter().collect()).await?;
         }
         let (heads, members) = self.with_us(|doc| (doc.heads(), doc.change_hashes()));
         // One head, or none at all: a document with no changes has no
@@ -882,7 +769,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     ///
     /// Derived from the documents rather than remembered: the document *is*
     /// the record of what this device has read, rebuilt from its own changes
-    /// on every load (`crate::document::Document`), and it answers for a
+    /// on every load (`polyvisor_document_history::Document`), and it answers for a
     /// range that arrived as somebody else's fragment just as well as for one
     /// this device compacted itself.
     #[must_use]
@@ -895,7 +782,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 }
             }
         };
-        for doc in self.apps.borrow().values() {
+        for doc in self.documents.borrow().values() {
             walk(doc.tree(), doc.applied_ids());
         }
         if let Some(doc) = self.us.borrow().as_ref() {
@@ -915,7 +802,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 .as_ref()
                 .is_some_and(|doc| doc.applied_ids().contains(&commit));
         }
-        self.apps
+        self.documents
             .borrow()
             .values()
             .find(|doc| doc.tree() == tree)
@@ -1079,7 +966,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             Some(vault) => Some(vault.state().await?),
             None => self.pending_vault.borrow().clone(),
         };
-        let apps = self.apps.borrow();
+        let apps = self.documents.borrow();
         let us = self
             .us
             .borrow()
@@ -1101,7 +988,12 @@ impl<T: Transport<Local> + 'static> Engine<T> {
 
     /// Every tree this device holds a document for.
     fn trees(&self) -> Vec<SedimentreeId> {
-        let mut trees: Vec<SedimentreeId> = self.apps.borrow().values().map(AppDoc::tree).collect();
+        let mut trees: Vec<SedimentreeId> = self
+            .documents
+            .borrow()
+            .values()
+            .map(Document::tree)
+            .collect();
         if self.us.borrow().is_some() {
             trees.push(us_tree());
             // The group's keyhive operations: a peer that cannot ask for them
@@ -1156,10 +1048,10 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                     .as_mut()
                     .ok_or_else(|| "this device has no group document".to_string())?;
                 doc.add_member(key, String::new(), enrolled)?;
-                doc.last_local_commit()
+                doc.drain_local_commits()
             };
             self.refresh_members();
-            self.push_us_commit(commit).await?;
+            self.push_us_commits(commit).await?;
         }
         // The founder names its keyhive group and document in the one place
         // every device of the group will read: a joiner learns which document
@@ -1173,9 +1065,9 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                     .as_mut()
                     .ok_or_else(|| "this device has no group document".to_string())?;
                 doc.set_keyhive(group, doc_id)?;
-                doc.last_local_commit()
+                doc.drain_local_commits()
             };
-            self.push_us_commit(commit).await?;
+            self.push_us_commits(commit).await?;
         }
         self.publish_keyhive().await?;
         Ok(())
@@ -1197,7 +1089,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     }
 
     /// The vault, cloned out of its cell: every keyhive call is async, and a
-    /// `RefCell` borrow may not span an await (see `crate::document`).
+    /// `RefCell` borrow may not span an await (see `Document`).
     fn vault(&self) -> Option<Rc<Vault>> {
         self.vault.borrow().clone()
     }
@@ -1240,15 +1132,15 @@ impl<T: Transport<Local> + 'static> Engine<T> {
 
     /// Carry a user-system change into its tree, and wait for the driver to
     /// have persisted it (the barrier [`Engine::mutate`] documents).
-    async fn push_us_commit(
+    async fn push_us_commits(
         &self,
-        commit: Option<subduction_protocol::command::NewCommit>,
+        commits: Vec<subduction_protocol::command::NewCommit>,
     ) -> Result<(), String> {
-        let Some(commit) = commit else {
+        if commits.is_empty() {
             return Ok(());
-        };
+        }
         self.handle
-            .add_commits(us_tree(), vec![commit])
+            .add_commits(us_tree(), commits)
             .await
             .map_err(|e| e.to_string())?;
         let _heads = self
@@ -1275,23 +1167,23 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         change: impl FnOnce(&mut UsDoc) -> Result<R, String>,
     ) -> Result<R, String> {
         self.open_us().await?;
-        let (answer, commit) = {
+        let (answer, commits) = {
             let mut cell = self.us.borrow_mut();
             let doc = cell
                 .as_mut()
                 .ok_or_else(|| "this device has no group document".to_string())?;
-            let answer = change(doc)?;
-            (answer, doc.last_local_commit())
+            let answer = change(doc);
+            (answer, doc.drain_local_commits())
         };
         self.refresh_members();
-        self.push_us_commit(commit).await?;
+        self.push_us_commits(commits).await?;
         // The group document is compacted on the same terms as an app's:
         // `Engine::absorb` covers what arrives, this covers what is written
         // here. A group that reaches a fragment's worth of membership edits
         // is not a case anyone expects, and the cost of saying so is one
         // walk of a very short change graph.
         let _compacted = self.compact(us_tree()).await;
-        Ok(answer)
+        answer
     }
 
     /// Mirror the document's members into the set the policy reads.
@@ -1339,22 +1231,31 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     async fn mutate<R>(
         &self,
         app: &str,
-        change: impl FnOnce(&mut AppDoc) -> Result<R, String>,
+        change: impl FnOnce(&mut Document) -> Result<R, String>,
     ) -> Result<R, String> {
-        self.open_app(app).await?;
-        let (answer, tree, commit) = self.with_app(app, |doc| {
-            let answer = change(doc)?;
-            Ok((answer, doc.tree(), doc.last_local_commit()))
+        self.open_document(app).await?;
+        let (answer, tree, commits) = self.with_document(app, |doc| {
+            let answer = change(doc);
+            Ok((answer, doc.tree(), doc.drain_local_commits()))
         })?;
-        if let Some(commit) = commit {
-            let (commit, sealed) = self.seal(commit).await?;
+        if !commits.is_empty() {
+            let mut published = Vec::with_capacity(commits.len());
+            let mut sealed_commits = Vec::with_capacity(commits.len());
+            for commit in commits {
+                let (commit, sealed) = self.seal(commit).await?;
+                published.push(commit);
+                sealed_commits.push(sealed);
+            }
             self.handle
-                .add_commits(tree, vec![commit])
+                .add_commits(tree, published)
                 .await
                 .map_err(|e| e.to_string())?;
             // Only now: until the driver has taken the commit, the parents
             // whose keys are inside it must stay on the frontier.
-            self.require_vault()?.confirm(&sealed);
+            let vault = self.require_vault()?;
+            for sealed in &sealed_commits {
+                vault.confirm(sealed);
+            }
             // A durability barrier, and the reason the kernel may checkpoint
             // the moment this returns. `add_commits` only queues a command;
             // the driver signs and persists it inside `drain_effects`, which
@@ -1382,7 +1283,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             // user's write as failed. The roll-up waits for the next one.
             let _compacted = self.compact(tree).await;
         }
-        Ok(answer)
+        answer
     }
 
     /// Roll every closed commit range of `tree` up into a sedimentree
@@ -1428,8 +1329,8 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         // the whole history to throw all but the newest away would make each
         // mutation cost the whole document.
         let candidates: Vec<(automerge::Fragment, Vec<u8>)> = {
-            let apps = self.apps.borrow();
-            let doc: Option<&AppDoc> = enveloped
+            let apps = self.documents.borrow();
+            let doc: Option<&Document> = enveloped
                 .then(|| apps.values().find(|doc| doc.tree() == tree))
                 .flatten();
             if enveloped && doc.is_none() {
@@ -1579,24 +1480,24 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     /// peer is syncing and subscribed to its tree.
     ///
     /// A device only learns of an app's tree by holding it: the tree id is
-    /// derived from the app id (see [`tasks_tree`]), so opening the app *is*
+    /// derived from the partition id (see [`document_tree`]), so opening it is
     /// the discovery step, and both directions of a connection must ask for
-    /// the tree before either sees the other's history. Every `tasks_*` call
+    /// the tree before either sees the other's history. Every document access
     /// goes through here, which is why a session opening an app on a device
     /// that has never seen it pulls the other device's list.
-    async fn open_app(&self, app: &str) -> Result<(), String> {
+    async fn open_document(&self, app: &str) -> Result<(), String> {
         self.hydrate().await?;
         // The group document names the keyhive document every app tree is
         // sealed to, so it is opened first even for a device whose caller only
         // ever asked about tasks.
         self.open_us().await?;
-        if self.apps.borrow().contains_key(app) {
+        if self.documents.borrow().contains_key(app) {
             return Ok(());
         }
-        let tree = tasks_tree(app);
+        let tree = document_tree(app);
         {
-            let doc = AppDoc::empty(app, tree, self.seed);
-            let _created = self.apps.borrow_mut().insert(app.to_string(), doc);
+            let doc = Document::empty(actor(b"polyvisor:actor:", self.seed, app.as_bytes()), tree);
+            let _created = self.documents.borrow_mut().insert(app.to_string(), doc);
         }
         // The tree may already hold envelopes: a peer pushed them before this
         // device ever opened the app, and the event pump had no document to
@@ -1659,7 +1560,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             return self.absorb_keyhive().await;
         }
         let Some(app) = self
-            .apps
+            .documents
             .borrow()
             .iter()
             .find(|(_, doc)| doc.tree() == tree)
@@ -1667,7 +1568,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         else {
             // A tree with no local document: this device has never opened
             // that app. The items stay in storage and are opened the moment
-            // it does (`AppDoc::restore` on the next boot, or `open_app`).
+            // it does (`Document::load` on the next boot, or `open_document`).
             return false;
         };
         self.absorb_app(&app).await
@@ -1681,13 +1582,21 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             return false;
         };
         let (wanted, bundles, tree, known) = {
-            let apps = self.apps.borrow();
+            let apps = self.documents.borrow();
             let Some(doc) = apps.get(app) else {
                 return false;
             };
             (
-                doc.unapplied(&self.storage),
-                doc.unapplied_fragments(&self.storage),
+                self.storage
+                    .commit_blobs(doc.tree())
+                    .into_iter()
+                    .filter(|(id, _)| !doc.contains(id))
+                    .collect::<Vec<_>>(),
+                self.storage
+                    .fragment_blobs(doc.tree())
+                    .into_iter()
+                    .filter(|(id, _)| !doc.contains(id))
+                    .collect::<Vec<_>>(),
                 doc.tree(),
                 doc.applied_ids()
                     .into_iter()
@@ -1741,7 +1650,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             return false;
         };
         let (absorbed, tree, anchor) = {
-            let mut apps = self.apps.borrow_mut();
+            let mut apps = self.documents.borrow_mut();
             let Some(doc) = apps.get_mut(app) else {
                 return false;
             };
@@ -1801,7 +1710,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         if !ingested {
             return false;
         }
-        let apps: Vec<String> = self.apps.borrow().keys().cloned().collect();
+        let apps: Vec<String> = self.documents.borrow().keys().cloned().collect();
         let mut landed = false;
         for app in apps {
             landed |= self.absorb_app(&app).await;
@@ -1816,12 +1725,12 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     /// document *and* subscribes the live peers to its tree. Creating one
     /// here as a fallback would paper over a caller that skipped that, and
     /// hand back a document nothing is syncing.
-    fn with_app<R>(
+    fn with_document<R>(
         &self,
         app: &str,
-        f: impl FnOnce(&mut AppDoc) -> Result<R, String>,
+        f: impl FnOnce(&mut Document) -> Result<R, String>,
     ) -> Result<R, String> {
-        let mut apps = self.apps.borrow_mut();
+        let mut apps = self.documents.borrow_mut();
         let doc = apps
             .get_mut(app)
             .ok_or_else(|| format!("no document is open for {app}"))?;

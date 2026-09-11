@@ -7,13 +7,17 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::task::Poll;
 
+use automerge::{ROOT, ReadDoc, transaction::Transactable};
 use future_form::Local;
 use futures::future::LocalBoxFuture;
 use futures::{executor::LocalPool, task::LocalSpawnExt as _};
 use polyvisor_engine::{
     AppState, Engine, EngineClock, EngineEvent, EngineNotify, ItemKind, LocalFuture, Snapshot,
-    Spawner, StoreItem, TaskSnapshot, TreeState, tasks_tree,
+    Spawner, StoreItem, TreeState, document_tree,
 };
+use polyvisor_todo_model::Snapshot as TaskSnapshot;
+use polyvisor_visor_model as visor;
+use sha2::Digest as _;
 use subduction_protocol::event::Direction;
 use subduction_runtime::memory::transport::MemoryTransport;
 use subduction_runtime::transport::Transport;
@@ -37,6 +41,86 @@ impl EngineClock for TestClock {
 }
 
 type TestEngine = Engine<MemoryTransport>;
+
+/// Domain conveniences for sync integration tests. Production composition
+/// lives in the kernel; the engine API itself remains schema-neutral.
+trait Models {
+    async fn tasks_items(&self, app: &str) -> Result<TaskSnapshot, String>;
+    async fn tasks_add(&self, app: &str, title: String) -> Result<String, String>;
+    async fn tasks_set_completed(&self, app: &str, id: &str, value: bool) -> Result<(), String>;
+    async fn visor_personalization(&self) -> Result<visor::Personalization, String>;
+    async fn set_visor_personalization(
+        &self,
+        hue: Option<Option<u16>>,
+        word: Option<Option<String>>,
+        fields: Vec<(Option<String>, String, Option<String>)>,
+    ) -> Result<(), String>;
+    async fn visor_save(&self) -> Result<Vec<u8>, String>;
+    async fn adopt_visor(&self, bytes: &[u8]) -> Result<(), String>;
+    async fn visor_route_key(&self) -> Result<([u8; 32], bool), String>;
+    async fn visor_install(&self, app: &str) -> Result<([u8; 16], bool), String>;
+    async fn visor_installs(&self) -> Result<Vec<([u8; 16], String)>, String>;
+}
+
+impl Models for TestEngine {
+    async fn tasks_items(&self, app: &str) -> Result<TaskSnapshot, String> {
+        self.document_read(app, polyvisor_todo_model::snapshot)
+            .await
+    }
+    async fn tasks_add(&self, app: &str, title: String) -> Result<String, String> {
+        self.document_mutate(app, move |doc| polyvisor_todo_model::add(doc, title))
+            .await
+    }
+    async fn tasks_set_completed(&self, app: &str, id: &str, value: bool) -> Result<(), String> {
+        let id = id.to_string();
+        self.document_mutate(app, move |doc| {
+            polyvisor_todo_model::set_completed(doc, &id, value)
+        })
+        .await
+    }
+    async fn visor_personalization(&self) -> Result<visor::Personalization, String> {
+        self.document_read(visor::VISOR_APP, visor::personalization)
+            .await
+    }
+    async fn set_visor_personalization(
+        &self,
+        hue: Option<Option<u16>>,
+        word: Option<Option<String>>,
+        fields: Vec<(Option<String>, String, Option<String>)>,
+    ) -> Result<(), String> {
+        self.document_mutate(visor::VISOR_APP, move |doc| {
+            visor::set_personalization(doc, hue, word, fields)
+        })
+        .await
+    }
+    async fn visor_save(&self) -> Result<Vec<u8>, String> {
+        self.document_save(visor::VISOR_APP).await
+    }
+    async fn adopt_visor(&self, bytes: &[u8]) -> Result<(), String> {
+        self.document_adopt(visor::VISOR_APP, bytes, visor::adopt)
+            .await
+    }
+    async fn visor_route_key(&self) -> Result<([u8; 32], bool), String> {
+        let entropy = self.model_entropy();
+        self.document_mutate(visor::VISOR_APP, move |doc| {
+            let device = sha2::Sha256::digest(doc.actor_id()).into();
+            visor::route_key_or_create(doc, device, entropy)
+        })
+        .await
+    }
+    async fn visor_install(&self, app: &str) -> Result<([u8; 16], bool), String> {
+        let entropy = self.model_entropy();
+        let app = app.to_string();
+        self.document_mutate(visor::VISOR_APP, move |doc| {
+            let device = sha2::Sha256::digest(doc.actor_id()).into();
+            visor::install_or_create(doc, device, entropy, &app)
+        })
+        .await
+    }
+    async fn visor_installs(&self) -> Result<Vec<([u8; 16], String)>, String> {
+        self.document_read(visor::VISOR_APP, visor::installs).await
+    }
+}
 
 /// An engine with its driver and event pump spawned on `pool`. `changes`
 /// counts the remote changes the pump absorbed — the kernel's checkpoint
@@ -388,6 +472,60 @@ fn two_devices_converge_in_both_directions() {
         .await;
         assert!(after.items[0].completed);
         assert!(a.changes.get() > 0, "a's pump saw the remote change");
+    });
+}
+
+#[test]
+fn generic_mutation_publishes_every_transaction_even_before_a_domain_error() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 41, None);
+    let b = device(&pool, 42, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+
+    let saved = pool.run_until(async move {
+        eb.document_read("generic", |_| ()).await.unwrap();
+        wire(&ea, &eb).await;
+        ea.document_mutate("generic", |doc| {
+            doc.transact(|tx| tx.put(ROOT, "one", 1).map_err(|e| e.to_string()))?;
+            doc.transact(|tx| tx.put(ROOT, "two", 2).map_err(|e| e.to_string()))
+        })
+        .await
+        .unwrap();
+        let error = ea
+            .document_mutate("generic", |doc| {
+                doc.transact(|tx| tx.put(ROOT, "before-error", 3).map_err(|e| e.to_string()))?;
+                Err::<(), _>("domain refused the rest".to_string())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error, "domain refused the rest");
+        until(|| async {
+            eb.document_read("generic", |doc| {
+                ["one", "two", "before-error"]
+                    .into_iter()
+                    .all(|key| doc.read().get(ROOT, key).ok().flatten().is_some())
+            })
+            .await
+            .ok()
+            .filter(|seen| *seen)
+        })
+        .await;
+        ea.snapshot().await.unwrap()
+    });
+
+    let restored = device(&pool, 41, Some(saved));
+    pool.run_until(async {
+        let count = restored
+            .engine
+            .document_read("generic", |doc| {
+                ["one", "two", "before-error"]
+                    .into_iter()
+                    .filter(|key| doc.read().get(ROOT, *key).ok().flatten().is_some())
+                    .count()
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
     });
 }
 
@@ -872,7 +1010,7 @@ fn a_card_for_another_key_is_not_enrolled() {
 
 /// The app-tree item A authored for its one task, as the store carries it.
 fn app_item(engine: &TestEngine) -> StoreItem {
-    let tree = *polyvisor_engine::tasks_tree(APP).as_bytes();
+    let tree = *polyvisor_engine::document_tree(APP).as_bytes();
     engine
         .items()
         .into_iter()
@@ -1070,7 +1208,7 @@ fn a_branch_written_before_a_joiner_existed_reaches_it_through_the_anchor() {
             let mut own: Vec<[u8; 32]> = eb
                 .items()
                 .iter()
-                .filter(|item| item.tree == *tasks_tree(APP).as_bytes())
+                .filter(|item| item.tree == *document_tree(APP).as_bytes())
                 .map(|item| item.commit)
                 .collect();
             assert_eq!(own.len(), 1, "B wrote more than the one commit");
@@ -1139,7 +1277,7 @@ fn parents_delivered_after_their_child_still_open() {
     let (ea, ec) = (Rc::clone(&a.engine), Rc::clone(&c.engine));
 
     pool.run_until(async move {
-        let app_tree = *tasks_tree(APP).as_bytes();
+        let app_tree = *document_tree(APP).as_bytes();
         let app_commits = |engine: &TestEngine| -> Vec<[u8; 32]> {
             engine
                 .items()
@@ -1269,7 +1407,7 @@ fn a_closed_range_becomes_one_fragment_and_the_commits_it_carries_go() {
         // The saving, stated as the inequality it is rather than as a
         // predicted number: how many commits one fragment covers is the hash
         // draw's business.
-        let tree = *tasks_tree(APP).as_bytes();
+        let tree = *document_tree(APP).as_bytes();
         let loose = ea
             .items()
             .iter()
@@ -1486,7 +1624,7 @@ fn a_chain_of_fragments_is_still_one_entry_point() {
         );
         // Scoped to the app tree: B also holds a fragment over the group
         // document it adopted at enrollment (`Engine::adopt_fragment`).
-        let app = *tasks_tree(APP).as_bytes();
+        let app = *document_tree(APP).as_bytes();
         assert_eq!(
             eb.items()
                 .iter()

@@ -145,7 +145,7 @@ impl SnapshotStorage {
 
     /// Every stored fragment of `tree` as `(head, blob)`. The blob is an
     /// automerge *bundle* (or, on an app tree, an envelope around one) —
-    /// see `crate::document::Document::apply_bundles`.
+    /// see `polyvisor_document_history::Document::apply_bundles`.
     pub fn fragment_blobs(&self, tree: SedimentreeId) -> Vec<(CommitId, Vec<u8>)> {
         self.trees
             .borrow()

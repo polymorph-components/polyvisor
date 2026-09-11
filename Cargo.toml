@@ -2,8 +2,11 @@
 resolver = "3"
 members = [
     "runtime/component",
+    "runtime/crates/document-history",
     "runtime/crates/engine",
     "runtime/crates/kernel",
+    "runtime/crates/todo-model",
+    "runtime/crates/visor-model",
     "visor",
     "apps/todomvc",
     # Not shipped by the production site build: `web/build.ts --fixtures`
