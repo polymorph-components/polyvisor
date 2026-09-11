@@ -35,7 +35,6 @@ pub struct TodoItem {
 /// `polyvisor:app/tasks.snapshot`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSnapshot {
-    pub revision: u64,
     pub items: Vec<TodoItem>,
 }
 
@@ -89,8 +88,8 @@ impl AppDoc {
         self.core.save()
     }
 
-    /// The number of changes in the document's history — what `tasks.revision`
-    /// promises an app.
+    /// The number of changes in the document's history. Used to order and
+    /// uniquely name local additions.
     pub fn revision(&self) -> u64 {
         self.core.revision()
     }
@@ -138,7 +137,6 @@ impl AppDoc {
         }
         items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
         TaskSnapshot {
-            revision: self.revision(),
             items: items.into_iter().map(|(_, item)| item).collect(),
         }
     }

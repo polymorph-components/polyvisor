@@ -1,8 +1,7 @@
 //! Device pairing: the ceremony that enrolls a device into the group
 //! (internal.wit `interface pairing`).
 //!
-//! The shape, and every rule it encodes, is the pinned pairing contract
-//! (PAIRING.md §1–§2):
+//! The protocol rules are:
 //!
 //! - The **joiner** shows a code — `0x01 ‖ its endpoint key(32) ‖ token(16)`
 //!   in `BASE32_NOPAD_VISUAL`, 79 characters. The **adder** types or scans it
@@ -18,7 +17,7 @@
 //!   users compare them, and **both** confirm. Only then does the adder write
 //!   the joiner into the user-system document and send it over.
 //! - The joiner **adopts** that document — its group of one is discarded —
-//!   acknowledges with ENROLLED (PAIRING.md §2 step 8, added here), and only
+//!   acknowledges with ENROLLED, and only
 //!   then dials the adder on the subduction ALPN. That order is load-bearing:
 //!   the membership check on a subduction connection consults the group, and
 //!   both sides must already agree on it before the dial.
@@ -47,7 +46,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{EngineTransport, Error, ErrorCode, Kernel, PAIRING_ALPN};
 
-/// How long an offer stands (PAIRING.md §1).
+/// How long an offer stands.
 const OFFER_TTL_MS: u64 = 120_000;
 
 /// The code's version byte. A different first byte is a different ceremony,
@@ -784,7 +783,7 @@ enum Frame {
         name_key: Vec<u8>,
     },
     /// Joiner → adder, last: the enrollment has been adopted *and*
-    /// checkpointed here (PAIRING.md §2 step 8). It carries nothing — the
+    /// checkpointed here. It carries nothing — the
     /// message is that it arrived at all.
     ///
     /// It exists for the connection's sake rather than the protocol's: the
@@ -803,7 +802,7 @@ async fn send_frame(transport: &dyn EngineTransport, frame: &Frame) -> Result<()
 }
 
 /// The next frame, or `None` for a clean end, a dead connection, or bytes
-/// that are not a frame at all — reject-on-unknown (PAIRING.md §2).
+/// that are not a frame at all. Unknown frames are rejected.
 async fn recv_frame(transport: &dyn EngineTransport) -> Option<Frame> {
     let bytes = transport.recv().await?;
     serde_json::from_slice(&bytes).ok()
@@ -847,7 +846,7 @@ fn nonce32(bytes: &[u8]) -> Result<[u8; 32], String> {
 
 // -- code and SAS ------------------------------------------------------------
 
-/// `BASE32_NOPAD_VISUAL(0x01 ‖ key ‖ token)` — 79 characters (PAIRING.md §1).
+/// `BASE32_NOPAD_VISUAL(0x01 ‖ key ‖ token)` — 79 characters.
 /// The visor displays it in groups of four; the groups are not part of it.
 fn encode_code(key: &[u8; 32], token: &[u8; 16]) -> String {
     let mut payload = Vec::with_capacity(49);
@@ -883,7 +882,7 @@ fn decode_code(code: &str) -> Result<([u8; 32], [u8; 16]), String> {
     Ok((key, token))
 }
 
-/// The six digits both users compare (PAIRING.md §2).
+/// The six digits both users compare.
 ///
 /// `transcript = 0x01 ‖ token ‖ joiner-key ‖ adder-key ‖ nonce_j ‖ nonce_a`;
 /// the SAS is the first four bytes of its BLAKE3 read big-endian, modulo
@@ -918,7 +917,7 @@ mod tests {
         let key = [7u8; 32];
         let token = [9u8; 16];
         let code = encode_code(&key, &token);
-        assert_eq!(code.len(), 79, "PAIRING.md §1: 79 characters");
+        assert_eq!(code.len(), 79);
         assert_eq!(decode_code(&code).unwrap(), (key, token));
         // Grouped in fours for display, and hyphenated: the same code.
         let grouped: String = code

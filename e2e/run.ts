@@ -1,7 +1,5 @@
-// The M1 gates on real Chromium (docs/design.md "Delivery": "Playwright on
-// real Chromium for every claim about pixels or realms", and "M1": "app
-// renders in the opaque frame; zero network requests from the frame; no
-// JSPI").
+// Real Chromium, per docs/design.md "Delivery": claims about pixels or
+// realms need it, mocks don't prove them.
 //
 // The server sets neither COOP nor COEP: a SharedWorker needs none, and
 // setting them would make this harness diverge from what a home origin
@@ -236,17 +234,10 @@ async function open(ctx: BrowserContext, origin: string): Promise<Page> {
 // ---------------------------------------------------------------------------
 // The visor, as these scenarios drive it
 //
-// Every selector and every label below is the visor's own tree (visor/src/
-// ui.rs): `#visor-root` carrying `.unclaimed` until the device is open and
-// the `--hue` inline style when it is (nothing else ever paints it),
-// `#visor-strip` with its two halves `#visor-app` and `#visor-self`,
-// `#visor-drawer` holding one `.pane` per tenant, `.sheet` / `.sheet-error`
-// / `.app-row` / `.device-row`. They live in one block so a visor rename is
-// one edit here rather than six.
-//
-// The drawer is no longer a toggle: with nothing running it is pinned open
-// on the app list, so "close" means "back to the app list" and pressing the
-// half whose sheet is already showing does nothing at all.
+// Every selector below is the visor's own tree (visor/src/ui.rs), kept in
+// one block so a rename there is one edit here. With nothing running, the
+// drawer is pinned open on the app list rather than closed, so pressing the
+// half whose sheet is already showing does nothing.
 // ---------------------------------------------------------------------------
 
 const strip = (page: Page) => page.locator("#visor-strip");
@@ -257,15 +248,9 @@ const appsButton = (page: Page) => page.locator("#visor-app");
 /** The strip's right half: who this is, and this device's settings. */
 const settingsButton = (page: Page) => page.locator("#visor-self");
 
-/** Wait for the drawer to hold exactly one pane, done sliding and not on its
- * way out.
- *
- * A tenant switch renders two panes for the length of the slide — the one
- * arriving still wearing an `enter-` class — and a click into a moving
- * target lands wherever the animation had got to. A drawer in mid-close is
- * one pane and no `enter` class, so "settled" has to exclude `closing` too
- * (visor/src/ui.rs `drawer_class`) or this passes on a pane that is
- * leaving. */
+/** Wait for the drawer to hold exactly one settled pane: a tenant switch
+ * renders two for the length of the slide, and a click into a moving target
+ * lands wherever the animation had got to (visor/src/ui.rs `drawer_class`). */
 async function paneSettled(page: Page): Promise<void> {
   await drawer(page).waitFor({ timeout: 10_000 });
   await page.waitForFunction(
@@ -324,14 +309,10 @@ async function launchApp(
     await page.waitForSelector("#app-zone iframe[sandbox]", {
       timeout: 30_000,
     });
-    // The frame is not the end of the launch: the visor closes the drawer
-    // over it (visor/src/ui.rs `apply`, the `(Some(t), None)` arm), and that
-    // close outlives the frame's arrival — first as an open drawer whose
-    // `closing` render has not landed yet, then as a mounted `closing`
-    // drawer, which is `inert` and so hands every press to the scrim
-    // underneath. Returning inside that window makes the caller press a
-    // drawer that is on its way out. `Drawer::Closed` unmounts the element,
-    // so its absence is the visor's own statement that the launch is over.
+    // The visor closes the drawer over the frame, and that close outlives
+    // the frame's arrival — returning inside that window risks pressing a
+    // drawer that is still mid-close (`inert`, taking no press). Its
+    // absence is the visor's own statement that the launch is over.
     await page.waitForFunction(
       () => document.querySelector("#visor-drawer") === null,
       undefined,
@@ -367,19 +348,14 @@ async function saveDraft(page: Page): Promise<void> {
 }
 
 /**
- * Raise the running app's own sheet, from wherever the drawer is.
- *
- * Not by pressing the strip's app half from another pane. With a session
- * running, every clean pane offers `Close` and that is the supported way
- * out (visor/src/ui.rs `dismissal`); pressing the half for the tenant
- * already on screen is worse than useless, since a dirty draft parks the
- * transition and the dialog that raises makes the strip `inert` — after
- * which no press can land at all.
+ * Raise the running app's own sheet, from wherever the drawer is, via the
+ * pane's own `Close` control rather than pressing the strip's app half from
+ * another pane — that press is a no-op while a dirty draft has parked the
+ * transition behind a confirmation dialog.
  */
 async function toAppSheet(page: Page): Promise<void> {
-  // Settled first. A drawer in mid-close is `inert`, and so is one under
-  // the dialog (visor/src/ui.rs, `flag(confirming || shutting)`): its
-  // buttons take no press and the scrim behind takes it instead.
+  // A drawer mid-close, or one under the confirmation dialog, is `inert`
+  // and takes no press.
   await page.waitForFunction(
     () => {
       const d = document.querySelector("#visor-drawer");
@@ -427,30 +403,14 @@ async function setAppGlyph(
     exact: true,
   });
   await tile.waitFor({ timeout: 10_000 });
-  // Selected until it stays selected. Unlike the settings sheet, the app sheet
-  // seeds its draft from a kernel read that lands AFTER the pane is on
-  // screen (visor/src/ui.rs: the `AppInfo` arm spawns `read_app_meta` and
-  // calls `seed_draft` only when it comes back), so a choice made the
-  // instant the pane settles can be wiped by that seed arriving — leaving a
-  // clean draft, no "unsaved changes" dialog, and nothing saved. The seed
-  // happens once per transition, so this converges immediately.
-  const deadline = performance.now() + 15_000;
-  for (;;) {
-    await tile.click();
-    const picker = drawer(page).locator(".glyph-picker");
-    const search = picker.getByRole("searchbox", {
-      name: "Enter glyph or search",
-    });
-    await search.fill(glyph);
-    await picker.getByRole("button", { name: `Use ${expected}`, exact: true })
-      .click();
-    await page.waitForTimeout(300);
-    if ((await tile.textContent()) === expected) break;
-    check(
-      performance.now() < deadline,
-      "the app sheet's glyph tile would not hold a value",
-    );
-  }
+  await tile.click();
+  const picker = drawer(page).locator(".glyph-picker");
+  const search = picker.getByRole("searchbox", {
+    name: "Enter glyph or search",
+  });
+  await search.fill(glyph);
+  await picker.getByRole("button", { name: `Use ${expected}`, exact: true })
+    .click();
   await saveDraft(page);
   await page.waitForFunction(
     (want) =>
@@ -860,21 +820,13 @@ async function shot(page: Page, name: string): Promise<void> {
 // ---------------------------------------------------------------------------
 // Devices, as these scenarios drive it
 //
-// Everything here is shaped by one fact about the visor: it holds no state
-// of its own and no timer exists in its world (visor/src/ui.rs), so nothing
-// on screen refreshes on its own. `device.status`, `sync.peers`,
-// `sync.members` and `pairing.status` are read on the press that opens the
-// Settings tenant and on the Devices section's own "Refresh" button — so
-// pressing Refresh is how this harness re-reads any of them. That is not a
-// workaround for a missing feature; polling chrome is a thing the milestone
-// deliberately does not have.
-//
-// Pairing phases are the exception, and they are not a press: the kernel
-// pushes `events.pairing-changed` on every transition and the runtime's
-// `events.next` parks, so a phase the OTHER device caused reaches this
-// screen with nothing pressed here (internal.wit `interface events`). The
-// scenarios below therefore wait on those without pressing Refresh, which
-// is what makes them exercise the push path at all.
+// The visor has no timer and holds no state of its own: `device.status`,
+// `sync.peers` and `sync.members` are read on the press that opens Settings
+// and on its "Refresh" button, so that press is the only way this harness
+// re-reads any of them. Pairing phases are the exception — the kernel
+// pushes `events.pairing-changed`, so a phase the OTHER device caused
+// reaches this screen with nothing pressed here, and the scenarios below
+// wait on those without pressing Refresh to prove exactly that.
 // ---------------------------------------------------------------------------
 
 const devicesSheet = (page: Page) => sheet(page, "Devices");
@@ -1058,17 +1010,14 @@ async function waitForConnectedPeer(page: Page, peer: string): Promise<void> {
 // ---------------------------------------------------------------------------
 // Storage, as these scenarios drive it
 //
-// The section is Settings → "Storage" (visor/src/ui.rs `StorageSection`),
-// and like everything else in that drawer it is only ever as fresh as the
-// press that read it: the state line comes from `storage.status`, re-read
-// on the press that opens Settings and after every act in the section.
+// Settings → "Storage" is re-read the same way Devices is: on the press
+// that opens it and after every act in the section.
 //
-// The ceremony runs headless. "Connect Google Drive" opens a popup at the
-// URL the kernel minted; the fake's `/auth` 302s straight back to this
-// page's URL with `code` and `state`, that returning load broadcasts the
-// pair on the ceremony's BroadcastChannel and closes itself (web/boot.ts —
-// the popup is opened `noopener`, so there is no opener to post to), and the
-// waiting `shell.open-popup` resolves with it. No consent screen to click.
+// The ceremony runs headless: "Connect Google Drive" opens a popup at the
+// kernel-minted URL, the fake's `/auth` 302s straight back with `code` and
+// `state`, and that returning load broadcasts the pair on the ceremony's
+// BroadcastChannel for `shell.open-popup` to resolve with. No consent
+// screen to click.
 // ---------------------------------------------------------------------------
 
 const storageSheet = (page: Page) => sheet(page, "Storage");
@@ -1205,13 +1154,11 @@ async function addTodo(page: Page, title: string): Promise<void> {
 }
 
 /** Reload the page and put TodoMVC back on screen: a fresh mount, which is
- * a fresh `tasks.items` read. A reload with the app open leaves `#app/<token>`
- * in the URL, and the visor auto-restores whatever fragment it finds after
- * boot (docs/design.md "Routing"), so this — and every other
- * reload-with-the-app-open site below — waits for that restore rather than
- * pressing "Apps" itself, which would race the visor's own click. With no
- * app open (a page that arrived at the bare origin) there is no fragment,
- * and the press is the only way. */
+ * a fresh `tasks.items` read. With the app open, the URL still carries
+ * `#app/<token>` and the visor restores it on boot, so this waits for that
+ * restore rather than pressing "Apps" itself and racing the visor's own
+ * click; with no app open there is no fragment, and the press is the only
+ * way. */
 async function remountTodoMvc(page: Page): Promise<void> {
   const bookmarked = await page.evaluate(() =>
     location.hash.startsWith("#app/")
@@ -1231,18 +1178,10 @@ async function remountTodoMvc(page: Page): Promise<void> {
  * Wait for a todo that was written on the *other* device.
  *
  * Nothing pushes into a mounted app: `polyvisor:app/tasks` is pull-only and
- * the TodoMVC guest re-reads after its own mutations and at mount
- * (apps/todomvc/src/lib.rs). So a remote change is on this device's disk
- * long before it is on this device's screen, and the only honest way to
- * observe it is to make the app read again — which is what the remount
- * between attempts does.
+ * the TodoMVC guest re-reads only at mount and after its own mutations, so
+ * a remote change shows up only on the next remount.
  */
 async function waitForRemoteTodo(page: Page, title: string): Promise<void> {
-  // The app re-reads `tasks.items` only on mount and after its own
-  // mutations (wit/app.wit `tasks`: a change feed is the additive next
-  // step), so a remote change shows up on the next mount. Remounting costs
-  // a wasm instance per realm; a few seconds between attempts keeps the
-  // whole wait inside a handful of them.
   const deadline = performance.now() + 60_000;
   for (;;) {
     try {
@@ -1469,11 +1408,10 @@ const scenarios: Scenario[] = [
       await toggle.click();
       await app.locator("li.completed").first().waitFor({ timeout: 15_000 });
 
-      // ONE tab, on purpose. M1 kept a second page open so the SharedWorker
-      // would outlive the reload; M2's claim is the stronger one
-      // (docs/design.md "Devices"): "the worker respawns on every single-tab
-      // reload — checkpoint + rehydrate, not worker-memory luck". A second
-      // tab here would hide exactly the failure this scenario is for.
+      // ONE tab, on purpose: a second tab would keep the SharedWorker alive
+      // across the reload, hiding a claim this scenario exists to check —
+      // that the todo survives from checkpoint + rehydrate, not from
+      // worker memory.
       await page.reload();
       await visorReady(page);
       await page.waitForSelector("#app-zone iframe[sandbox]", {
@@ -1497,16 +1435,12 @@ const scenarios: Scenario[] = [
     async run(ctx, origin, browser) {
       const page = await open(ctx, origin);
       await visorReady(page);
-      // A device with no route key yet mints one on its first encode
-      // (README/dispatch: "minted on first use"); "kept" is not what that
-      // needs, but every other scenario that leans on a device surviving
-      // more than one page is kept first, and this one reloads twice.
+      // Kept first, since every reload below needs the same route key.
       await keepDevice(page, "the workbench");
       await launchTodoMvc(page);
-      // TodoMVC's footer — and the filter links in it — only renders with
-      // at least one todo (apps/todomvc/src/lib.rs: the footer is gated on
-      // `!items.read().is_empty()`), and the todo persists on this device,
-      // so one add here is enough for the reopened app in step (c) too.
+      // The footer's filter links only render with at least one todo
+      // (apps/todomvc/src/lib.rs), and that todo persists on this device,
+      // so one add here also covers the reopened app in step (c) below.
       await addTodo(page, "bookmark this filter");
 
       const h0 = await page.evaluate(() => location.hash);
@@ -1570,11 +1504,8 @@ const scenarios: Scenario[] = [
         )
       );
 
-      // Closing the session is the glue's own act of clearing the bar
-      // (internal.wit `shell`: "clears it in close-frame") — no navigation
-      // involved, so this is the one place that is not also covered by the
-      // notice-only checks below. The strip's left half opens the running
-      // app's sheet, and "Close app" is in there.
+      // Closing the session (not navigation) also clears the bar — the one
+      // case the notice-only checks below don't cover.
       await page.locator("#visor-app").click();
       await paneSettled(page);
       await drawer(page).getByRole("button", { name: "Close app", exact: true })
@@ -1585,12 +1516,10 @@ const scenarios: Scenario[] = [
         { timeout: 10_000 },
       );
 
-      // A fragment that is not a token this device's route key sealed:
-      // `not-found`, and the visor says so in its own voice rather than
-      // opening anything. `goto` to a URL that differs only in its fragment
-      // is a same-document navigation — no boot, and the visor ignores
-      // `hashchange` by ruling (docs/design.md "Routing") — so the reload
-      // is what makes this a bookmark being opened rather than a bar edit.
+      // A fragment this device's route key never sealed: the visor says so
+      // rather than opening anything. The reload is what makes this a
+      // bookmark being opened rather than a same-document hash edit, which
+      // the visor ignores by ruling (docs/design.md "Routing").
       await page.goto(origin + "/#app/not-a-real-token");
       await page.reload();
       await visorReady(page);
@@ -1628,13 +1557,10 @@ const scenarios: Scenario[] = [
   },
 
   {
-    // The case the per-tab anchor used to break (docs/design.md "Devices",
-    // last bullet): a bookmark opened in a genuinely fresh tab — no
-    // sessionStorage anchor, because Chromium only copies that on
-    // duplicate/`window.open`, not on a plain navigation to a URL typed or
-    // clicked elsewhere. Before LAST, this minted a brand-new device with
-    // no route key, so the token could never decrypt. With LAST, the fresh
-    // tab adopts the profile's kept device and the bookmark just opens.
+    // A bookmark opened in a genuinely fresh tab: Chromium only copies
+    // sessionStorage on duplicate/`window.open`, not on a plain navigation,
+    // so this tab has no device anchor of its own and must adopt the
+    // profile's kept device to decrypt the token at all.
     name: "bookmark-in-a-new-tab",
     async run(ctx, origin) {
       const page = await open(ctx, origin);
@@ -2154,10 +2080,9 @@ const scenarios: Scenario[] = [
       await keepDevice(page, "laptop");
 
       // Dropping only the tab's own anchor is a lost anchor, not a new
-      // device: `device.status` wrote LAST when this device was kept above
-      // (docs/design.md "Devices", last bullet), and it is still there.
-      // `deviceId` adopts it, so this reload is the SAME device and the
-      // picker never appears at all.
+      // device: LAST still names the device kept above, and `deviceId`
+      // adopts it, so this reload is the SAME device and the picker never
+      // appears.
       await page.evaluate((key) => sessionStorage.removeItem(key), ANCHOR);
       await page.reload();
       await visorReady(page);
@@ -2168,12 +2093,9 @@ const scenarios: Scenario[] = [
         "a lost anchor with a kept LAST device showed the picker anyway",
       );
 
-      // Now drop LAST too: an explicit new device, per the design's "only a
-      // profile with no kept device ... mints". This is exactly what
-      // `shell.switch-device(none)` does; doing it here rather than through
-      // a button keeps this scenario to what the WIT guarantees, so it does
-      // not depend on which control the visor happens to offer for a
-      // second device.
+      // Now drop LAST too — an explicit new device, done directly rather
+      // than through a button so this scenario depends only on what
+      // `shell.switch-device(none)` guarantees.
       await page.evaluate((key) => sessionStorage.removeItem(key), ANCHOR);
       await page.evaluate((key) => localStorage.removeItem(key), LAST);
       await page.reload();
@@ -2314,15 +2236,10 @@ const scenarios: Scenario[] = [
         const onB = await sasDigits(b);
         eq(onA, onB, "the two devices showed different pairing digits");
 
-        // B presses "No" — `pairing.cancel` (runtime/crates/kernel/src/
-        // pairing.rs `pairing_cancel`). The canceller's own phase goes
-        // straight to `Idle` (pairing.rs:220 `set_phase(Phase::Idle)`); it
-        // is the OTHER side that lands on a `Failed` phase, from whichever
-        // race it sees first: the Cancel frame itself (`cancelled()`,
-        // pairing.rs:664, "the other device cancelled") or the transport
-        // closing ahead of it (pairing.rs:668, "the other device went
-        // away") — both are the kernel's own words for "the other side is
-        // gone", so both count.
+        // B presses "No" (`pairing.cancel`). B's own phase goes straight to
+        // Idle; A lands on a failed phase, whether from the cancel itself
+        // or from the transport closing first — both are the kernel's own
+        // words for "the other side is gone," so both count.
         await devicesSheet(b).getByRole("button", { name: "No", exact: true })
           .click();
 
@@ -2348,8 +2265,8 @@ const scenarios: Scenario[] = [
           );
         }
 
-        // The canceller (B) lands on `Idle` too, same as pairing.rs:220 —
-        // its offer/claim controls are back, not stuck mid-ceremony.
+        // The canceller (B) also lands on Idle: its offer/claim controls
+        // are back, not stuck mid-ceremony.
         await refreshSettings(b);
         check(
           await devicesSheet(b).getByRole("button", {
@@ -2402,21 +2319,12 @@ const scenarios: Scenario[] = [
 
   {
     // The store as a sync path: what one device pushed, another device of
-    // the SAME group pulls — with no live connection between them.
-    //
-    // Two claims, and the scenario is arranged around keeping each of them
-    // from being answered by the other path:
-    //
-    //   * ISOLATION. B, connected to the same Drive account but not in A's
-    //     group, has a different naming key, so every object A wrote sits
-    //     at a name B cannot derive. It sees nothing of A's. Asserted
-    //     while the two are unpaired, so no live path exists at all.
-    //   * THE STORE CARRIES. Pairing does bring a live path up, and it is
-    //     fast — so the todo this claim turns on is written while B's page
-    //     is CLOSED (no page, no worker, no endpoint), and A is gone
-    //     entirely before B comes back. The fake's `alt=media` counter is
-    //     the corroboration: B read objects out of the store, which a
-    //     device that converged over the wire never does.
+    // the SAME group pulls, with no live connection between them. Two
+    // claims: unrelated groups derive different names and so read nothing
+    // of each other's (checked unpaired, so no live path exists at all);
+    // and after pairing, the store alone carries a todo written while B is
+    // offline and read after A is gone — `mediaReads` corroborates that B
+    // actually read it from the store rather than over a live connection.
     name: "drive-round-trip",
     async run(ctx, origin, browser, drive) {
       const ctxB = await browser.newContext();
@@ -2471,22 +2379,11 @@ const scenarios: Scenario[] = [
         await waitForMember(a, idB);
         await waitForMember(b, idA);
 
-        // B goes offline: navigating the tab away takes its SharedWorker
-        // with it (a worker lives while a client holds it), and with the
-        // worker goes the endpoint A could reach B on. Its device survives
-        // — the OPFS and the sealed tokens are the context's.
-        //
-        // NAVIGATED, not closed, and this is the whole reason: the device
-        // anchor is `sessionStorage` (web/boot.ts), which is per TAB — but
-        // a second tab is no longer reliably a second device (docs/design.md
-        // "Devices", last bullet): B here is ephemeral, so its LAST pointer
-        // was never written and a second tab would still mint fresh, but a
-        // KEPT device's second tab would instead ADOPT it — same group,
-        // same tokens, B's own worker still up. Closing this tab is
-        // therefore not a dependable way to take B offline for either case;
-        // navigating it away is, because it is the same client dropping
-        // its hold on B's SharedWorker (a worker lives while a client holds
-        // it) regardless of what any other tab would resolve to.
+        // B offline: navigating away (not closing the tab) drops its hold
+        // on its SharedWorker regardless of what a second tab would resolve
+        // to, and the device anchor is per-tab sessionStorage anyway, so
+        // this is the one dependable way to take B offline while keeping
+        // its checkpoint (OPFS, sealed tokens) alive under the context.
         await b.goto("about:blank");
 
         // Written while B could not be listening, so the store is the only
@@ -2902,9 +2799,8 @@ const scenarios: Scenario[] = [
     async run(ctx, origin) {
       const page = await open(ctx, origin);
       await visorReady(page);
-      // The strip paints before the worker answers, and M2's boot is slower
-      // than M1's (OPFS preopen, checkpoint read) — so wait for the mark
-      // rather than sampling it the instant the first pixel lands.
+      // The strip paints before the worker answers (OPFS preopen, checkpoint
+      // read), so wait for the mark rather than sampling it at first pixel.
       await page.waitForFunction(
         () =>
           ((globalThis as Record<string, unknown>).__polyvisor as {
@@ -2913,13 +2809,11 @@ const scenarios: Scenario[] = [
         undefined,
         { timeout: 30_000 },
       );
-      // Both realms on this side instantiated, and every `instantiate` call
-      // in the repository — visor, frame and worker alike — passes
-      // `{ jspi: false }` (web/jspi_test.ts pins that at the source level).
-      // Under that option polyengine refuses a sync-typed import that
-      // returns a Promise, so the visor having rendered its strip and the
-      // worker having answered `booted` — which needs the runtime
-      // component's exports, and its endpoint's in-guest signer — proves no
+      // Every `instantiate` call in the repository passes `{ jspi: false }`
+      // (web/jspi_test.ts pins that at the source level), under which
+      // polyengine refuses a sync-typed import that returns a Promise. So
+      // the strip rendering and the worker answering `booted` — which needs
+      // the runtime's exports and its endpoint's in-guest signer — proves no
       // import took a suspending path.
       const marks = await page.evaluate(() =>
         (globalThis as Record<string, unknown>).__polyvisor
@@ -3193,9 +3087,8 @@ const scenarios: Scenario[] = [
       await strip(page).getByText("the workbench").waitFor({ timeout: 15_000 });
 
       // With an app running there is a scrim as well, and it is a press
-      // target: pressing it while the dialog stands used to replace the
-      // parked transition, so "Revert" closed the drawer instead of opening
-      // the sheet the user had actually asked for.
+      // target, so it must not silently answer the dialog in place of one
+      // of the three named buttons.
       await launchTodoMvc(page);
       await openSettingsSheet(page);
       await field.fill("typed over the app");
@@ -3221,11 +3114,11 @@ const scenarios: Scenario[] = [
   },
 
   {
-    // Two handheld widths. The Devices section is long machine identifiers
-    // next to short framework-voice facts about them, which is the shape
-    // that used to lay one over the other. Nothing may be answered by
-    // hiding: the whole identifier stays reachable — wrapped or locally
-    // scrolled — while neither the page nor the drawer scrolls sideways.
+    // Two handheld widths. The Devices section pairs long machine
+    // identifiers with short framework-voice facts, so nothing may be
+    // answered by hiding: the whole identifier stays reachable — wrapped or
+    // locally scrolled — while neither the page nor the drawer scrolls
+    // sideways.
     name: "visor-narrow-layout",
     async run(ctx, origin) {
       const page = await open(ctx, origin);
@@ -3236,9 +3129,8 @@ const scenarios: Scenario[] = [
         .locator("input").fill("Ada Lovelace-Byron the Elder");
       await saveDraft(page);
 
-      // The unnamed case is the one that overlapped: with no petname, a
-      // device is shown by its endpoint id — tens of characters of machine
-      // text beside "this device" and an age.
+      // The unnamed case, where an id and a short fact sit closest: with no
+      // petname, a device is shown by its endpoint id alone.
       const id = await endpointId(page);
       check(id.length > 20, `the endpoint id is implausibly short: ${id}`);
       await waitInDevices(
@@ -3519,11 +3411,10 @@ async function main(): Promise<void> {
       } catch (err) {
         failures++;
         console.error(`FAIL ${scenario.name}: ${(err as Error).message}`);
-        // What the visor was showing when the wait gave up, per open page:
-        // the M3a flakes were diagnosed from exactly this line. EVERY
-        // context, not just this scenario's own: a scenario with a second
-        // device fails at that device as often as at this one, and dumping
-        // only `ctx` prints nothing at all when the failure is over there.
+        // What the visor was showing when the wait gave up, per open page —
+        // EVERY context, not just this scenario's own: a scenario with a
+        // second device fails at that device as often as at this one, and
+        // dumping only `ctx` prints nothing when the failure is over there.
         for (
           const page of browser?.contexts().flatMap((c) => c.pages()) ?? []
         ) {

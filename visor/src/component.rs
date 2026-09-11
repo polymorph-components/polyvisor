@@ -1,20 +1,9 @@
-//! The `visor` world: bindings, and the two producer exports.
-//!
-//! `stream_dom_dioxus::launch!` is deliberately not used: it exports the
-//! bare `producer` world, which has none of the visor's kernel imports
-//! (m1-context.md "Rust facts"). Instead this world's own `generate!`
-//! remaps the three `polymorph:stream-dom` interfaces onto
-//! `stream_dom_guest::bindings`, so the `StreamReader<u8>` and `DomEvent`
-//! that cross into `stream_dom_dioxus::driver` are the same types the
-//! driver was compiled against, and `run`/`handle-event` are two-line
-//! delegations.
+//! The visor world bindings and stream-dom producer exports. This cannot use
+//! `stream_dom_dioxus::launch!` because the visor has additional imports; the
+//! remaps keep the generated stream and event types identical to the driver.
 
-// No `async:` option, for the reason spelled out in
-// `runtime/component/src/component.rs`: one blanket mode lowers WIT-sync
-// functions with the async canonical option, which is illegal and only
-// wasmtime catches it. Every function in this world is `async func`
-// anyway, so following the WIT annotations is both correct today and
-// proof against a sync one arriving later.
+// WIT annotations decide async lowering; blanket async would incorrectly
+// lower synchronous functions.
 // `features`: not for this world, which imports nothing unstable — for the
 // package. `world runtime` in the same directory imports
 // `polymorph:iroh/identity-from-seed`, which is

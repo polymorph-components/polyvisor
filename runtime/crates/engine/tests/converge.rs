@@ -239,8 +239,7 @@ fn two_devices_converge_in_both_directions() {
         assert_eq!(titles(&seen), vec!["buy milk", "walk the dog"]);
         assert!(b.changes.get() > 0, "the pump reported the remote change");
 
-        // The reverse direction: B toggles, A sees it, and A's revision moves.
-        let before = ea.tasks_revision(APP).await.unwrap();
+        // The reverse direction: B toggles and A sees the changed item.
         let id = seen.items[0].id.clone();
         eb.tasks_set_completed(APP, &id, true).await.unwrap();
 
@@ -249,11 +248,7 @@ fn two_devices_converge_in_both_directions() {
             items.items[0].completed.then_some(items)
         })
         .await;
-        assert!(
-            after.revision > before,
-            "a remote change advances the revision: {before} -> {}",
-            after.revision
-        );
+        assert!(after.items[0].completed);
         assert!(a.changes.get() > 0, "a's pump saw the remote change");
     });
 }
@@ -379,7 +374,7 @@ fn a_restored_engine_does_not_re_mint_the_id_it_last_used() {
 }
 
 #[test]
-fn a_dead_connection_leaves_the_registry() {
+fn a_dead_connection_notifies_the_caller_once() {
     let mut pool = LocalPool::new();
     let a = device(&pool, 10, None);
     let b = device(&pool, 11, None);
@@ -396,12 +391,10 @@ fn a_dead_connection_leaves_the_registry() {
                 *inbound.borrow_mut() = Some(eb.connect(tb, Direction::Inbound, None).await);
             })
             .await;
-        assert_eq!(ea.live_connections(), 1);
-
         // B goes away: its end of the wire closes, which A's read loop sees
         // as a clean close and reports as `ConnectionClosed`.
         Transport::<Local>::disconnect(&b_wire).await;
-        until(|| async { (ea.live_connections() == 0).then_some(()) }).await;
+        until(|| async { (a.closed.get() == 1).then_some(()) }).await;
         assert_eq!(
             a.closed.get(),
             1,
@@ -497,9 +490,9 @@ fn a_group_this_device_is_not_in_is_not_adopted() {
     });
 }
 
-/// M3c's whole claim, from the outside: what rests in storage — and so what
-/// crosses the wire and sits on a relay — is a keyhive envelope, and a party
-/// holding those bytes without being in the group gets nothing from them.
+/// What rests in storage — and so what crosses the wire and sits on a relay —
+/// is a keyhive envelope, and a party holding those bytes without being in the
+/// group gets nothing from them.
 #[test]
 fn commits_at_rest_are_envelopes_a_stranger_cannot_open() {
     let mut pool = LocalPool::new();
@@ -559,10 +552,10 @@ fn commits_at_rest_are_envelopes_a_stranger_cannot_open() {
 /// commit only — not the whole read-back set — still materializes the entire
 /// ancestry behind it.
 ///
-/// This is the mechanism PAIRING.md §4b calls causal-key read-back, and it is
-/// the reason the sealed plaintext is keyhive's own `Envelope` rather than a
-/// look-alike: the walk deserializes an `Envelope` out of every plaintext it
-/// opens, so a parallel format would fail here and nowhere else.
+/// This causal-key read-back is why the sealed plaintext is keyhive's own
+/// `Envelope` rather than a look-alike: the walk deserializes an `Envelope`
+/// out of every plaintext it opens, so a parallel format would fail here and
+/// nowhere else.
 #[test]
 fn a_joiner_walks_the_ancestry_from_a_single_key() {
     use sedimentree_core::loose_commit::LooseCommit;
@@ -839,45 +832,6 @@ fn a_store_does_not_get_to_decide_what_an_item_is() {
         // And again is not news: the store re-offering what this device holds
         // must not read as a change to checkpoint.
         assert!(!eb.ingest_items(vec![good]).await.unwrap());
-    });
-}
-
-#[test]
-fn a_checkpoint_written_before_the_store_existed_still_mints_a_name_key() {
-    // The pre-M4 shape: a device with a group document and no name key. It
-    // never takes the founding branch again, so a mint that only ran there
-    // would leave it with a store it cannot name a single object in.
-    let mut pool = LocalPool::new();
-    let sealed = {
-        let a = device(&pool, 1, None);
-        let ea = Rc::clone(&a.engine);
-        pool.run_until(async move {
-            ea.tasks_add(APP, "buy milk".into()).await.unwrap();
-            ea.snapshot().await.unwrap()
-        })
-    };
-    assert!(sealed.us.is_some(), "the device founded its group");
-    let pre_m4 = Snapshot {
-        name_key: None,
-        ..sealed
-    };
-
-    let restored = device(&pool, 1, Some(pre_m4));
-    let engine = Rc::clone(&restored.engine);
-    pool.run_until(async move {
-        assert_eq!(engine.name_key(), None, "nothing was restored");
-        // The first touch of the group document is what mints it.
-        let _members = engine.members().await.unwrap();
-        assert!(
-            engine.name_key().is_some(),
-            "a restored device can name its store's objects"
-        );
-        // And it is carried from then on.
-        assert_eq!(
-            engine.snapshot().await.unwrap().name_key,
-            engine.name_key(),
-            "the mint rides the next checkpoint"
-        );
     });
 }
 

@@ -1,8 +1,5 @@
-// Build-time translation CLI. The site never ships the translator
-// (~0.5 MB gzip) — each component is translated once here, producing an
-// envelope that `artifactsFromEnvelope` (web/mount.ts's `source`)
-// reconstitutes at load time. polyengine is consumed from JSR at a caret
-// pin (deno.json), so the packaged translator asset is the one to use.
+// Build-time translation CLI. The site ships translation envelopes, not the
+// translator.
 //
 // Usage:
 //   deno run -A web/translate.ts <component.wasm> [-o <out.plan.json>]

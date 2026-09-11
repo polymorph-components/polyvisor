@@ -9,10 +9,6 @@ use std::sync::LazyLock;
 
 use crate::{Error, ErrorCode};
 
-/// Bumped when a stored shape changes; a record from the future is an error
-/// rather than a silent partial read.
-pub const SCHEMA: u32 = 3;
-
 const WORDS: &str = include_str!("../eff_short_wordlist.txt");
 
 /// `polyvisor:internal/device.state`, plus the terminal state an erased
@@ -64,7 +60,6 @@ pub struct DeviceStatus {
 /// beyond the petname.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexRow {
-    v: u32,
     pub id: String,
     pub petname: String,
     pub tier: Tier,
@@ -80,7 +75,6 @@ impl IndexRow {
     /// A fresh device: ephemeral, resting open, unnamed.
     pub fn fresh(id: &str, now: u64) -> IndexRow {
         IndexRow {
-            v: SCHEMA,
             id: id.to_string(),
             petname: String::new(),
             tier: Tier::Ephemeral,
@@ -91,22 +85,12 @@ impl IndexRow {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<IndexRow, Error> {
-        let row: IndexRow = serde_json::from_slice(bytes).map_err(|e| {
+        serde_json::from_slice(bytes).map_err(|e| {
             Error::new(
                 ErrorCode::Failed,
                 format!("a device index row could not be read: {e}"),
             )
-        })?;
-        if row.v != SCHEMA {
-            return Err(Error::new(
-                ErrorCode::Failed,
-                format!(
-                    "a device index row is version {}; this runtime speaks {SCHEMA}",
-                    row.v
-                ),
-            ));
-        }
-        Ok(row)
+        })
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
@@ -128,9 +112,7 @@ pub struct Device {
     pub hue: u16,
     pub word: String,
     /// The user's own labels — petname, glyph, whatever the visor settles on
-    /// (internal.wit `meta-scope`). Absent from checkpoints written before
-    /// this field existed; `serde(default)` keeps those loading.
-    #[serde(default)]
+    /// (internal.wit `meta-scope`).
     pub meta: Meta,
 }
 
@@ -138,14 +120,12 @@ pub struct Device {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Meta {
     pub user: BTreeMap<String, String>,
-    pub device: BTreeMap<String, String>,
     pub app: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Which map `meta`/`set_meta` reads or replaces.
 pub enum MetaScope {
     User,
-    Device,
     App(String),
 }
 

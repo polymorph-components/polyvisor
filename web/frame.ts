@@ -1,16 +1,5 @@
-// The frame loader: the entire contents of every app frame.
-//
-// It is constant — one build artifact, hash-pinned in the srcdoc's meta CSP
-// (web/boot.ts `frameSrcdoc`) — so the app's own code arrives as data over a
-// port and never as script. The frame is an opaque origin with no
-// `connect-src`: everything it renders comes down the mutation stream or out
-// of a `blob:` minted here from bytes the kernel served over the session
-// port. That is the e2e `frame-network-dead` claim, structurally.
-//
-// Its authority is exactly one session port (internal.wit "Realms"): the
-// app's `polyvisor:app/tasks` import and the three `polyvisor:internal/apps`
-// members that read its own bundle. It never states a session id; the worker
-// bound one to this port.
+// Constant loader for opaque, network-dead app frames. Component bytes and
+// the session-bound capability port arrive as data from the parent.
 
 import { artifactsFromEnvelope } from "@polyengine/runtime/embedder";
 
@@ -41,12 +30,7 @@ let mounted: MountedProducer | undefined;
  * exists an await later, which is not a guard. */
 let mounting = false;
 
-/** `polyvisor:app/route.get`'s answer: the route the mount message carried
- * ("" for a plain launch), fixed for this frame's lifetime — `wit/app.wit`
- * `route`: "the route the app was launched at". Served locally, never over
- * the session port: the port answers `tasks`/`apps`, and route is a
- * page-URL concern the glue owns on the other side of `postMessage`, not a
- * kernel call (internal.wit `shell.open-frame` docs). */
+/** Launch route, fixed for the frame lifetime and served locally. */
 let route = "";
 
 function teardown(message: string): void {
@@ -62,13 +46,7 @@ async function mount(
   port: MessagePort,
 ): Promise<void> {
   const imports = proxyInterfaces(port, [I.tasks]);
-  // `route` is local, not proxied over `port`: `get` reads the value the
-  // mount message carried and `set` relays to the parent, which is the one
-  // side that can touch `location` at all (internal.wit `shell.open-frame`:
-  // "the glue also writes the page fragment ... on every `route.set` the
-  // frame relays"). Same shape as a proxied interface — a record of
-  // camelCase methods, keyed by the verbatim WIT interface id — so it merges
-  // into `imports` exactly where a proxy would have gone.
+  // Only the parent can update the page URL.
   imports[I.route] = {
     get: () => route,
     set: (r: string) => {

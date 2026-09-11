@@ -324,7 +324,6 @@ function mintSessionPort(
   const { port1, port2 } = new MessageChannel();
   serveInterfaces(port1, {
     [I.tasks]: {
-      revision: () => svc.tasksRevision(session),
       items: () => svc.tasksItems(session),
       add: (title: string) => svc.tasksAdd(session, title),
       setCompleted: (id: string, completed: boolean) =>
@@ -479,7 +478,6 @@ self.onconnect = (ev: MessageEvent) => {
       // open it at.
       installFragment: async (app: string) =>
         (await ready)[I.apps].installFragment(app),
-      sessionApp: async (s: number) => (await ready)[I.apps].sessionApp(s),
       component: async (s: number) => (await ready)[I.apps].component(s),
       assets: async (s: number) => (await ready)[I.apps].assets(s),
       asset: async (s: number, h: Uint8Array) =>

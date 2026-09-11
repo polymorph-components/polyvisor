@@ -513,7 +513,6 @@ impl guest::device::Guest for Component {
     async fn meta(scope: guest::device::MetaScope) -> Result<Vec<(String, String)>, Error> {
         let scope = match scope {
             guest::device::MetaScope::User => polyvisor_kernel::MetaScope::User,
-            guest::device::MetaScope::Device => polyvisor_kernel::MetaScope::Device,
             guest::device::MetaScope::App(id) => polyvisor_kernel::MetaScope::App(id),
         };
         Ok(kernel()?
@@ -528,7 +527,6 @@ impl guest::device::Guest for Component {
     ) -> Result<(), Error> {
         let scope = match scope {
             guest::device::MetaScope::User => polyvisor_kernel::MetaScope::User,
-            guest::device::MetaScope::Device => polyvisor_kernel::MetaScope::Device,
             guest::device::MetaScope::App(id) => polyvisor_kernel::MetaScope::App(id),
         };
         kernel()?
@@ -677,12 +675,6 @@ impl guest::apps::Guest for Component {
     async fn launch(app: String) -> Result<u32, Error> {
         kernel()?.launch(&app).map_err(map_error)
     }
-    async fn session_app(session: u32) -> Result<guest::apps::AppInfo, Error> {
-        kernel()?
-            .session_app(session)
-            .map(app_info)
-            .map_err(map_error)
-    }
     async fn component(session: u32) -> Result<guest::apps::ComponentArtifacts, Error> {
         let artifacts = kernel()?.component(session).await.map_err(map_error)?;
         Ok(guest::apps::ComponentArtifacts {
@@ -758,19 +750,12 @@ fn unavailable_service() -> String {
 }
 
 impl guest::app_services::Guest for Component {
-    async fn tasks_revision(session: u32) -> Result<u64, String> {
-        kernel()
-            .map_err(|_| unavailable_service())?
-            .tasks_revision(session)
-            .await
-    }
     async fn tasks_items(session: u32) -> Result<guest::app_services::Snapshot, String> {
         let snapshot = kernel()
             .map_err(|_| unavailable_service())?
             .tasks_items(session)
             .await?;
         Ok(guest::app_services::Snapshot {
-            revision: snapshot.revision,
             items: snapshot
                 .items
                 .into_iter()

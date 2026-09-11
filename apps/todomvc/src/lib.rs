@@ -1,43 +1,17 @@
-//! polyvisor's TodoMVC app: `world app` from `wit/app.wit`.
-//!
-//! Ported from polymorph-stream-dom's `guests/dioxus/todomvc/src/lib.rs`
-//! (rev 1974923), which is itself DioxusLabs/dioxus @ v0.7.10
-//! `examples/01-app-demos/todomvc.rs` (MIT/Apache-2.0). Components, names and
-//! structure are kept recognisable; what changed is where the state lives.
-//!
-//! **The list is not ours.** The example keeps a `HashMap<u32, TodoItem>` in a
-//! signal and mutates it in place. Here the schema authority is the `tasks`
-//! service (`wit/app.wit`, interface `tasks`): the signal holds a *snapshot*,
-//! every mutation is a service call, and the snapshot is re-fetched after it.
-//! See [`refresh`] for what that costs and what is missing.
-//!
-//! The module is split the way `stream-dom-dioxus` splits its own: everything
-//! that names WIT bindings is `#[cfg(target_arch = "wasm32")]`, so a plain
-//! `cargo clippy --workspace` still type-checks the components against the
-//! `#[cfg(not(target_arch = "wasm32"))]` stub in [`service`].
+//! TodoMVC over `polyvisor:app/tasks`. The signal is a service snapshot;
+//! mutations go to the service and then refresh it.
+//! UI structure derives from DioxusLabs' Dioxus TodoMVC example (v0.7.10,
+//! MIT/Apache-2.0), via polymorph-stream-dom rev 1974923.
 
 use dioxus::prelude::*;
 
-// ---------------------------------------------------------------------------
-// The component world
-// ---------------------------------------------------------------------------
-
-/// Bindings for `polyvisor:app/app`.
-///
-/// Generated here rather than reached through `stream_dom_dioxus::launch!`:
-/// `launch!` exports the bare `polymorph:stream-dom/producer` world, which
-/// has no `tasks` import. The `with:` remaps make this world's stream-dom
-/// types *the same Rust types* as `stream_dom_guest::bindings`', so the
-/// `EventTarget` / `DomEvent` this world's `handle-event` receives can be
-/// handed straight to `stream_dom_dioxus::driver`.
+/// Generated here because the exported app world includes `tasks`; the
+/// remaps keep stream-dom event types identical to the driver's.
 #[cfg(target_arch = "wasm32")]
 #[allow(clippy::empty_docs)]
 mod bindings {
-    // No `async:` option, for the reason spelled out in
-    // `runtime/component/src/component.rs`: one blanket mode lowers WIT-sync
-    // functions with the async canonical option, which the canonical ABI
-    // forbids and only wasmtime and polyengine's translator catch. Omitting
-    // it makes each function follow its own WIT declaration.
+    // WIT annotations decide async lowering; blanket async would incorrectly
+    // lower synchronous resource functions.
     wit_bindgen::generate!({
         path: "../../wit",
         world: "app",
@@ -71,32 +45,21 @@ impl bindings::Guest for Component {
 #[cfg(target_arch = "wasm32")]
 bindings::export!(Component with_types_in bindings);
 
-/// Keeps the root component reachable off the component target, so a native
-/// `clippy -D warnings` type-checks it rather than dead-coding it away. Same
-/// trick, and same reason, as `stream_dom_dioxus::launch!`'s non-wasm arm.
+/// Keep the UI type-checked by native clippy.
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub fn __launch_root() {
     let _ = app;
 }
 
-// ---------------------------------------------------------------------------
-// The service
-// ---------------------------------------------------------------------------
-
-/// One task, as the components see it. A plain mirror of
-/// `polyvisor:app/tasks.todo-item` so the components name no bindings and the
-/// `id` stays what the service says it is: an opaque `string`.
+/// UI-facing mirror of `polyvisor:app/tasks.todo-item`.
 #[derive(Clone, PartialEq, Eq)]
-pub struct TodoItem {
+struct TodoItem {
     pub id: String,
     pub title: String,
     pub completed: bool,
 }
 
-/// `polyvisor:app/tasks`, one thin layer up: the generated bindings' types
-/// mapped onto [`TodoItem`], and every `result<_, string>` kept as
-/// `Result<_, String>`.
 #[cfg(target_arch = "wasm32")]
 mod service {
     use super::TodoItem;
@@ -132,7 +95,6 @@ mod service {
     }
 }
 
-/// `polyvisor:app/route`, thin like [`service`] above.
 #[cfg(target_arch = "wasm32")]
 mod route {
     use crate::bindings::polyvisor::app::route;
@@ -146,8 +108,6 @@ mod route {
     }
 }
 
-/// Off the component target there is no host to answer it; same reason as
-/// `service`'s native stub just below.
 #[cfg(not(target_arch = "wasm32"))]
 mod route {
     pub fn get() -> String {
@@ -157,10 +117,7 @@ mod route {
     pub fn set(_route: &str) {}
 }
 
-/// Off the component target there is no service and no host to answer it.
-/// The stub exists only so the components below type-check under a native
-/// `cargo clippy --workspace --all-targets`; it is never linked into the
-/// component.
+/// Native stub used only to type-check the UI.
 #[cfg(not(target_arch = "wasm32"))]
 mod service {
     use super::TodoItem;
@@ -186,42 +143,21 @@ mod service {
     }
 }
 
-/// Replace the snapshot with a fresh one from the service.
-///
-/// This is the *only* thing that refreshes: it runs on mount and after each
-/// of our own mutations. `tasks.revision` is a cheap monotonic probe and this
-/// app never calls it, because there is nothing in the app world to call it
-/// *from* — no timer, no wakeup, no incoming event that is not already one of
-/// our own mutations. So a change applied by another session (or a sync) is
-/// invisible here until the user touches something.
-///
-/// That is the documented shape of the contract, not an oversight:
-/// `wit/app.wit`'s `tasks` doc calls the interface "poll-shaped on purpose"
-/// and names "a change feed ... once apps have an event path that wants one"
-/// as the expected additive next step (docs/design.md "Contracts"). When that
-/// lands, this function is what it replaces.
-///
-/// A failed fetch leaves the previous snapshot in place. M1 has no surface to
-/// report an error on.
+/// Refresh after mount and local mutations. Without an app event path,
+/// remote changes become visible on the next local mutation.
 async fn refresh(mut items: Signal<Vec<TodoItem>>) {
     if let Ok(fresh) = service::items().await {
         items.set(fresh);
     }
 }
 
-/// Run one mutation, then re-read the list. Every write path goes through
-/// here, which is what keeps "mutate then re-fetch" from being restated six
-/// times.
+/// Run one mutation, then re-read the list.
 fn mutate(items: Signal<Vec<TodoItem>>, work: impl Future<Output = ()> + 'static) {
     spawn(async move {
         work.await;
         refresh(items).await;
     });
 }
-
-// ---------------------------------------------------------------------------
-// The app
-// ---------------------------------------------------------------------------
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum FilterState {
@@ -237,7 +173,6 @@ enum FilterState {
 const STYLESHEET: &str = "asset:0f827d119b7bec30534b1767e8ab8ee0f2890c98f93baa1159dcf1a46f10bc17";
 
 pub fn app() -> Element {
-    // The snapshot. Owned by the `tasks` service; this is a cached view of it.
     let items = use_signal(Vec::<TodoItem>::new);
     // The route is this app's own prior output, relayed back by the visor —
     // not user-typed input (`wit/app.wit` `route`: "a route this app is
@@ -250,7 +185,6 @@ pub fn app() -> Element {
         _ => FilterState::All,
     });
 
-    // On mount: the first snapshot.
     use_future(move || refresh(items));
 
     let active_todo_count = use_memo(move || items.read().iter().filter(|i| !i.completed).count());
@@ -513,8 +447,6 @@ fn ListFooter(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
 
 /// The bundle's `manifest.json` and `assets/` must agree on the asset handle,
 /// which is `sha256(asset bytes)` (`runtime/crates/kernel/src/apps.rs`, "Asset

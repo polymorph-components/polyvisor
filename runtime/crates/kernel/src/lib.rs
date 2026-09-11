@@ -565,7 +565,6 @@ impl Kernel {
         let device = state.device.as_ref().expect("open implies a device");
         Ok(match scope {
             MetaScope::User => device.meta.user.clone(),
-            MetaScope::Device => device.meta.device.clone(),
             MetaScope::App(id) => device.meta.app.get(&id).cloned().unwrap_or_default(),
         })
     }
@@ -582,7 +581,6 @@ impl Kernel {
         self.with_device(|d| {
             match scope {
                 MetaScope::User => d.meta.user = meta,
-                MetaScope::Device => d.meta.device = meta,
                 MetaScope::App(id) => {
                     if meta.is_empty() {
                         d.meta.app.remove(&id);
@@ -880,7 +878,7 @@ impl Kernel {
     async fn write_checkpoint(&self) -> Result<(), Error> {
         // Taken before the state borrow: `Engine::snapshot` borrows the
         // engine's own cells, and nothing may hold two of ours at once. It is
-        // also async since M3c (it carries the device's keyhive), so the
+        // also async because it carries the device's keyhive, so the
         // engine handle is cloned out and the borrow released before awaiting.
         let engine = self.engine.borrow().clone();
         let engine = match engine {
@@ -960,17 +958,6 @@ impl Kernel {
         *next += 1;
         self.sessions.borrow_mut().insert(session, app.to_string());
         Ok(session)
-    }
-
-    pub fn session_app(&self, session: SessionId) -> Result<AppInfo, Error> {
-        self.open()?;
-        let app = self.session_app_id(session)?;
-        self.registry.info(&app).ok_or_else(|| {
-            Error::new(
-                ErrorCode::UnknownApp,
-                format!("session {session} names an app that is no longer installed"),
-            )
-        })
     }
 
     pub async fn component(&self, session: SessionId) -> Result<ComponentArtifacts, Error> {
@@ -1129,11 +1116,6 @@ impl Kernel {
     }
 
     // -- app services --------------------------------------------------------
-
-    pub async fn tasks_revision(&self, session: SessionId) -> Result<u64, String> {
-        let (app, engine) = self.app_engine(session)?;
-        engine.tasks_revision(&app).await
-    }
 
     pub async fn tasks_items(&self, session: SessionId) -> Result<Snapshot, String> {
         let (app, engine) = self.app_engine(session)?;

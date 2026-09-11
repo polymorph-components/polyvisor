@@ -303,13 +303,6 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         self.with_app(app, |doc| Ok(doc.snapshot()))
     }
 
-    /// The app document's revision: the number of changes in its history, so
-    /// it advances on a remote change exactly as it does on a local one.
-    pub async fn tasks_revision(&self, app: &str) -> Result<u64, String> {
-        self.open_app(app).await?;
-        self.with_app(app, |doc| Ok(doc.revision()))
-    }
-
     /// Append a task, returning the id the document gave it.
     pub async fn tasks_add(&self, app: &str, title: String) -> Result<String, String> {
         self.mutate(app, move |doc| doc.add(title)).await
@@ -951,8 +944,8 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     /// Not the seed — the kernel holds that, in the same sealed checkpoint,
     /// and two copies of an identity is one copy too many to keep in step.
     ///
-    /// Async, and fallible, since M3c: it now also carries this device's
-    /// keyhive, whose archive is an async read.
+    /// Async and fallible because it carries this device's keyhive, whose
+    /// archive is an async read.
     pub async fn snapshot(&self) -> Result<Snapshot, String> {
         // The vault's own state first, and outside the `apps` borrow: reading
         // keyhive's archive is async.
@@ -980,13 +973,6 @@ impl<T: Transport<Local> + 'static> Engine<T> {
 
     // -- internals -----------------------------------------------------------
 
-    /// How many authenticated connections are live. Test introspection for
-    /// the registry `pump_events` shrinks.
-    #[must_use]
-    pub fn live_connections(&self) -> usize {
-        self.conns.borrow().len()
-    }
-
     /// Every tree this device holds a document for.
     fn trees(&self) -> Vec<SedimentreeId> {
         let mut trees: Vec<SedimentreeId> = self.apps.borrow().values().map(AppDoc::tree).collect();
@@ -1008,21 +994,10 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         // already and would otherwise never build the keyhive that document
         // names.
         self.open_vault().await?;
-        // Also before the early return, and for a second reason: a checkpoint
-        // written before the store existed restores a group document with no
-        // name key beside it, and that device would otherwise never mint one
-        // — it has a group already, so it never takes the founding branch
-        // below, and `storage` would sit there with nothing to name.
-        //
-        // Minting here is safe for a joiner too: `adopt_us` replaces the key
-        // along with the document, because the names it must derive are the
-        // ones the group already writes under.
-        if self.name_key.borrow().is_none() {
-            *self.name_key.borrow_mut() = Some(self.name_key_seed);
-        }
         if self.us.borrow().is_some() {
             return Ok(());
         }
+        *self.name_key.borrow_mut() = Some(self.name_key_seed);
         let tree = us_tree();
         {
             let mut doc = UsDoc::empty(self.seed);
@@ -1450,9 +1425,8 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         Ok(())
     }
 
-    /// Replace an app commit's plaintext change with its keyhive envelope.
-    /// This is the whole of M3c's claim: what reaches the driver — and so the
-    /// wire, the relay and storage — is ciphertext.
+    /// Replace an app commit's plaintext change with its keyhive envelope, so
+    /// what reaches the driver, wire, relay and storage is ciphertext.
     async fn seal(
         &self,
         commit: subduction_protocol::command::NewCommit,
@@ -1510,7 +1484,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         // for the same app returns from the check above without waiting for
         // the subscription to be placed. That is deliberate: it reads an
         // empty-but-live document a moment early rather than blocking on the
-        // network, and callers poll `revision` for what arrives after.
+        // network. A later service read observes what the event pump applies.
         let conns: Vec<_> = self.conns.borrow().clone();
         for conn in conns {
             conn.sync_tree(tree, true)

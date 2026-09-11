@@ -88,25 +88,8 @@ pub(crate) fn boot_drawer(
     }
 }
 
-/// Ordering between a read that takes time and the writes it may race.
-///
-/// The visor reads kernel state in spawned tasks — `device.status` when
-/// Settings opens, `store.devices` during the boot — and a task that starts
-/// before a write completes after it. Its answer describes the world as it
-/// was *before* the write, so applying it afterwards silently undoes the
-/// write. Both of the visor's flakes were exactly this:
-///
-/// * a `device.status` read spawned by the Settings press landed after the
-///   user's set-name had been applied, and put the old name back;
-/// * the boot's `boot_drawer` decision — one read of `device.status` and
-///   one of `store.devices` — landed after the user had already opened a
-///   tenant, and closed the drawer under their hands.
-///
-/// So a write bumps the generation, and a read carries the generation it
-/// began with and applies its result only if nothing was written since.
-/// Losing a read is always safe: the next press reads again, and what it
-/// reads is newer than what was dropped. Losing a *write* is not, which is
-/// why the tie goes to the writer.
+/// Generation gate preventing an async read from overwriting a newer user
+/// action. Writes bump it; reads apply only at the generation they began.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) struct Gate {
     writes: u64,

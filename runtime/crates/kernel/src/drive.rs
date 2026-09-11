@@ -142,11 +142,8 @@ pub struct Tokens {
 /// The store's checkpointed half.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sealed {
-    #[serde(default)]
     pub tokens: Option<Tokens>,
-    #[serde(default)]
     pub last_pull: u64,
-    #[serde(default)]
     pub last_push: u64,
 }
 
@@ -274,8 +271,8 @@ impl Kernel {
     /// app's, or (`None`) the group document's. A fragment is a commit range
     /// carried as one item (`docs/design.md` §"Read-back and partitions").
     ///
-    /// Test introspection, in the shape of `Engine::live_connections`:
-    /// which commit closes a fragment is the hash's decision, so a test that
+    /// Test introspection: which commit closes a fragment is the hash's
+    /// decision, so a test that
     /// wants the compacted case has to write until one appears and cannot
     /// predict the number. Nothing in the WIT world reads this.
     ///
