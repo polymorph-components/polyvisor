@@ -332,22 +332,32 @@ pub(crate) const CSS: &str = r#"
   border: 0; background: transparent;
 }
 #visor-root .glyph-tile-button .glyph-tile-face { pointer-events: none; }
+#visor-root .glyph-dialog {
+  box-sizing: border-box; width: 100vw; max-width: none; height: 100dvh;
+  max-height: none; margin: 0; padding: max(12px, env(safe-area-inset-top)) 12px
+    max(12px, env(safe-area-inset-bottom));
+  border: 0; background: transparent; color: inherit;
+  place-items: center;
+}
+#visor-root .glyph-dialog[open] { display: grid; }
+#visor-root .glyph-dialog::backdrop { background: oklch(0 0 0 / 0.45); }
 #visor-root .glyph-picker {
   display: flex; flex-direction: column; align-items: stretch; gap: 8px;
+  box-sizing: border-box; width: min(32rem, 100%); min-height: 0; max-height: 100%;
+  overflow: hidden;
   padding: 8px; border: 1px solid var(--edge);
   border-radius: 6px; background: var(--field);
 }
 #visor-root .glyph-picker label { margin: 0; }
 #visor-root .glyph-results {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(44px, 1fr));
-  gap: 4px; max-height: min(16rem, 36vh); overflow-y: auto;
+  flex: 1 1 auto; gap: 4px; min-height: 0; max-height: min(24rem, 60dvh); overflow-y: auto;
 }
 #visor-root .glyph-results button { padding: 4px; font-size: 24px; }
 #visor-root .glyph-face {
   font-family: Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji,
     "Polyvisor Noto Emoji", emoji, sans-serif;
 }
-#visor-root .glyph-picker .glyph-clear { align-self: flex-start; font-size: inherit; }
 
 /* Rows wrap rather than overlap: a name and some framework-voice facts about
    it do not fit on one 320px line, so the facts follow under the name. */
