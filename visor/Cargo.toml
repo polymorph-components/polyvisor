@@ -16,6 +16,7 @@ crate-type = ["cdylib"]
 # (m1-context.md "Rust facts").
 dioxus = { workspace = true, features = ["hooks"] }
 emojis = "0.9"
+polyvisor-petname.workspace = true
 stream-dom-dioxus.workspace = true
 stream-dom-guest.workspace = true
 unicode-segmentation = "1.13"

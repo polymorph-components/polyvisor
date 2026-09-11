@@ -388,7 +388,7 @@ the handshake.
 
 - **The index** (`store`) is the one unsealed record: id, local picker
   petname, tier, how the device rests, timestamps. Never the member label,
-  shared hue/word/metadata or any key.
+  shared hue/metadata or any key.
   The visor boots unclaimed (grey, no identity) and paints the user's
   colour only after the seal opens, so a page imitating the picker cannot
   paint it.
@@ -415,8 +415,8 @@ the handshake.
   generation. The kernel never lists a directory: `read-directory` is one
   of four sync functions left on the 0.3 track and its OPFS host answers
   with a Promise (JSPI), so every path is named from the pointer and
-  removal reaches n+1 down to n-2 by name. A founder draws the anchor
-  (hue, word) from the RNG and writes it to the sealed visor document before
+  removal reaches n+1 down to n-2 by name. A founder draws the hue and a
+  random user petname from the RNG and writes them to the sealed visor document before
   exposure; later devices adopt that document during pairing. The kernel's
   device record only caches these fields in memory.
 - **Switching devices is a reload** (`shell.switch-device`): the anchor
@@ -433,7 +433,7 @@ the handshake.
 
 Both are Dioxus producers via `stream-dom-dioxus`. The visor runs with
 no vocabulary policy (it is trusted); apps run under the frame policy
-above. The visor is close to stateless: identity, hue, anchor word,
+above. The visor is close to stateless: identity, hue,
 trust table and boot cache are kernel state served over `device`/`apps`,
 so the visor has no persistence import of its own and the same component
 runs under a native shell.
@@ -484,7 +484,12 @@ interprets.
   key by automerge's last-writer-wins, and the loser's pre-pairing
   bookmarks stop opening — stated, not fixed.
   The same sealed visor document is the authority for the shared hue,
-  recognition word, user labels and per-app labels. They are root scalar
+  user labels and per-app labels. User and device petnames are generated at
+  founding/device creation; an app petname is generated before its first
+  launch. Explicitly saving an empty petname generates and persists a
+  replacement. Draft re-rolls happen synchronously in the visor from the same
+  EFF generator using its own `wasi:random` import; no naming policy crosses
+  the internal API. They are root scalar
   keys in collision-safe namespaces (`identity:`, `user:`, `app:`), so edits
   to different fields do not replace a nested map. Device labels remain
   member records keyed by endpoint public key in plaintext `us`; the local

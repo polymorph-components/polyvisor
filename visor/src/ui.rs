@@ -15,7 +15,7 @@
 //!
 //! The visor holds no state of its own beyond what is on screen right now
 //! (docs/design.md "Visor and apps render through stream-dom"): identity,
-//! hue, word, the labels, the app list and the device index are kernel
+//! hue, the labels, the app list and the device index are kernel
 //! state, read at mount and re-read only when the visor itself changed
 //! them. The one exception is a [`Draft`], which is what a user has typed
 //! and not saved — on screen, and nowhere else.
@@ -29,7 +29,7 @@
 use dioxus::html::Key;
 use dioxus::prelude::*;
 
-use crate::draft::rebase_map;
+use crate::draft::{RollState, RollTarget, rebase_map};
 use crate::glyph::normalize_glyph;
 use crate::kernel::{
     self, App, Binding, Entry, Event, InstallOutcome, Member, Meta, MetaScope, Peer, SessionId,
@@ -102,6 +102,36 @@ fn rebase_draft(latest: Draft, baseline: &Draft, current: &Draft) -> Draft {
     rebase_map(&mut rebased.user, &baseline.user, &current.user);
     rebase_map(&mut rebased.app, &baseline.app, &current.app);
     rebased
+}
+
+fn roll_petname(
+    target: RollTarget,
+    previous: String,
+    mut rolls: CopyValue<RollState>,
+    mut draft: Signal<Draft>,
+    session: Signal<Option<(SessionId, App)>>,
+) {
+    let value = polyvisor_petname::generate(
+        || {
+            let bytes = crate::component::wasi::random::random::get_random_bytes(4);
+            u32::from_le_bytes(bytes.try_into().expect("wasi:random returned four bytes"))
+        },
+        &previous,
+    );
+    if let RollTarget::App(expected) = &target
+        && session.read().as_ref().map(|(_, app)| &app.id) != Some(expected)
+    {
+        return;
+    }
+    rolls.write().activate(target.clone(), value.clone());
+    let mut d = draft();
+    match target {
+        RollTarget::Device => d.name = value,
+        RollTarget::User => set_field(&mut d.user, PETNAME, value),
+        RollTarget::App(_) => set_field(&mut d.app, PETNAME, value),
+        RollTarget::Picker => {}
+    }
+    draft.set(d);
 }
 
 fn meta_patch(before: &Meta, after: &Meta) -> Vec<(String, Option<String>)> {
@@ -623,6 +653,9 @@ pub(crate) fn Visor() -> Element {
     // never shows a label the kernel has not been told about.
     let mut user_meta = use_signal(Meta::new);
     let mut app_meta = use_signal(Meta::new);
+    // Page-session state, deliberately above remounting sheets. App entries
+    // are keyed by package id, so switching apps cannot transfer eligibility.
+    let mut rolls = use_hook(|| CopyValue::new(RollState::default()));
 
     // What the sheets are editing. `seed` is the identity as the sheet was
     // opened, `draft` as it stands; dirty is exactly `draft != seed`.
@@ -656,7 +689,7 @@ pub(crate) fn Visor() -> Element {
     // to it would re-render the visor on every press that bumps it.
     //
     // `status_gate`: bumped by everything that changes this device
-    // (a saved draft, word, keep, unseal), read by `read_status` and
+    // (a saved draft, keep, unseal), read by `read_status` and
     // `read_identity`.
     //
     // `drawer_gate`: bumped by every transition the user caused, read by
@@ -1110,22 +1143,6 @@ pub(crate) fn Visor() -> Element {
         });
     });
 
-    // The word is not part of the draft: a reroll is a new secret from the
-    // kernel, not an edit, and there is nothing to type or take back.
-    let on_reroll = use_callback(move |()| {
-        status_gate.write().bump();
-        spawn(async move {
-            match kernel::reroll_word().await {
-                Ok(word) => status.with_mut(|s| {
-                    if let Some(s) = s {
-                        s.word = word
-                    }
-                }),
-                Err(e) => notice.set(Some(Notice::Plain(e))),
-            }
-        });
-    });
-
     let running = session.read().is_some();
     let tenant = drawer().tenant();
     let ident = Ident::of(&status.read());
@@ -1226,21 +1243,19 @@ pub(crate) fn Visor() -> Element {
     // the two this is: only the pane that is staying carries the ids, since
     // two elements with one id is a tree nobody can query.
     let sheet_for = move |t: Tenant, current: bool| -> Element {
-        let (self_id, tier, rest, petname, endpoint_id, word, hue) = match status.read().as_ref() {
+        let (self_id, tier, rest, petname, endpoint_id, hue) = match status.read().as_ref() {
             Some(s) => (
                 s.id.clone(),
                 s.tier,
                 s.rest,
                 s.petname.clone(),
                 s.endpoint_id.clone(),
-                s.word.clone(),
                 s.hue,
             ),
             None => (
                 String::new(),
                 Tier::Ephemeral,
                 Rest::RestsOpen,
-                String::new(),
                 String::new(),
                 String::new(),
                 0,
@@ -1303,8 +1318,9 @@ pub(crate) fn Visor() -> Element {
                                 span { class: "{Voice::Framework.class()}", "nothing running" }
                             },
                         }
-                        label {
-                            span { class: "{Voice::Framework.class()}", "petname" }
+                        div { class: "petname-control",
+                            label {
+                                span { class: "{Voice::Framework.class()}", "petname" }
                             // Controlled, unlike the fields this replaced.
                             // `value` is volatile in dioxus-html — written
                             // on every diff — which is why the old fields
@@ -1313,13 +1329,35 @@ pub(crate) fn Visor() -> Element {
                             // reset them. Nothing re-reads a draft, so the
                             // signal is the field's only writer and the
                             // volatility has nothing to overwrite with.
-                            input {
+                                input {
                                 r#type: "text",
                                 value: "{info_petname}",
                                 oninput: move |e| {
+                                    if let Some((_, app)) = live.as_ref() {
+                                        rolls.write().invalidate(&RollTarget::App(app.id.clone()));
+                                    }
                                     let mut d = draft.write();
                                     set_field(&mut d.app, PETNAME, e.value());
                                 },
+                                }
+                            }
+                            if let Some((_, app)) = live.as_ref() {
+                                RollButton {
+                                    label: "Re-roll app petname",
+                                    enabled: info_petname.is_empty() || rolls.read().is_active(&RollTarget::App(app.id.clone()), &info_petname),
+                                    onclick: {
+                                        let target = RollTarget::App(app.id.clone());
+                                        let previous = info_petname.clone();
+                                        move |_| {
+                                            let target = target.clone();
+                                            let previous = previous.clone();
+                                            if draft().app.get(PETNAME).is_none_or(String::is_empty)
+                                                || rolls.read().is_active(&target, &petname_of(&draft().app)) {
+                                                roll_petname(target, previous, rolls, draft, session)
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         GlyphPicker {
@@ -1374,7 +1412,6 @@ pub(crate) fn Visor() -> Element {
                 Tenant::Settings => rsx! {
                     SettingsSheet {
                         draft,
-                        word: word.clone(),
                         tier,
                         petname: petname.clone(),
                         rest,
@@ -1383,10 +1420,12 @@ pub(crate) fn Visor() -> Element {
                         members: members.read().clone(),
                         peers: peers.read().clone(),
                         phase: pairing_phase.read().clone(),
-                        on_reroll,
+                        rolls,
+                        session,
                         on_refresh_storage: refresh_storage,
                         on_refresh_devices: refresh_devices,
                         on_kept,
+                        device_name: draft().name,
                         on_devices: show_devices,
                         focus_glyph: current.then(|| focus_glyph.clone()).flatten(),
                         focus_glyph_search: current.then(|| focus_glyph_search.clone()).flatten(),
@@ -1580,9 +1619,6 @@ pub(crate) fn Visor() -> Element {
                         }
                     }
                 }
-                // The anchor word is a recognition secret between the user
-                // and this device: spoken only in the settings sheet, on
-                // request, never left standing in the strip.
             }
 
             // Unsaved changes, over the drawer that holds them. The three
@@ -1628,7 +1664,7 @@ pub(crate) fn Visor() -> Element {
 enum Ident {
     /// No answer from `device.status` yet.
     Waking,
-    /// Answered `sealed`: nothing personal is readable (name, hue and word
+    /// Answered `sealed`: nothing personal is readable (name and hue
     /// come back blank), so nothing personal is drawn.
     Unclaimed,
     /// `fresh` or `open` — both fully usable, both painted.
@@ -1756,11 +1792,59 @@ fn DevicesSheet(entries: Vec<Entry>, self_id: String, on_stay: EventHandler<()>)
     }
 }
 
+#[component]
+fn RollButton(label: &'static str, enabled: bool, onclick: EventHandler<()>) -> Element {
+    let mut explain = use_signal(|| false);
+    let tooltip_id = use_hook(|| {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+        format!(
+            "roll-help-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    });
+    rsx! {
+        span { class: "roll-control",
+            button {
+                r#type: "button",
+                class: "roll-button",
+                aria_label: label,
+                "aria-disabled": (!enabled).then_some("true"),
+                aria_describedby: (!enabled).then_some(tooltip_id.as_str()),
+                onfocus: move |_| if !enabled { explain.set(true) },
+                onblur: move |_| explain.set(false),
+                onmouseenter: move |_| if !enabled { explain.set(true) },
+                onmouseleave: move |_| explain.set(false),
+                onkeydown: move |event| if event.key() == Key::Escape {
+                    event.stop_propagation();
+                    explain.set(false)
+                },
+                onclick: move |_| if enabled { onclick.call(()) } else { explain.set(true) },
+                svg {
+                    "aria-hidden": "true", view_box: "0 0 24 24", width: "20", height: "20",
+                    rect { x: "2", y: "2", width: "20", height: "20", rx: "3", fill: "none", stroke: "currentColor", stroke_width: "2" }
+                    circle { cx: "7", cy: "7", r: "1.5", fill: "currentColor" }
+                    circle { cx: "17", cy: "7", r: "1.5", fill: "currentColor" }
+                    circle { cx: "12", cy: "12", r: "1.5", fill: "currentColor" }
+                    circle { cx: "7", cy: "17", r: "1.5", fill: "currentColor" }
+                    circle { cx: "17", cy: "17", r: "1.5", fill: "currentColor" }
+                }
+            }
+            if explain() && !enabled {
+                span { id: tooltip_id.as_str(), class: "roll-tooltip", role: "tooltip", "clear to re-roll" }
+            }
+        }
+    }
+}
+
 /// "Keep this device": the promotion from ephemeral to durable, and the
 /// one place the user chooses how the device rests.
 #[component]
-fn KeepSheet(on_kept: EventHandler<bool>) -> Element {
-    let mut petname = use_signal(String::new);
+fn KeepSheet(
+    on_kept: EventHandler<bool>,
+    device_name: String,
+    rolls: CopyValue<RollState>,
+) -> Element {
+    let mut petname = use_signal(|| device_name.clone());
     let mut under_passphrase = use_signal(|| false);
     let mut first = use_signal(String::new);
     let mut second = use_signal(String::new);
@@ -1771,12 +1855,34 @@ fn KeepSheet(on_kept: EventHandler<bool>) -> Element {
             div { class: "sheet-head",
                 span { class: "{Voice::Framework.class()}", "Keep this device" }
             }
-            label {
-                span { class: "{Voice::Framework.class()}", "petname" }
-                input {
+            div { class: "petname-control",
+                label {
+                    span { class: "{Voice::Framework.class()}", "petname" }
+                    input {
                     r#type: "text",
                     value: "{petname}",
-                    oninput: move |e| petname.set(e.value()),
+                    oninput: move |e| {
+                        rolls.write().invalidate(&RollTarget::Picker);
+                        petname.set(e.value())
+                    },
+                    }
+                }
+                RollButton {
+                    label: "Re-roll local device picker petname",
+                    enabled: petname().is_empty() || rolls.read().is_active(&RollTarget::Picker, &petname()),
+                    onclick: move |_| {
+                        if !petname().is_empty() && !rolls.read().is_active(&RollTarget::Picker, &petname()) {
+                            return;
+                        }
+                        let target = RollTarget::Picker;
+                        let previous = petname();
+                        let value = polyvisor_petname::generate(|| {
+                            let bytes = crate::component::wasi::random::random::get_random_bytes(4);
+                            u32::from_le_bytes(bytes.try_into().expect("wasi:random returned four bytes"))
+                        }, &previous);
+                        rolls.write().activate(target, value.clone());
+                        petname.set(value);
+                    }
                 }
             }
             div { class: "choice",
@@ -2086,7 +2192,7 @@ fn DevicesSection(
             // one means it has not answered, and says so rather than
             // implying this device belongs to nothing.
             for member in members {
-                div { key: "{member.endpoint_id}", class: "member-row",
+                div { key: "{member.endpoint_id}", class: "member-row", "data-endpoint-id": "{member.endpoint_id}",
                     div { class: "member-row-name",
                         if member.petname.is_empty() {
                             // No petname: the id is what this device is
@@ -2105,10 +2211,12 @@ fn DevicesSection(
                     }
                     if !member.me {
                         button {
-                            onclick: move |_| {
-                                let id = member.endpoint_id.clone();
+                            onclick: {
+                                let endpoint_id = member.endpoint_id.clone();
+                                move |_| {
+                                let id = endpoint_id.clone();
                                 async move { acted(kernel::connect(id).await) }
-                            },
+                            }},
                             "Connect"
                         }
                     }
@@ -2458,17 +2566,15 @@ fn GlyphPicker(
 /// Everything about this device, and the user, that is a field rather
 /// than a ceremony.
 ///
-/// The four editable fields go through the draft, not the kernel: what a
+/// The editable fields go through the draft, not the kernel: what a
 /// user has typed and not saved is theirs, and the kernel hears about it
 /// once, on `Save`. `Revert` puts the sheet back to what the kernel last
-/// said. The word is the exception and is deliberately not a field — a
-/// reroll is a new secret from the kernel, immediate, with nothing to take
-/// back.
+/// said. Dice also change only the draft, so Save and Revert retain their
+/// ordinary meanings.
 #[component]
 #[allow(clippy::too_many_arguments)]
 fn SettingsSheet(
     draft: Signal<Draft>,
-    word: String,
     tier: Tier,
     petname: String,
     rest: Rest,
@@ -2477,10 +2583,12 @@ fn SettingsSheet(
     members: Vec<Member>,
     peers: Vec<Peer>,
     phase: Phase,
-    on_reroll: EventHandler<()>,
+    rolls: CopyValue<RollState>,
+    session: Signal<Option<(SessionId, App)>>,
     on_refresh_storage: EventHandler<()>,
     on_refresh_devices: EventHandler<()>,
     on_kept: EventHandler<bool>,
+    device_name: String,
     on_devices: EventHandler<()>,
     focus_glyph: Option<String>,
     focus_glyph_search: Option<String>,
@@ -2501,12 +2609,32 @@ fn SettingsSheet(
         )
     };
     rsx! {
-        label {
-            span { class: "{Voice::Framework.class()}", "device petname" }
-            input {
+        div { class: "petname-control",
+            label {
+                span { class: "{Voice::Framework.class()}", "device petname" }
+                input {
                 r#type: "text",
                 value: "{name}",
-                oninput: move |e| draft.write().name = e.value(),
+                oninput: move |e| {
+                    rolls.write().invalidate(&RollTarget::Device);
+                    draft.write().name = e.value()
+                },
+                }
+            }
+            RollButton {
+                label: "Re-roll device petname",
+                enabled: name.is_empty() || rolls.read().is_active(&RollTarget::Device, &name),
+                onclick: {
+                    let previous = name.clone();
+                    move |_| {
+                        let previous = previous.clone();
+                        async move {
+                            if draft().name.is_empty() || rolls.read().is_active(&RollTarget::Device, &draft().name) {
+                            roll_petname(RollTarget::Device, previous, rolls, draft, session)
+                            }
+                        }
+                    }
+                }
             }
         }
         label {
@@ -2525,15 +2653,34 @@ fn SettingsSheet(
                 },
             }
         }
-        label {
-            span { class: "{Voice::Framework.class()}", "your petname" }
-            input {
+        div { class: "petname-control",
+            label {
+                span { class: "{Voice::Framework.class()}", "your petname" }
+                input {
                 r#type: "text",
                 value: "{user_petname}",
                 oninput: move |e| {
+                    rolls.write().invalidate(&RollTarget::User);
                     let mut d = draft.write();
                     set_field(&mut d.user, PETNAME, e.value());
                 },
+                }
+            }
+            RollButton {
+                label: "Re-roll user petname",
+                enabled: user_petname.is_empty() || rolls.read().is_active(&RollTarget::User, &user_petname),
+                onclick: {
+                    let previous = user_petname.clone();
+                    move |_| {
+                        let previous = previous.clone();
+                        async move {
+                            if draft().user.get(PETNAME).is_none_or(String::is_empty)
+                                || rolls.read().is_active(&RollTarget::User, &petname_of(&draft().user)) {
+                            roll_petname(RollTarget::User, previous, rolls, draft, session)
+                            }
+                        }
+                    }
+                }
             }
         }
         GlyphPicker {
@@ -2548,16 +2695,10 @@ fn SettingsSheet(
             onreturn: move |_| on_glyph_return.call(()),
             onsearch: move |_| on_glyph_search.call(()),
         }
-        label {
-            span { class: "{Voice::Framework.class()}", "word" }
-            span { class: "{Voice::Framework.class()}", "{word}" }
-            button { onclick: move |_| on_reroll.call(()), "Reroll" }
-        }
-
         if tier == Tier::Durable {
             KeptNote { petname: petname.clone(), rest }
         } else {
-            KeepSheet { on_kept }
+            KeepSheet { on_kept, device_name, rolls }
         }
 
         StorageSection { binding, on_refresh: on_refresh_storage }
