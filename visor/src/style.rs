@@ -19,6 +19,14 @@
 //! contrast does not depend on what happens to be behind it.
 
 pub(crate) const CSS: &str = r#"
+@font-face {
+  font-family: "Polyvisor Noto Emoji";
+  src: url("fonts/noto-emoji-animals.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  unicode-range: U+1F3B2, U+1F400-1F43F, U+FE0F;
+}
 /* The two arms of the anchor rule, and the only place either is spelled.
    Claimed: every colour is `--hue` at a fixed lightness/chroma. Unclaimed:
    the same lightnesses at zero chroma, so an unpainted visor is the same
@@ -110,7 +118,9 @@ pub(crate) const CSS: &str = r#"
   justify-content: center;
   background: var(--strip-edge);
   color: var(--accent-ink);
-  font-size: 28px; line-height: 1; font-weight: 600;
+  font-size: 28px; line-height: 1; font-weight: 400;
+  font-family: Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji,
+    "Polyvisor Noto Emoji", emoji, sans-serif;
   width: 36px; height: 36px; 
 }
 #visor-root .glyph-tile-face {
@@ -301,6 +311,10 @@ pub(crate) const CSS: &str = r#"
 #visor-root .petname-control > label { flex: 0 1 auto; min-width: 0; margin-bottom: 0; }
 #visor-root .roll-control { position: relative; flex: none; }
 #visor-root .roll-button { min-width: 44px; min-height: 44px; padding: 6px 10px; }
+#visor-root .roll-glyph {
+  font: 400 20px/1 Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji,
+    "Polyvisor Noto Emoji", emoji, sans-serif;
+}
 #visor-root .roll-button[aria-disabled="true"] { opacity: .45; cursor: not-allowed; }
 #visor-root .roll-tooltip {
   position: absolute; z-index: 3; right: 0; top: calc(100% + 4px);
@@ -329,6 +343,10 @@ pub(crate) const CSS: &str = r#"
   gap: 4px; max-height: min(16rem, 36vh); overflow-y: auto;
 }
 #visor-root .glyph-results button { padding: 4px; font-size: 24px; }
+#visor-root .glyph-face {
+  font-family: Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji,
+    "Polyvisor Noto Emoji", emoji, sans-serif;
+}
 #visor-root .glyph-picker .glyph-clear { align-self: flex-start; font-size: inherit; }
 
 /* Rows wrap rather than overlap: a name and some framework-voice facts about

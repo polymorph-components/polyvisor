@@ -726,9 +726,14 @@ async function paintIcon(
   hue: number,
   size: number,
 ): Promise<ArrayBuffer> {
-  // The PNG is digested and stored immediately, with no repaint later, so a
-  // font that has not loaded would be tofu for good.
-  if (document.fonts !== undefined) await document.fonts.ready;
+  // The PNG is digested and stored immediately, with no repaint later. Merely
+  // awaiting `ready` does not request a face unused elsewhere, so explicitly
+  // load this glyph through the same native-first stack as the visor.
+  const glyphFont = "Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, " +
+    "'Polyvisor Noto Emoji', emoji, sans-serif";
+  if (document.fonts !== undefined) {
+    await document.fonts.load(`400 32px ${glyphFont}`, glyph);
+  }
   const canvas = document.createElement("canvas");
   canvas.width = size;
   canvas.height = size;
@@ -739,7 +744,7 @@ async function paintIcon(
   ctx.fillStyle = "#ffffff";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.font = `${Math.round(size * 0.62)}px system-ui, sans-serif`;
+  ctx.font = `400 ${Math.round(size * 0.62)}px ${glyphFont}`;
   // Rust has already reduced this to one extended grapheme. Keep the page
   // glue byte-for-byte passive; a second segmentation algorithm here would
   // eventually disagree with the visor.
