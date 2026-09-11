@@ -196,12 +196,12 @@ interface device {
     /// The user's own labels for themself and each installed app — petname,
     /// glyph, whatever the visor settles on. Free-form while
     /// the field set is in flux: keys are the visor's vocabulary, values are
-    /// user voice. Personal: rides in the sealed checkpoint with name/hue/
-    /// word, so `unavailable` while sealed.
+    /// user voice. Personal: lives in the sealed visor document, so
+    /// `unavailable` while sealed.
     variant meta-scope { user, app(string) }
     meta: async func(scope: meta-scope) -> result<list<tuple<string, string>>, error>;
-    /// Replaces the whole map for `scope`.
-    set-meta: async func(scope: meta-scope, entries: list<tuple<string, string>>) -> result<_, error>;
+    /// Apply only the named fields. `none` deletes a field.
+    patch-meta: async func(scope: meta-scope, fields: list<tuple<string, option<string>>>) -> result<_, error>;
 
     /// Promote to durable. `passphrase = none` is `rests-open`. Idempotent
     /// on the petname; changing the rest of a kept device is `refused`
@@ -450,6 +450,9 @@ interface events {
         /// and the visor re-reads it after every act of its own; this is
         /// the push that makes waiting cost nothing.
         pairing-changed(phase),
+        /// Sealed shared personalization or group membership changed. The
+        /// visor re-reads authoritative snapshots and rebases clean fields.
+        personalization-changed,
     }
 
     /// Resolves with the next event; parks while there is none.
@@ -464,6 +467,7 @@ interface app-services {
     use polyvisor:app/tasks@0.1.0.{snapshot};
 
     tasks-items: async func(session: session-id) -> result<snapshot, string>;
+    tasks-watch: async func(session: session-id, after: u64) -> result<snapshot, string>;
     tasks-add: async func(session: session-id, title: string) -> result<string, string>;
     tasks-set-completed: async func(session: session-id, id: string, completed: bool) -> result<_, string>;
     tasks-set-title: async func(session: session-id, id: string, title: string) -> result<_, string>;

@@ -396,6 +396,9 @@ impl Kernel {
         // goes over. Enrollment is the adder's act — the joiner never writes
         // its own membership.
         let engine = self.engine().map_err(|e| e.message)?;
+        self.initialize_personalization()
+            .await
+            .map_err(|e| e.message)?;
         let enrolled = self.seams.clock.now_ms();
         engine.add_member(joiner_key, petname, enrolled).await?;
         // The keyhive half of the same grant, and in this order: the group
@@ -403,6 +406,7 @@ impl Kernel {
         // operations first would have nothing to attach them to.
         let (keyhive, read_back) = engine.enroll_keyhive(&card, joiner_key).await?;
         let us = engine.us_save().await?;
+        let visor = engine.visor_save().await?;
         // The group's store-name key travels here and nowhere else: it is a
         // group secret, and this connection is the one the two users have
         // just compared six digits over. Without it the joiner would be a
@@ -418,6 +422,7 @@ impl Kernel {
                 keyhive,
                 read_back,
                 name_key: name_key.to_vec(),
+                visor,
             },
         )
         .await?;
@@ -567,7 +572,13 @@ impl Kernel {
 
         let joiner_key = self.self_key().map_err(|e| e.message)?;
         let card = self.engine().map_err(|e| e.message)?.keyhive_card().await?;
-        let petname = self.state.borrow().row.petname.clone();
+        let petname = self
+            .state
+            .borrow()
+            .device
+            .as_ref()
+            .map(|device| device.name.clone())
+            .unwrap_or_default();
         let mut nonce_j = [0u8; 32];
         self.seams.rng.fill(&mut nonce_j);
         send_frame(
@@ -605,13 +616,14 @@ impl Kernel {
         send_frame(transport.as_ref(), &Frame::ConfirmJoin).await?;
         self.set_phase(Phase::AwaitingPeer);
 
-        let (us, keyhive, read_back, name_key) = match frames.next().await {
+        let (us, keyhive, read_back, name_key, visor) = match frames.next().await {
             Some(Frame::Enroll {
                 us,
                 keyhive,
                 read_back,
                 name_key,
-            }) => (us, keyhive, read_back, name_key),
+                visor,
+            }) => (us, keyhive, read_back, name_key, visor),
             Some(Frame::Cancel) => return Err(cancelled()),
             Some(_) => return Err(out_of_order()),
             None => return Err(gone()),
@@ -623,6 +635,11 @@ impl Kernel {
         let engine = self.engine().map_err(|e| e.message)?;
         engine.adopt_us(&us, adder_key, name_key).await?;
         engine.adopt_keyhive(&keyhive, &read_back).await?;
+        engine.adopt_visor(&visor).await?;
+        self.refresh_personalization()
+            .await
+            .map_err(|e| e.message)?;
+        self.push_event(crate::Event::PersonalizationChanged);
         self.checkpoint().await.map_err(|e| e.message)?;
         // The read receipt, and it is sent *after* the adoption is on disk:
         // it says "the enrollment landed here", so it may not run ahead of
@@ -781,6 +798,10 @@ enum Frame {
         /// `read_back` — a joiner that minted its own would write a second,
         /// invisible store beside the group's.
         name_key: Vec<u8>,
+        /// Serialized visor document bytes. They are plaintext inside this
+        /// SAS-authenticated encrypted transport, never persisted plaintext;
+        /// keyhive protects the document on sync and storage paths.
+        visor: Vec<u8>,
     },
     /// Joiner → adder, last: the enrollment has been adopted *and*
     /// checkpointed here. It carries nothing — the

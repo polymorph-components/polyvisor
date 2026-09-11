@@ -150,6 +150,17 @@ impl Kernel {
                         // pointed generation.
                         EngineEvent::Changed => {
                             let _written = kernel.checkpoint().await;
+                            // A keyhive event can unlock an app envelope that
+                            // arrived earlier, so the reporting tree alone is
+                            // insufficient. Re-read snapshots; task watches
+                            // compare revisions and the visor compares fields.
+                            let apps: Vec<String> =
+                                kernel.sessions.borrow().values().cloned().collect();
+                            for app in apps {
+                                kernel.wake_tasks(&app);
+                            }
+                            let _ = kernel.refresh_personalization().await;
+                            kernel.push_event(crate::Event::PersonalizationChanged);
                         }
                         EngineEvent::PeerClosed(peer) => kernel.close_peer(peer),
                     }
@@ -265,7 +276,13 @@ impl Kernel {
             .members()
             .await
             .map_err(|why| Error::new(ErrorCode::Failed, why))?;
-        let mine = self.state.borrow().row.petname.clone();
+        let mine = self
+            .state
+            .borrow()
+            .device
+            .as_ref()
+            .map(|d| d.name.clone())
+            .unwrap_or_default();
         Ok(members
             .into_iter()
             .map(|member| {

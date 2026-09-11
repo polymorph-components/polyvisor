@@ -16,6 +16,7 @@ package polyvisor:app@0.1.0;
 /// data — its schema, policy and migrations — and any number of apps
 /// project it. Apps never see documents; they see this.
 ///
+/// `items` is a full snapshot and `watch` parks for a newer revision.
 interface tasks {
     record todo-item {
         /// Stable, opaque, unique within the partition.
@@ -26,12 +27,18 @@ interface tasks {
 
     /// A consistent view of the partition.
     record snapshot {
+        /// Monotonic on one replica; equal means the snapshot is unchanged.
+        revision: u64,
         /// Items ordered by creation position, then id to break concurrent ties.
         items: list<todo-item>,
     }
 
     /// Apply any newly synced changes, then snapshot.
     items: async func() -> result<snapshot, string>;
+    /// Park until this session's snapshot revision differs from `after`, then
+    /// return the new full snapshot. Returns immediately when already newer.
+    /// Closing the session settles a parked call with an error.
+    watch: async func(after: u64) -> result<snapshot, string>;
     /// Create a task; returns its id.
     add: async func(title: string) -> result<string, string>;
     set-completed: async func(id: string, completed: bool) -> result<_, string>;

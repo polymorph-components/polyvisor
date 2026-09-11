@@ -347,6 +347,30 @@ async function saveDraft(page: Page): Promise<void> {
   );
 }
 
+async function pageCleanDrawer(page: Page): Promise<void> {
+  const revert = drawer(page).getByRole("button", { name: "Revert", exact: true });
+  if (await revert.count() > 0) {
+    await revert.click();
+    await page.waitForFunction(() =>
+      document.querySelector("#visor-actions")?.textContent?.trim() === "Close"
+    );
+  }
+  const close = drawer(page).getByRole("button", { name: "Close", exact: true });
+  if (await close.count() > 0) {
+    await close.click();
+    await page.waitForFunction(() => document.querySelector("#visor-drawer") === null);
+  }
+}
+
+async function waitForPageText(page: Page, text: string, ms = 30_000): Promise<void> {
+  const deadline = performance.now() + ms;
+  while (performance.now() < deadline) {
+    if ((await page.locator("#visor-root").textContent())?.includes(text)) return;
+    await page.waitForTimeout(100);
+  }
+  throw new Failure(`never saw ${text}`);
+}
+
 /**
  * Raise the running app's own sheet, from wherever the drawer is, via the
  * pane's own `Close` control rather than pressing the strip's app half from
@@ -420,6 +444,32 @@ async function setAppGlyph(
     expected,
     { timeout: 15_000 },
   );
+}
+
+async function setUserPetname(page: Page, value: string): Promise<void> {
+  await openSettingsSheet(page);
+  await setTextDraft(page, /^your petname$/, value);
+}
+
+async function setAppPetname(page: Page, value: string): Promise<void> {
+  await toAppSheet(page);
+  await setTextDraft(page, /^petname$/, value);
+}
+
+async function setTextDraft(page: Page, label: RegExp, value: string): Promise<void> {
+  const deadline = performance.now() + 30_000;
+  for (;;) {
+    const input = drawer(page).locator("label").filter({ hasText: label }).locator("input");
+    await input.fill(value);
+    const save = drawer(page).getByRole("button", { name: "Save", exact: true });
+    try {
+      await save.click({ timeout: 2_000 });
+      await page.waitForFunction(() => document.querySelector("#visor-actions")?.textContent?.trim() === "Close", undefined, { timeout: 15_000 });
+      return;
+    } catch {
+      if (performance.now() > deadline) throw new Failure(`could not save ${value}`);
+    }
+  }
 }
 
 /** Press "Install as app" and read back the manifest.
@@ -1094,16 +1144,14 @@ async function syncNow(page: Page): Promise<void> {
 /**
  * Wait for a todo written on ANOTHER device to arrive through the store.
  *
- * Two things have to happen and neither is automatic here: a pull, which is
- * the "Sync now" press, and a re-read by the app, which is the remount
- * (`polyvisor:app/tasks` is pull-only and the guest re-reads at mount).
+ * The explicit pull is needed; the mounted app's parked `tasks.watch` then
+ * observes the resulting revision without a remount or local dummy action.
  */
 async function pullUntilTodo(page: Page, title: string): Promise<void> {
   const deadline = performance.now() + 120_000;
   for (;;) {
     await syncNow(page);
     await new Promise((r) => setTimeout(r, 2_000));
-    await remountTodoMvc(page);
     try {
       await todoFrame(page).getByText(title).first().waitFor({
         timeout: 3_000,
@@ -1177,26 +1225,11 @@ async function remountTodoMvc(page: Page): Promise<void> {
 /**
  * Wait for a todo that was written on the *other* device.
  *
- * Nothing pushes into a mounted app: `polyvisor:app/tasks` is pull-only and
- * the TodoMVC guest re-reads only at mount and after its own mutations, so
- * a remote change shows up only on the next remount.
+ * `tasks.watch` is a revision long-poll, so this observes the already-mounted
+ * app directly. Reloading here would not prove real-time propagation.
  */
 async function waitForRemoteTodo(page: Page, title: string): Promise<void> {
-  const deadline = performance.now() + 60_000;
-  for (;;) {
-    try {
-      await todoFrame(page).getByText(title).first().waitFor({
-        timeout: 5_000,
-      });
-      return;
-    } catch {
-      if (performance.now() > deadline) {
-        throw new Failure(`"${title}" never arrived from the other device`);
-      }
-    }
-    await page.waitForTimeout(3_000);
-    await remountTodoMvc(page);
-  }
+  await todoFrame(page).getByText(title).first().waitFor({ timeout: 60_000 });
 }
 
 /**
@@ -2126,20 +2159,127 @@ const scenarios: Scenario[] = [
     async run(ctx, origin, browser) {
       const ctxB = await browser.newContext();
       try {
-        const { a } = await converge(ctx, ctxB, origin);
+        const { a, b } = await converge(ctx, ctxB, origin);
 
-        // A is not asked to do anything of its own: no mutation, no dial.
-        // The claim is that the change B made arrived on A and went into
-        // A's checkpoint, so A's *next boot* — a cold read off disk — has
-        // it. Nothing in worker memory can be doing this work.
-        await remountTodoMvc(a);
+        // A is not asked to do anything of its own: no mutation, no dial and
+        // no reload. Its mounted app must wake from `tasks.watch`.
         await waitForRemoteTodo(a, "from B");
         await todoFrame(a).getByText("from A").first().waitFor({
           timeout: 15_000,
         });
+        await pageCleanDrawer(a);
+        await pageCleanDrawer(b);
+        await todoFrame(a).getByText("from B").dblclick();
+        const edit = todoFrame(a).locator("input.edit");
+        await edit.fill("edited on A");
+        await edit.press("Enter");
+        await todoFrame(b).getByText("edited on A").waitFor({ timeout: 15_000 });
+        await todoFrame(b).locator("li").filter({ hasText: "from A" })
+          .locator("input[type=checkbox]").click();
+        await todoFrame(a).locator("li.completed").filter({ hasText: "from A" })
+          .waitFor({ timeout: 15_000 });
+        await todoFrame(a).locator("li").filter({ hasText: "edited on A" })
+          .locator("button.destroy").click();
+        await todoFrame(b).getByText("edited on A").waitFor({ state: "detached", timeout: 15_000 });
       } finally {
         await ctxB.close();
       }
+    },
+  },
+
+  {
+    name: "live-personalization-and-device-names",
+    async run(ctx, origin, browser) {
+      const ctxB = await browser.newContext();
+      try {
+        const a = await open(ctx, origin);
+        const b = await open(ctxB, origin);
+        await visorReady(a);
+        await visorReady(b);
+        await setDeviceName(a, "alpha device");
+        await setUserPetname(a, "group owner");
+        await launchTodoMvc(a);
+        await setAppPetname(a, "shared todos");
+
+        // Conflicting pre-pair values on the joiner must be replaced by A's
+        // established group identity, while B keeps its own device label.
+        await setDeviceName(b, "beta device");
+        await setUserPetname(b, "joiner value");
+        await launchTodoMvc(b);
+        await setAppPetname(b, "joiner todos");
+        const idA = await endpointId(a);
+        await endpointId(b);
+        await pair(a, b);
+        await waitForConnectedPeer(b, idA);
+        await waitForPageText(b, "group owner");
+        await pageCleanDrawer(a);
+        await pageCleanDrawer(b);
+        await openSettingsSheet(a);
+        await devicesSheet(a).locator(".member-row").filter({ hasText: "beta device" }).waitFor({ timeout: 30_000 });
+
+        // Keep one device-local field dirty while clean shared fields update.
+        await openSettingsSheet(b);
+        const dirtyName = drawer(b).locator("label").filter({ hasText: /^device petname$/ }).locator("input");
+        await dirtyName.fill("unsaved beta");
+        await setUserPetname(a, "post-pair owner");
+        await waitForPageText(b, "post-pair owner");
+        eq(await dirtyName.inputValue(), "unsaved beta", "remote refresh replaced a dirty field");
+        await drawer(b).getByRole("button", { name: "Revert", exact: true }).click();
+        eq(await dirtyName.inputValue(), "beta device", "Revert did not use the latest synced baseline");
+
+        await openSettingsSheet(a);
+        await drawer(a).getByRole("button", { name: "Choose your glyph", exact: true }).click();
+        const userPicker = drawer(a).locator(".glyph-picker");
+        await userPicker.getByRole("searchbox", { name: "Enter glyph or search" }).fill("★");
+        await userPicker.getByRole("button", { name: "Use ★", exact: true }).click();
+        await saveDraft(a);
+        await waitForPageText(b, "★");
+
+        await openSettingsSheet(a);
+        await drawer(a).locator('input[type="range"]').fill("123");
+        await saveDraft(a);
+        await b.waitForFunction(() => document.querySelector("#visor-root")?.getAttribute("style")?.includes("123"), undefined, { timeout: 30_000 });
+        const oldWord = (await drawer(b).locator("label").filter({ hasText: /^word/ }).textContent()) ?? "";
+        await drawer(a).locator("button").filter({ hasText: /^Reroll$/ }).click();
+        await b.waitForFunction((old) => {
+          const label = [...document.querySelectorAll("label")].find((node) => node.textContent?.trim().startsWith("word"));
+          return label?.textContent !== old;
+        }, oldWord, { timeout: 30_000 });
+        await setAppPetname(a, "post-pair todos");
+        await waitForPageText(b, "post-pair todos");
+
+        await a.reload();
+        await visorReady(a);
+        await waitForPageText(a, "post-pair owner", 15_000);
+      } finally {
+        await ctxB.close();
+      }
+    },
+  },
+
+  {
+    name: "same-device-tabs-live-tasks",
+    async run(ctx, origin) {
+      const a = await open(ctx, origin);
+      await visorReady(a);
+      await keepDevice(a, "shared tab device");
+      await launchTodoMvc(a);
+      const b = await ctx.newPage();
+      await b.goto(`${origin}/`);
+      await visorReady(b);
+      await launchTodoMvc(b);
+
+      await addTodo(a, "live lifecycle");
+      await todoFrame(b).getByText("live lifecycle").waitFor({ timeout: 15_000 });
+      await todoFrame(b).getByText("live lifecycle").dblclick();
+      const edit = todoFrame(b).locator("input.edit");
+      await edit.fill("edited remotely");
+      await edit.press("Enter");
+      await todoFrame(a).getByText("edited remotely").waitFor({ timeout: 15_000 });
+      await todoFrame(a).locator("li input[type=checkbox]").first().click();
+      await todoFrame(b).locator("li.completed").first().waitFor({ timeout: 15_000 });
+      await todoFrame(b).locator("button.destroy").first().click();
+      await todoFrame(a).getByText("edited remotely").waitFor({ state: "detached", timeout: 15_000 });
     },
   },
 
@@ -2361,10 +2501,7 @@ const scenarios: Scenario[] = [
           "a device outside the group read an object out of the store",
         );
         await launchTodoMvc(b);
-        // A remount is a fresh `tasks.items` read (the app polls; nothing
-        // pushes into a mounted frame), so this is B looking as hard as it
-        // can.
-        await remountTodoMvc(b);
+        // Its mounted watcher must remain quiet for another group's objects.
         eq(
           await todoFrame(b).getByText("from A").count(),
           0,
@@ -2399,6 +2536,7 @@ const scenarios: Scenario[] = [
         const readsBefore = drive.mediaReads();
         await b.goto(`${origin}/`);
         await visorReady(b);
+        await launchTodoMvc(b);
         await pullUntilTodo(b, "posted while B was away");
         check(
           drive.mediaReads() > readsBefore,
@@ -3164,8 +3302,7 @@ const scenarios: Scenario[] = [
           laid.length === 0,
           `at ${width}px rows overlap: ${laid.join("; ")}`,
         );
-        // Every id on screen — this device's endpoint, and the same id
-        // again as the unnamed member row — is one line, whole, scrollable
+      // Every id on screen is one line, whole, scrollable
         // to its end, and focusable so a keyboard can do the scrolling.
         const ids = await unreadableIdentifiers(page);
         check(ids.length === 0, `at ${width}px: ${ids.join("; ")}`);
@@ -3194,11 +3331,8 @@ const scenarios: Scenario[] = [
 
       const shown = devicesSheet(page).locator("#visor-endpoint-id");
       eq(await shown.textContent(), id, "the endpoint id was truncated");
-      eq(
-        await devicesSheet(page).locator(".member-row .endpoint-id").count(),
-        1,
-        "no unnamed member id was on screen to check",
-      );
+      // A named member intentionally shows its device-specific label instead
+      // of duplicating the endpoint id.
     },
   },
 

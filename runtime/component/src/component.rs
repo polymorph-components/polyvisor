@@ -481,7 +481,17 @@ fn rest(rest: polyvisor_kernel::Rest) -> guest::device::Rest {
 
 impl guest::device::Guest for Component {
     async fn status() -> Result<guest::device::DeviceStatus, Error> {
-        let status = kernel()?.device_status().map_err(map_error)?;
+        let kernel = kernel()?;
+        if !matches!(
+            kernel.device_status().map_err(map_error)?.state,
+            polyvisor_kernel::State::Sealed
+        ) {
+            kernel
+                .initialize_personalization()
+                .await
+                .map_err(map_error)?;
+        }
+        let status = kernel.device_status().map_err(map_error)?;
         Ok(guest::device::DeviceStatus {
             id: status.id,
             // `erased` never reaches here: it answers `unavailable` above.
@@ -521,18 +531,15 @@ impl guest::device::Guest for Component {
             .into_iter()
             .collect())
     }
-    async fn set_meta(
+    async fn patch_meta(
         scope: guest::device::MetaScope,
-        entries: Vec<(String, String)>,
+        fields: Vec<(String, Option<String>)>,
     ) -> Result<(), Error> {
         let scope = match scope {
             guest::device::MetaScope::User => polyvisor_kernel::MetaScope::User,
             guest::device::MetaScope::App(id) => polyvisor_kernel::MetaScope::App(id),
         };
-        kernel()?
-            .set_meta(scope, entries.into_iter().collect())
-            .await
-            .map_err(map_error)
+        kernel()?.patch_meta(scope, fields).await.map_err(map_error)
     }
     async fn keep(petname: String, passphrase: Option<String>) -> Result<(), Error> {
         kernel()?.keep(petname, passphrase).await.map_err(map_error)
@@ -741,6 +748,9 @@ impl guest::events::Guest for Component {
             polyvisor_kernel::Event::PairingChanged(p) => {
                 guest::events::Event::PairingChanged(phase(p))
             }
+            polyvisor_kernel::Event::PersonalizationChanged => {
+                guest::events::Event::PersonalizationChanged
+            }
         }
     }
 }
@@ -756,6 +766,28 @@ impl guest::app_services::Guest for Component {
             .tasks_items(session)
             .await?;
         Ok(guest::app_services::Snapshot {
+            revision: snapshot.revision,
+            items: snapshot
+                .items
+                .into_iter()
+                .map(|i| polyvisor::app::tasks::TodoItem {
+                    id: i.id,
+                    title: i.title,
+                    completed: i.completed,
+                })
+                .collect(),
+        })
+    }
+    async fn tasks_watch(
+        session: u32,
+        after: u64,
+    ) -> Result<guest::app_services::Snapshot, String> {
+        let snapshot = kernel()
+            .map_err(|_| unavailable_service())?
+            .tasks_watch(session, after)
+            .await?;
+        Ok(guest::app_services::Snapshot {
+            revision: snapshot.revision,
             items: snapshot
                 .items
                 .into_iter()

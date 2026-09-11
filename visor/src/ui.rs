@@ -29,6 +29,7 @@
 use dioxus::html::Key;
 use dioxus::prelude::*;
 
+use crate::draft::rebase_map;
 use crate::glyph::normalize_glyph;
 use crate::kernel::{
     self, App, Binding, Entry, Event, InstallOutcome, Member, Meta, MetaScope, Peer, SessionId,
@@ -61,7 +62,7 @@ fn petname_of(meta: &Meta) -> String {
 }
 
 /// Write one field of a draft's meta map. An emptied field removes its key
-/// rather than storing "": `set-meta` replaces the whole map, so an empty
+/// rather than storing "": the patch contract represents clear as `none`, so an empty
 /// value would be a key that means nothing — and, worse, would leave the
 /// draft comparing unequal to its seed, which is the whole definition of
 /// "unsaved changes" here.
@@ -88,6 +89,30 @@ struct Draft {
     hue: u16,
     user: Meta,
     app: Meta,
+}
+
+fn rebase_draft(latest: Draft, baseline: &Draft, current: &Draft) -> Draft {
+    let mut rebased = latest;
+    if current.name != baseline.name {
+        rebased.name = current.name.clone();
+    }
+    if current.hue != baseline.hue {
+        rebased.hue = current.hue;
+    }
+    rebase_map(&mut rebased.user, &baseline.user, &current.user);
+    rebase_map(&mut rebased.app, &baseline.app, &current.app);
+    rebased
+}
+
+fn meta_patch(before: &Meta, after: &Meta) -> Vec<(String, Option<String>)> {
+    let keys: std::collections::BTreeSet<String> =
+        before.keys().chain(after.keys()).cloned().collect();
+    keys.into_iter()
+        .filter_map(|key| {
+            let value = after.get(&key);
+            (before.get(&key) != value).then(|| (key, value.cloned()))
+        })
+        .collect()
 }
 
 /// Commit a draft: one kernel call per field that actually changed, then
@@ -144,8 +169,11 @@ async fn save_draft(
         }
     }
     if now.user != was.user {
-        match kernel::set_meta(MetaScope::User, now.user.clone()).await {
-            Ok(()) => user_meta.set(now.user.clone()),
+        match kernel::patch_meta(MetaScope::User, meta_patch(&was.user, &now.user)).await {
+            Ok(()) => match kernel::meta(MetaScope::User).await {
+                Ok(latest) => user_meta.set(latest),
+                Err(e) => fail(e, &mut failed),
+            },
             Err(e) => fail(e, &mut failed),
         }
     }
@@ -153,15 +181,42 @@ async fn save_draft(
     // runs, and Settings seeds `app` from that same session, so there is no
     // path here that could write one app's labels into another's.
     if now.app != was.app
-        && let Some(id) = app_id
+        && let Some(id) = app_id.as_ref()
     {
-        match kernel::set_meta(MetaScope::App(id), now.app.clone()).await {
-            Ok(()) => app_meta.set(now.app.clone()),
+        match kernel::patch_meta(MetaScope::App(id.clone()), meta_patch(&was.app, &now.app)).await {
+            Ok(()) => {}
             Err(e) => fail(e, &mut failed),
         }
     }
     if !failed {
-        seed.set(now);
+        let fresh_status = kernel::status().await;
+        let fresh_user = kernel::meta(MetaScope::User).await;
+        let fresh_app = match app_id.as_ref() {
+            Some(id) => kernel::meta(MetaScope::App(id.clone())).await,
+            None => Ok(Meta::new()),
+        };
+        match (fresh_status, fresh_user, fresh_app) {
+            (Ok(fresh_status), Ok(fresh_user), Ok(fresh_app)) => {
+                let latest = Draft {
+                    name: fresh_status.name.clone(),
+                    hue: fresh_status.hue,
+                    user: fresh_user.clone(),
+                    app: fresh_app.clone(),
+                };
+                // Anything typed while Save awaited remains a draft over the
+                // authoritative post-save snapshot; unrelated remote fields
+                // therefore become clean rather than being re-sent later.
+                let current = draft();
+                let rebased = rebase_draft(latest.clone(), &now, &current);
+                status.set(Some(fresh_status));
+                user_meta.set(fresh_user);
+                app_meta.set(fresh_app);
+                seed.set(latest);
+                draft.set(rebased);
+                status_gate.write().bump();
+            }
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => fail(e, &mut failed),
+        }
     }
     !failed
 }
@@ -560,13 +615,13 @@ pub(crate) fn Visor() -> Element {
     let mut session = use_signal(|| None::<(SessionId, App)>);
     let mut notice = use_signal(|| None::<Notice>);
     let peers = use_signal(Vec::<Peer>::new);
-    let members = use_signal(Vec::<Member>::new);
+    let mut members = use_signal(Vec::<Member>::new);
     let pairing_phase = use_signal(Phase::default);
     let binding = use_signal(|| None::<Binding>);
     // The user's own labels, and the running app's. Kernel state, like
     // everything else here — and written back only by a save, so the strip
     // never shows a label the kernel has not been told about.
-    let user_meta = use_signal(Meta::new);
+    let mut user_meta = use_signal(Meta::new);
     let mut app_meta = use_signal(Meta::new);
 
     // What the sheets are editing. `seed` is the identity as the sheet was
@@ -881,6 +936,60 @@ pub(crate) fn Visor() -> Element {
                 Event::PairingChanged(next) => {
                     apply_phase(next, pairing_phase, members, notice).await;
                 }
+                Event::PersonalizationChanged => loop {
+                    let status_token = status_gate.peek().begin();
+                    let drawer_token = drawer_gate.peek().begin();
+                    let expected_session = session
+                        .read()
+                        .as_ref()
+                        .map(|(id, app)| (*id, app.id.clone()));
+                    let fresh_status = kernel::status().await;
+                    let fresh_user = kernel::meta(MetaScope::User).await;
+                    let fresh_members = kernel::members().await;
+                    let fresh_app = match expected_session.as_ref() {
+                        Some((_, app)) => kernel::meta(MetaScope::App(app.clone())).await,
+                        None => Ok(Meta::new()),
+                    };
+                    let session_now = session
+                        .read()
+                        .as_ref()
+                        .map(|(id, app)| (*id, app.id.clone()));
+                    if !status_gate.peek().apply(status_token)
+                        || !drawer_gate.peek().apply(drawer_token)
+                        || session_now != expected_session
+                    {
+                        continue;
+                    }
+                    let (fresh_status, fresh_user, fresh_members, fresh_app) =
+                        match (fresh_status, fresh_user, fresh_members, fresh_app) {
+                            (Ok(s), Ok(u), Ok(m), Ok(a)) => (s, u, m, a),
+                            (Err(e), _, _, _)
+                            | (_, Err(e), _, _)
+                            | (_, _, Err(e), _)
+                            | (_, _, _, Err(e)) => {
+                                notice.set(Some(Notice::Plain(e)));
+                                break;
+                            }
+                        };
+                    let mut fresh = Draft {
+                        name: fresh_status.name.clone(),
+                        hue: fresh_status.hue,
+                        user: fresh_user.clone(),
+                        app: fresh_app.clone(),
+                    };
+                    normalize_meta_glyph(&mut fresh.user);
+                    normalize_meta_glyph(&mut fresh.app);
+                    let current_seed = seed();
+                    let current_draft = draft();
+                    let rebased = rebase_draft(fresh.clone(), &current_seed, &current_draft);
+                    status.set(Some(fresh_status));
+                    user_meta.set(fresh_user);
+                    app_meta.set(fresh_app);
+                    members.set(fresh_members);
+                    seed.set(fresh);
+                    draft.set(rebased);
+                    break;
+                },
             }
         }
     });

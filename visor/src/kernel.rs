@@ -256,7 +256,7 @@ pub(crate) async fn reroll_word() -> Result<String, String> {
     api::device::reroll_word().await.map_err(message)
 }
 
-/// Which map `meta`/`set_meta` reads or replaces (internal.wit `meta-scope`).
+/// Which map `meta`/`patch-meta` addresses (internal.wit `meta-scope`).
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum MetaScope {
     User,
@@ -281,9 +281,12 @@ pub(crate) async fn meta(scope: MetaScope) -> Result<Meta, String> {
         .collect())
 }
 
-/// Replaces the whole map for `scope` (internal.wit `device.set-meta`).
-pub(crate) async fn set_meta(scope: MetaScope, meta: Meta) -> Result<(), String> {
-    api::device::set_meta(meta_scope(scope), meta.into_iter().collect())
+/// Apply field changes for `scope` (internal.wit `device.patch-meta`).
+pub(crate) async fn patch_meta(
+    scope: MetaScope,
+    fields: Vec<(String, Option<String>)>,
+) -> Result<(), String> {
+    api::device::patch_meta(meta_scope(scope), fields)
         .await
         .map_err(message)
 }
@@ -520,11 +523,13 @@ pub(crate) enum Event {
     /// text, the contract would have to change first, and this would have to
     /// become an `AppText`.
     SessionEnded(SessionId, String),
+    PersonalizationChanged,
 }
 
 pub(crate) async fn next_event() -> Event {
     match api::events::next().await {
         api::events::Event::SessionEnded((session, reason)) => Event::SessionEnded(session, reason),
         api::events::Event::PairingChanged(p) => Event::PairingChanged(phase(p)),
+        api::events::Event::PersonalizationChanged => Event::PersonalizationChanged,
     }
 }

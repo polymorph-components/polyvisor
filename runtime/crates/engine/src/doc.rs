@@ -35,6 +35,7 @@ pub struct TodoItem {
 /// `polyvisor:app/tasks.snapshot`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSnapshot {
+    pub revision: u64,
     pub items: Vec<TodoItem>,
 }
 
@@ -73,6 +74,23 @@ impl AppDoc {
         }
     }
 
+    pub fn try_restore(
+        app: &str,
+        tree: SedimentreeId,
+        bytes: &[u8],
+        seed: [u8; 32],
+    ) -> Result<AppDoc, String> {
+        Ok(AppDoc {
+            core: Document::try_load(
+                bytes,
+                actor(b"polyvisor:actor:", seed, app.as_bytes()),
+                tree,
+            )?,
+            seed,
+            app: app.to_string(),
+        })
+    }
+
     pub const fn tree(&self) -> SedimentreeId {
         self.core.tree()
     }
@@ -88,8 +106,11 @@ impl AppDoc {
         self.core.save()
     }
 
-    /// The number of changes in the document's history. Used to order and
-    /// uniquely name local additions.
+    pub(crate) fn merge_snapshot(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.core.merge_snapshot(bytes)
+    }
+
+    /// The number of changes in the document's history.
     pub fn revision(&self) -> u64 {
         self.core.revision()
     }
@@ -137,6 +158,7 @@ impl AppDoc {
         }
         items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
         TaskSnapshot {
+            revision: self.revision(),
             items: items.into_iter().map(|(_, item)| item).collect(),
         }
     }
@@ -255,6 +277,14 @@ impl AppDoc {
 
     pub fn merge_anchor(&mut self) -> Option<NewCommit> {
         self.core.merge_anchor()
+    }
+
+    pub(crate) fn heads(&self) -> Vec<automerge::ChangeHash> {
+        self.core.heads()
+    }
+
+    pub(crate) fn change_hashes(&self) -> Vec<automerge::ChangeHash> {
+        self.core.change_hashes()
     }
 
     fn put_field(&mut self, id: &str, field: &str, value: ScalarValue) -> Result<(), String> {

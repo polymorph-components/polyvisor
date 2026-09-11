@@ -509,6 +509,14 @@ impl Kernel {
             Ok(ingested) => {
                 self.drive.borrow_mut().trouble = None;
                 if ingested {
+                    // Store imports bypass the engine's live event pump, so
+                    // perform the same UI notifications here after apply.
+                    let apps: Vec<String> = self.sessions.borrow().values().cloned().collect();
+                    for app in apps {
+                        self.wake_tasks(&app);
+                    }
+                    let _ = self.refresh_personalization().await;
+                    self.push_event(crate::Event::PersonalizationChanged);
                     // What the store handed back is now this device's, and a
                     // reload must not have to fetch it again. This checkpoint
                     // schedules one more pass through the gate above, which

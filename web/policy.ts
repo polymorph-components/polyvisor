@@ -93,6 +93,7 @@ const LISTENERS = new Set([
   "keyup",
   "blur",
   "focus",
+  "focusout",
   "dblclick",
 ]);
 

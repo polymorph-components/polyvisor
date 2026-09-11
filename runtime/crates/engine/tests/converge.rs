@@ -112,6 +112,144 @@ fn device(pool: &LocalPool, seed: u8, snapshot: Option<Snapshot>) -> Device {
     }
 }
 
+#[test]
+fn personalization_fields_merge_and_clears_survive_reload() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 71, None);
+    let b = device(&pool, 72, None);
+    pool.run_until(async {
+        wire(&a.engine, &b.engine).await;
+        a.engine
+            .set_visor_personalization(
+                Some(Some(42)),
+                None,
+                vec![(None, "petname".into(), Some("A".into()))],
+            )
+            .await
+            .unwrap();
+        b.engine
+            .set_visor_personalization(
+                None,
+                Some(Some("shared".into())),
+                vec![(Some(APP.into()), "glyph".into(), Some("✓".into()))],
+            )
+            .await
+            .unwrap();
+        until(|| async {
+            let pa = a.engine.visor_personalization().await.ok()?;
+            let pb = b.engine.visor_personalization().await.ok()?;
+            (pa == pb && pa.hue == Some(42) && pa.word.as_deref() == Some("shared")).then_some(())
+        })
+        .await;
+        a.engine
+            .set_visor_personalization(None, None, vec![(Some(APP.into()), "glyph".into(), None)])
+            .await
+            .unwrap();
+        until(|| async {
+            b.engine
+                .visor_personalization()
+                .await
+                .ok()?
+                .apps
+                .get(APP)
+                .is_none_or(|m| !m.contains_key("glyph"))
+                .then_some(())
+        })
+        .await;
+    });
+    let saved = pool.run_until(a.engine.snapshot()).unwrap();
+    let restored = device(&pool, 71, Some(saved));
+    let p = pool
+        .run_until(restored.engine.visor_personalization())
+        .unwrap();
+    assert_eq!(p.hue, Some(42));
+    assert!(p.apps.get(APP).is_none_or(|m| !m.contains_key("glyph")));
+}
+
+#[test]
+fn concurrent_same_personalization_field_resolves_identically() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 73, None);
+    let b = device(&pool, 74, None);
+    pool.run_until(async {
+        wire(&a.engine, &b.engine).await;
+        a.engine
+            .set_visor_personalization(None, Some(Some("alpha".into())), Vec::new())
+            .await
+            .unwrap();
+        b.engine
+            .set_visor_personalization(None, Some(Some("beta".into())), Vec::new())
+            .await
+            .unwrap();
+        until(|| async {
+            let pa = a.engine.visor_personalization().await.ok()?;
+            let pb = b.engine.visor_personalization().await.ok()?;
+            (pa.word == pb.word).then_some(())
+        })
+        .await;
+    });
+}
+
+#[test]
+fn joining_device_adopts_group_personalization_not_its_prior_values() {
+    let mut pool = LocalPool::new();
+    let group = device(&pool, 75, None);
+    let joiner = device(&pool, 76, None);
+    pool.run_until(async {
+        group
+            .engine
+            .set_visor_personalization(
+                Some(Some(25)),
+                Some(Some("group".into())),
+                vec![(None, "petname".into(), Some("owner".into()))],
+            )
+            .await
+            .unwrap();
+        joiner
+            .engine
+            .set_visor_personalization(
+                Some(Some(300)),
+                Some(Some("joiner".into())),
+                vec![(None, "petname".into(), Some("other".into()))],
+            )
+            .await
+            .unwrap();
+        enroll(&group.engine, &joiner.engine).await;
+        let bytes = group.engine.visor_save().await.unwrap();
+        joiner.engine.adopt_visor(&bytes).await.unwrap();
+        let adopted = joiner.engine.visor_personalization().await.unwrap();
+        assert_eq!(adopted.hue, Some(25));
+        assert_eq!(adopted.word.as_deref(), Some("group"));
+        assert_eq!(
+            adopted.user.get("petname").map(String::as_str),
+            Some("owner")
+        );
+        wire_only(&group.engine, &joiner.engine).await;
+        joiner
+            .engine
+            .set_visor_personalization(
+                None,
+                None,
+                vec![(None, "petname".into(), Some("after join".into()))],
+            )
+            .await
+            .unwrap();
+        until(|| async {
+            (group
+                .engine
+                .visor_personalization()
+                .await
+                .ok()?
+                .user
+                .get("petname")
+                .map(String::as_str)
+                == Some("after join"))
+            .then_some(())
+        })
+        .await;
+    });
+}
+
 /// Let every spawned task make progress until `check` answers `Some`.
 ///
 /// `LocalPool::run_until` drives the whole pool, so yielding here is what

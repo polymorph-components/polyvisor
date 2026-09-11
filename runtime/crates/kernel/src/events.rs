@@ -30,6 +30,7 @@ pub enum Event {
     /// the only way a transition the OTHER device drove reaches a screen
     /// (internal.wit `events.pairing-changed`).
     PairingChanged(crate::pairing::Phase),
+    PersonalizationChanged,
 }
 
 #[derive(Default)]

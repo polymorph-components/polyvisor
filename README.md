@@ -43,7 +43,9 @@ suite against a local iroh relay.
 **Implemented:** three realms with TodoMVC; devices with two
 tiers of rest, sealed OPFS checkpoints and a swept index; `tasks` as an
 automerge document synced between devices over subduction and the iroh
-relay; pairing by code + SAS into a device group that is the sync policy;
+relay with live revision watches; pairing by code + SAS into a device group
+that is the sync policy; shared visor personalization in the same sealed
+app-document machinery, with device-specific member labels;
 app content sealed as keyhive/BeeKEM envelopes; Google Drive as a dumb
 ciphertext store (OAuth split between kernel and shell; a fake Drive in
 e2e); app history rolled up as sedimentree fragments. Passkey unseal
