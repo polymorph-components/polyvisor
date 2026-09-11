@@ -325,6 +325,7 @@ function mintSessionPort(
   serveInterfaces(port1, {
     [I.tasks]: {
       items: () => svc.tasksItems(session),
+      watch: (after: bigint) => svc.tasksWatch(session, after),
       add: (title: string) => svc.tasksAdd(session, title),
       setCompleted: (id: string, completed: boolean) =>
         svc.tasksSetCompleted(session, id, completed),
@@ -415,8 +416,8 @@ self.onconnect = (ev: MessageEvent) => {
       setHue: async (hue: number) => (await ready)[I.device].setHue(hue),
       rerollWord: async () => (await ready)[I.device].rerollWord(),
       meta: async (scope: unknown) => (await ready)[I.device].meta(scope),
-      setMeta: async (scope: unknown, entries: [string, string][]) =>
-        (await ready)[I.device].setMeta(scope, entries),
+      patchMeta: async (scope: unknown, fields: [string, string | undefined][]) =>
+        (await ready)[I.device].patchMeta(scope, fields),
       keep: async (petname: string, passphrase: string | undefined) =>
         (await ready)[I.device].keep(petname, passphrase),
       unseal: async (passphrase: string) =>

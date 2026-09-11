@@ -1,5 +1,5 @@
-//! TodoMVC over `polyvisor:app/tasks`. The signal is a service snapshot;
-//! mutations go to the service and then refresh it.
+//! TodoMVC over `polyvisor:app/tasks`. The signal caches a service snapshot;
+//! mutations refresh it and one revision watch keeps it current across peers.
 //! UI structure derives from DioxusLabs' Dioxus TodoMVC example (v0.7.10,
 //! MIT/Apache-2.0), via polymorph-stream-dom rev 1974923.
 
@@ -65,17 +65,27 @@ mod service {
     use super::TodoItem;
     use crate::bindings::polyvisor::app::tasks;
 
-    pub async fn items() -> Result<Vec<TodoItem>, String> {
-        Ok(tasks::items()
-            .await?
-            .items
-            .into_iter()
-            .map(|i| TodoItem {
-                id: i.id,
-                title: i.title,
-                completed: i.completed,
-            })
-            .collect())
+    pub async fn items() -> Result<(u64, Vec<TodoItem>), String> {
+        snapshot(tasks::items().await?)
+    }
+
+    pub async fn watch(after: u64) -> Result<(u64, Vec<TodoItem>), String> {
+        snapshot(tasks::watch(after).await?)
+    }
+
+    fn snapshot(value: tasks::Snapshot) -> Result<(u64, Vec<TodoItem>), String> {
+        Ok((
+            value.revision,
+            value
+                .items
+                .into_iter()
+                .map(|i| TodoItem {
+                    id: i.id,
+                    title: i.title,
+                    completed: i.completed,
+                })
+                .collect(),
+        ))
     }
 
     pub async fn add(title: String) -> Result<String, String> {
@@ -122,8 +132,11 @@ mod route {
 mod service {
     use super::TodoItem;
 
-    pub async fn items() -> Result<Vec<TodoItem>, String> {
-        Ok(Vec::new())
+    pub async fn items() -> Result<(u64, Vec<TodoItem>), String> {
+        Ok((0, Vec::new()))
+    }
+    pub async fn watch(_after: u64) -> Result<(u64, Vec<TodoItem>), String> {
+        std::future::pending().await
     }
 
     pub async fn add(title: String) -> Result<String, String> {
@@ -143,19 +156,25 @@ mod service {
     }
 }
 
-/// Refresh after mount and local mutations. Without an app event path,
-/// remote changes become visible on the next local mutation.
-async fn refresh(mut items: Signal<Vec<TodoItem>>) {
-    if let Ok(fresh) = service::items().await {
-        items.set(fresh);
+async fn refresh(mut snapshot: Signal<(u64, Vec<TodoItem>)>) {
+    if let Ok(fresh) = service::items().await
+        && accepts_snapshot(snapshot.peek().0, fresh.0)
+    {
+        snapshot.set(fresh);
     }
 }
 
-/// Run one mutation, then re-read the list.
-fn mutate(items: Signal<Vec<TodoItem>>, work: impl Future<Output = ()> + 'static) {
+fn accepts_snapshot(current: u64, incoming: u64) -> bool {
+    incoming >= current
+}
+
+/// Run one mutation, then re-read the list. Every write path goes through
+/// here, which is what keeps "mutate then re-fetch" from being restated six
+/// times.
+fn mutate(snapshot: Signal<(u64, Vec<TodoItem>)>, work: impl Future<Output = ()> + 'static) {
     spawn(async move {
         work.await;
-        refresh(items).await;
+        refresh(snapshot).await;
     });
 }
 
@@ -173,7 +192,9 @@ enum FilterState {
 const STYLESHEET: &str = "asset:0f827d119b7bec30534b1767e8ab8ee0f2890c98f93baa1159dcf1a46f10bc17";
 
 pub fn app() -> Element {
-    let items = use_signal(Vec::<TodoItem>::new);
+    // The snapshot. Owned by the `tasks` service; this is a cached view of it.
+    let mut snapshot = use_signal(|| (0, Vec::<TodoItem>::new()));
+    let items = use_memo(move || snapshot.read().1.clone());
     // The route is this app's own prior output, relayed back by the visor —
     // not user-typed input (`wit/app.wit` `route`: "a route this app is
     // handed is one it wrote itself on one of the user's own devices"). An
@@ -185,7 +206,19 @@ pub fn app() -> Element {
         _ => FilterState::All,
     });
 
-    use_future(move || refresh(items));
+    use_future(move || async move {
+        refresh(snapshot).await;
+        loop {
+            let after = snapshot.peek().0;
+            match service::watch(after).await {
+                Ok(fresh) if fresh.0 != after && accepts_snapshot(snapshot.peek().0, fresh.0) => {
+                    snapshot.set(fresh)
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    });
 
     let active_todo_count = use_memo(move || items.read().iter().filter(|i| !i.completed).count());
 
@@ -215,7 +248,7 @@ pub fn app() -> Element {
             .filter(|i| i.completed != completed)
             .map(|i| i.id.clone())
             .collect::<Vec<_>>();
-        mutate(items, async move {
+        mutate(snapshot, async move {
             for id in ids {
                 let _ = service::set_completed(id, completed).await;
             }
@@ -226,7 +259,7 @@ pub fn app() -> Element {
         link { rel: "stylesheet", href: STYLESHEET }
 
         section { class: "todoapp",
-            TodoHeader { items }
+            TodoHeader { items: snapshot }
             section { class: "main",
                 if !items.read().is_empty() {
                     input {
@@ -241,12 +274,12 @@ pub fn app() -> Element {
 
                 ul { class: "todo-list",
                     for item in filtered_todos() {
-                        TodoEntry { key: "{item.id}", item, items }
+                        TodoEntry { key: "{item.id}", item, items: snapshot }
                     }
                 }
 
                 if !items.read().is_empty() {
-                    ListFooter { active_todo_count, items, filter }
+                    ListFooter { active_todo_count, items: snapshot, filter }
                 }
             }
         }
@@ -263,7 +296,7 @@ pub fn app() -> Element {
 }
 
 #[component]
-fn TodoHeader(items: Signal<Vec<TodoItem>>) -> Element {
+fn TodoHeader(items: Signal<(u64, Vec<TodoItem>)>) -> Element {
     let mut draft = use_signal(String::new);
 
     // A `<form onsubmit>` rather than the example's `onkeydown == Enter`:
@@ -300,7 +333,7 @@ fn TodoHeader(items: Signal<Vec<TodoItem>>) -> Element {
 /// A single todo entry. Takes the item by value: the snapshot is immutable
 /// here, so there is nothing to memoize a read out of.
 #[component]
-fn TodoEntry(item: TodoItem, items: Signal<Vec<TodoItem>>) -> Element {
+fn TodoEntry(item: TodoItem, items: Signal<(u64, Vec<TodoItem>)>) -> Element {
     let mut is_editing = use_signal(|| false);
     // The edit box is local until it is committed. The example wrote every
     // keystroke into the shared map; doing that here would be one
@@ -384,16 +417,17 @@ fn TodoEntry(item: TodoItem, items: Signal<Vec<TodoItem>>) -> Element {
 
 #[component]
 fn ListFooter(
-    items: Signal<Vec<TodoItem>>,
+    items: Signal<(u64, Vec<TodoItem>)>,
     active_todo_count: ReadSignal<usize>,
     mut filter: Signal<FilterState>,
 ) -> Element {
-    let show_clear_completed = use_memo(move || items.read().iter().any(|i| i.completed));
+    let show_clear_completed = use_memo(move || items.read().1.iter().any(|i| i.completed));
 
     // No bulk call in the contract, so: a loop over `remove`.
     let clear_completed = move |_| {
         let ids = items
             .read()
+            .1
             .iter()
             .filter(|i| i.completed)
             .map(|i| i.id.clone())
@@ -455,6 +489,13 @@ fn ListFooter(
 mod tests {
     use super::STYLESHEET;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn delayed_snapshot_never_reverts_a_newer_one() {
+        assert!(super::accepts_snapshot(7, 7));
+        assert!(super::accepts_snapshot(7, 8));
+        assert!(!super::accepts_snapshot(8, 7));
+    }
 
     fn manifest() -> serde_json::Value {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

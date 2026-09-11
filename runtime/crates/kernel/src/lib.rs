@@ -7,11 +7,12 @@
 //! so nothing here is `Send`: the trait futures are boxed without a `Send`
 //! bound and shared state is `RefCell`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
+use std::task::{Poll, Waker};
 
 mod apps;
 mod checkpoint;
@@ -379,6 +380,8 @@ pub struct Kernel {
     /// reason: one push/pull in flight, and a request made during one is
     /// coalesced into a single further pass.
     syncing: RefCell<Checkpointing>,
+    next_watch: Cell<u64>,
+    task_waiters: RefCell<BTreeMap<u64, (String, Waker)>>,
 }
 
 /// The checkpoint gate: at most one writer, and one bit of "someone asked
@@ -447,12 +450,17 @@ impl Kernel {
             checkpointing: RefCell::new(Checkpointing::default()),
             drive: RefCell::new(drive),
             syncing: RefCell::new(Checkpointing::default()),
+            next_watch: Cell::new(1),
+            task_waiters: RefCell::new(BTreeMap::new()),
         });
         *kernel.me.borrow_mut() = Rc::downgrade(&kernel);
         // A sealed device has no seed in memory, so it has no engine and no
         // endpoint until `unseal` (internal.wit `device`).
         if kernel.state() != State::Sealed {
             kernel.start_sync();
+            if kernel.initialize_personalization().await? {
+                kernel.checkpoint().await?;
+            }
             // At boot, after `open`: a device that was off while its group
             // wrote catches up without anyone asking (internal.wit
             // `storage.sync-now`). Bound or not is the schedule's question.
@@ -534,26 +542,41 @@ impl Kernel {
 
     pub async fn set_name(&self, name: String) -> Result<(), Error> {
         self.open()?;
+        self.initialize_personalization().await?;
+        let key = self.engine()?.verifying_key().to_bytes();
+        self.engine()?
+            .set_member_petname(key, name.clone())
+            .await
+            .map_err(engine_failed)?;
         self.with_device(|d| {
             d.name = name;
             Ok(())
         })?;
-        self.checkpoint().await
+        self.checkpoint().await?;
+        self.push_event(Event::PersonalizationChanged);
+        Ok(())
     }
 
     pub async fn set_hue(&self, hue: u16) -> Result<(), Error> {
         self.open()?;
+        self.initialize_personalization().await?;
+        if hue >= 360 {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                format!("hue must be below 360 degrees; got {hue}"),
+            ));
+        }
+        self.engine()?
+            .set_visor_personalization(Some(Some(hue)), None, Vec::new())
+            .await
+            .map_err(engine_failed)?;
         self.with_device(|d| {
-            if hue >= 360 {
-                return Err(Error::new(
-                    ErrorCode::Refused,
-                    format!("hue must be below 360 degrees; got {hue}"),
-                ));
-            }
             d.hue = hue;
             Ok(())
         })?;
-        self.checkpoint().await
+        self.checkpoint().await?;
+        self.push_event(Event::PersonalizationChanged);
+        Ok(())
     }
 
     /// internal.wit `device.meta`: an unknown app id answers an empty map
@@ -569,43 +592,50 @@ impl Kernel {
         })
     }
 
-    /// internal.wit `device.set-meta`: replaces the whole map for `scope`.
-    /// An empty map for an app scope removes that app's entry rather than
-    /// leaving an empty one behind.
-    pub async fn set_meta(
+    /// internal.wit `device.patch-meta`: apply only explicitly changed fields.
+    pub async fn patch_meta(
         &self,
         scope: MetaScope,
-        meta: BTreeMap<String, String>,
+        fields: Vec<(String, Option<String>)>,
     ) -> Result<(), Error> {
         self.open()?;
-        self.with_device(|d| {
-            match scope {
-                MetaScope::User => d.meta.user = meta,
-                MetaScope::App(id) => {
-                    if meta.is_empty() {
-                        d.meta.app.remove(&id);
-                    } else {
-                        d.meta.app.insert(id, meta);
-                    }
-                }
-            }
-            Ok(())
-        })?;
-        self.checkpoint().await
+        self.initialize_personalization().await?;
+        let app = match &scope {
+            MetaScope::App(id) => Some(id.clone()),
+            MetaScope::User => None,
+        };
+        let patch = fields
+            .into_iter()
+            .map(|(key, value)| (app.clone(), key, value))
+            .collect();
+        self.engine()?
+            .set_visor_personalization(None, None, patch)
+            .await
+            .map_err(engine_failed)?;
+        self.refresh_personalization().await?;
+        self.checkpoint().await?;
+        self.push_event(Event::PersonalizationChanged);
+        Ok(())
     }
 
     pub async fn reroll_word(&self) -> Result<String, Error> {
         self.open()?;
+        self.initialize_personalization().await?;
         let word = {
             let state = self.state.borrow();
             let device = state.device.as_ref().expect("open implies a device");
             device.reroll(self.seams.rng.as_ref())
         };
+        self.engine()?
+            .set_visor_personalization(None, Some(Some(word.clone())), Vec::new())
+            .await
+            .map_err(engine_failed)?;
         self.with_device(|d| {
             d.word = word.clone();
             Ok(())
         })?;
         self.checkpoint().await?;
+        self.push_event(Event::PersonalizationChanged);
         Ok(word)
     }
 
@@ -634,6 +664,25 @@ impl Kernel {
                 ));
             }
             self.state.borrow_mut().row.petname = petname;
+            let label = self.state.borrow().row.petname.clone();
+            self.with_device(|device| {
+                if device.name.is_empty() {
+                    device.name = label;
+                }
+                Ok(())
+            })?;
+            let key = self.engine()?.verifying_key().to_bytes();
+            let name = self
+                .state
+                .borrow()
+                .device
+                .as_ref()
+                .map(|d| d.name.clone())
+                .unwrap_or_default();
+            self.engine()?
+                .set_member_petname(key, name)
+                .await
+                .map_err(engine_failed)?;
             return self.checkpoint().await;
         }
 
@@ -667,6 +716,12 @@ impl Kernel {
         let row = {
             let mut state = self.state.borrow_mut();
             state.row.petname = petname;
+            let label = state.row.petname.clone();
+            if let Some(device) = state.device.as_mut()
+                && device.name.is_empty()
+            {
+                device.name = label;
+            }
             state.row.tier = Tier::Durable;
             state.row.rest = rest;
             state.row.encode()?
@@ -675,6 +730,19 @@ impl Kernel {
             .platform
             .set(store::index_key(&self.id), row)
             .await;
+
+        let key = self.engine()?.verifying_key().to_bytes();
+        let name = self
+            .state
+            .borrow()
+            .device
+            .as_ref()
+            .map(|d| d.name.clone())
+            .unwrap_or_default();
+        self.engine()?
+            .set_member_petname(key, name)
+            .await
+            .map_err(engine_failed)?;
 
         if rest == Rest::Passphrase {
             // Last. A crash before this leaves a device whose row already
@@ -740,6 +808,9 @@ impl Kernel {
             state.wrapped = None;
         }
         self.start_sync();
+        if self.initialize_personalization().await? {
+            self.checkpoint().await?;
+        }
         // The boot trigger's other half: a device that rested under a
         // passphrase has been off, and unsealing is the moment it can catch
         // up with what its group wrote meanwhile (`Kernel::boot` does the
@@ -757,6 +828,11 @@ impl Kernel {
         // un-erasable)". Nothing here reads the DEK; the namespace is removed
         // by name and the row by key.
         self.not_erased()?;
+        let apps: Vec<String> = self.sessions.borrow().values().cloned().collect();
+        self.sessions.borrow_mut().clear();
+        for app in apps {
+            self.wake_tasks(&app);
+        }
         store::destroy(
             self.seams.platform.as_ref(),
             self.seams.files.as_ref(),
@@ -986,7 +1062,10 @@ impl Kernel {
     /// an error. No event either — `session-ended` reports the endings the
     /// visor did not ask for, and this one it did.
     pub fn close(&self, session: SessionId) {
-        self.sessions.borrow_mut().remove(&session);
+        let app = self.sessions.borrow_mut().remove(&session);
+        if let Some(app) = app {
+            self.wake_tasks(&app);
+        }
     }
 
     /// The glue reports a session that died on its own (internal.wit
@@ -1122,10 +1201,118 @@ impl Kernel {
         engine.tasks_items(&app).await
     }
 
+    pub async fn tasks_watch(&self, session: SessionId, after: u64) -> Result<Snapshot, String> {
+        let (app, engine) = self.app_engine(session)?;
+        // Opens/absorbs before registration. The poll below then compares and
+        // registers without an await, closing the lost-wakeup window.
+        let first = engine.tasks_items(&app).await?;
+        if first.revision != after {
+            if self.sessions.borrow().get(&session) != Some(&app) {
+                return Err("unknown session".to_string());
+            }
+            return Ok(first);
+        }
+        let id = self.next_watch.get();
+        self.next_watch.set(id.wrapping_add(1));
+        struct Guard<'a> {
+            id: u64,
+            waiters: &'a RefCell<BTreeMap<u64, (String, Waker)>>,
+        }
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.waiters.borrow_mut().remove(&self.id);
+            }
+        }
+        let guard = Guard {
+            id,
+            waiters: &self.task_waiters,
+        };
+        std::future::poll_fn(|cx| {
+            if self.sessions.borrow().get(&session) != Some(&app) {
+                return Poll::Ready(Err("unknown session".to_string()));
+            }
+            if engine.tasks_revision_open(&app) != Some(after) {
+                return Poll::Ready(Ok(()));
+            }
+            self.task_waiters
+                .borrow_mut()
+                .insert(id, (app.clone(), cx.waker().clone()));
+            Poll::Pending
+        })
+        .await?;
+        drop(guard);
+        let snapshot = engine.tasks_items(&app).await?;
+        if self.sessions.borrow().get(&session) != Some(&app) {
+            return Err("unknown session".to_string());
+        }
+        Ok(snapshot)
+    }
+
+    pub(crate) async fn refresh_personalization(&self) -> Result<(), Error> {
+        let shared = self
+            .engine()?
+            .visor_personalization()
+            .await
+            .map_err(engine_failed)?;
+        let (Some(hue), Some(word)) = (shared.hue, shared.word) else {
+            return Ok(());
+        };
+        self.with_device(|d| {
+            d.hue = hue;
+            d.word = word;
+            d.meta.user = shared.user;
+            d.meta.app = shared.apps;
+            Ok(())
+        })
+    }
+
+    pub async fn initialize_personalization(&self) -> Result<bool, Error> {
+        let (hue, word, user, apps) = {
+            let state = self.state.borrow();
+            let d = state
+                .device
+                .as_ref()
+                .ok_or_else(|| Error::new(ErrorCode::Unavailable, "device is sealed"))?;
+            (
+                d.hue,
+                d.word.clone(),
+                d.meta.user.clone(),
+                d.meta.app.clone(),
+            )
+        };
+        let members = self.engine()?.members().await.map_err(engine_failed)?;
+        let me = self.engine()?.verifying_key().to_bytes();
+        let am_founder = members.first().is_none_or(|member| member.key == me);
+        let shared = self
+            .engine()?
+            .visor_personalization()
+            .await
+            .map_err(engine_failed)?;
+        let wrote = shared.hue.is_none() && shared.word.is_none() && am_founder;
+        if wrote {
+            let mut fields = Vec::new();
+            for (key, value) in user {
+                fields.push((None, key, Some(value)));
+            }
+            for (app, meta) in apps {
+                for (key, value) in meta {
+                    fields.push((Some(app.clone()), key, Some(value)));
+                }
+            }
+            self.engine()?
+                .set_visor_personalization(Some(Some(hue)), Some(Some(word)), fields)
+                .await
+                .map_err(engine_failed)?;
+        }
+        self.refresh_personalization().await?;
+        Ok(wrote)
+    }
+
     pub async fn tasks_add(&self, session: SessionId, title: String) -> Result<String, String> {
         let (app, engine) = self.app_engine(session)?;
         let id = engine.tasks_add(&app, title).await?;
         self.checkpoint_service().await?;
+        self.wake_tasks(&app);
         Ok(id)
     }
 
@@ -1137,7 +1324,9 @@ impl Kernel {
     ) -> Result<(), String> {
         let (app, engine) = self.app_engine(session)?;
         engine.tasks_set_completed(&app, id, completed).await?;
-        self.checkpoint_service().await
+        self.checkpoint_service().await?;
+        self.wake_tasks(&app);
+        Ok(())
     }
 
     pub async fn tasks_set_title(
@@ -1148,13 +1337,17 @@ impl Kernel {
     ) -> Result<(), String> {
         let (app, engine) = self.app_engine(session)?;
         engine.tasks_set_title(&app, id, title).await?;
-        self.checkpoint_service().await
+        self.checkpoint_service().await?;
+        self.wake_tasks(&app);
+        Ok(())
     }
 
     pub async fn tasks_remove(&self, session: SessionId, id: &str) -> Result<(), String> {
         let (app, engine) = self.app_engine(session)?;
         engine.tasks_remove(&app, id).await?;
-        self.checkpoint_service().await
+        self.checkpoint_service().await?;
+        self.wake_tasks(&app);
+        Ok(())
     }
 
     /// The gate every `app-services` call passes: the device is open, the
@@ -1176,6 +1369,23 @@ impl Kernel {
 
     async fn checkpoint_service(&self) -> Result<(), String> {
         self.checkpoint().await.map_err(|e| e.message)
+    }
+
+    fn wake_tasks(&self, app: &str) {
+        let wakes: Vec<Waker> = {
+            let mut waiters = self.task_waiters.borrow_mut();
+            let ids: Vec<u64> = waiters
+                .iter()
+                .filter(|(_, (a, _))| a == app)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| waiters.remove(&id).map(|(_, w)| w))
+                .collect()
+        };
+        for wake in wakes {
+            wake.wake();
+        }
     }
 
     // -- events --------------------------------------------------------------

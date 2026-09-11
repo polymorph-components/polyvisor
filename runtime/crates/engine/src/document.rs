@@ -112,6 +112,18 @@ impl Document {
         self.doc.save()
     }
 
+    pub fn merge_snapshot(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let mut other = Automerge::load(bytes).map_err(|e| e.to_string())?;
+        self.doc.merge(&mut other).map_err(|e| e.to_string())?;
+        self.applied = self
+            .doc
+            .get_changes(&[])
+            .iter()
+            .map(|change| CommitId::new(change.hash().0))
+            .collect();
+        Ok(())
+    }
+
     /// The number of changes in the document's history. Monotonic (changes
     /// are only ever added) and identical on every device that has seen the
     /// same history, so a remote change advances it exactly as a local one

@@ -103,16 +103,17 @@ impl IndexRow {
     }
 }
 
-/// The personal half: name, hue, anchor word. Never in `kv` — it rides in the
-/// encrypted checkpoint (docs/design.md "Devices": the index carries "never
-/// the name, hue, word or any key").
+/// Device-local state plus an in-memory cache of the shared visor document.
+/// The cache fields are skipped by serde: the sealed engine snapshot is their
+/// sole durable source and refreshes them before the component returns status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
     pub name: String,
+    #[serde(skip)]
     pub hue: u16,
+    #[serde(skip)]
     pub word: String,
-    /// The user's own labels — petname, glyph, whatever the visor settles on
-    /// (internal.wit `meta-scope`).
+    #[serde(skip)]
     pub meta: Meta,
 }
 
@@ -123,7 +124,7 @@ pub struct Meta {
     pub app: BTreeMap<String, BTreeMap<String, String>>,
 }
 
-/// Which map `meta`/`set_meta` reads or replaces.
+/// Which map `meta`/`patch_meta` addresses.
 pub enum MetaScope {
     User,
     App(String),

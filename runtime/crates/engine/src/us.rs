@@ -256,6 +256,22 @@ impl UsDoc {
             Ok(())
         })
     }
+
+    /// Rename an existing member without touching its enrollment stamp.
+    pub fn set_member_petname(&mut self, key: [u8; 32], petname: String) -> Result<(), String> {
+        let hex_key = hex(&key);
+        self.core.transact(move |tx| {
+            let (_value, members) = tx
+                .get(ROOT, MEMBERS)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "the group has no members".to_string())?;
+            let (_value, entry) = tx
+                .get(&members, &hex_key)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "this device is not in its group".to_string())?;
+            tx.put(&entry, PETNAME, petname).map_err(|e| e.to_string())
+        })
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {

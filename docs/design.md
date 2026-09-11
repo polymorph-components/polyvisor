@@ -353,8 +353,9 @@ starts as a group of one; pairing replaces the joiner's group with the
 adder's, members reconnect at boot, and non-members are closed after
 the handshake.
 
-- **The index** (`store`) is the one unsealed record: id, petname, tier,
-  how the device rests, timestamps. Never the name, hue, word or any key.
+- **The index** (`store`) is the one unsealed record: id, local picker
+  petname, tier, how the device rests, timestamps. Never the member label,
+  shared hue/word/metadata or any key.
   The visor boots unclaimed (grey, no identity) and paints the user's
   colour only after the seal opens, so a page imitating the picker cannot
   paint it.
@@ -381,9 +382,10 @@ the handshake.
   generation. The kernel never lists a directory: `read-directory` is one
   of four sync functions left on the 0.3 track and its OPFS host answers
   with a Promise (JSPI), so every path is named from the pointer and
-  removal reaches n+1 down to n-2 by name. The anchor (hue, word) is drawn
-  from the RNG and checkpointed at mint — a value derived from the public
-  id would be readable before unseal.
+  removal reaches n+1 down to n-2 by name. A founder draws the anchor
+  (hue, word) from the RNG and writes it to the sealed visor document before
+  exposure; later devices adopt that document during pairing. The kernel's
+  device record only caches these fields in memory.
 - **Switching devices is a reload** (`shell.switch-device`): the anchor
   changes and the page restarts against another worker. Erase destroys
   the namespace and the index row, then switches to a fresh device.
@@ -448,6 +450,21 @@ interprets.
   user-visible act; two devices that mint before pairing converge on one
   key by automerge's last-writer-wins, and the loser's pre-pairing
   bookmarks stop opening — stated, not fixed.
+  The same sealed visor document is the authority for the shared hue,
+  recognition word, user labels and per-app labels. They are root scalar
+  keys in collision-safe namespaces (`identity:`, `user:`, `app:`), so edits
+  to different fields do not replace a nested map. Device labels remain
+  member records keyed by endpoint public key in plaintext `us`; the local
+  index petname remains only the browser-profile picker label. Pairing sends
+  the established group's visor snapshot inside the SAS-authenticated
+  enrollment exchange. The joiner merges its route/install history, then
+  adopts the group's personalization with a causally later field patch,
+  retaining its own device label. A new founder seeds the empty
+  shared document once; a non-empty document is never reseeded, so a field
+  deleted remotely stays deleted.
+  The kernel may cache these values in memory for its synchronous core API,
+  but does not serialize that cache; the engine snapshot is the sole durable
+  copy.
 - **The glue owns the URL bar.** `shell.open-frame` writes the fragment
   for the one open session, `close-frame` clears it, and an app's
   `route.set` is relayed by the frame to the glue, debounced, encoded by

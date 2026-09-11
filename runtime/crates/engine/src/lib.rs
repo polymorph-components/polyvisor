@@ -303,6 +303,19 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         self.with_app(app, |doc| Ok(doc.snapshot()))
     }
 
+    /// The app document's revision: the number of changes in its history, so
+    /// it advances on a remote change exactly as it does on a local one.
+    pub async fn tasks_revision(&self, app: &str) -> Result<u64, String> {
+        self.open_app(app).await?;
+        self.with_app(app, |doc| Ok(doc.revision()))
+    }
+
+    /// Revision after the caller has opened the document. Synchronous so a
+    /// kernel watch can compare and register its waker in one poll turn.
+    pub fn tasks_revision_open(&self, app: &str) -> Option<u64> {
+        self.apps.borrow().get(app).map(AppDoc::revision)
+    }
+
     /// Append a task, returning the id the document gave it.
     pub async fn tasks_add(&self, app: &str, title: String) -> Result<String, String> {
         self.mutate(app, move |doc| doc.add(title)).await
@@ -386,6 +399,114 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         self.with_app(visor::VISOR_APP, |doc| Ok(visor::installs(doc)))
     }
 
+    pub async fn visor_personalization(&self) -> Result<visor::Personalization, String> {
+        self.open_app(visor::VISOR_APP).await?;
+        self.with_app(visor::VISOR_APP, |doc| Ok(visor::personalization(doc)))
+    }
+
+    pub async fn set_visor_personalization(
+        &self,
+        hue: Option<Option<u16>>,
+        word: Option<Option<String>>,
+        fields: Vec<(Option<String>, String, Option<String>)>,
+    ) -> Result<(), String> {
+        self.mutate(visor::VISOR_APP, move |doc| {
+            visor::set_personalization(doc, hue, word, fields)
+        })
+        .await
+    }
+
+    pub async fn visor_save(&self) -> Result<Vec<u8>, String> {
+        self.open_app(visor::VISOR_APP).await?;
+        self.with_app(visor::VISOR_APP, |doc| Ok(doc.save()))
+    }
+
+    /// Merge the established visor history (preserving route/install entries),
+    /// then author one causally-later field patch that makes its personalization
+    /// authoritative over the joiner's pre-pairing values.
+    pub async fn adopt_visor(&self, bytes: &[u8]) -> Result<(), String> {
+        self.hydrate().await?;
+        let app = visor::VISOR_APP;
+        let tree = tasks_tree(app);
+        let mut source = AppDoc::try_restore(app, tree, bytes, self.seed)?;
+        let wanted = visor::personalization(&mut source);
+        if wanted.hue.is_none() || wanted.word.as_deref().is_none_or(str::is_empty) {
+            return Err("that device sent incomplete personalization".to_string());
+        }
+        self.open_app(app).await?;
+        self.mutate(app, move |doc| {
+            let current = visor::personalization(doc);
+            doc.merge_snapshot(bytes)?;
+            let mut fields = Vec::new();
+            let mut user_keys: BTreeSet<String> = current.user.keys().cloned().collect();
+            user_keys.extend(wanted.user.keys().cloned());
+            for key in user_keys {
+                fields.push((None, key.clone(), wanted.user.get(&key).cloned()));
+            }
+            let mut app_ids: BTreeSet<String> = current.apps.keys().cloned().collect();
+            app_ids.extend(wanted.apps.keys().cloned());
+            for app_id in app_ids {
+                let before = current.apps.get(&app_id);
+                let after = wanted.apps.get(&app_id);
+                let mut keys: BTreeSet<String> =
+                    before.into_iter().flat_map(|m| m.keys()).cloned().collect();
+                keys.extend(after.into_iter().flat_map(|m| m.keys()).cloned());
+                for key in keys {
+                    fields.push((
+                        Some(app_id.clone()),
+                        key.clone(),
+                        after.and_then(|m| m.get(&key)).cloned(),
+                    ));
+                }
+            }
+            visor::set_personalization(doc, Some(wanted.hue), Some(wanted.word), fields)
+        })
+        .await?;
+        self.adopt_app_fragment(app).await
+    }
+
+    async fn adopt_app_fragment(&self, app: &str) -> Result<(), String> {
+        let tree = tasks_tree(app);
+        let heads = self.with_app(app, |doc| Ok(doc.heads()))?;
+        if heads.len() > 1 {
+            let anchor = self.with_app(app, |doc| Ok(doc.merge_anchor()))?;
+            if let Some(anchor) = anchor {
+                let (anchor, sealed) = self.seal(anchor).await?;
+                self.handle
+                    .add_commits(tree, vec![anchor])
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let _ = self
+                    .handle
+                    .tree_heads(tree)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.require_vault()?.confirm(&sealed);
+            }
+        }
+        let (heads, members) = self.with_app(app, |doc| Ok((doc.heads(), doc.change_hashes())))?;
+        let (Some(head), 1) = (heads.first().copied(), heads.len()) else {
+            return Ok(());
+        };
+        let fragment = automerge::Fragment {
+            head,
+            level: head.0.iter().take_while(|byte| **byte == 0).count(),
+            boundary: Vec::new(),
+            checkpoints: members
+                .iter()
+                .filter(|hash| **hash != head)
+                .copied()
+                .collect(),
+            members,
+        };
+        let bundle = self
+            .with_app(app, |doc| {
+                Ok(doc.bundle(vec![fragment.clone()]).into_iter().next())
+            })?
+            .ok_or_else(|| "the adopted personalization could not be bundled".to_string())?;
+        self.install_fragment(tree, &fragment, bundle, true).await
+    }
+
     // -- the user-system document --------------------------------------------
 
     /// This device's group, oldest enrollment first.
@@ -403,6 +524,11 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         enrolled: u64,
     ) -> Result<(), String> {
         self.us_mutate(move |doc| doc.add_member(key, petname, enrolled))
+            .await
+    }
+
+    pub async fn set_member_petname(&self, key: [u8; 32], petname: String) -> Result<(), String> {
+        self.us_mutate(move |doc| doc.set_member_petname(key, petname))
             .await
     }
 
