@@ -196,8 +196,16 @@ There is no special "data model component" kind or elevated runtime trust tier.
   bindings and supplies trustworthy caller context; the provider enforces
   domain policy.
 
-This is the intended split; task semantics and Automerge integration currently
-reside in the engine. The history WIT interface is not yet designed.
+The first, trusted-Rust stage of this split is in place. `todo-model` owns the
+task schema and operations, `visor-model` owns the encrypted visor route,
+install, personalization, and adoption policy, and both operate on the
+`document-history` crate's Automerge document adapter. The engine owns one live
+document per partition plus subscriptions, encrypted publication/receipt,
+in-memory history storage, compaction, and history snapshots; the kernel
+composes model operations with that schema-neutral Rust interface and schedules
+browser checkpoint persistence. These crates still run together inside the
+trusted runtime component. No history WIT interface or separate provider
+component is introduced yet.
 
 ## Sync engine: subduction sans-IO
 

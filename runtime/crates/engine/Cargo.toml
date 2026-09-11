@@ -22,6 +22,7 @@ bincode.workspace = true
 ed25519-dalek.workspace = true
 future_form.workspace = true
 futures.workspace = true
+polyvisor-document-history = { path = "../document-history" }
 keyhive_core.workspace = true
 keyhive_crypto.workspace = true
 nonempty.workspace = true
@@ -35,3 +36,5 @@ subduction_runtime.workspace = true
 
 [dev-dependencies]
 futures = { workspace = true, features = ["executor"] }
+polyvisor-todo-model = { path = "../todo-model" }
+polyvisor-visor-model = { path = "../visor-model" }

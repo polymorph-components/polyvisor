@@ -86,7 +86,7 @@ use serde::{Deserialize, Serialize};
 
 /// A commit id, which is what keyhive calls a content reference. Identical to
 /// keyhive's own default `ContentRef`, and identical to the automerge change
-/// hash a sedimentree `CommitId` already is (see `crate::document`).
+/// hash a sedimentree `CommitId` already is.
 type Cref = [u8; 32];
 
 /// The plaintext keyhive seals. Not the automerge change alone: see the

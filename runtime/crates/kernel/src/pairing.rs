@@ -406,7 +406,9 @@ impl Kernel {
         // operations first would have nothing to attach them to.
         let (keyhive, read_back) = engine.enroll_keyhive(&card, joiner_key).await?;
         let us = engine.us_save().await?;
-        let visor = engine.visor_save().await?;
+        let visor = engine
+            .document_save(polyvisor_visor_model::VISOR_APP)
+            .await?;
         // The group's store-name key travels here and nowhere else: it is a
         // group secret, and this connection is the one the two users have
         // just compared six digits over. Without it the joiner would be a
@@ -635,7 +637,13 @@ impl Kernel {
         let engine = self.engine().map_err(|e| e.message)?;
         engine.adopt_us(&us, adder_key, name_key).await?;
         engine.adopt_keyhive(&keyhive, &read_back).await?;
-        engine.adopt_visor(&visor).await?;
+        engine
+            .document_adopt(
+                polyvisor_visor_model::VISOR_APP,
+                &visor,
+                polyvisor_visor_model::adopt,
+            )
+            .await?;
         self.refresh_personalization()
             .await
             .map_err(|e| e.message)?;

@@ -24,8 +24,6 @@ use automerge::{ActorId, Automerge};
 use sedimentree_core::{blob::Blob, id::SedimentreeId, loose_commit::id::CommitId};
 use subduction_protocol::command::NewCommit;
 
-use crate::storage::SnapshotStorage;
-
 /// What one batch of [`Document::apply`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Absorbed {
@@ -46,8 +44,9 @@ pub struct Document {
     /// "must the kernel checkpoint?" — answerable without re-decoding every
     /// stored blob.
     applied: BTreeSet<CommitId>,
-    /// The commit for the last local change, until the engine takes it.
-    pending: Option<NewCommit>,
+    /// Local changes not yet handed to the history publisher, in transaction
+    /// order. A model callback may deliberately author more than one change.
+    pending: Vec<NewCommit>,
 }
 
 impl Document {
@@ -57,7 +56,7 @@ impl Document {
             doc: Automerge::new().with_actor(actor),
             tree,
             applied: BTreeSet::new(),
-            pending: None,
+            pending: Vec::new(),
         }
     }
 
@@ -95,13 +94,18 @@ impl Document {
             doc,
             tree,
             applied,
-            pending: None,
+            pending: Vec::new(),
         }
     }
 
     /// The document, for reads.
     pub const fn read(&self) -> &Automerge {
         &self.doc
+    }
+
+    /// This document's per-device, per-partition Automerge actor identifier.
+    pub fn actor_id(&self) -> &[u8] {
+        self.doc.get_actor().to_bytes()
     }
 
     pub const fn tree(&self) -> SedimentreeId {
@@ -132,26 +136,9 @@ impl Document {
         self.doc.get_changes_meta(&[]).len() as u64
     }
 
-    /// Take the sedimentree commit for the last local change, if the last
-    /// mutation produced one.
-    pub fn last_local_commit(&mut self) -> Option<NewCommit> {
-        self.pending.take()
-    }
-
-    /// Apply every stored change of this tree the document has not seen.
-    /// Returns whether anything landed. The plaintext path, for the
-    /// user-system document — an app document's blobs are envelopes, and the
-    /// engine decrypts them before calling [`Document::apply`].
-    ///
-    /// Fragments first. Automerge buffers a change whose dependencies are
-    /// missing either way, so the order is not required for correctness; it
-    /// is cheaper, because a bundle that lands first makes every loose commit
-    /// it carries a no-op instead of a second decode.
-    pub fn absorb(&mut self, storage: &SnapshotStorage) -> bool {
-        let bundles = self.unapplied_fragments(storage);
-        let fragments = self.apply_bundles(bundles);
-        let items = self.unapplied(storage);
-        fragments.landed | self.apply(items).landed
+    /// Take all unpublished local commits in transaction order.
+    pub fn drain_local_commits(&mut self) -> Vec<NewCommit> {
+        std::mem::take(&mut self.pending)
     }
 
     /// The commits this document has already applied. The vault needs them to
@@ -162,28 +149,11 @@ impl Document {
         self.applied.clone()
     }
 
-    /// The stored blobs of this tree the document has not applied yet, raw.
-    /// For an app document these are keyhive envelopes.
-    pub fn unapplied(&self, storage: &SnapshotStorage) -> Vec<(CommitId, Vec<u8>)> {
-        storage
-            .commit_blobs(self.tree)
-            .into_iter()
-            .filter(|(id, _)| !self.applied.contains(id))
-            .collect()
-    }
-
-    /// The stored *fragment* blobs of this tree the document has not applied.
-    ///
-    /// A fragment is skipped once its head is applied, and that is exact
-    /// rather than approximate: the head is a member of the fragment
-    /// (automerge `change_graph.rs:1661` — `members` is the section the head
-    /// closes), so a document that has the head has been through this bundle.
-    pub fn unapplied_fragments(&self, storage: &SnapshotStorage) -> Vec<(CommitId, Vec<u8>)> {
-        storage
-            .fragment_blobs(self.tree)
-            .into_iter()
-            .filter(|(head, _)| !self.applied.contains(head))
-            .collect()
+    /// Whether this history already contains `id`. The engine uses this to
+    /// select stored encrypted items before it releases its document borrow
+    /// and awaits decryption.
+    pub fn contains(&self, id: &CommitId) -> bool {
+        self.applied.contains(id)
     }
 
     /// Apply fragment payloads: automerge *bundles*, each carrying every
@@ -248,7 +218,7 @@ impl Document {
     ///
     /// For the one caller that has to describe a whole document as a single
     /// sedimentree fragment rather than take automerge's own partition of it
-    /// (`crate::Engine::adopt_fragment`).
+    /// when publishing an adopted document as one fragment.
     pub fn heads(&self) -> Vec<automerge::ChangeHash> {
         self.doc.get_heads()
     }
@@ -279,12 +249,7 @@ impl Document {
     /// own merge commit (`Automerge::empty_commit` — "the main reason to do
     /// this is if you want to create a merge commit").
     ///
-    /// It carries no operations, so it changes nothing anyone reads. What it
-    /// carries is its *envelope*: sealed under the group's current epoch with
-    /// the content keys of both branches inside it
-    /// (`crate::vault::Vault::seal`), it is the "new head" that
-    /// `design/causal_encryption.md` §"Multiple Heads" says connects a branch
-    /// no current member holds a key for.
+    /// It carries no operations, so it changes nothing a model reads.
     pub fn merge_anchor(&mut self) -> Option<NewCommit> {
         let _hash = self
             .doc
@@ -352,7 +317,7 @@ impl Document {
         };
         let head = CommitId::new(change.hash().0);
         let _known = self.applied.insert(head);
-        self.pending = Some(NewCommit {
+        self.pending.push(NewCommit {
             head,
             parents: change.deps().iter().map(|h| CommitId::new(h.0)).collect(),
             blob: Blob::new(change.raw_bytes().to_vec()),

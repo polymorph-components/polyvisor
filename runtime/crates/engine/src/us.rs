@@ -11,7 +11,7 @@
 //! devices that have paired converge on it with no naming step.
 //!
 //! The nested `members` map is safe here in a way the tasks document's would
-//! not have been (see `crate::doc`): the two `members` objects that would
+//! not have been: the two `members` objects that would
 //! conflict are the ones two *unrelated* documents create, and unrelated
 //! user-system documents never merge. A fresh device is its own group of
 //! one, and joining a group **replaces** that document rather than merging
@@ -24,8 +24,8 @@ use sedimentree_core::{id::SedimentreeId, loose_commit::id::CommitId};
 use sha2::{Digest as _, Sha256};
 use subduction_protocol::command::NewCommit;
 
-use crate::document::{Document, actor};
 use crate::storage::SnapshotStorage;
+use polyvisor_document_history::{Document, actor};
 
 /// One device of this user's group.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,11 +119,22 @@ impl UsDoc {
     }
 
     pub fn absorb(&mut self, storage: &SnapshotStorage) -> bool {
-        self.core.absorb(storage)
+        let bundles = storage
+            .fragment_blobs(self.tree())
+            .into_iter()
+            .filter(|(id, _)| !self.core.contains(id))
+            .collect();
+        let fragments = self.core.apply_bundles(bundles);
+        let commits = storage
+            .commit_blobs(self.tree())
+            .into_iter()
+            .filter(|(id, _)| !self.core.contains(id))
+            .collect();
+        fragments.landed | self.core.apply(commits).landed
     }
 
     /// The fragments automerge draws over this document at level 1 and
-    /// deeper. See `crate::document::Document::fragments`.
+    /// deeper.
     pub fn fragments(&self) -> Vec<automerge::Fragment> {
         self.core.fragments()
     }
@@ -135,7 +146,7 @@ impl UsDoc {
     }
 
     /// This document's heads, and every change hash in its history. See
-    /// `crate::document::Document::heads`.
+    /// the shared document adapter's heads.
     pub fn heads(&self) -> Vec<automerge::ChangeHash> {
         self.core.heads()
     }
@@ -145,19 +156,18 @@ impl UsDoc {
     }
 
     /// An empty change depending on every current head — automerge's own
-    /// merge commit. See `crate::document::Document::merge_anchor`.
+    /// merge commit.
     pub fn merge_anchor(&mut self) -> Option<NewCommit> {
         self.core.merge_anchor()
     }
 
-    /// The bundle bytes for those fragments. See
-    /// `crate::document::Document::bundle`.
+    /// The bundle bytes for those fragments.
     pub fn bundle(&self, fragments: Vec<automerge::Fragment>) -> Vec<Vec<u8>> {
         self.core.bundle(fragments)
     }
 
-    pub fn last_local_commit(&mut self) -> Option<NewCommit> {
-        self.core.last_local_commit()
+    pub fn drain_local_commits(&mut self) -> Vec<NewCommit> {
+        self.core.drain_local_commits()
     }
 
     /// The group, oldest enrollment first and the key breaking ties — an
