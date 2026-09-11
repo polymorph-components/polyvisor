@@ -1772,6 +1772,7 @@ dependencies = [
  "futures",
  "hmac",
  "polyvisor-engine",
+ "polyvisor-petname",
  "polyvisor-todo-model",
  "polyvisor-visor-model",
  "serde",
@@ -1779,6 +1780,10 @@ dependencies = [
  "sha2 0.10.9",
  "subduction_protocol",
 ]
+
+[[package]]
+name = "polyvisor-petname"
+version = "0.1.0"
 
 [[package]]
 name = "polyvisor-runtime"
@@ -1818,6 +1823,7 @@ version = "0.1.0"
 dependencies = [
  "dioxus",
  "emojis",
+ "polyvisor-petname",
  "stream-dom-dioxus",
  "stream-dom-guest",
  "unicode-segmentation",

@@ -52,7 +52,6 @@ trait Models {
     async fn set_visor_personalization(
         &self,
         hue: Option<Option<u16>>,
-        word: Option<Option<String>>,
         fields: Vec<(Option<String>, String, Option<String>)>,
     ) -> Result<(), String>;
     async fn visor_save(&self) -> Result<Vec<u8>, String>;
@@ -85,11 +84,10 @@ impl Models for TestEngine {
     async fn set_visor_personalization(
         &self,
         hue: Option<Option<u16>>,
-        word: Option<Option<String>>,
         fields: Vec<(Option<String>, String, Option<String>)>,
     ) -> Result<(), String> {
         self.document_mutate(visor::VISOR_APP, move |doc| {
-            visor::set_personalization(doc, hue, word, fields)
+            visor::set_personalization(doc, hue, fields)
         })
         .await
     }
@@ -206,7 +204,6 @@ fn personalization_fields_merge_and_clears_survive_reload() {
         a.engine
             .set_visor_personalization(
                 Some(Some(42)),
-                None,
                 vec![(None, "petname".into(), Some("A".into()))],
             )
             .await
@@ -214,7 +211,6 @@ fn personalization_fields_merge_and_clears_survive_reload() {
         b.engine
             .set_visor_personalization(
                 None,
-                Some(Some("shared".into())),
                 vec![(Some(APP.into()), "glyph".into(), Some("✓".into()))],
             )
             .await
@@ -222,11 +218,11 @@ fn personalization_fields_merge_and_clears_survive_reload() {
         until(|| async {
             let pa = a.engine.visor_personalization().await.ok()?;
             let pb = b.engine.visor_personalization().await.ok()?;
-            (pa == pb && pa.hue == Some(42) && pa.word.as_deref() == Some("shared")).then_some(())
+            (pa == pb && pa.hue == Some(42)).then_some(())
         })
         .await;
         a.engine
-            .set_visor_personalization(None, None, vec![(Some(APP.into()), "glyph".into(), None)])
+            .set_visor_personalization(None, vec![(Some(APP.into()), "glyph".into(), None)])
             .await
             .unwrap();
         until(|| async {
@@ -258,17 +254,17 @@ fn concurrent_same_personalization_field_resolves_identically() {
     pool.run_until(async {
         wire(&a.engine, &b.engine).await;
         a.engine
-            .set_visor_personalization(None, Some(Some("alpha".into())), Vec::new())
+            .set_visor_personalization(None, vec![(None, "petname".into(), Some("alpha".into()))])
             .await
             .unwrap();
         b.engine
-            .set_visor_personalization(None, Some(Some("beta".into())), Vec::new())
+            .set_visor_personalization(None, vec![(None, "petname".into(), Some("beta".into()))])
             .await
             .unwrap();
         until(|| async {
             let pa = a.engine.visor_personalization().await.ok()?;
             let pb = b.engine.visor_personalization().await.ok()?;
-            (pa.word == pb.word).then_some(())
+            (pa.user.get("petname") == pb.user.get("petname")).then_some(())
         })
         .await;
     });
@@ -284,7 +280,6 @@ fn joining_device_adopts_group_personalization_not_its_prior_values() {
             .engine
             .set_visor_personalization(
                 Some(Some(25)),
-                Some(Some("group".into())),
                 vec![(None, "petname".into(), Some("owner".into()))],
             )
             .await
@@ -293,8 +288,14 @@ fn joining_device_adopts_group_personalization_not_its_prior_values() {
             .engine
             .set_visor_personalization(
                 Some(Some(300)),
-                Some(Some("joiner".into())),
-                vec![(None, "petname".into(), Some("other".into()))],
+                vec![
+                    (None, "petname".into(), Some("other".into())),
+                    (
+                        Some("joiner-only".into()),
+                        "petname".into(),
+                        Some("local app".into()),
+                    ),
+                ],
             )
             .await
             .unwrap();
@@ -303,16 +304,22 @@ fn joining_device_adopts_group_personalization_not_its_prior_values() {
         joiner.engine.adopt_visor(&bytes).await.unwrap();
         let adopted = joiner.engine.visor_personalization().await.unwrap();
         assert_eq!(adopted.hue, Some(25));
-        assert_eq!(adopted.word.as_deref(), Some("group"));
         assert_eq!(
             adopted.user.get("petname").map(String::as_str),
             Some("owner")
+        );
+        assert_eq!(
+            adopted
+                .apps
+                .get("joiner-only")
+                .and_then(|m| m.get("petname"))
+                .map(String::as_str),
+            Some("local app")
         );
         wire_only(&group.engine, &joiner.engine).await;
         joiner
             .engine
             .set_visor_personalization(
-                None,
                 None,
                 vec![(None, "petname".into(), Some("after join".into()))],
             )

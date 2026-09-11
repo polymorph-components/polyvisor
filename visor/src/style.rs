@@ -294,6 +294,19 @@ pub(crate) const CSS: &str = r#"
   align-self: stretch;
 }
 #visor-root label > span:first-child { flex: 0 0 auto; }
+#visor-root .petname-control {
+  display: flex; align-items: flex-end; gap: 8px;
+  align-self: flex-start; max-width: 100%;
+}
+#visor-root .petname-control > label { flex: 0 1 auto; min-width: 0; margin-bottom: 0; }
+#visor-root .roll-control { position: relative; flex: none; }
+#visor-root .roll-button { min-width: 44px; min-height: 44px; padding: 6px 10px; }
+#visor-root .roll-button[aria-disabled="true"] { opacity: .45; cursor: not-allowed; }
+#visor-root .roll-tooltip {
+  position: absolute; z-index: 3; right: 0; top: calc(100% + 4px);
+  padding: 4px 7px; white-space: nowrap; border-radius: 4px;
+  color: var(--ink); background: var(--plate); border: 1px solid var(--edge);
+}
 #visor-root .glyph-control {
   display: flex; flex-direction: column; align-items: stretch; gap: 8px;
   align-self: flex-start; width: min(32rem, 100%); margin-bottom: 12px;

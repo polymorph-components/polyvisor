@@ -5,6 +5,7 @@ members = [
     "runtime/crates/document-history",
     "runtime/crates/engine",
     "runtime/crates/kernel",
+    "runtime/crates/petname",
     "runtime/crates/todo-model",
     "runtime/crates/visor-model",
     "visor",
@@ -20,6 +21,7 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+polyvisor-petname = { path = "runtime/crates/petname" }
 # docs/design.md "Devices": sealing is pure Rust in the kernel with the key
 # as bytes. `aes-gcm` is the checkpoint/DEK-wrap AEAD, `argon2` the Argon2id
 # KEK derivation behind a passphrase. Both with default features off: the

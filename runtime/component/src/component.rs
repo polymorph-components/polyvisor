@@ -507,7 +507,6 @@ impl guest::device::Guest for Component {
             petname: status.petname,
             name: status.name,
             hue: status.hue,
-            word: status.word,
             endpoint_id: status.endpoint_id,
         })
     }
@@ -516,9 +515,6 @@ impl guest::device::Guest for Component {
     }
     async fn set_hue(hue: u16) -> Result<(), Error> {
         kernel()?.set_hue(hue).await.map_err(map_error)
-    }
-    async fn reroll_word() -> Result<String, Error> {
-        kernel()?.reroll_word().await.map_err(map_error)
     }
     async fn meta(scope: guest::device::MetaScope) -> Result<Vec<(String, String)>, Error> {
         let scope = match scope {
@@ -680,7 +676,7 @@ impl guest::apps::Guest for Component {
             .collect())
     }
     async fn launch(app: String) -> Result<u32, Error> {
-        kernel()?.launch(&app).map_err(map_error)
+        kernel()?.launch(&app).await.map_err(map_error)
     }
     async fn component(session: u32) -> Result<guest::apps::ComponentArtifacts, Error> {
         let artifacts = kernel()?.component(session).await.map_err(map_error)?;

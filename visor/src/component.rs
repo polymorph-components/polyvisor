@@ -18,6 +18,7 @@ wit_bindgen::generate!({
         "polymorph:stream-dom/types@0.1.0": stream_dom_guest::bindings::polymorph::stream_dom::types,
         "polymorph:stream-dom/queries@0.1.0": stream_dom_guest::bindings::polymorph::stream_dom::queries,
         "polymorph:stream-dom/events@0.1.0": stream_dom_guest::bindings::polymorph::stream_dom::events,
+        "wasi:random/random@0.3.1": generate,
     },
 });
 

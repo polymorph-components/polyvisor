@@ -666,7 +666,7 @@ impl Fetch for FakeFetch {
 }
 
 /// Randomness for keys and nonces. `scripted` hands out four-byte draws for
-/// the tests that care what `reroll-word` sees; everything else runs on
+/// tests that care what petname generation sees; everything else runs on
 /// xorshift64*, which is not cryptographic and does not need to be — the only
 /// property the kernel depends on is that two draws differ.
 #[derive(Clone)]
@@ -693,14 +693,6 @@ impl FakeRng {
             state: Rc::new(Cell::new(state)),
             ..FakeRng::default()
         }
-    }
-
-    /// Each value is one four-byte little-endian draw, handed out before the
-    /// generator takes over.
-    fn draws(values: &[u32]) -> FakeRng {
-        let rng = FakeRng::default();
-        *rng.scripted.borrow_mut() = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        rng
     }
 }
 
@@ -1184,13 +1176,6 @@ impl Default for World {
 }
 
 impl World {
-    fn with_rng(rng: FakeRng) -> World {
-        World {
-            rng,
-            ..World::default()
-        }
-    }
-
     fn with_net(net: FakeNet) -> World {
         World {
             net,
@@ -1314,7 +1299,7 @@ fn boot() -> Rc<Kernel> {
 }
 
 fn session(kernel: &Kernel) -> u32 {
-    kernel.launch("todomvc").unwrap()
+    block_on(kernel.launch("todomvc")).unwrap()
 }
 
 // -- boot, identity, checkpoint ----------------------------------------------
@@ -1330,8 +1315,8 @@ fn a_fresh_boot_writes_a_row_a_key_and_its_anchor() {
     assert_eq!(status.tier, Tier::Ephemeral);
     assert_eq!(status.rest, Rest::RestsOpen);
     assert_eq!(status.petname, "");
-    assert_eq!(status.name, "");
-    assert!(!status.word.is_empty());
+    assert!(!status.name.is_empty());
+    assert!(!kernel.meta(MetaScope::User).unwrap()["petname"].is_empty());
 
     assert!(world.kv_has(&format!("index/{ID}")));
     assert!(
@@ -1351,18 +1336,18 @@ fn a_fresh_boot_writes_a_row_a_key_and_its_anchor() {
 #[test]
 fn the_anchor_is_drawn_once_and_survives_an_untouched_reload() {
     // The anchor is drawn from the RNG, never derived from the id: the id is
-    // public, and a hue and word anyone could compute from it would be the
+    // public, and an identity anyone could compute from it would be the
     // visor's anti-impostor signal given away. Drawn means it must be
     // checkpointed at mint, or a reload would repaint the device.
     let world = World::default();
     let minted = world.boot().device_status().unwrap();
     let restored = world.boot().device_status().unwrap();
     assert_eq!(restored.hue, minted.hue);
-    assert_eq!(restored.word, minted.word);
+    assert_eq!(restored.name, minted.name);
 
     // A second device draws its own, from the same generator.
     let other = world.try_boot_as("beef").unwrap().device_status().unwrap();
-    assert_ne!(other.word, minted.word);
+    assert_ne!(other.name, minted.name);
     assert_ne!(other.hue, minted.hue);
 }
 
@@ -1502,18 +1487,15 @@ fn tasks_survive_a_reload_but_sessions_do_not() {
 }
 
 #[test]
-fn reroll_never_repeats_the_current_word_and_survives_a_reload() {
-    // Draw 5, then 5 again, then 6: the repeat must be rejected and redrawn.
-    let world = World::with_rng(FakeRng::draws(&[5, 5, 6]));
+fn generated_candidates_do_not_persist_until_saved() {
+    let world = World::default();
     let kernel = world.boot();
-    let minted = kernel.device_status().unwrap().word;
-
-    let first = block_on(kernel.reroll_word()).unwrap();
-    assert_ne!(first, minted);
-    let second = block_on(kernel.reroll_word()).unwrap();
-    assert_ne!(second, first, "the redraw skipped the repeated word");
-
-    assert_eq!(world.boot().device_status().unwrap().word, second);
+    let original = kernel.device_status().unwrap().name;
+    let candidate = polyvisor_petname::generate(|| 7, &original);
+    assert_ne!(candidate, original);
+    assert_eq!(world.boot().device_status().unwrap().name, original);
+    block_on(kernel.set_name(candidate.clone())).unwrap();
+    assert_eq!(world.boot().device_status().unwrap().name, candidate);
 }
 
 #[test]
@@ -1553,7 +1535,6 @@ fn keeping_under_a_passphrase_wraps_the_key_and_the_next_boot_is_sealed() {
     assert_eq!(status.petname, "desk");
     assert_eq!(status.name, "");
     assert_eq!(status.hue, 0);
-    assert_eq!(status.word, "");
 
     // Every other export is unavailable until the seal opens...
     assert_eq!(
@@ -1649,7 +1630,6 @@ fn every_export_works_on_a_fresh_device() {
     assert_eq!(kernel.device_status().unwrap().state, State::Fresh);
     block_on(kernel.set_name("study".into())).unwrap();
     block_on(kernel.set_hue(120)).unwrap();
-    block_on(kernel.reroll_word()).unwrap();
     assert_eq!(block_on(kernel.devices()).unwrap().len(), 1);
     assert_eq!(kernel.installed().unwrap().len(), 1);
     let s = session(&kernel);
@@ -2042,6 +2022,53 @@ fn registry_lists_what_the_home_origin_serves() {
 }
 
 #[test]
+fn first_launch_persists_an_app_petname() {
+    let world = World::default();
+    {
+        let kernel = world.boot();
+        assert!(
+            kernel
+                .meta(MetaScope::App("todomvc".into()))
+                .unwrap()
+                .is_empty()
+        );
+        session(&kernel);
+        let first = kernel.meta(MetaScope::App("todomvc".into())).unwrap()["petname"].clone();
+        assert!(!first.is_empty());
+        block_on(kernel.patch_meta(
+            MetaScope::App("todomvc".into()),
+            vec![("petname".into(), None)],
+        ))
+        .unwrap();
+        let replacement = kernel.meta(MetaScope::App("todomvc".into())).unwrap()["petname"].clone();
+        assert!(!replacement.is_empty());
+        assert_ne!(replacement, first);
+    }
+    assert!(!world.boot().meta(MetaScope::App("todomvc".into())).unwrap()["petname"].is_empty());
+}
+
+#[test]
+fn explicitly_empty_names_are_replaced_and_persisted() {
+    let world = World::default();
+    let kernel = world.boot();
+    let old_device = kernel.device_status().unwrap().name;
+    let old_user = kernel.meta(MetaScope::User).unwrap()["petname"].clone();
+    block_on(kernel.set_name(String::new())).unwrap();
+    block_on(kernel.patch_meta(MetaScope::User, vec![("petname".into(), None)])).unwrap();
+    block_on(kernel.keep(String::new(), None)).unwrap();
+    let status = kernel.device_status().unwrap();
+    let user = kernel.meta(MetaScope::User).unwrap()["petname"].clone();
+    assert!(!status.name.is_empty());
+    assert_ne!(status.name, old_device);
+    assert!(!user.is_empty());
+    assert_ne!(user, old_user);
+    assert_eq!(status.petname, status.name);
+    let restored = world.boot();
+    assert_eq!(restored.device_status().unwrap().name, status.name);
+    assert_eq!(restored.meta(MetaScope::User).unwrap()["petname"], user);
+}
+
+#[test]
 fn sessions_are_monotonic_and_close_is_idempotent() {
     let kernel = boot();
     let a = session(&kernel);
@@ -2065,7 +2092,7 @@ fn sessions_are_monotonic_and_close_is_idempotent() {
 fn launching_an_unknown_app_is_refused() {
     let kernel = boot();
     assert_eq!(
-        kernel.launch("nope").unwrap_err().code,
+        block_on(kernel.launch("nope")).unwrap_err().code,
         ErrorCode::UnknownApp
     );
 }

@@ -158,7 +158,7 @@ interface lifecycle {
 /// definition. `fresh` is not a gate: an ephemeral device is fully usable,
 /// and its colour is freshly minted, so painting it before "keep" gives an
 /// impostor nothing.
-/// Nothing personal (name, hue, word) is readable — or renderable — before
+/// Nothing personal (name or hue) is readable — or renderable — before
 /// the seal opens; that is what makes unseal-as-login unspoofable.
 interface device {
     use types.{error};
@@ -176,12 +176,10 @@ interface device {
         /// The device's own label in the index, user voice, readable
         /// before unseal (ruled acceptable in the clear). "" until kept.
         petname: string,
-        /// User voice. "" until the user names it. Empty while sealed.
+        /// User voice. Randomly named at creation. Empty while sealed.
         name: string,
         /// The anchor colour, degrees on the hue wheel. 0 while sealed.
         hue: u16,
-        /// The audible anchor word (trusted pixels only). "" while sealed.
-        word: string,
         /// This device's iroh endpoint id (z-base-32, iroh's spelling): what
         /// another device dials. "" while sealed, and until the endpoint is
         /// bound.
@@ -191,7 +189,6 @@ interface device {
     status: async func() -> result<device-status, error>;
     set-name: async func(name: string) -> result<_, error>;
     set-hue: async func(hue: u16) -> result<_, error>;
-    reroll-word: async func() -> result<string, error>;
 
     /// The user's own labels for themself and each installed app — petname,
     /// glyph, whatever the visor settles on. Free-form while
@@ -624,6 +621,7 @@ world runtime {
 /// The visor component: the trusted pixels, on the main thread.
 world visor {
     include polymorph:stream-dom/producer@0.1.0;
+    import wasi:random/random@0.3.1;
 
     import device;
     import sync;

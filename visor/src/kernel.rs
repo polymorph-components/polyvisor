@@ -22,7 +22,7 @@ pub(crate) struct App {
 
 /// The device identity the strip and the settings tenant show.
 ///
-/// `name`/`hue`/`word` are empty and zero while sealed (internal.wit
+/// `name`/`hue` are empty and zero while sealed (internal.wit
 /// `device`), which is exactly why the strip keys its dress off `state`
 /// and never off "is the name empty": an unpainted anchor must be
 /// unpaintable while the seal is shut, not merely usually blank.
@@ -40,7 +40,6 @@ pub(crate) struct Status {
     pub(crate) petname: String,
     pub(crate) name: String,
     pub(crate) hue: u16,
-    pub(crate) word: String,
     /// This device's iroh endpoint id, z-base-32 (internal.wit `device`).
     /// "" while sealed, and until the endpoint is bound — so the sync
     /// section has to have something to say about an empty one.
@@ -107,7 +106,6 @@ pub(crate) async fn status() -> Result<Status, String> {
             petname: s.petname,
             name: s.name,
             hue: s.hue,
-            word: s.word,
             endpoint_id: s.endpoint_id,
         })
 }
@@ -250,10 +248,6 @@ pub(crate) async fn set_name(name: String) -> Result<(), String> {
 
 pub(crate) async fn set_hue(hue: u16) -> Result<(), String> {
     api::device::set_hue(hue).await.map_err(message)
-}
-
-pub(crate) async fn reroll_word() -> Result<String, String> {
-    api::device::reroll_word().await.map_err(message)
 }
 
 /// Which map `meta`/`patch-meta` addresses (internal.wit `meta-scope`).

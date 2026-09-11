@@ -535,7 +535,6 @@ impl Kernel {
             petname: inner.row.petname.clone(),
             name: device.as_ref().map(|d| d.name.clone()).unwrap_or_default(),
             hue: device.as_ref().map(|d| d.hue).unwrap_or(0),
-            word: device.map(|d| d.word).unwrap_or_default(),
             endpoint_id,
         })
     }
@@ -543,6 +542,18 @@ impl Kernel {
     pub async fn set_name(&self, name: String) -> Result<(), Error> {
         self.open()?;
         self.initialize_personalization().await?;
+        let name = if name.is_empty() {
+            let previous = self
+                .state
+                .borrow()
+                .device
+                .as_ref()
+                .map(|device| device.name.clone())
+                .unwrap_or_default();
+            device::generate_petname(self.seams.rng.as_ref(), &previous)
+        } else {
+            name
+        };
         let key = self.engine()?.verifying_key().to_bytes();
         self.engine()?
             .set_member_petname(key, name.clone())
@@ -566,7 +577,7 @@ impl Kernel {
                 format!("hue must be below 360 degrees; got {hue}"),
             ));
         }
-        self.set_shared_personalization(Some(Some(hue)), None, Vec::new())
+        self.set_shared_personalization(Some(Some(hue)), Vec::new())
             .await
             .map_err(engine_failed)?;
         self.with_device(|d| {
@@ -603,37 +614,36 @@ impl Kernel {
             MetaScope::App(id) => Some(id.clone()),
             MetaScope::User => None,
         };
+        let previous_petname = self
+            .meta(scope.clone())?
+            .get("petname")
+            .cloned()
+            .unwrap_or_default();
+        let fields = fields
+            .into_iter()
+            .map(|(key, value)| {
+                let value = if key == "petname" && value.as_deref().is_none_or(str::is_empty) {
+                    Some(device::generate_petname(
+                        self.seams.rng.as_ref(),
+                        &previous_petname,
+                    ))
+                } else {
+                    value
+                };
+                (key, value)
+            })
+            .collect::<Vec<_>>();
         let patch = fields
             .into_iter()
             .map(|(key, value)| (app.clone(), key, value))
             .collect();
-        self.set_shared_personalization(None, None, patch)
+        self.set_shared_personalization(None, patch)
             .await
             .map_err(engine_failed)?;
         self.refresh_personalization().await?;
         self.checkpoint().await?;
         self.push_event(Event::PersonalizationChanged);
         Ok(())
-    }
-
-    pub async fn reroll_word(&self) -> Result<String, Error> {
-        self.open()?;
-        self.initialize_personalization().await?;
-        let word = {
-            let state = self.state.borrow();
-            let device = state.device.as_ref().expect("open implies a device");
-            device.reroll(self.seams.rng.as_ref())
-        };
-        self.set_shared_personalization(None, Some(Some(word.clone())), Vec::new())
-            .await
-            .map_err(engine_failed)?;
-        self.with_device(|d| {
-            d.word = word.clone();
-            Ok(())
-        })?;
-        self.checkpoint().await?;
-        self.push_event(Event::PersonalizationChanged);
-        Ok(word)
     }
 
     /// "Keep this device": promote to durable and fix how it rests.
@@ -645,6 +655,22 @@ impl Kernel {
     /// booted.
     pub async fn keep(&self, petname: String, passphrase: Option<String>) -> Result<(), Error> {
         self.open()?;
+        let petname = if petname.is_empty() {
+            let name = self
+                .state
+                .borrow()
+                .device
+                .as_ref()
+                .map(|d| d.name.clone())
+                .unwrap_or_default();
+            if name.is_empty() {
+                device::generate_petname(self.seams.rng.as_ref(), "")
+            } else {
+                name
+            }
+        } else {
+            petname
+        };
         let (tier, rest) = {
             let state = self.state.borrow();
             (state.row.tier, state.row.rest)
@@ -1018,13 +1044,26 @@ impl Kernel {
         Ok(self.registry.installed())
     }
 
-    pub fn launch(&self, app: &str) -> Result<SessionId, Error> {
+    pub async fn launch(&self, app: &str) -> Result<SessionId, Error> {
         self.open()?;
         if !self.registry.contains(app) {
             return Err(Error::new(
                 ErrorCode::UnknownApp,
                 format!("no app named {app} is installed"),
             ));
+        }
+        self.initialize_personalization().await?;
+        let existing = self.meta(MetaScope::App(app.to_string()))?;
+        if existing.get("petname").is_none_or(String::is_empty) {
+            let petname = device::generate_petname(self.seams.rng.as_ref(), "");
+            self.set_shared_personalization(
+                None,
+                vec![(Some(app.to_string()), "petname".into(), Some(petname))],
+            )
+            .await
+            .map_err(engine_failed)?;
+            self.refresh_personalization().await?;
+            self.checkpoint().await?;
         }
         let mut next = self.next_session.borrow_mut();
         let session = *next;
@@ -1119,13 +1158,12 @@ impl Kernel {
     async fn set_shared_personalization(
         &self,
         hue: Option<Option<u16>>,
-        word: Option<Option<String>>,
         fields: Vec<(Option<String>, String, Option<String>)>,
     ) -> Result<(), String> {
         self.engine()
             .map_err(|e| e.message)?
             .document_mutate(visor_model::VISOR_APP, move |doc| {
-                visor_model::set_personalization(doc, hue, word, fields)
+                visor_model::set_personalization(doc, hue, fields)
             })
             .await
     }
@@ -1295,12 +1333,11 @@ impl Kernel {
             .document_read(visor_model::VISOR_APP, visor_model::personalization)
             .await
             .map_err(engine_failed)?;
-        let (Some(hue), Some(word)) = (shared.hue, shared.word) else {
+        let Some(hue) = shared.hue else {
             return Ok(());
         };
         self.with_device(|d| {
             d.hue = hue;
-            d.word = word;
             d.meta.user = shared.user;
             d.meta.app = shared.apps;
             Ok(())
@@ -1308,18 +1345,13 @@ impl Kernel {
     }
 
     pub async fn initialize_personalization(&self) -> Result<bool, Error> {
-        let (hue, word, user, apps) = {
+        let (hue, user, apps) = {
             let state = self.state.borrow();
             let d = state
                 .device
                 .as_ref()
                 .ok_or_else(|| Error::new(ErrorCode::Unavailable, "device is sealed"))?;
-            (
-                d.hue,
-                d.word.clone(),
-                d.meta.user.clone(),
-                d.meta.app.clone(),
-            )
+            (d.hue, d.meta.user.clone(), d.meta.app.clone())
         };
         let members = self.engine()?.members().await.map_err(engine_failed)?;
         let me = self.engine()?.verifying_key().to_bytes();
@@ -1329,7 +1361,7 @@ impl Kernel {
             .document_read(visor_model::VISOR_APP, visor_model::personalization)
             .await
             .map_err(engine_failed)?;
-        let wrote = shared.hue.is_none() && shared.word.is_none() && am_founder;
+        let wrote = shared.hue.is_none() && am_founder;
         if wrote {
             let mut fields = Vec::new();
             for (key, value) in user {
@@ -1340,7 +1372,7 @@ impl Kernel {
                     fields.push((Some(app.clone()), key, Some(value)));
                 }
             }
-            self.set_shared_personalization(Some(Some(hue)), Some(Some(word)), fields)
+            self.set_shared_personalization(Some(Some(hue)), fields)
                 .await
                 .map_err(engine_failed)?;
         }
@@ -1466,7 +1498,7 @@ impl Kernel {
 /// The checkpoint is not deferred to the first mutation, because the anchor
 /// is *drawn* rather than derived (see [`Device::mint`]): an ephemeral device
 /// that was booted and reloaded without being touched would otherwise come
-/// back a different colour with a different word, which is the one thing the
+/// back a different colour and petnames, which is the one thing the
 /// anchor may not do. Ephemeral and resting open, because that is what "not
 /// yet kept" means.
 async fn mint(seams: &Seams, id: &str, now: u64) -> Result<DeviceState, Error> {

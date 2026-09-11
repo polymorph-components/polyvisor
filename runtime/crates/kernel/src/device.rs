@@ -5,11 +5,8 @@
 use serde::{Deserialize, Serialize};
 
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
 
 use crate::{Error, ErrorCode};
-
-const WORDS: &str = include_str!("../eff_short_wordlist.txt");
 
 /// `polyvisor:internal/device.state`, plus the terminal state an erased
 /// device sits in. `Erased` has no WIT spelling on purpose: after `erase`
@@ -49,7 +46,6 @@ pub struct DeviceStatus {
     pub petname: String,
     pub name: String,
     pub hue: u16,
-    pub word: String,
     /// This device's iroh endpoint id; `""` while sealed and until the
     /// endpoint is bound.
     pub endpoint_id: String,
@@ -112,8 +108,6 @@ pub struct Device {
     #[serde(skip)]
     pub hue: u16,
     #[serde(skip)]
-    pub word: String,
-    #[serde(skip)]
     pub meta: Meta,
 }
 
@@ -125,48 +119,37 @@ pub struct Meta {
 }
 
 /// Which map `meta`/`patch_meta` addresses.
+#[derive(Clone)]
 pub enum MetaScope {
     User,
     App(String),
 }
 
 impl Device {
-    /// A fresh device's anchor.
+    /// A fresh device's identity.
     ///
     /// Drawn from the RNG, not derived from the id: the id is public (it
     /// names the SharedWorker and sits in every index row), and internal.wit
     /// `device` says nothing personal is readable before unseal. A hue and a
-    /// word that are a pure function of the id would be readable by anyone
-    /// who knows the id, which is exactly the visor's anti-impostor signal
-    /// given away. Because it is drawn rather than derived, the anchor has to
+    /// petname that is a pure function of the id would be readable by anyone
+    /// who knows the id. Because it is drawn rather than derived, the identity has to
     /// be checkpointed at once — see `Kernel::boot`'s mint path.
     pub fn mint(rng: &dyn crate::Rng) -> Device {
         Device {
-            name: String::new(),
+            name: generate_petname(rng, ""),
             hue: (draw(rng) % 360) as u16,
-            word: word_at(draw(rng)),
-            meta: Meta::default(),
-        }
-    }
-
-    /// A word other than the current one: rerolling to the same word would
-    /// read as a broken button.
-    pub fn reroll(&self, rng: &dyn crate::Rng) -> String {
-        loop {
-            let word = word_at(draw(rng));
-            if word != self.word {
-                return word;
-            }
+            meta: Meta {
+                user: BTreeMap::from([("petname".into(), generate_petname(rng, ""))]),
+                app: BTreeMap::new(),
+            },
         }
     }
 }
 
-/// The wordlist, split once: `reroll` calls this in a loop.
-static WORD_LIST: LazyLock<Vec<&'static str>> =
-    LazyLock::new(|| WORDS.lines().filter(|w| !w.is_empty()).collect());
-
-fn word_at(draw: u32) -> String {
-    WORD_LIST[draw as usize % WORD_LIST.len()].to_string()
+/// A candidate petname distinct from `previous`. Generation has no storage
+/// side effect; callers decide whether a candidate is a draft or persisted.
+pub fn generate_petname(rng: &dyn crate::Rng, previous: &str) -> String {
+    polyvisor_petname::generate(|| draw(rng), previous)
 }
 
 fn draw(rng: &dyn crate::Rng) -> u32 {

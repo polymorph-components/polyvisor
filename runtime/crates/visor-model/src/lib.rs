@@ -15,7 +15,7 @@
 //! ```text
 //! route-key: str                      # lowercase hex, 32 bytes
 //! install:<install id hex>: { app: str }
-//! identity:hue / identity:word        # shared anchor scalars
+//! identity:hue                        # shared anchor scalar
 //! user:<hex field>                    # user metadata scalars
 //! app:<hex app id>:<hex field>        # per-app metadata scalars
 //! ```
@@ -61,7 +61,6 @@ pub const VISOR_APP: &str = "polyvisor:visor";
 pub const ROUTE_KEY: &str = "route-key";
 const INSTALL_PREFIX: &str = "install:";
 const HUE: &str = "identity:hue";
-const WORD: &str = "identity:word";
 const USER_PREFIX: &str = "user:";
 const APP_PREFIX: &str = "app:";
 
@@ -166,7 +165,6 @@ pub fn add_install(doc: &mut Document, id: [u8; 16], app: &str) -> Result<(), St
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Personalization {
     pub hue: Option<u16>,
-    pub word: Option<String>,
     pub user: std::collections::BTreeMap<String, String>,
     pub apps: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
@@ -180,14 +178,8 @@ pub fn personalization(doc: &Document) -> Personalization {
         .and_then(|(v, _)| v.to_i64())
         .and_then(|v| u16::try_from(v).ok())
         .filter(|v| *v < 360);
-    let word = read
-        .get(ROOT, WORD)
-        .ok()
-        .flatten()
-        .and_then(|(v, _)| v.to_str().map(str::to_string));
     let mut out = Personalization {
         hue,
-        word,
         ..Personalization::default()
     };
     for key in read.keys(ROOT) {
@@ -221,7 +213,6 @@ pub fn personalization(doc: &Document) -> Personalization {
 pub fn set_personalization(
     doc: &mut Document,
     hue: Option<Option<u16>>,
-    word: Option<Option<String>>,
     fields: Vec<(Option<String>, String, Option<String>)>,
 ) -> Result<(), String> {
     doc.transact(move |tx| {
@@ -230,14 +221,6 @@ pub fn set_personalization(
                 Some(v) => tx.put(ROOT, HUE, i64::from(v)).map_err(|e| e.to_string())?,
                 None => {
                     tx.delete(ROOT, HUE).map_err(|e| e.to_string())?;
-                }
-            }
-        }
-        if let Some(value) = word {
-            match value {
-                Some(v) => tx.put(ROOT, WORD, v).map_err(|e| e.to_string())?,
-                None => {
-                    tx.delete(ROOT, WORD).map_err(|e| e.to_string())?;
                 }
             }
         }
@@ -266,7 +249,7 @@ pub fn set_personalization(
 /// merged without replacement policy beyond Automerge's schema rules.
 pub fn adopt(current: &mut Document, source: &Document) -> Result<(), String> {
     let wanted = personalization(source);
-    if wanted.hue.is_none() || wanted.word.as_deref().is_none_or(str::is_empty) {
+    if wanted.hue.is_none() || wanted.user.get("petname").is_none_or(String::is_empty) {
         return Err("that device sent incomplete personalization".to_string());
     }
     let before = personalization(current);
@@ -282,6 +265,12 @@ pub fn adopt(current: &mut Document, source: &Document) -> Result<(), String> {
     for app in app_ids {
         let old = before.apps.get(&app);
         let new = wanted.apps.get(&app);
+        // Apps installed only on the joining device retain their local
+        // personalization. For an app the group knows, the group's fields
+        // are authoritative and causally supersede the joiner's values.
+        if new.is_none() {
+            continue;
+        }
         let mut keys: BTreeSet<String> = old.into_iter().flat_map(|m| m.keys()).cloned().collect();
         keys.extend(new.into_iter().flat_map(|m| m.keys()).cloned());
         for key in keys {
@@ -292,7 +281,7 @@ pub fn adopt(current: &mut Document, source: &Document) -> Result<(), String> {
             ));
         }
     }
-    set_personalization(current, Some(wanted.hue), Some(wanted.word), fields)
+    set_personalization(current, Some(wanted.hue), fields)
 }
 
 fn digest(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -336,22 +325,24 @@ mod tests {
         Document::empty(ActorId::from(&[1_u8][..]), SedimentreeId::new([2; 32]))
     }
 
+    fn doc_for(actor: u8) -> Document {
+        Document::empty(ActorId::from(&[actor][..]), SedimentreeId::new([2; 32]))
+    }
+
     #[test]
     fn field_patch_sets_and_clears_independently() {
         let mut doc = doc();
         set_personalization(
             &mut doc,
             Some(Some(42)),
-            Some(Some("word".into())),
             vec![(None, "theme".into(), Some("dark".into()))],
         )
         .unwrap();
-        set_personalization(&mut doc, None, None, vec![(None, "theme".into(), None)]).unwrap();
+        set_personalization(&mut doc, None, vec![(None, "theme".into(), None)]).unwrap();
         assert_eq!(
             personalization(&doc),
             Personalization {
                 hue: Some(42),
-                word: Some("word".into()),
                 ..Default::default()
             }
         );
@@ -371,6 +362,45 @@ mod tests {
         assert_eq!(
             install_or_create(&mut doc, [5; 32], [6; 32], "app").unwrap(),
             (install.0, false)
+        );
+    }
+
+    #[test]
+    fn adoption_keeps_joiner_only_app_personalization() {
+        let mut group = doc_for(1);
+        set_personalization(
+            &mut group,
+            Some(Some(42)),
+            vec![(None, "petname".into(), Some("owner".into()))],
+        )
+        .unwrap();
+        let mut joiner = doc_for(2);
+        set_personalization(
+            &mut joiner,
+            Some(Some(7)),
+            vec![
+                (None, "petname".into(), Some("joiner".into())),
+                (
+                    Some("local-app".into()),
+                    "petname".into(),
+                    Some("local".into()),
+                ),
+            ],
+        )
+        .unwrap();
+        adopt(&mut joiner, &group).unwrap();
+        let result = personalization(&joiner);
+        assert_eq!(
+            result.user.get("petname").map(String::as_str),
+            Some("owner")
+        );
+        assert_eq!(
+            result
+                .apps
+                .get("local-app")
+                .and_then(|m| m.get("petname"))
+                .map(String::as_str),
+            Some("local")
         );
     }
 }

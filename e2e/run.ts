@@ -6,7 +6,7 @@
 // actually serves.
 
 import { chromium } from "playwright";
-import type { Browser, BrowserContext, Page } from "playwright";
+import type { Browser, BrowserContext, Locator, Page } from "playwright";
 import { contentType } from "@std/media-types";
 import { copy } from "@std/fs";
 import { extname, join, normalize } from "@std/path";
@@ -470,6 +470,16 @@ async function setTextDraft(page: Page, label: RegExp, value: string): Promise<v
       if (performance.now() > deadline) throw new Failure(`could not save ${value}`);
     }
   }
+}
+
+async function waitForInputToDiffer(input: Locator, previous: string): Promise<string> {
+  const deadline = performance.now() + 10_000;
+  while (performance.now() < deadline) {
+    const value = await input.inputValue();
+    if (value !== previous) return value;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Failure(`input stayed ${JSON.stringify(previous)}`);
 }
 
 /** Press "Install as app" and read back the manifest.
@@ -1000,7 +1010,7 @@ async function waitForMember(page: Page, peer: string): Promise<void> {
     page,
     `${peer} in the group`,
     async () =>
-      await devicesSheet(page).locator(".member-row").filter({ hasText: peer })
+      await devicesSheet(page).locator(`.member-row[data-endpoint-id="${peer}"]`)
         .count() > 0,
     { refresh: true },
   );
@@ -1286,7 +1296,7 @@ async function converge(
 const scenarios: Scenario[] = [
   {
     name: "boot",
-    async run(ctx, origin) {
+    async run(ctx, origin, browser) {
       const page = await open(ctx, origin);
       await visorReady(page);
       const box = await page.locator("#visor-strip").boundingBox();
@@ -1294,9 +1304,7 @@ const scenarios: Scenario[] = [
       // The strip says "waking" until `device.status` answers over the
       // worker port; the placeholder is the first kernel-backed pixel, and
       // it is the right half — the one that speaks for this device.
-      await page.locator("#visor-self").getByText("this device").waitFor({
-        timeout: 10_000,
-      });
+      await page.locator("#visor-self .bottom .user").waitFor({ timeout: 10_000 });
     },
   },
 
@@ -2089,7 +2097,7 @@ const scenarios: Scenario[] = [
         { timeout: 15_000 },
       );
       await visorReady(page);
-      await strip(page).getByText("this device").waitFor({ timeout: 15_000 });
+      await strip(page).locator("#visor-self .bottom .user").waitFor({ timeout: 15_000 });
 
       await openSettingsSheet(page);
       await drawer(page).getByRole("button", { name: "Other devices" }).click();
@@ -2188,6 +2196,115 @@ const scenarios: Scenario[] = [
   },
 
   {
+    name: "petname-dice",
+    async run(ctx, origin, browser) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+      await openSettingsSheet(page);
+
+      const field = (label: RegExp) =>
+        drawer(page).locator("label").filter({ hasText: label }).locator("input");
+      const user = field(/^your petname$/);
+      const device = field(/^device petname$/);
+      const userDie = drawer(page).getByRole("button", { name: "Re-roll user petname" });
+      const deviceDie = drawer(page).getByRole("button", { name: "Re-roll device petname" });
+
+      const assertDieGap = async (input: Locator, die: Locator, where: string) => {
+        const inputBox = await input.boundingBox();
+        const dieBox = await die.boundingBox();
+        check(inputBox !== null && dieBox !== null, `${where} petname controls are not visible`);
+        const gap = dieBox.x - (inputBox.x + inputBox.width);
+        check(gap >= 0 && gap <= 12, `${where} die gap is ${gap}px, expected 0..12px`);
+        console.log(`  ${where} die gap: ${gap}px`);
+        return gap;
+      };
+      await assertDieGap(user, userDie, "desktop user");
+      await assertDieGap(device, deviceDie, "desktop device");
+
+      for (const [input, die] of [[user, userDie], [device, deviceDie]] as const) {
+        const initial = await input.inputValue();
+        eq(await die.getAttribute("aria-disabled"), "true", "saved petname die was enabled");
+        await die.hover();
+        let tip = drawer(page).getByRole("tooltip", { name: "clear to re-roll" });
+        await tip.waitFor();
+        eq(await die.getAttribute("aria-describedby"), await tip.getAttribute("id"), "tooltip association missing");
+        await page.mouse.move(0, 0);
+        await tip.waitFor({ state: "detached" });
+        await die.focus();
+        await tip.waitFor();
+        await die.press("Escape");
+        await tip.waitFor({ state: "detached" });
+        await die.click({ force: true });
+        eq(await input.inputValue(), initial, "disabled die changed a petname");
+        await input.fill("");
+        await die.click();
+        const first = await waitForInputToDiffer(input, "");
+        await die.click();
+        await waitForInputToDiffer(input, first);
+      }
+      await shot(page, "desktop-petname-roll");
+      await saveDraft(page);
+      await appsButton(page).click();
+      await paneSettled(page);
+      await openSettingsSheet(page);
+      eq(await drawer(page).getByRole("button", { name: "Re-roll user petname" }).getAttribute("aria-disabled"), null, "saved roll lost eligibility on reopen");
+
+      await launchTodoMvc(page);
+      await toAppSheet(page);
+      const app = field(/^petname$/);
+      const appDie = drawer(page).getByRole("button", { name: "Re-roll app petname" });
+      eq(await appDie.getAttribute("aria-disabled"), "true", "generated app default was rerollable");
+      await app.fill("");
+      await appDie.click();
+      await page.waitForFunction(() => {
+        const label = [...document.querySelectorAll("label")].find((node) => node.textContent?.trim() === "petname");
+        return (label?.querySelector("input") as HTMLInputElement | null)?.value.length;
+      });
+      await drawer(page).getByRole("button", { name: "Revert", exact: true }).click();
+      await pageCleanDrawer(page);
+      await page.reload();
+      await visorReady(page);
+      await page.waitForSelector("#app-zone iframe[sandbox]", { timeout: 30_000 });
+      await page.waitForFunction(() => document.querySelector("#visor-drawer") === null);
+      await openSettingsSheet(page);
+      eq(await drawer(page).getByRole("button", { name: "Re-roll user petname" }).getAttribute("aria-disabled"), "true", "reload retained roll eligibility");
+      check(await drawer(page).getByText("word", { exact: true }).count() === 0, "obsolete word field is still rendered");
+
+      const reloadedUser = field(/^your petname$/);
+      const reloadedDevice = field(/^device petname$/);
+      await reloadedUser.fill("");
+      await reloadedDevice.fill("");
+      await saveDraft(page);
+      check((await reloadedUser.inputValue()).length > 0, "blank user save was not normalized");
+      check((await reloadedDevice.inputValue()).length > 0, "blank device save was not normalized");
+
+      await toAppSheet(page);
+      const savedApp = field(/^petname$/);
+      await savedApp.fill("");
+      await saveDraft(page);
+      check((await savedApp.inputValue()).length > 0, "blank app save was not normalized");
+
+      await page.setViewportSize({ width: 390, height: 844 });
+      await assertDieGap(field(/^petname$/), drawer(page).getByRole("button", { name: "Re-roll app petname" }), "mobile app");
+      await shot(page, "mobile-petname-roll");
+      const touch = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true });
+      try {
+        const mobile = await open(touch, origin);
+        await visorReady(mobile);
+        await openSettingsSheet(mobile);
+        const mobileUser = drawer(mobile).locator("label").filter({ hasText: /^your petname$/ }).locator("input");
+        const mobileDie = drawer(mobile).getByRole("button", { name: "Re-roll user petname" });
+        const before = await mobileUser.inputValue();
+        await mobileDie.tap({ force: true });
+        eq(await mobileUser.inputValue(), before, "disabled touch die changed the draft");
+        await drawer(mobile).getByRole("tooltip", { name: "clear to re-roll" }).waitFor();
+      } finally {
+        await touch.close();
+      }
+    },
+  },
+
+  {
     name: "live-personalization-and-device-names",
     async run(ctx, origin, browser) {
       const ctxB = await browser.newContext();
@@ -2219,10 +2336,19 @@ const scenarios: Scenario[] = [
 
         // Keep one device-local field dirty while clean shared fields update.
         await openSettingsSheet(b);
+        const remoteUser = drawer(b).locator("label").filter({ hasText: /^your petname$/ }).locator("input");
+        const remoteDie = drawer(b).getByRole("button", { name: "Re-roll user petname" });
+        await remoteUser.fill("");
+        await remoteDie.click();
+        await waitForInputToDiffer(remoteUser, "");
+        await saveDraft(b);
+        eq(await remoteDie.getAttribute("aria-disabled"), null, "saved roll lost eligibility");
         const dirtyName = drawer(b).locator("label").filter({ hasText: /^device petname$/ }).locator("input");
         await dirtyName.fill("unsaved beta");
         await setUserPetname(a, "post-pair owner");
         await waitForPageText(b, "post-pair owner");
+        eq(await remoteUser.inputValue(), "post-pair owner", "remote petname did not replace the clean draft");
+        eq(await remoteDie.getAttribute("aria-disabled"), "true", "remote replacement inherited roll eligibility");
         eq(await dirtyName.inputValue(), "unsaved beta", "remote refresh replaced a dirty field");
         await drawer(b).getByRole("button", { name: "Revert", exact: true }).click();
         eq(await dirtyName.inputValue(), "beta device", "Revert did not use the latest synced baseline");
@@ -2239,12 +2365,6 @@ const scenarios: Scenario[] = [
         await drawer(a).locator('input[type="range"]').fill("123");
         await saveDraft(a);
         await b.waitForFunction(() => document.querySelector("#visor-root")?.getAttribute("style")?.includes("123"), undefined, { timeout: 30_000 });
-        const oldWord = (await drawer(b).locator("label").filter({ hasText: /^word/ }).textContent()) ?? "";
-        await drawer(a).locator("button").filter({ hasText: /^Reroll$/ }).click();
-        await b.waitForFunction((old) => {
-          const label = [...document.querySelectorAll("label")].find((node) => node.textContent?.trim().startsWith("word"));
-          return label?.textContent !== old;
-        }, oldWord, { timeout: 30_000 });
         await setAppPetname(a, "post-pair todos");
         await waitForPageText(b, "post-pair todos");
 
@@ -2602,6 +2722,7 @@ const scenarios: Scenario[] = [
       const field = drawer(page).locator("label").filter({
         hasText: /^device petname$/,
       }).locator("input");
+      const original = await field.inputValue();
       const confirm = page.locator("#visor-confirm");
 
       eq(
@@ -2619,7 +2740,7 @@ const scenarios: Scenario[] = [
 
       await drawer(page).getByRole("button", { name: "Revert", exact: true })
         .click();
-      eq(await field.inputValue(), "", "bar Revert kept the abandoned draft");
+      eq(await field.inputValue(), original, "bar Revert kept the abandoned draft");
       check(
         await focusIn(page, "#visor-actions") &&
           await drawer(page).getByRole("button", { name: "Close", exact: true })
@@ -2642,7 +2763,7 @@ const scenarios: Scenario[] = [
 
       // Revert means "throw it away and go": the transition happens, and
       // the sheet goes back to what the kernel last said — which for a
-      // device nobody has named is nothing.
+      // device is its generated name.
       await appsButton(page).click();
       await confirm.waitFor({ timeout: 10_000 });
       await confirm.getByRole("button", { name: "Revert", exact: true })
@@ -2653,7 +2774,7 @@ const scenarios: Scenario[] = [
         "Revert did not go on to the transition it was asked about",
       );
       await openSettingsSheet(page);
-      eq(await field.inputValue(), "", "Revert kept the abandoned draft");
+      eq(await field.inputValue(), original, "Revert kept the abandoned draft");
 
       // Saved, and it is the kernel that remembers it: a reload has no
       // draft at all, and reads the name back off the device.
