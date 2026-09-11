@@ -174,6 +174,31 @@ component. Component-model linking is reserved for the untrusted tier
 Inside the TCB it would buy a second WIT surface and marshalling for
 nothing.
 
+## Component-owned data models (direction)
+
+Task semantics will move out of the engine into an ordinary service component.
+There is no special "data model component" kind or elevated runtime trust tier.
+
+- Components can export domain services, consume services through granted
+  bindings, and hold partition-scoped document-history capabilities.
+- Domain providers own their schemas, operations, migrations and domain access
+  controls. They may be developed outside Polyvisor's core. The additional
+  trust is the user's reliance on a provider to faithfully process data and
+  mediate access for multiple consumers, not runtime privilege.
+- Providers use Automerge directly as a library. The platform exposes history
+  synchronization, not a generic Automerge object/transaction WIT API;
+  synchronization is an implementation detail of the domain service.
+- Apps can also access app-private document partitions directly through the
+  same history interface. Service providers and UI apps follow the same
+  component and partition confinement rules.
+- A service binding does **not** grant access to the provider's underlying
+  document history. The platform enforces partition access and service
+  bindings and supplies trustworthy caller context; the provider enforces
+  domain policy.
+
+This is the intended split; task semantics and Automerge integration currently
+reside in the engine. The history WIT interface is not yet designed.
+
 ## Sync engine: subduction sans-IO
 
 The engine crate is a driver for `subduction_protocol::Node` (the
