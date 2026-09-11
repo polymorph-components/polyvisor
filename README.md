@@ -1,5 +1,10 @@
 # polyvisor
 
+**Exploratory, unstable, and has no users.** APIs, storage formats, and UI
+may change without compatibility support. Implementation choices favor
+cheap revision over preserving existing behavior; see
+[project maturity and tradeoffs](docs/design.md#project-maturity-and-tradeoffs).
+
 A framework for PWAs that inverts the usual architecture: applications run
 client-side as WebAssembly component-model components under
 user-controlled capability confinement. The organizing invariant: nothing
