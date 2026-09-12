@@ -57,6 +57,16 @@ pub struct Snapshot {
     ///
     /// `None` while a device has not opened its group document.
     pub name_key: Option<[u8; 32]>,
+    /// Raw opaque trees. Their lifecycle descriptors are in `us`; only trees
+    /// current at snapshot time are emitted here.
+    #[serde(default)]
+    pub opaque: Vec<OpaqueState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpaqueState {
+    pub tree: [u8; 32],
+    pub commits: Vec<Item>,
 }
 
 /// One app's document and the tree behind it.
@@ -119,6 +129,7 @@ pub struct StoreItem {
 #[derive(Debug, Default)]
 pub struct SnapshotStorage {
     trees: RefCell<BTreeMap<SedimentreeId, Tree>>,
+    lifecycle: crate::opaque::Lifecycle,
 }
 
 #[derive(Debug, Default)]
@@ -128,6 +139,12 @@ struct Tree {
 }
 
 impl SnapshotStorage {
+    pub(crate) fn new(lifecycle: crate::opaque::Lifecycle) -> Self {
+        Self {
+            trees: RefCell::new(BTreeMap::new()),
+            lifecycle,
+        }
+    }
     /// Every stored commit of `tree` as `(id, blob)`, for the automerge
     /// document to apply what it has not seen.
     pub fn commit_blobs(&self, tree: SedimentreeId) -> Vec<(CommitId, Vec<u8>)> {
@@ -180,6 +197,9 @@ impl SnapshotStorage {
         self.trees
             .borrow()
             .iter()
+            .filter(|(tree, _)| {
+                crate::opaque::status(&self.lifecycle, tree.as_bytes()) != Some(false)
+            })
             .flat_map(|(tree, t)| {
                 let commits = t.commits.iter().map(|(id, (signed, blob))| StoreItem {
                     tree: *tree.as_bytes(),
@@ -287,21 +307,45 @@ impl SnapshotStorage {
     /// Reinstate a snapshot's items for one tree. Items whose envelope no
     /// longer decodes are skipped, as in [`Self::metadata`].
     pub fn restore(&self, tree: SedimentreeId, commits: Vec<Item>, fragments: Vec<Item>) {
-        let mut trees = self.trees.borrow_mut();
-        let entry = trees.entry(tree).or_default();
+        let opaque = crate::opaque::is_opaque_tree(tree.as_bytes());
+        if opaque
+            && (crate::opaque::status(&self.lifecycle, tree.as_bytes()) != Some(true)
+                || !fragments.is_empty())
+        {
+            return;
+        }
+        let mut accepted_commits = Vec::new();
         for item in commits {
             if let Ok(signed) = Signed::<LooseCommit>::try_decode(&item.signed)
                 && let Ok(payload) = signed.try_decode_trusted_payload()
+                && (!opaque
+                    || crate::opaque::mode(&self.lifecycle, tree.as_bytes())
+                        != Some(crate::opaque::OpaqueMode::CallerEncrypted)
+                    || valid_raw_commit(tree, &payload, &item.blob))
             {
-                let _previous = entry.commits.insert(payload.head(), (signed, item.blob));
+                accepted_commits.push((payload.head(), signed, item.blob));
             }
         }
+        let mut accepted_fragments = Vec::new();
         for item in fragments {
             if let Ok(signed) = Signed::<Fragment>::try_decode(&item.signed)
                 && let Ok(payload) = signed.try_decode_trusted_payload()
             {
-                let _previous = entry.fragments.insert(payload.head(), (signed, item.blob));
+                accepted_fragments.push((payload.head(), signed, item.blob));
             }
+        }
+        // Eligibility is checked again at the execution point, immediately
+        // before mutating storage.
+        if opaque && crate::opaque::status(&self.lifecycle, tree.as_bytes()) != Some(true) {
+            return;
+        }
+        let mut trees = self.trees.borrow_mut();
+        let entry = trees.entry(tree).or_default();
+        for (head, signed, blob) in accepted_commits {
+            let _previous = entry.commits.insert(head, (signed, blob));
+        }
+        for (head, signed, blob) in accepted_fragments {
+            let _previous = entry.fragments.insert(head, (signed, blob));
         }
     }
 
@@ -336,6 +380,18 @@ impl SnapshotStorage {
             keyhive: keyhive.map(|tree| self.tree_state(tree, Vec::new())),
             vault,
             name_key,
+            opaque: self
+                .trees
+                .borrow()
+                .iter()
+                .filter(|(tree, _)| {
+                    crate::opaque::status(&self.lifecycle, tree.as_bytes()) == Some(true)
+                })
+                .map(|(tree, stored)| OpaqueState {
+                    tree: *tree.as_bytes(),
+                    commits: items(stored.commits.values()),
+                })
+                .collect(),
         }
     }
 
@@ -377,6 +433,14 @@ impl Storage<Local> for SnapshotStorage {
         fragments: Vec<(Signed<Fragment>, Vec<u8>)>,
     ) -> LocalBoxFuture<'_, Result<u32, StorageFailure>> {
         Local::from_future(async move {
+            if crate::opaque::is_opaque_tree(tree.as_bytes()) {
+                if crate::opaque::status(&self.lifecycle, tree.as_bytes()) != Some(true) {
+                    return Err(StorageFailure::Retryable);
+                }
+                if !fragments.is_empty() {
+                    return Err(StorageFailure::Permanent);
+                }
+            }
             let mut trees = self.trees.borrow_mut();
             let entry = trees.entry(tree).or_default();
             let mut stored = 0u32;
@@ -384,6 +448,13 @@ impl Storage<Local> for SnapshotStorage {
                 let Ok(payload) = signed.try_decode_trusted_payload() else {
                     return Err(StorageFailure::Permanent);
                 };
+                if crate::opaque::is_opaque_tree(tree.as_bytes())
+                    && crate::opaque::mode(&self.lifecycle, tree.as_bytes())
+                        == Some(crate::opaque::OpaqueMode::CallerEncrypted)
+                    && !valid_raw_commit(tree, &payload, &blob)
+                {
+                    return Err(StorageFailure::Permanent);
+                }
                 let _previous = entry.commits.insert(payload.head(), (signed, blob));
                 stored += 1;
             }
@@ -405,6 +476,11 @@ impl Storage<Local> for SnapshotStorage {
         fragment_heads: Vec<CommitId>,
     ) -> LocalBoxFuture<'_, Result<Option<FetchedItems>, StorageFailure>> {
         Local::from_future(async move {
+            if crate::opaque::is_opaque_tree(tree.as_bytes())
+                && crate::opaque::status(&self.lifecycle, tree.as_bytes()) != Some(true)
+            {
+                return Ok(None);
+            }
             let trees = self.trees.borrow();
             let Some(t) = trees.get(&tree) else {
                 return Ok(None);
@@ -429,5 +505,52 @@ impl Storage<Local> for SnapshotStorage {
             let _removed = self.trees.borrow_mut().remove(&tree);
             Ok(())
         })
+    }
+}
+
+fn valid_raw_commit(tree: SedimentreeId, payload: &LooseCommit, blob: &[u8]) -> bool {
+    let mut parents: Vec<_> = payload
+        .parents()
+        .iter()
+        .map(|parent| *parent.as_bytes())
+        .collect();
+    parents.sort_unstable();
+    parents.dedup();
+    parents.len() == payload.parents().len()
+        && crate::opaque::item_id(*tree.as_bytes(), &parents, blob) == *payload.head().as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opaque::{LifecycleState, OpaqueMode, RegisterValue, slot_hash, tree_id};
+    use futures::executor::block_on;
+    use std::rc::Rc;
+
+    #[test]
+    fn queued_raw_persist_rechecks_lifecycle_when_polled() {
+        let lifecycle = Rc::new(RefCell::new(LifecycleState::default()));
+        let slot = slot_hash("queued");
+        let nonce = [3; 16];
+        lifecycle.borrow_mut().registers.insert(
+            slot,
+            RegisterValue {
+                sequence: 1,
+                nonce,
+                mode: Some(OpaqueMode::CallerEncrypted),
+            },
+        );
+        let storage = SnapshotStorage::new(Rc::clone(&lifecycle));
+        let tree = SedimentreeId::new(tree_id(slot, nonce));
+        let future = storage.persist_items(tree, Vec::new(), Vec::new());
+        lifecycle.borrow_mut().registers.insert(
+            slot,
+            RegisterValue {
+                sequence: 2,
+                nonce: [4; 16],
+                mode: None,
+            },
+        );
+        assert_eq!(block_on(future), Err(StorageFailure::Retryable));
     }
 }

@@ -11,13 +11,14 @@
 //! here is `Send`, every trait future is `Local`, and shared state is
 //! `RefCell`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 
 mod clock;
+mod opaque;
 mod policy;
 mod storage;
 mod transport;
@@ -26,8 +27,9 @@ mod vault;
 
 pub use clock::EngineClock;
 pub use ed25519_dalek::VerifyingKey;
+pub use opaque::{OpaqueItem, OpaqueMode, is_opaque_tree};
 pub use polyvisor_document_history::Document;
-pub use storage::{AppState, Item, ItemKind, Snapshot, StoreItem, TreeState};
+pub use storage::{AppState, Item, ItemKind, OpaqueState, Snapshot, StoreItem, TreeState};
 pub use subduction_protocol::peer_id::PeerId;
 pub use transport::{DynTransport, EngineTransport};
 pub use us::{Member, us_tree};
@@ -85,16 +87,29 @@ pub type EngineNotify = Rc<dyn Fn(EngineEvent) -> LocalBoxFuture<'static, ()>>;
 /// that connection's handshake, which the read loop is what makes progress.
 pub type Spawner = Rc<dyn Fn(LocalBoxFuture<'static, ()>)>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPhase {
+    AwaitUs,
+    AwaitKeyhive,
+    Ready,
+}
+
 /// The sedimentree every device keeps a document partition in.
 ///
 /// Derived from the app id alone, so two devices that dial each other
 /// converge with no naming step; M3b replaces this with keyhive partitions.
 #[must_use]
 pub fn document_tree(partition: &str) -> SedimentreeId {
-    let mut hasher = Sha256::new();
-    hasher.update(b"polyvisor:tasks:");
-    hasher.update(partition.as_bytes());
-    SedimentreeId::new(hasher.finalize().into())
+    let digest: [u8; 32] = Sha256::new()
+        .chain_update(b"polyvisor:tasks:v2:")
+        .chain_update(partition.as_bytes())
+        .finalize()
+        .into();
+    let mut tree = digest;
+    // The first byte is a namespace tag, not hash output. Opaque ids use a
+    // different tag and therefore cannot alias a document tree.
+    tree[0] = 0;
+    SedimentreeId::new(tree)
 }
 
 /// The tree the group's keyhive operations travel in.
@@ -170,6 +185,18 @@ pub struct Engine<T: Transport<Local> + 'static> {
     /// own driver — the caller has not spawned it yet — so a restored
     /// snapshot's trees are handed to the driver on the first async call.
     pending_hydration: RefCell<Option<Vec<SedimentreeId>>>,
+    opaque: opaque::Lifecycle,
+    opaque_nonce: RefCell<u64>,
+    control_phases: RefCell<BTreeMap<subduction_protocol::id::ConnId, ControlPhase>>,
+    control_initiators: RefCell<BTreeSet<subduction_protocol::id::ConnId>>,
+    remote_catalogs: RefCell<BTreeMap<subduction_protocol::id::ConnId, Vec<SedimentreeId>>>,
+    pending_catalogs: RefCell<BTreeMap<subduction_protocol::id::ConnId, Vec<SedimentreeId>>>,
+    catalog_sent: RefCell<BTreeSet<subduction_protocol::id::ConnId>>,
+    control_write: futures::lock::Mutex<()>,
+    control_revision: Cell<u64>,
+    pending_opaque_retire: RefCell<BTreeSet<[u8; 32]>>,
+    pending_opaque_subscribe: RefCell<BTreeSet<[u8; 12]>>,
+    group_generation: Cell<u64>,
 }
 
 impl<T: Transport<Local> + 'static> Engine<T> {
@@ -195,7 +222,8 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     {
         let signing_key = SigningKey::from_bytes(&seed);
         let peer = PeerId::from(signing_key.verifying_key());
-        let storage = Rc::new(SnapshotStorage::default());
+        let opaque: opaque::Lifecycle = Rc::new(RefCell::new(Default::default()));
+        let storage = Rc::new(SnapshotStorage::new(Rc::clone(&opaque)));
 
         let mut apps = BTreeMap::new();
         let mut hydrate = Vec::new();
@@ -228,6 +256,15 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 let _absorbed = doc.absorb(&storage);
                 us = Some(doc);
             }
+            opaque.borrow_mut().registers =
+                us.as_ref().map(UsDoc::opaque_registers).unwrap_or_default();
+            for state in state.opaque {
+                if opaque::status(&opaque, &state.tree) == Some(true) {
+                    let tree = SedimentreeId::new(state.tree);
+                    storage.restore(tree, state.commits, Vec::new());
+                    hydrate.push(tree);
+                }
+            }
             if let Some(state) = state.keyhive {
                 let tree = keyhive_tree();
                 storage.restore(tree, state.commits, state.fragments);
@@ -253,7 +290,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             ClockAdapter::new(Rc::clone(&clock)),
             MemorySigner::from_bytes(&seed),
             Rc::clone(&storage),
-            Policy::new(Rc::clone(&members)),
+            Policy::new(Rc::clone(&members), Rc::clone(&opaque)),
         );
 
         let engine = Engine {
@@ -274,6 +311,18 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             members,
             conns: RefCell::new(Vec::new()),
             pending_hydration: RefCell::new((!hydrate.is_empty()).then_some(hydrate)),
+            opaque,
+            opaque_nonce: RefCell::new(0),
+            control_phases: RefCell::new(BTreeMap::new()),
+            control_initiators: RefCell::new(BTreeSet::new()),
+            remote_catalogs: RefCell::new(BTreeMap::new()),
+            pending_catalogs: RefCell::new(BTreeMap::new()),
+            catalog_sent: RefCell::new(BTreeSet::new()),
+            control_write: futures::lock::Mutex::new(()),
+            control_revision: Cell::new(0),
+            pending_opaque_retire: RefCell::new(BTreeSet::new()),
+            pending_opaque_subscribe: RefCell::new(BTreeSet::new()),
+            group_generation: Cell::new(0),
         };
         (engine, driver.run())
     }
@@ -328,6 +377,304 @@ impl<T: Transport<Local> + 'static> Engine<T> {
 
     pub fn model_entropy(&self) -> [u8; 32] {
         self.model_entropy
+    }
+
+    /// Wait until every local `us` mutation submitted before this call has
+    /// crossed the driver's storage barrier.
+    pub async fn control_barrier(&self) -> Result<(), String> {
+        let _serial = self.control_write.lock().await;
+        let _heads = self
+            .handle
+            .tree_heads(us_tree())
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn control_revision(&self) -> u64 {
+        self.control_revision.get()
+    }
+
+    // -- opaque histories ---------------------------------------------------
+
+    pub fn opaque_status(&self, tree: &[u8; 32]) -> Option<bool> {
+        opaque::status(&self.opaque, tree)
+    }
+
+    pub fn item_publishable(&self, item: &StoreItem) -> bool {
+        !is_opaque_tree(&item.tree) || self.opaque_status(&item.tree) == Some(true)
+    }
+
+    /// Structural/authenticity validation independent of lifecycle and
+    /// novelty. Drive uses this before deleting a correctly named obsolete
+    /// object, so eligibility must deliberately not be part of the answer.
+    pub fn valid_store_item(&self, item: &StoreItem) -> bool {
+        let members = self.members.borrow();
+        valid_item(&members, item)
+    }
+
+    pub async fn opaque_current(&self, slot: &str) -> Result<Option<[u8; 32]>, String> {
+        self.open_us().await?;
+        Ok(self
+            .with_us(|doc| doc.opaque_register(slot))
+            .and_then(|value| {
+                value
+                    .mode
+                    .map(|_| opaque::tree_id(opaque::slot_hash(slot), value.nonce))
+            }))
+    }
+
+    pub async fn opaque_replace(&self, slot: &str, mode: OpaqueMode) -> Result<[u8; 32], String> {
+        self.open_us().await?;
+        let nonce = self.next_opaque_nonce(slot);
+        self.us_mutate(|doc| {
+            let sequence = doc.opaque_register(slot).map_or(Ok(1), |value| {
+                value
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| "opaque sequence exhausted".to_string())
+            })?;
+            doc.set_opaque_register(
+                slot,
+                opaque::RegisterValue {
+                    sequence,
+                    nonce,
+                    mode: Some(mode),
+                },
+            )
+        })
+        .await?;
+        let tree = opaque::tree_id(opaque::slot_hash(slot), nonce);
+        if self.opaque_status(&tree) != Some(true) {
+            return Err("a concurrent opaque replacement won".to_string());
+        }
+        Ok(tree)
+    }
+
+    pub async fn opaque_disable(&self, slot: &str) -> Result<(), String> {
+        self.open_us().await?;
+        let nonce = self.next_opaque_nonce(slot);
+        self.us_mutate(|doc| {
+            let sequence = doc.opaque_register(slot).map_or(Ok(1), |value| {
+                value
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| "opaque sequence exhausted".to_string())
+            })?;
+            doc.set_opaque_register(
+                slot,
+                opaque::RegisterValue {
+                    sequence,
+                    nonce,
+                    mode: None,
+                },
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub async fn opaque_open(&self, tree: [u8; 32]) -> Result<(), String> {
+        self.open_us().await?;
+        self.require_current_opaque(&tree)?;
+        let tree = SedimentreeId::new(tree);
+        let conns: Vec<_> = self
+            .conns
+            .borrow()
+            .iter()
+            .filter(|conn| {
+                self.control_phases.borrow().get(&conn.id()) == Some(&ControlPhase::Ready)
+            })
+            .cloned()
+            .collect();
+        for conn in conns {
+            self.require_current_opaque(tree.as_bytes())?;
+            conn.sync_tree(tree, true)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub async fn opaque_publish(
+        &self,
+        tree: [u8; 32],
+        parents: Vec<[u8; 32]>,
+        bytes: Vec<u8>,
+    ) -> Result<[u8; 32], String> {
+        self.open_us().await?;
+        let mode = self.require_current_opaque(&tree)?;
+        let mut parents = parents;
+        parents.sort_unstable();
+        parents.dedup();
+        let sedimentree = SedimentreeId::new(tree);
+        if parents
+            .iter()
+            .any(|parent| !self.storage.holds(sedimentree, CommitId::new(*parent)))
+        {
+            return Err("opaque parents must be commits in the same tree".to_string());
+        }
+        let id = opaque::item_id(tree, &parents, &bytes);
+        let parent_ids = parents.iter().copied().map(CommitId::new).collect();
+        let (blob, sealed, operation_refs) = match mode {
+            OpaqueMode::CallerEncrypted => (Blob::new(bytes), None, Vec::new()),
+            OpaqueMode::GroupSealed => {
+                let cref = raw_cref(tree, id);
+                let mut preds: Vec<_> = parents
+                    .iter()
+                    .map(|parent| raw_cref(tree, *parent))
+                    .collect();
+                // Signed parents are a set. BeeKEM hashes this vector, while
+                // `open_raw` reconstructs it from a BTreeSet, so both sides
+                // must use the scoped-reference order rather than raw-id order.
+                preds.sort_unstable();
+                let vault = self.require_vault()?;
+                let sealed = match vault.seal(cref, &preds, bytes).await {
+                    Ok(sealed) => sealed,
+                    Err(error) => {
+                        vault.forget(std::iter::once(cref)).await;
+                        return Err(error);
+                    }
+                };
+                if self.require_current_opaque(&tree).is_err() {
+                    vault.forget(std::iter::once(cref)).await;
+                    return Err("opaque tree was retired while sealing".to_string());
+                }
+                (
+                    Blob::new(sealed.blob.clone()),
+                    Some((vault, sealed)),
+                    vec![cref],
+                )
+            }
+        };
+        let result = async {
+            self.require_current_opaque(&tree)?;
+            self.handle
+                .add_commits(
+                    sedimentree,
+                    vec![subduction_protocol::command::NewCommit {
+                        head: CommitId::new(id),
+                        parents: parent_ids,
+                        blob,
+                    }],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            self.require_current_opaque(&tree)?;
+            let _heads = self
+                .handle
+                .tree_heads(sedimentree)
+                .await
+                .map_err(|e| e.to_string())?;
+            self.require_current_opaque(&tree)?;
+            if !self.storage.holds(sedimentree, CommitId::new(id)) {
+                return Err("opaque publication did not persist".to_string());
+            }
+            if let Some((vault, sealed)) = &sealed {
+                self.publish_keyhive().await?;
+                self.require_current_opaque(&tree)?;
+                // Frontier movement is last: storage is known durable and no
+                // fallible await remains after the confirmation.
+                vault.confirm(sealed);
+            }
+            Ok(id)
+        }
+        .await;
+        if result.is_err()
+            && let Some((vault, _)) = &sealed
+        {
+            vault.forget(operation_refs).await;
+            if self.opaque_status(&tree) != Some(true) {
+                let _retired = self.retire_tree(tree).await;
+            }
+        }
+        result
+    }
+
+    pub async fn opaque_read(&self, tree: [u8; 32]) -> Result<Vec<OpaqueItem>, String> {
+        self.open_us().await?;
+        let mode = self.require_current_opaque(&tree)?;
+        let sedimentree = SedimentreeId::new(tree);
+        let metadata: BTreeMap<_, _> = self
+            .storage
+            .metadata(sedimentree)
+            .0
+            .into_iter()
+            .map(|commit| {
+                (
+                    commit.head(),
+                    commit
+                        .parents()
+                        .iter()
+                        .map(|p| *p.as_bytes())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let owned_refs: BTreeSet<[u8; 32]> = metadata
+            .iter()
+            .flat_map(|(id, parents)| {
+                std::iter::once(raw_cref(tree, *id.as_bytes()))
+                    .chain(parents.iter().map(|parent| raw_cref(tree, *parent)))
+            })
+            .collect();
+        let blobs = self.storage.commit_blobs(sedimentree);
+        let opened: Vec<_> = match mode {
+            OpaqueMode::CallerEncrypted => blobs
+                .into_iter()
+                .map(|(id, bytes)| (*id.as_bytes(), bytes))
+                .collect(),
+            OpaqueMode::GroupSealed => {
+                let scoped_parents: BTreeMap<[u8; 32], BTreeSet<[u8; 32]>> = metadata
+                    .iter()
+                    .map(|(id, parents)| {
+                        (
+                            raw_cref(tree, *id.as_bytes()),
+                            parents
+                                .iter()
+                                .map(|parent| raw_cref(tree, *parent))
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                self.require_vault()?
+                    .open_raw(
+                        blobs
+                            .into_iter()
+                            .map(|(id, bytes)| (raw_cref(tree, *id.as_bytes()), bytes))
+                            .collect(),
+                        &scoped_parents,
+                    )
+                    .await?
+                    .into_iter()
+                    .filter_map(|(cref, bytes)| {
+                        metadata
+                            .keys()
+                            .find(|id| raw_cref(tree, *id.as_bytes()) == cref)
+                            .map(|id| (*id.as_bytes(), bytes))
+                    })
+                    .collect()
+            }
+        };
+        if self.require_current_opaque(&tree).is_err() {
+            if let Some(vault) = self.vault() {
+                vault.forget(owned_refs).await;
+            }
+            return Err("opaque tree was retired while reading".to_string());
+        }
+        let mut answer: Vec<_> = opened
+            .into_iter()
+            .filter_map(|(id, bytes)| {
+                let parents = metadata.get(&CommitId::new(id))?.clone();
+                if opaque::item_id(tree, &parents, &bytes) != id {
+                    return None;
+                }
+                Some(OpaqueItem { id, parents, bytes })
+            })
+            .collect();
+        answer.sort_by_key(|item| item.id);
+        Ok(answer)
     }
 
     pub async fn document_save(&self, partition: &str) -> Result<Vec<u8>, String> {
@@ -484,6 +831,12 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         Ok(self.require_vault()?.entry_points())
     }
 
+    #[doc(hidden)]
+    pub fn has_opaque_entry_point(&self, tree: [u8; 32], id: [u8; 32]) -> bool {
+        self.vault()
+            .is_some_and(|vault| vault.holds_entry_point(&raw_cref(tree, id)))
+    }
+
     /// The user-system document's bytes, for the adder to put in ENROLL.
     pub async fn us_save(&self) -> Result<Vec<u8>, String> {
         self.open_us().await?;
@@ -539,7 +892,11 @@ impl<T: Transport<Local> + 'static> Engine<T> {
 
         *self.us.borrow_mut() = Some(adopted);
         *self.name_key.borrow_mut() = Some(name_key);
+        self.group_generation
+            .set(self.group_generation.get().saturating_add(1));
         self.refresh_members();
+        self.refresh_opaque_admission();
+        self.reconcile_opaque().await?;
 
         // Resubscribe: `remove_tree` took the tree out of the driver's
         // residency, and this device now wants every commit behind the
@@ -665,14 +1022,39 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         // read loop is feeding the driver.
         (self.spawn)(Box::pin(read_loop));
         let conn = pending.authenticated().await.map_err(|e| e.to_string())?;
-
-        for tree in self.trees() {
-            conn.sync_tree(tree, true)
-                .await
-                .map_err(|e| e.to_string())?;
+        let duplicate = self
+            .conns
+            .borrow()
+            .iter()
+            .any(|existing| existing.peer() == conn.peer());
+        if duplicate {
+            let peer = conn.peer();
+            conn.disconnect().await;
+            return Ok(peer);
         }
+
+        // Register before requesting control: a fast in-memory peer can return
+        // SyncFinished before this future is polled again, and the event pump
+        // needs the capability to schedule the next (keyhive) phase.
+        self.conns.borrow_mut().push(conn.clone());
+        // Every connection runs its own control phase in both directions.
+        // Marking the peer pending immediately also prevents a second live
+        // connection from inheriting an earlier connection's readiness.
+        self.control_phases
+            .borrow_mut()
+            .insert(conn.id(), ControlPhase::AwaitUs);
+        if direction == Direction::Outbound {
+            self.control_initiators.borrow_mut().insert(conn.id());
+        }
+        self.rebuild_ready_peers();
+        // Control first. `SyncFinished` is queued before response persistence
+        // (pinned Subduction core_machine/sync.rs:381-389), so it is not a
+        // durability barrier. Keyhive is requested second; its completion can
+        // only be observed by the pump after a preceding us `TreeUpdated`.
+        conn.sync_tree(us_tree(), true)
+            .await
+            .map_err(|e| e.to_string())?;
         let peer = conn.peer();
-        self.conns.borrow_mut().push(conn);
         Ok(peer)
     }
 
@@ -695,9 +1077,78 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 // neither carries the items, so the engine reads them back
                 // out of its own storage
                 // (subduction_protocol/src/effect.rs:93).
-                AppEvent::TreeUpdated { tree, .. } | AppEvent::SyncFinished { tree, .. } => {
-                    if self.absorb(tree).await {
+                AppEvent::TreeUpdated { tree, .. } => {
+                    let changed = if is_opaque_tree(tree.as_bytes()) {
+                        self.opaque_status(tree.as_bytes()) == Some(true)
+                    } else {
+                        self.absorb(tree).await
+                    };
+                    if tree == us_tree() {
+                        let _reconciled = self.reconcile_opaque().await;
+                    }
+                    if changed {
                         notify(EngineEvent::Changed).await;
+                    }
+                }
+                AppEvent::SyncFinished { conn, tree, status }
+                    if tree == us_tree()
+                        && self.control_phases.borrow().get(&conn)
+                            == Some(&ControlPhase::AwaitUs)
+                        && status == subduction_protocol::effect::SyncStatus::Completed =>
+                {
+                    // CONTRACT: SyncFinished is emitted before the queued
+                    // persist completes (pinned sync.rs:381-389). A handle
+                    // round trip is the barrier; only then may keyhive, and
+                    // later content, be requested from this peer.
+                    let _barrier = self.handle.tree_heads(us_tree()).await;
+                    let changed = self.absorb(us_tree()).await;
+                    let _reconciled = self.reconcile_opaque().await;
+                    if changed {
+                        notify(EngineEvent::Changed).await;
+                    }
+                    self.control_phases
+                        .borrow_mut()
+                        .insert(conn, ControlPhase::AwaitKeyhive);
+                    let connection = self.conns.borrow().iter().find(|c| c.id() == conn).cloned();
+                    if let Some(connection) = connection {
+                        let _queued = connection.sync_tree(keyhive_tree(), true).await;
+                    }
+                }
+                AppEvent::SyncFinished { conn, tree, status }
+                    if tree == keyhive_tree()
+                        && self.control_phases.borrow().get(&conn)
+                            == Some(&ControlPhase::AwaitKeyhive)
+                        && status == subduction_protocol::effect::SyncStatus::Completed =>
+                {
+                    let _barrier = self.handle.tree_heads(keyhive_tree()).await;
+                    let _absorbed = self.absorb(keyhive_tree()).await;
+                    self.control_phases
+                        .borrow_mut()
+                        .insert(conn, ControlPhase::Ready);
+                    self.rebuild_ready_peers();
+                    let connection = self.conns.borrow().iter().find(|c| c.id() == conn).cloned();
+                    let should_send = self.catalog_sent.borrow_mut().insert(conn);
+                    if let Some(connection) = connection
+                        && should_send
+                    {
+                        for batch in encode_catalog(&self.content_trees()) {
+                            let _sent = connection.send_extension(batch).await;
+                        }
+                    }
+                    self.maybe_sync_catalog(conn).await;
+                }
+                AppEvent::ExtensionMessage { conn, peer, bytes } => {
+                    let registered = self.control_phases.borrow().contains_key(&conn);
+                    let member = self.members.borrow().contains(peer.as_bytes());
+                    if retain_catalog(
+                        &mut self.remote_catalogs.borrow_mut(),
+                        &mut self.pending_catalogs.borrow_mut(),
+                        conn,
+                        registered,
+                        member,
+                        &bytes,
+                    ) {
+                        self.maybe_sync_catalog(conn).await;
                     }
                 }
                 // The connection registry is the engine's, so this is where
@@ -706,6 +1157,12 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 // subscribe a tree on it.
                 AppEvent::ConnectionClosed { conn, peer } => {
                     self.conns.borrow_mut().retain(|live| live.id() != conn);
+                    self.control_phases.borrow_mut().remove(&conn);
+                    self.control_initiators.borrow_mut().remove(&conn);
+                    self.remote_catalogs.borrow_mut().remove(&conn);
+                    self.pending_catalogs.borrow_mut().remove(&conn);
+                    self.catalog_sent.borrow_mut().remove(&conn);
+                    self.rebuild_ready_peers();
                     notify(EngineEvent::PeerClosed(peer)).await;
                 }
                 _ => continue,
@@ -824,43 +1281,64 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     /// reason [`Engine::hydrate`] gives: the keyhive events are the material
     /// that turns a blob this device cannot open into one it can.
     pub async fn ingest_items(&self, items: Vec<StoreItem>) -> Result<bool, String> {
+        let initial_generation = self.group_generation.get();
         self.hydrate().await?;
-        self.open_us().await?;
-        let mut by_tree: BTreeMap<SedimentreeId, (Vec<Item>, Vec<Item>)> = BTreeMap::new();
-        let mut fresh = false;
-        // The member keys, read once: the store is not a peer, so nothing
-        // else has checked who authored what it hands back.
-        let members: std::collections::BTreeSet<[u8; 32]> = self.members.borrow().clone();
-        for item in items {
-            if self.accept(&members, &item) {
-                fresh = true;
-                let bucket = by_tree.entry(SedimentreeId::new(item.tree)).or_default();
-                let landing = match item.kind {
-                    ItemKind::Commit => &mut bucket.0,
-                    ItemKind::Fragment => &mut bucket.1,
-                };
-                landing.push(Item {
-                    signed: item.signed,
-                    blob: item.blob,
-                });
-            }
+        if self.group_generation.get() != initial_generation {
+            return Err("group changed during store import".to_string());
         }
-        if !fresh {
-            return Ok(false);
+        self.open_us().await?;
+        if self.group_generation.get() != initial_generation {
+            return Err("group changed during store import".to_string());
+        }
+        let group_generation = *self.name_key.borrow();
+        let mut by_tree: BTreeMap<SedimentreeId, Vec<StoreItem>> = BTreeMap::new();
+        let mut fresh = false;
+        for item in items {
+            by_tree
+                .entry(SedimentreeId::new(item.tree))
+                .or_default()
+                .push(item);
         }
         let mut order: Vec<SedimentreeId> = by_tree.keys().copied().collect();
         order.sort_by_key(|tree| {
-            if *tree == keyhive_tree() {
+            if *tree == us_tree() {
                 0
-            } else if *tree == us_tree() {
+            } else if *tree == keyhive_tree() {
                 1
             } else {
                 2
             }
         });
         for tree in order {
-            let (commits, fragments) = by_tree.remove(&tree).unwrap_or_default();
+            if *self.name_key.borrow() != group_generation {
+                return Err("group changed during store import".to_string());
+            }
+            let members = self.members.borrow().clone();
+            let mut commits = Vec::new();
+            let mut fragments = Vec::new();
+            for item in by_tree.remove(&tree).unwrap_or_default() {
+                if !self.accept(&members, &item) {
+                    continue;
+                }
+                fresh = true;
+                let landing = match item.kind {
+                    ItemKind::Commit => &mut commits,
+                    ItemKind::Fragment => &mut fragments,
+                };
+                landing.push(Item {
+                    signed: item.signed,
+                    blob: item.blob,
+                });
+            }
+            if commits.is_empty() && fragments.is_empty() {
+                continue;
+            }
             self.storage.restore(tree, commits, fragments);
+            if is_opaque_tree(tree.as_bytes()) && self.opaque_status(tree.as_bytes()) != Some(true)
+            {
+                self.storage.forget_tree(tree);
+                continue;
+            }
             let (commits, fragments) = self.storage.metadata(tree);
             // Merged, not replaced: `Command::HydrateTree` adds each commit to
             // the resident tree (subduction_protocol/src/core_machine.rs:284),
@@ -869,9 +1347,19 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 .hydrate_tree(tree, commits, fragments)
                 .await
                 .map_err(|e| e.to_string())?;
-            let _landed = self.absorb(tree).await;
+            if *self.name_key.borrow() != group_generation {
+                return Err("group changed during store import".to_string());
+            }
+            if tree == us_tree() {
+                let _landed = self.absorb(tree).await;
+                self.reconcile_opaque().await?;
+            } else if !is_opaque_tree(tree.as_bytes()) {
+                let _landed = self.absorb(tree).await;
+            } else if self.opaque_status(tree.as_bytes()) != Some(true) {
+                self.retire_tree(*tree.as_bytes()).await?;
+            }
         }
-        Ok(true)
+        Ok(fresh)
     }
 
     /// Whether one item a store handed back may be installed, and is news.
@@ -909,22 +1397,26 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     /// A failing item is skipped, not fatal: the folder is the user's own
     /// Drive and one bad object must not stop the rest from landing.
     fn accept(&self, members: &std::collections::BTreeSet<[u8; 32]>, item: &StoreItem) -> bool {
+        if !valid_item(members, item) || !self.item_publishable(item) {
+            return false;
+        }
+        if is_opaque_tree(&item.tree)
+            && opaque::mode(&self.opaque, &item.tree) == Some(OpaqueMode::CallerEncrypted)
+        {
+            let Some(payload) =
+                verify::<sedimentree_core::loose_commit::LooseCommit>(&item.signed, members)
+            else {
+                return false;
+            };
+            let parents: Vec<_> = payload.parents().iter().map(|id| *id.as_bytes()).collect();
+            if opaque::item_id(item.tree, &parents, &item.blob) != item.commit {
+                return false;
+            }
+        }
         let tree = SedimentreeId::new(item.tree);
         let id = CommitId::new(item.commit);
-        let blob = BlobMeta::new(&Blob::new(item.blob.clone()));
         match item.kind {
             ItemKind::Commit => {
-                let Some(payload) =
-                    verify::<sedimentree_core::loose_commit::LooseCommit>(&item.signed, members)
-                else {
-                    return false;
-                };
-                if payload.sedimentree_id() != tree
-                    || payload.head() != id
-                    || *payload.blob_meta() != blob
-                {
-                    return false;
-                }
                 // Held is not the whole of "not news": a commit whose change
                 // the document has already applied was read and then pruned
                 // (or never held loose at all, having arrived inside somebody
@@ -932,20 +1424,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 // on every pass. See [`Engine::read_not_held`].
                 !self.storage.holds(tree, id) && !self.read(tree, id)
             }
-            ItemKind::Fragment => {
-                let Some(payload) =
-                    verify::<sedimentree_core::fragment::Fragment>(&item.signed, members)
-                else {
-                    return false;
-                };
-                if payload.sedimentree_id() != tree
-                    || payload.head() != id
-                    || payload.summary().blob_meta() != blob
-                {
-                    return false;
-                }
-                !self.storage.holds_fragment(tree, id)
-            }
+            ItemKind::Fragment => !self.storage.holds_fragment(tree, id),
         }
     }
 
@@ -960,6 +1439,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     /// Async and fallible because it carries this device's keyhive, whose
     /// archive is an async read.
     pub async fn snapshot(&self) -> Result<Snapshot, String> {
+        self.control_barrier().await?;
         // The vault's own state first, and outside the `apps` borrow: reading
         // keyhive's archive is async.
         let vault = match self.vault() {
@@ -986,20 +1466,24 @@ impl<T: Transport<Local> + 'static> Engine<T> {
 
     // -- internals -----------------------------------------------------------
 
-    /// Every tree this device holds a document for.
-    fn trees(&self) -> Vec<SedimentreeId> {
-        let mut trees: Vec<SedimentreeId> = self
+    fn content_trees(&self) -> Vec<SedimentreeId> {
+        let mut trees: Vec<_> = self
             .documents
             .borrow()
             .values()
             .map(Document::tree)
             .collect();
-        if self.us.borrow().is_some() {
-            trees.push(us_tree());
-            // The group's keyhive operations: a peer that cannot ask for them
-            // cannot open a single app envelope this device writes.
-            trees.push(keyhive_tree());
-        }
+        trees.extend(
+            self.opaque
+                .borrow()
+                .registers
+                .iter()
+                .filter_map(|(slot, value)| {
+                    value
+                        .mode
+                        .map(|_| SedimentreeId::new(opaque::tree_id(*slot, value.nonce)))
+                }),
+        );
         trees
     }
 
@@ -1167,6 +1651,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         change: impl FnOnce(&mut UsDoc) -> Result<R, String>,
     ) -> Result<R, String> {
         self.open_us().await?;
+        let _serial = self.control_write.lock().await;
         let (answer, commits) = {
             let mut cell = self.us.borrow_mut();
             let doc = cell
@@ -1176,7 +1661,14 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             (answer, doc.drain_local_commits())
         };
         self.refresh_members();
+        self.control_revision
+            .set(self.control_revision.get().saturating_add(1));
+        // Admission changes before the first await. A queued remote storage
+        // continuation must observe the new register even while its control
+        // commit is still being persisted locally.
+        self.refresh_opaque_admission();
         self.push_us_commits(commits).await?;
+        self.reconcile_opaque().await?;
         // The group document is compacted on the same terms as an app's:
         // `Engine::absorb` covers what arrives, this covers what is written
         // here. A group that reaches a fragment's worth of membership edits
@@ -1190,6 +1682,164 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     fn refresh_members(&self) {
         let keys = self.with_us(|doc| doc.members().into_iter().map(|m| m.key).collect());
         *self.members.borrow_mut() = keys;
+    }
+
+    fn rebuild_ready_peers(&self) {
+        let phases = self.control_phases.borrow();
+        let conns = self.conns.borrow();
+        let mut live: BTreeMap<[u8; 32], (usize, usize)> = BTreeMap::new();
+        for conn in conns.iter() {
+            let counts = live.entry(*conn.peer().as_bytes()).or_default();
+            counts.0 += 1;
+            if phases.get(&conn.id()) == Some(&ControlPhase::Ready) {
+                counts.1 += 1;
+            }
+        }
+        // Conservative duplicate handling: every connection for a peer must
+        // have independently completed control before any may touch opaque
+        // storage. A newly connected duplicate therefore revokes readiness.
+        self.opaque.borrow_mut().ready_peers = live
+            .into_iter()
+            .filter_map(|(peer, (all, ready))| (all == ready).then_some((peer, ready)))
+            .collect();
+    }
+
+    async fn maybe_sync_catalog(&self, id: subduction_protocol::id::ConnId) {
+        let phase = self.control_phases.borrow().get(&id).copied();
+        let remote = self.remote_catalogs.borrow().get(&id).cloned();
+        let Some(remote) = ready_catalog(phase, remote) else {
+            return;
+        };
+        let Some(conn) = self
+            .conns
+            .borrow()
+            .iter()
+            .find(|conn| conn.id() == id)
+            .cloned()
+        else {
+            return;
+        };
+        // Catalog exchange makes preexisting trees discoverable in both
+        // directions. Only the dialer requests their union, avoiding
+        // simultaneous Automerge absorb/anchor cycles while Subduction's diff
+        // remains bidirectional.
+        if !self.control_initiators.borrow().contains(&id) {
+            return;
+        }
+        let mut trees = self.content_trees();
+        trees.extend(remote);
+        trees.sort_unstable();
+        trees.dedup();
+        for tree in trees {
+            if !is_opaque_tree(tree.as_bytes()) || self.opaque_status(tree.as_bytes()) == Some(true)
+            {
+                let _queued = conn.sync_tree(tree, true).await;
+            }
+        }
+    }
+
+    fn next_opaque_nonce(&self, slot: &str) -> [u8; 16] {
+        let mut counter = self.opaque_nonce.borrow_mut();
+        *counter = counter.saturating_add(1);
+        let digest = Sha256::new()
+            .chain_update(b"polyvisor:opaque-nonce:v1\0")
+            .chain_update(self.model_entropy)
+            .chain_update(self.seed)
+            .chain_update(slot.as_bytes())
+            .chain_update(counter.to_be_bytes())
+            .finalize();
+        digest[..16].try_into().expect("fixed digest slice")
+    }
+
+    fn require_current_opaque(&self, tree: &[u8; 32]) -> Result<OpaqueMode, String> {
+        opaque::mode(&self.opaque, tree)
+            .ok_or_else(|| "opaque tree is unknown or retired".to_string())
+    }
+
+    fn refresh_opaque_admission(&self) {
+        let next = self.with_us(UsDoc::opaque_registers);
+        let old = std::mem::replace(&mut self.opaque.borrow_mut().registers, next.clone());
+        for (slot, value) in &old {
+            if value.mode.is_some() {
+                let tree = opaque::tree_id(*slot, value.nonce);
+                if opaque::status(&self.opaque, &tree) != Some(true) {
+                    self.pending_opaque_retire.borrow_mut().insert(tree);
+                }
+            }
+        }
+        self.pending_opaque_subscribe.borrow_mut().extend(
+            next.iter()
+                .filter_map(|(slot, value)| (old.get(slot) != Some(value)).then_some(*slot)),
+        );
+    }
+
+    async fn reconcile_opaque(&self) -> Result<(), String> {
+        let retired = std::mem::take(&mut *self.pending_opaque_retire.borrow_mut());
+        for tree in retired {
+            self.retire_tree(tree).await?;
+        }
+        let changed = std::mem::take(&mut *self.pending_opaque_subscribe.borrow_mut());
+        let next = self.opaque.borrow().registers.clone();
+        let conns: Vec<_> = self
+            .conns
+            .borrow()
+            .iter()
+            .filter(|conn| {
+                self.control_phases.borrow().get(&conn.id()) == Some(&ControlPhase::Ready)
+            })
+            .cloned()
+            .collect();
+        for (slot, value) in next {
+            if value.mode.is_some() && changed.contains(&slot) {
+                let tree = SedimentreeId::new(opaque::tree_id(slot, value.nonce));
+                for conn in &conns {
+                    if self.opaque_status(tree.as_bytes()) == Some(true) {
+                        conn.sync_tree(tree, true)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn retire_tree(&self, tree: [u8; 32]) -> Result<(), String> {
+        let sedimentree = SedimentreeId::new(tree);
+        let mut crefs: BTreeSet<_> = self
+            .storage
+            .metadata(sedimentree)
+            .0
+            .into_iter()
+            .flat_map(|commit| {
+                std::iter::once(raw_cref(tree, *commit.head().as_bytes()))
+                    .chain(
+                        commit
+                            .parents()
+                            .iter()
+                            .map(|parent| raw_cref(tree, *parent.as_bytes())),
+                    )
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let conns: Vec<_> = self.conns.borrow().clone();
+        for conn in conns {
+            let _unsubscribed = conn.unsubscribe(vec![sedimentree]).await;
+        }
+        self.handle
+            .remove_tree(sedimentree)
+            .await
+            .map_err(|e| e.to_string())?;
+        let _barrier = self
+            .handle
+            .tree_heads(sedimentree)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.storage.forget_tree(sedimentree);
+        if let Some(vault) = self.vault() {
+            vault.forget(std::mem::take(&mut crefs)).await;
+        }
+        Ok(())
     }
 
     /// Hand a restored snapshot's trees to the driver, once. Idempotent: the
@@ -1553,6 +2203,11 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 // A remote change to the group is a change to who may
                 // connect at all: the policy's set moves with it.
                 self.refresh_members();
+                self.control_revision
+                    .set(self.control_revision.get().saturating_add(1));
+                // Synchronous admission refresh: no await may observe the new
+                // control document with the old opaque eligibility map.
+                self.refresh_opaque_admission();
             }
             return landed;
         }
@@ -1778,6 +2433,123 @@ where
     Some(verified.payload().clone())
 }
 
+fn valid_item(members: &BTreeSet<[u8; 32]>, item: &StoreItem) -> bool {
+    let tree = SedimentreeId::new(item.tree);
+    let id = CommitId::new(item.commit);
+    let blob = BlobMeta::new(&Blob::new(item.blob.clone()));
+    match item.kind {
+        ItemKind::Commit => {
+            verify::<sedimentree_core::loose_commit::LooseCommit>(&item.signed, members)
+                .is_some_and(|payload| {
+                    payload.sedimentree_id() == tree
+                        && payload.head() == id
+                        && *payload.blob_meta() == blob
+                })
+        }
+        ItemKind::Fragment => {
+            if is_opaque_tree(&item.tree) {
+                return false;
+            }
+            verify::<sedimentree_core::fragment::Fragment>(&item.signed, members).is_some_and(
+                |payload| {
+                    payload.sedimentree_id() == tree
+                        && payload.head() == id
+                        && payload.summary().blob_meta() == blob
+                },
+            )
+        }
+    }
+}
+
+fn raw_cref(tree: [u8; 32], id: [u8; 32]) -> [u8; 32] {
+    *blake3::Hasher::new()
+        .update(b"polyvisor:opaque-cref:v1\0")
+        .update(&tree)
+        .update(&id)
+        .finalize()
+        .as_bytes()
+}
+
+const CATALOG_PREFIX: &[u8; 4] = b"PVC1";
+const CATALOG_BATCH_TREES: usize = 1024;
+
+fn encode_catalog(trees: &[SedimentreeId]) -> Vec<Vec<u8>> {
+    let batches = trees.len().div_ceil(CATALOG_BATCH_TREES).max(1);
+    (0..batches)
+        .map(|index| {
+            let start = index * CATALOG_BATCH_TREES;
+            let end = trees.len().min(start + CATALOG_BATCH_TREES);
+            let chunk = &trees[start..end];
+            let mut out = Vec::with_capacity(5 + chunk.len() * 32);
+            out.extend_from_slice(CATALOG_PREFIX);
+            out.push(u8::from(index + 1 == batches));
+            for tree in chunk {
+                out.extend_from_slice(tree.as_bytes());
+            }
+            out
+        })
+        .collect()
+}
+
+fn decode_catalog(bytes: &[u8]) -> Option<(bool, Vec<SedimentreeId>)> {
+    let payload = bytes.strip_prefix(CATALOG_PREFIX)?;
+    let (&final_batch, payload) = payload.split_first()?;
+    if final_batch > 1 || payload.len() % 32 != 0 || payload.len() / 32 > CATALOG_BATCH_TREES {
+        return None;
+    }
+    let (chunks, remainder) = payload.as_chunks::<32>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    let trees: Vec<_> = chunks
+        .iter()
+        .map(|chunk| SedimentreeId::new(*chunk))
+        .collect();
+    if trees
+        .iter()
+        .any(|tree| *tree == us_tree() || *tree == keyhive_tree())
+    {
+        return None;
+    }
+    Some((final_batch == 1, trees))
+}
+
+fn retain_catalog(
+    complete: &mut BTreeMap<subduction_protocol::id::ConnId, Vec<SedimentreeId>>,
+    pending: &mut BTreeMap<subduction_protocol::id::ConnId, Vec<SedimentreeId>>,
+    conn: subduction_protocol::id::ConnId,
+    registered: bool,
+    member: bool,
+    bytes: &[u8],
+) -> bool {
+    if !registered || !member || complete.contains_key(&conn) {
+        return false;
+    }
+    let Some((final_batch, trees)) = decode_catalog(bytes) else {
+        pending.remove(&conn);
+        return false;
+    };
+    let accumulated = pending.entry(conn).or_default();
+    accumulated.extend(trees);
+    if !final_batch {
+        return false;
+    }
+    let mut trees = pending.remove(&conn).unwrap_or_default();
+    trees.sort_unstable();
+    trees.dedup();
+    complete.insert(conn, trees);
+    true
+}
+
+fn ready_catalog(
+    phase: Option<ControlPhase>,
+    catalog: Option<Vec<SedimentreeId>>,
+) -> Option<Vec<SedimentreeId>> {
+    (phase == Some(ControlPhase::Ready))
+        .then_some(catalog)
+        .flatten()
+}
+
 /// A domain-separated 32 bytes from the device seed and this run's
 /// randomness.
 fn mix(domain: &[u8], seed: &[u8; 32], entropy: &[u8; 32]) -> [u8; 32] {
@@ -1786,4 +2558,67 @@ fn mix(domain: &[u8], seed: &[u8; 32], entropy: &[u8; 32]) -> [u8; 32] {
     hasher.update(seed);
     hasher.update(entropy);
     hasher.finalize().into()
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use subduction_protocol::id::ConnId;
+
+    #[test]
+    fn catalog_batches_preserve_more_than_one_message_of_trees() {
+        let trees: Vec<_> = (0..2050u32)
+            .map(|index| {
+                let mut id = [0; 32];
+                id[..4].copy_from_slice(&index.to_be_bytes());
+                SedimentreeId::new(id)
+            })
+            .collect();
+        let batches = encode_catalog(&trees);
+        assert_eq!(batches.len(), 3);
+        let conn = ConnId::new(8);
+        let mut complete = BTreeMap::new();
+        let mut pending = BTreeMap::new();
+        for (index, batch) in batches.iter().enumerate() {
+            let completed = retain_catalog(&mut complete, &mut pending, conn, true, true, batch);
+            assert_eq!(completed, index + 1 == batches.len());
+        }
+        assert_eq!(complete.get(&conn), Some(&trees));
+        assert!(!decode_catalog(&batches[0]).unwrap().0);
+        assert!(decode_catalog(&batches[2]).unwrap().0);
+    }
+
+    #[test]
+    fn early_catalog_is_retained_until_local_phase_can_use_it() {
+        let conn = ConnId::new(7);
+        let trees = vec![SedimentreeId::new([7; 32])];
+        let message = encode_catalog(&trees).pop().unwrap();
+        let mut complete = BTreeMap::new();
+        let mut pending = BTreeMap::new();
+
+        // `registered` represents AwaitUs/AwaitKeyhive as well as Ready. The
+        // handler retains this before its later `maybe_sync_catalog` Ready
+        // guard, so an early one-shot catalog is not lost.
+        assert!(retain_catalog(
+            &mut complete,
+            &mut pending,
+            conn,
+            true,
+            true,
+            &message,
+        ));
+        assert_eq!(complete.get(&conn), Some(&trees));
+        assert_eq!(
+            ready_catalog(
+                Some(ControlPhase::AwaitKeyhive),
+                complete.get(&conn).cloned()
+            ),
+            None,
+            "an early catalog is retained but cannot be used before local control is ready"
+        );
+        assert_eq!(
+            ready_catalog(Some(ControlPhase::Ready), complete.get(&conn).cloned()),
+            Some(trees),
+        );
+    }
 }

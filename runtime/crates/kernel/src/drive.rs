@@ -45,19 +45,21 @@
 //! - `POST <api>/upload/drive/v3/files?uploadType=multipart&fields=id`,
 //!   `multipart/related` of a JSON metadata part `{name, parents}` and an
 //!   `application/octet-stream` media part — create an object.
-//! - `GET <api>/drive/v3/files/<id>?alt=media` — read one.
+//! - `GET <api>/drive/v3/files/<id>?alt=media` — read one;
+//! - `DELETE <api>/drive/v3/files/<id>` — remove one (204 or an idempotent
+//!   404).
 //!
 //! An unknown bearer answers 401, which is what drives the one refresh
-//! attempt ([`Kernel::drive_request`]). Nothing here updates or deletes: an
-//! object is named by the item's own digests, so an object that exists is
-//! already the right bytes, and the store is append-only by construction.
+//! attempt ([`Kernel::drive_request`]). Objects are never updated. Opaque
+//! payloads are deleted after their lifecycle register retires them; ordinary
+//! sedimentree history remains append-only.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use data_encoding::{BASE64URL_NOPAD, HEXLOWER};
 use hmac::{Hmac, Mac as _};
-use polyvisor_engine::{ItemKind, StoreItem};
+use polyvisor_engine::{ItemKind, StoreItem, is_opaque_tree};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -533,7 +535,9 @@ impl Kernel {
         }
     }
 
-    /// Pull, then push. Answers whether the pull landed anything.
+    /// Pull control, pull eligible opaque content, push control then content,
+    /// and finally clean up validated retired opaque objects. Answers whether
+    /// either pull landed anything.
     ///
     /// The order matters, and it is the read-back order
     /// (`docs/design.md` §"Read-back and partitions"). A device coming back
@@ -560,18 +564,14 @@ impl Kernel {
 
         let remote = self.drive_list(&folder).await?;
 
-        // Pull: everything the store holds under a name this device cannot
-        // account for. `mine` is derived rather than listed, so an item this
-        // device holds but never pushed is not fetched back.
-        let mine: BTreeSet<String> = engine
+        // Names reveal nothing about object kind. Download the unknown batch,
+        // then separate lifecycle control from opaque payload. In particular,
+        // do not cache an opaque object merely because its slot is unknown:
+        // the control object in this same or a later pass can make it eligible.
+        let held: BTreeSet<String> = engine
             .items()
             .iter()
             .map(|item| object_name(name_key, &item.tree, &item.commit, item.kind))
-            // And the objects for changes this device has read but does not
-            // hold as items — a range a fragment carries instead
-            // (`Engine::read_not_held`). Nothing deletes them from the store,
-            // so without this the pull would fetch the whole compacted range
-            // back on every single pass, to be refused every time.
             .chain(
                 engine
                     .read_not_held()
@@ -579,9 +579,12 @@ impl Kernel {
                     .map(|(tree, commit)| object_name(name_key, tree, commit, ItemKind::Commit)),
             )
             .collect();
-        let mut fetched = Vec::new();
+        let mut downloaded = Vec::new();
         for (id, name) in &remote {
-            if mine.contains(name) || self.drive.borrow().rejected.contains(id) {
+            if engine.name_key().as_ref() != Some(name_key) {
+                return Ok(false);
+            }
+            if held.contains(name) || self.drive.borrow().rejected.contains(id) {
                 continue;
             }
             let Some(bytes) = self.drive_read(id).await? else {
@@ -593,7 +596,7 @@ impl Kernel {
             // is remembered, so the next pass does not fetch it again to
             // reach the same conclusion.
             match serde_json::from_slice::<StoreItem>(&bytes) {
-                Ok(item) => fetched.push(item),
+                Ok(item) => downloaded.push((id.clone(), name.clone(), item)),
                 Err(_) => {
                     let _first = self.drive.borrow_mut().rejected.insert(id.clone());
                 }
@@ -617,37 +620,182 @@ impl Kernel {
             return Ok(false);
         }
 
-        let mut landed = false;
-        if !fetched.is_empty() {
-            landed = engine
-                .ingest_items(fetched)
+        // The user-system register is ordinary signed sedimentree control, so
+        // it is indistinguishable by HMAC name and has to be decoded first.
+        // Ingest all non-opaque items before making any payload decision; the
+        // engine orders keyhive and `us` internally.
+        let control: Vec<StoreItem> = downloaded
+            .iter()
+            .filter(|(_, _, item)| !is_opaque_tree(&item.tree))
+            .map(|(_, _, item)| item.clone())
+            .collect();
+        let mut landed = if control.is_empty() {
+            false
+        } else {
+            engine
+                .ingest_items(control)
+                .await
+                .map_err(Trouble::Hiccup)?
+        };
+        if engine.name_key().as_ref() != Some(name_key) {
+            return Ok(landed);
+        }
+
+        let payload: Vec<StoreItem> = downloaded
+            .iter()
+            .filter(|(_, name, item)| {
+                is_opaque_tree(&item.tree)
+                    && *name == object_name(name_key, &item.tree, &item.commit, item.kind)
+                    && engine.valid_store_item(item)
+                    && engine.opaque_status(&item.tree) == Some(true)
+            })
+            .map(|(_, _, item)| item.clone())
+            .collect();
+        if !payload.is_empty() {
+            landed |= engine
+                .ingest_items(payload)
                 .await
                 .map_err(Trouble::Hiccup)?;
+        }
+        if landed {
             self.drive.borrow_mut().last_pull = self.seams.clock.now_ms();
         }
 
-        // Push: one object per item the store lacks, and never a second
+        // Push: control first, then opaque payload. One object per item the store lacks, and never a second
         // upload of a name it has — the name *is* the item's digest pair, so
         // an object that exists is already these bytes. Read after the pull,
         // so a merge anchor the ingest just authored goes up in this same
         // pass rather than waiting for the next one.
-        let present: BTreeSet<&str> = remote.iter().map(|(_, name)| name.as_str()).collect();
-        let mut pushed = false;
-        for item in engine.items() {
+        let mut present: BTreeSet<String> = remote.iter().map(|(_, name)| name.clone()).collect();
+        let us = *polyvisor_engine::us_tree().as_bytes();
+
+        // A lifecycle mutation can happen while any POST is awaiting Drive.
+        // Keep refreshing the user-system batch until every currently held
+        // control object is physically present. This is the barrier before
+        // opaque content and, separately below, before each cleanup.
+        let mut pushed = self
+            .drive_push_control(&engine, name_key, &folder, &mut present)
+            .await?;
+
+        for item in engine.items().into_iter().filter(|item| item.tree != us) {
+            if engine.name_key().as_ref() != Some(name_key) {
+                return Ok(landed);
+            }
+            if !engine.item_publishable(&item) {
+                continue;
+            }
             let name = object_name(name_key, &item.tree, &item.commit, item.kind);
-            if present.contains(name.as_str()) {
+            if present.contains(&name) {
                 continue;
             }
             let body = serde_json::to_vec(&item)
                 .map_err(|e| Trouble::Hiccup(format!("an item could not be written: {e}")))?;
-            self.drive_create(&folder, &name, body).await?;
+            let id = self.drive_create(&folder, &name, body).await?;
+            present.insert(name);
             pushed = true;
+            // Publication can race a replacement while the POST is in flight.
+            // The returned id is the only safe way to retire that exact object
+            // without waiting for another listing.
+            if engine.name_key().as_ref() != Some(name_key) {
+                // Group adoption invalidates the old pass, but does not grant
+                // authority to erase ordinary history (or even old-group
+                // opaque content) from the folder resolved under the old key.
+                // Leave the completed upload in that old group and retry only
+                // the new group on the next pass.
+                return Ok(landed);
+            }
+            if is_opaque_tree(&item.tree) && !engine.item_publishable(&item) {
+                self.drive_push_control(&engine, name_key, &folder, &mut present)
+                    .await?;
+                if engine.name_key().as_ref() != Some(name_key) {
+                    return Ok(landed);
+                }
+                if engine.opaque_status(&item.tree) == Some(false) {
+                    self.drive_delete(&id).await?;
+                }
+            }
         }
         if pushed {
             self.drive.borrow_mut().last_push = self.seams.clock.now_ms();
         }
 
+        // Delete only objects proved to be ours: the HMAC name agrees with the
+        // signed item, every signed-field/blob check passes, and final control
+        // says the opaque tree is obsolete. Unknown lifecycle state is left
+        // alone and retried on the next pass.
+        for (id, name, item) in downloaded {
+            if engine.name_key().as_ref() != Some(name_key) {
+                return Ok(landed);
+            }
+            if is_opaque_tree(&item.tree)
+                && name == object_name(name_key, &item.tree, &item.commit, item.kind)
+                && engine.valid_store_item(&item)
+                && engine.opaque_status(&item.tree) == Some(false)
+            {
+                self.drive_push_control(&engine, name_key, &folder, &mut present)
+                    .await?;
+                if engine.name_key().as_ref() != Some(name_key) {
+                    return Ok(landed);
+                }
+                if engine.opaque_status(&item.tree) == Some(false) {
+                    self.drive_delete(&id).await?;
+                }
+            }
+        }
+
         Ok(landed)
+    }
+
+    /// Upload the current user-system item batch and repeat if it changed
+    /// while a POST was in flight. Returning is the control-before-content /
+    /// control-before-delete barrier for this pass.
+    async fn drive_push_control(
+        self: &Rc<Self>,
+        engine: &Rc<polyvisor_engine::Engine<polyvisor_engine::DynTransport>>,
+        name_key: &[u8; 32],
+        folder: &str,
+        present: &mut BTreeSet<String>,
+    ) -> Result<bool, Trouble> {
+        let us = *polyvisor_engine::us_tree().as_bytes();
+        let mut pushed = false;
+        loop {
+            if engine.name_key().as_ref() != Some(name_key) {
+                return Ok(pushed);
+            }
+            // The register becomes visible to admission before its signed us
+            // commit is submitted. Wait for that submission before taking the
+            // batch that authorizes any following content upload or deletion.
+            engine.control_barrier().await.map_err(Trouble::Hiccup)?;
+            if engine.name_key().as_ref() != Some(name_key) {
+                return Ok(pushed);
+            }
+            let revision = engine.control_revision();
+            let control: Vec<StoreItem> = engine
+                .items()
+                .into_iter()
+                .filter(|item| item.tree == us && engine.item_publishable(item))
+                .collect();
+            for item in control {
+                let name = object_name(name_key, &item.tree, &item.commit, item.kind);
+                if present.contains(&name) {
+                    continue;
+                }
+                let body = serde_json::to_vec(&item)
+                    .map_err(|e| Trouble::Hiccup(format!("an item could not be written: {e}")))?;
+                self.drive_create(folder, &name, body).await?;
+                present.insert(name);
+                pushed = true;
+                if engine.name_key().as_ref() != Some(name_key) {
+                    return Ok(pushed);
+                }
+            }
+            if engine.control_revision() != revision {
+                continue;
+            }
+            // Stable revision means the batch just scanned still represents
+            // current control, and every absent object in it was uploaded.
+            return Ok(pushed);
+        }
     }
 
     // -- the Drive client ----------------------------------------------------
@@ -765,7 +913,7 @@ impl Kernel {
         folder: &str,
         name: &str,
         body: Vec<u8>,
-    ) -> Result<(), Trouble> {
+    ) -> Result<String, Trouble> {
         let meta = serde_json::json!({ "name": name, "parents": [folder] }).to_string();
         let mut multipart = Vec::new();
         multipart.extend_from_slice(
@@ -794,8 +942,30 @@ impl Kernel {
                 multipart,
             )
             .await?;
-        let _id = json(&response, "write to the store")?;
-        Ok(())
+        json(&response, "write to the store")?
+            .get("id")
+            .and_then(|id| id.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| Trouble::Hiccup("the store answered an object with no id".to_string()))
+    }
+
+    /// Delete one object. A missing object means this cleanup already landed,
+    /// either in an earlier pass or on another device.
+    async fn drive_delete(self: &Rc<Self>, id: &str) -> Result<(), Trouble> {
+        let response = self
+            .drive_request(
+                "DELETE",
+                format!("{}/drive/v3/files/{}", self.drive_config.api(), query(id)),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await?;
+        match response.status {
+            200..=299 | 404 => Ok(()),
+            status => Err(refusal(status, "delete from the store").unwrap_or_else(|| {
+                Trouble::Hiccup(format!("the store answered {status} deleting an object"))
+            })),
+        }
     }
 
     /// One object's bytes. `None` for a 404: an object that went away between

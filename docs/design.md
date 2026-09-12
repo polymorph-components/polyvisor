@@ -284,6 +284,59 @@ pin includes the transitive-authority fix separating relay access from
 group membership. Pairing enrolls a device with the group's current
 decryption heads, allowing it to read the group's history.
 
+### Opaque histories and disposable trees
+
+Sedimentree is the single content-sync primitive. Automerge is one payload
+consumer; trusted Rust callers can also create/open opaque trees and
+publish/read signed items with causal parents. Opaque items have their own
+snapshot representation and never enter Automerge or its fragment compactor.
+There is no public history WIT or raw-tree compaction policy yet.
+
+Each opaque tree declares its encryption mode. `GroupSealed` seals bytes
+through the existing keyhive document. Its content references are scoped to
+the tree, and readback validates the envelope's references and ancestors
+against signed Sedimentree metadata before following keys. `CallerEncrypted`
+accepts an already-encrypted envelope from trusted runtime code, for the
+future passphrase-encrypted backup consumer; it is not an app plaintext
+bypass. Item identities bind the tree, canonical parent set and payload.
+
+The plaintext `us` document holds one current metadata register per slot:
+sequence, creation nonce, and encryption mode (or disabled). Causally later
+edits win; concurrent edits choose the maximum sequence/nonce value across
+Automerge conflicts. Replacement always mints a fresh tree identity. IDs
+encode a domain-separated 96-bit slot digest and a 128-bit creation nonce
+under a reserved namespace; document trees use a disjoint namespace. Thus
+eligibility can be checked against the current register without retaining a
+retired-tree ledger. Disabled registers remain; payloads never enter control
+history. This changes document IDs without a migration, under the project's
+maturity policy.
+
+Learning the winning register immediately revokes old-tree admission.
+Storage rechecks eligibility when queued work executes, and retirement removes
+resident items and wrapper content-key/cache references. Restore reconciles
+control before restoring raw payload. Peer connections reconcile `us` and
+keyhive before enabling opaque exchange; a one-shot, authenticated tree-ID
+catalog discovers pre-existing content in either direction. Catalog metadata
+is sent in bounded batches of at most 1024 tree IDs; content still travels only
+as ordinary Subduction items. Unknown opaque trees remain retryable after
+control arrives.
+
+Drive pulls control before admitting opaque payloads and publishes durable
+current control before content or cleanup. Correctly named, signed objects
+for known-obsolete trees are deleted, including duplicates. DELETE is
+idempotent on 404; failed cleanup is rediscovered by the next sync, including
+after restart. An upload that races retirement is checked again on completion.
+
+This is cooperating-replica cleanup, not secure remote erasure. Once a replica
+learns the winning control, stale control/content cannot resurrect retired
+payloads; an offline replica can retain and serve its old version until then.
+Keyhive's private, nonserialized content-key cache can retain keys until vault
+teardown, but cannot override eligibility. Group adoption invalidates an
+in-flight old-folder pass; an upload completing there can remain orphaned,
+because joining another group supplies no authority to delete the old group's
+data. Neither this lifecycle nor opaque history implements root recovery,
+identity rotation, or chat semantics.
+
 ## Read-back and partitions
 
 App-tree envelopes are causal: keyhive's premise is that granting an
@@ -345,7 +398,7 @@ full history. Identity is head plus boundary, both functions of the
 change graph, so two devices build the same fragment; the second
 arrival is a no-op locally, and on the store the two land under one
 name and the last write wins, harmlessly, because they carry the same
-range. Nothing deletes from the store, so a device that pushed a range
+range. Compaction does not delete from the store, so a device that pushed a range
 before compacting leaves those objects behind: correct, and no smaller
 — the saving is in what is written from then on, and in what a device
 that compacts before publishing sends at all. The pull skips those

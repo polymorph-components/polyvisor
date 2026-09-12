@@ -12,12 +12,18 @@ use future_form::Local;
 use futures::future::LocalBoxFuture;
 use futures::{executor::LocalPool, task::LocalSpawnExt as _};
 use polyvisor_engine::{
-    AppState, Engine, EngineClock, EngineEvent, EngineNotify, ItemKind, LocalFuture, Snapshot,
-    Spawner, StoreItem, TreeState, document_tree,
+    AppState, Engine, EngineClock, EngineEvent, EngineNotify, ItemKind, LocalFuture, OpaqueMode,
+    Snapshot, Spawner, StoreItem, TreeState, document_tree,
 };
 use polyvisor_todo_model::Snapshot as TaskSnapshot;
 use polyvisor_visor_model as visor;
+use sedimentree_core::{
+    blob::{Blob, BlobMeta},
+    id::SedimentreeId,
+    loose_commit::{LooseCommit, id::CommitId},
+};
 use sha2::Digest as _;
+use subduction_crypto::{signed::Signed, signer::memory::MemorySigner};
 use subduction_protocol::event::Direction;
 use subduction_runtime::memory::transport::MemoryTransport;
 use subduction_runtime::transport::Transport;
@@ -38,6 +44,648 @@ impl EngineClock for TestClock {
     fn sleep(&self, _ms: u64) -> LocalFuture<'_, ()> {
         Box::pin(futures::future::pending())
     }
+}
+
+#[test]
+fn opaque_modes_round_trip_and_restore_without_fragments() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 80, None);
+    let ea = Rc::clone(&a.engine);
+    let snapshot = pool.run_until(async move {
+        let sealed = ea
+            .opaque_replace("sealed", OpaqueMode::GroupSealed)
+            .await
+            .unwrap();
+        let first = ea
+            .opaque_publish(sealed, vec![], b"first".to_vec())
+            .await
+            .unwrap();
+        let second = ea
+            .opaque_publish(sealed, vec![first], b"second".to_vec())
+            .await
+            .unwrap();
+        let caller = ea
+            .opaque_replace("caller", OpaqueMode::CallerEncrypted)
+            .await
+            .unwrap();
+        ea.opaque_publish(caller, vec![], b"already encrypted".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            ea.opaque_read(sealed)
+                .await
+                .unwrap()
+                .iter()
+                .find(|i| i.id == second)
+                .unwrap()
+                .parents,
+            vec![first]
+        );
+        assert_eq!(
+            ea.opaque_read(caller).await.unwrap()[0].bytes,
+            b"already encrypted"
+        );
+        assert!(
+            !ea.items()
+                .iter()
+                .any(|item| item.tree == sealed && item.kind == ItemKind::Fragment)
+        );
+
+        (ea.snapshot().await.unwrap(), sealed)
+    });
+    let restored = device(&pool, 80, Some(snapshot.0));
+    pool.run_until(async move {
+        assert_eq!(
+            restored.engine.opaque_current("sealed").await.unwrap(),
+            Some(snapshot.1)
+        );
+        assert_eq!(
+            restored.engine.opaque_read(snapshot.1).await.unwrap().len(),
+            2
+        );
+    });
+}
+
+#[test]
+fn opaque_retirement_purges_and_does_not_resurrect_from_store() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 81, None);
+    let ea = Rc::clone(&a.engine);
+    pool.run_until(async move {
+        let old = ea
+            .opaque_replace("slot", OpaqueMode::CallerEncrypted)
+            .await
+            .unwrap();
+        ea.opaque_publish(old, vec![], b"old".to_vec())
+            .await
+            .unwrap();
+        let stale = ea
+            .items()
+            .into_iter()
+            .filter(|item| item.tree == old)
+            .collect::<Vec<_>>();
+        let current = ea
+            .opaque_replace("slot", OpaqueMode::CallerEncrypted)
+            .await
+            .unwrap();
+        assert_eq!(ea.opaque_status(&old), Some(false));
+        assert_eq!(ea.opaque_status(&current), Some(true));
+        assert!(ea.opaque_read(old).await.is_err());
+        assert!(!ea.ingest_items(stale).await.unwrap());
+        assert!(!ea.items().iter().any(|item| item.tree == old));
+        ea.opaque_disable("slot").await.unwrap();
+        assert_eq!(ea.opaque_current("slot").await.unwrap(), None);
+        assert_eq!(ea.opaque_status(&current), Some(false));
+    });
+}
+
+#[test]
+fn opaque_peer_content_and_causal_references_converge_and_notify() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 82, None);
+    let b = device(&pool, 83, None);
+    let (ea, eb, changed) = (
+        Rc::clone(&a.engine),
+        Rc::clone(&b.engine),
+        Rc::clone(&b.changes),
+    );
+    pool.run_until(async move {
+        let tree = ea
+            .opaque_replace("peer", OpaqueMode::GroupSealed)
+            .await
+            .unwrap();
+        enroll(&ea, &eb).await;
+        assert_eq!(eb.opaque_current("peer").await.unwrap(), Some(tree));
+        wire_only(&ea, &eb).await;
+        let first = ea
+            .opaque_publish(tree, vec![], b"first".to_vec())
+            .await
+            .unwrap();
+        assert!(
+            ea.items()
+                .iter()
+                .find(|item| item.tree == tree && item.commit == first)
+                .is_some_and(|item| item.blob != b"first"),
+            "group-sealed opaque plaintext reached storage"
+        );
+        let second = ea
+            .opaque_publish(tree, vec![first], b"second".to_vec())
+            .await
+            .unwrap();
+        let seen = until(|| async {
+            let items = eb.opaque_read(tree).await.ok()?;
+            (items.len() == 2).then_some(items)
+        })
+        .await;
+        assert_eq!(
+            seen.iter().find(|item| item.id == second).unwrap().parents,
+            vec![first]
+        );
+        assert!(
+            changed.get() > 0,
+            "opaque receipt did not notify the kernel"
+        );
+    });
+}
+
+#[test]
+fn opaque_parent_identity_is_a_canonical_set() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 84, None);
+    let ea = Rc::clone(&a.engine);
+    pool.run_until(async move {
+        let tree = ea
+            .opaque_replace("canonical", OpaqueMode::CallerEncrypted)
+            .await
+            .unwrap();
+        let parent_a = ea
+            .opaque_publish(tree, vec![], b"parent a".to_vec())
+            .await
+            .unwrap();
+        let parent_b = ea
+            .opaque_publish(tree, vec![], b"parent b".to_vec())
+            .await
+            .unwrap();
+        let first = ea
+            .opaque_publish(
+                tree,
+                vec![parent_b, parent_a, parent_b],
+                b"payload".to_vec(),
+            )
+            .await
+            .unwrap();
+        let second = ea
+            .opaque_publish(tree, vec![parent_a, parent_b], b"payload".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        let item = ea
+            .opaque_read(tree)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == first)
+            .unwrap();
+        let mut expected = vec![parent_a, parent_b];
+        expected.sort_unstable();
+        assert_eq!(item.parents, expected);
+    });
+}
+
+#[test]
+fn group_sealed_multi_parent_set_survives_peer_and_restore() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 106, None);
+    let b = device(&pool, 107, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    let (snapshot, tree, child, expected) = pool.run_until(async move {
+        enroll(&ea, &eb).await;
+        let tree = ea
+            .opaque_replace("sealed-canonical", OpaqueMode::GroupSealed)
+            .await
+            .unwrap();
+        eb.ingest_items(ea.items()).await.unwrap();
+        let parent_a = ea
+            .opaque_publish(tree, vec![], b"parent a".to_vec())
+            .await
+            .unwrap();
+        let parent_b = ea
+            .opaque_publish(tree, vec![], b"parent b".to_vec())
+            .await
+            .unwrap();
+        let child = ea
+            .opaque_publish(
+                tree,
+                vec![parent_b, parent_a, parent_b],
+                b"multi-parent".to_vec(),
+            )
+            .await
+            .unwrap();
+        eb.ingest_items(ea.items()).await.unwrap();
+        let mut expected = vec![parent_a, parent_b];
+        expected.sort_unstable();
+        assert_eq!(
+            eb.opaque_read(tree)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == child)
+                .unwrap()
+                .parents,
+            expected
+        );
+        (ea.snapshot().await.unwrap(), tree, child, expected)
+    });
+    let restored = device(&pool, 106, Some(snapshot));
+    pool.run_until(async move {
+        assert_eq!(
+            restored
+                .engine
+                .opaque_read(tree)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|item| item.id == child)
+                .unwrap()
+                .parents,
+            expected
+        );
+    });
+}
+
+fn tree_items(engine: &TestEngine, tree: [u8; 32]) -> Vec<StoreItem> {
+    engine
+        .items()
+        .into_iter()
+        .filter(|item| item.tree == tree)
+        .collect()
+}
+
+#[test]
+fn concurrent_opaque_register_winners_do_not_roll_back_on_stale_replay() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 85, None);
+    let b = device(&pool, 86, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        enroll(&ea, &eb).await;
+        let baseline_a: std::collections::BTreeSet<_> =
+            tree_items(&ea, *polyvisor_engine::us_tree().as_bytes())
+                .into_iter()
+                .map(|item| item.commit)
+                .collect();
+        let baseline_b: std::collections::BTreeSet<_> =
+            tree_items(&eb, *polyvisor_engine::us_tree().as_bytes())
+                .into_iter()
+                .map(|item| item.commit)
+                .collect();
+        let a_tree = ea
+            .opaque_replace("race", OpaqueMode::CallerEncrypted)
+            .await
+            .unwrap();
+        let _b_tree = eb
+            .opaque_replace("race", OpaqueMode::GroupSealed)
+            .await
+            .unwrap();
+        let a_control = tree_items(&ea, *polyvisor_engine::us_tree().as_bytes())
+            .into_iter()
+            .filter(|item| !baseline_a.contains(&item.commit))
+            .collect::<Vec<_>>();
+        let b_control = tree_items(&eb, *polyvisor_engine::us_tree().as_bytes())
+            .into_iter()
+            .filter(|item| !baseline_b.contains(&item.commit))
+            .collect::<Vec<_>>();
+        ea.ingest_items(b_control.clone()).await.unwrap();
+        eb.ingest_items(a_control.clone()).await.unwrap();
+        let winner = ea.opaque_current("race").await.unwrap();
+        assert_eq!(winner, eb.opaque_current("race").await.unwrap());
+
+        // A causally later disable beats either concurrent replacement. Old
+        // controls replayed afterwards cannot resurrect either tree.
+        ea.opaque_disable("race").await.unwrap();
+        let disable = tree_items(&ea, *polyvisor_engine::us_tree().as_bytes());
+        eb.ingest_items(disable).await.unwrap();
+        ea.ingest_items(a_control).await.unwrap();
+        ea.ingest_items(b_control).await.unwrap();
+        assert_eq!(ea.opaque_current("race").await.unwrap(), None);
+        assert_eq!(eb.opaque_current("race").await.unwrap(), None);
+        assert_eq!(ea.opaque_status(&a_tree), Some(false));
+    });
+}
+
+#[test]
+fn unknown_raw_becomes_eligible_when_control_is_in_the_same_import() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 87, None);
+    let b = device(&pool, 88, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        enroll(&ea, &eb).await;
+        let tree = ea
+            .opaque_replace("drive", OpaqueMode::CallerEncrypted)
+            .await
+            .unwrap();
+        ea.opaque_publish(tree, vec![], b"synthetic encrypted envelope".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(eb.opaque_status(&tree), None);
+        let import = ea.items();
+        assert!(eb.ingest_items(import).await.unwrap());
+        assert_eq!(eb.opaque_current("drive").await.unwrap(), Some(tree));
+        assert_eq!(eb.opaque_read(tree).await.unwrap().len(), 1);
+    });
+}
+
+#[test]
+fn opaque_created_after_connection_is_discovered_without_explicit_open() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 89, None);
+    let b = device(&pool, 90, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        wire(&ea, &eb).await;
+        let tree = ea
+            .opaque_replace("late", OpaqueMode::CallerEncrypted)
+            .await
+            .unwrap();
+        ea.opaque_publish(tree, vec![], b"synthetic encrypted envelope".to_vec())
+            .await
+            .unwrap();
+        until(|| async {
+            (eb.opaque_current("late").await.ok()? == Some(tree)
+                && eb.opaque_read(tree).await.ok()?.len() == 1)
+                .then_some(())
+        })
+        .await;
+    });
+}
+
+#[test]
+fn preexisting_reverse_side_document_crosses_control_phases() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 91, None);
+    let b = device(&pool, 92, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        enroll(&ea, &eb).await;
+        ea.tasks_items("reverse-only").await.unwrap();
+        eb.tasks_add("reverse-only", "from inbound".into())
+            .await
+            .unwrap();
+        wire_only(&ea, &eb).await;
+        until(|| async {
+            (ea.tasks_items("reverse-only").await.ok()?.items.len() == 1).then_some(())
+        })
+        .await;
+    });
+}
+
+#[test]
+fn preexisting_reverse_side_raw_tree_crosses_catalog_phase() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 101, None);
+    let b = device(&pool, 102, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        enroll(&ea, &eb).await;
+        let tree = eb
+            .opaque_replace("reverse-raw", OpaqueMode::CallerEncrypted)
+            .await
+            .unwrap();
+        ea.ingest_items(tree_items(&eb, *polyvisor_engine::us_tree().as_bytes()))
+            .await
+            .unwrap();
+        eb.opaque_publish(tree, vec![], b"synthetic encrypted envelope".to_vec())
+            .await
+            .unwrap();
+        wire_only(&ea, &eb).await;
+        until(|| async { (ea.opaque_read(tree).await.ok()?.len() == 1).then_some(()) }).await;
+    });
+}
+
+#[test]
+fn duplicate_peer_connection_is_rejected_without_revoking_ready_connection() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 103, None);
+    let b = device(&pool, 104, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        wire(&ea, &eb).await;
+        let (ta, tb) = MemoryTransport::pair();
+        let attempts = futures::join!(
+            ea.connect(ta, Direction::Outbound, Some(eb.verifying_key())),
+            eb.connect(tb, Direction::Inbound, None),
+        );
+        assert!(attempts.0.is_ok() && attempts.1.is_ok());
+        let tree = ea
+            .opaque_replace("after-duplicate", OpaqueMode::CallerEncrypted)
+            .await
+            .unwrap();
+        ea.opaque_publish(tree, vec![], b"synthetic encrypted envelope".to_vec())
+            .await
+            .unwrap();
+        until(|| async { (eb.opaque_read(tree).await.ok()?.len() == 1).then_some(()) }).await;
+    });
+}
+
+#[test]
+fn stale_snapshot_reconnect_learns_retirement_before_old_content_can_publish() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 93, None);
+    let b = device(&pool, 94, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    let (stale, old, current) = pool.run_until(async move {
+        enroll(&ea, &eb).await;
+        let old = ea
+            .opaque_replace("reconnect", OpaqueMode::CallerEncrypted)
+            .await
+            .unwrap();
+        eb.ingest_items(ea.items()).await.unwrap();
+        let stale = eb.snapshot().await.unwrap();
+        let current = ea
+            .opaque_replace("reconnect", OpaqueMode::CallerEncrypted)
+            .await
+            .unwrap();
+        (stale, old, current)
+    });
+    let stale_peer = device(&pool, 94, Some(stale));
+    let ea = Rc::clone(&a.engine);
+    pool.run_until(async move {
+        wire_only(&ea, &stale_peer.engine).await;
+        until(|| async {
+            (stale_peer.engine.opaque_current("reconnect").await.ok()? == Some(current))
+                .then_some(())
+        })
+        .await;
+        assert!(
+            stale_peer
+                .engine
+                .opaque_publish(old, vec![], b"stale".to_vec())
+                .await
+                .is_err()
+        );
+        assert_eq!(stale_peer.engine.opaque_status(&old), Some(false));
+    });
+}
+
+#[test]
+fn raw_identity_and_blob_tampering_are_rejected() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 95, None);
+    let ea = Rc::clone(&a.engine);
+    pool.run_until(async move {
+        let tree = ea
+            .opaque_replace("identity", OpaqueMode::CallerEncrypted)
+            .await
+            .unwrap();
+        ea.opaque_publish(tree, vec![], b"synthetic encrypted envelope".to_vec())
+            .await
+            .unwrap();
+        let item = tree_items(&ea, tree).pop().unwrap();
+        assert!(ea.valid_store_item(&item));
+        let mut relabelled = item.clone();
+        relabelled.commit = [7; 32];
+        assert!(!ea.valid_store_item(&relabelled));
+        let mut swapped = item;
+        swapped.blob.push(0);
+        assert!(!ea.valid_store_item(&swapped));
+
+        // A member can sign arbitrary metadata. Signature validity is not
+        // enough: CallerEncrypted identity is derived from tree/parents/blob.
+        let blob = b"synthetic encrypted envelope".to_vec();
+        let forged = LooseCommit::new(
+            SedimentreeId::new(tree),
+            CommitId::new([9; 32]),
+            Default::default(),
+            BlobMeta::new(&Blob::new(blob.clone())),
+        );
+        let signed = Signed::seal::<Local, _>(&MemorySigner::from_bytes(&[95; 32]), forged)
+            .await
+            .into_signed();
+        let forged = StoreItem {
+            tree,
+            commit: [9; 32],
+            signed: signed.as_bytes().to_vec(),
+            blob,
+            kind: ItemKind::Commit,
+        };
+        assert!(!ea.ingest_items(vec![forged]).await.unwrap());
+        assert!(
+            !ea.items()
+                .iter()
+                .any(|item| item.tree == tree && item.commit == [9; 32])
+        );
+    });
+}
+
+#[test]
+fn concurrent_replace_and_disable_choose_one_winner_and_stale_control_cannot_reverse_it() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 96, None);
+    let b = device(&pool, 97, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        enroll(&ea, &eb).await;
+        let baseline: std::collections::BTreeSet<_> =
+            tree_items(&ea, *polyvisor_engine::us_tree().as_bytes())
+                .into_iter()
+                .map(|item| item.commit)
+                .collect();
+        ea.opaque_replace("mixed-race", OpaqueMode::CallerEncrypted)
+            .await
+            .unwrap();
+        eb.opaque_disable("mixed-race").await.unwrap();
+        let a_control = tree_items(&ea, *polyvisor_engine::us_tree().as_bytes())
+            .into_iter()
+            .filter(|item| !baseline.contains(&item.commit))
+            .collect::<Vec<_>>();
+        let b_control = tree_items(&eb, *polyvisor_engine::us_tree().as_bytes())
+            .into_iter()
+            .filter(|item| !baseline.contains(&item.commit))
+            .collect::<Vec<_>>();
+        ea.ingest_items(b_control.clone()).await.unwrap();
+        eb.ingest_items(a_control.clone()).await.unwrap();
+        let winner = ea.opaque_current("mixed-race").await.unwrap();
+        assert_eq!(winner, eb.opaque_current("mixed-race").await.unwrap());
+        ea.ingest_items(a_control).await.unwrap();
+        eb.ingest_items(b_control).await.unwrap();
+        assert_eq!(ea.opaque_current("mixed-race").await.unwrap(), winner);
+        assert_eq!(eb.opaque_current("mixed-race").await.unwrap(), winner);
+    });
+}
+
+#[test]
+fn queued_same_slot_replacements_take_distinct_increasing_sequences() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 105, None);
+    let ea = Rc::clone(&a.engine);
+    pool.run_until(async move {
+        let (first, second) = futures::join!(
+            ea.opaque_replace("serialized", OpaqueMode::CallerEncrypted),
+            ea.opaque_replace("serialized", OpaqueMode::GroupSealed),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_ne!(first, second);
+        let winner = ea.opaque_current("serialized").await.unwrap().unwrap();
+        assert!(winner == first || winner == second);
+        let loser = if winner == first { second } else { first };
+        assert_eq!(ea.opaque_status(&winner), Some(true));
+        assert_eq!(ea.opaque_status(&loser), Some(false));
+    });
+}
+
+#[test]
+fn publication_racing_replacement_leaves_no_retired_payload() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 98, None);
+    let ea = Rc::clone(&a.engine);
+    pool.run_until(async move {
+        let old = ea
+            .opaque_replace("publish-race", OpaqueMode::GroupSealed)
+            .await
+            .unwrap();
+        let (published, replacement) = futures::join!(
+            ea.opaque_publish(old, vec![], b"racing payload".to_vec()),
+            ea.opaque_replace("publish-race", OpaqueMode::GroupSealed),
+        );
+        let current = replacement.unwrap();
+        assert_ne!(old, current);
+        assert_eq!(ea.opaque_status(&old), Some(false));
+        assert!(tree_items(&ea, old).is_empty());
+        if published.is_ok() {
+            assert!(ea.opaque_read(old).await.is_err());
+        }
+    });
+}
+
+#[test]
+fn retirement_clears_missing_ancestor_frontier_entries() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 99, None);
+    let b = device(&pool, 100, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        enroll(&ea, &eb).await;
+        let tree = ea
+            .opaque_replace("missing-parent", OpaqueMode::GroupSealed)
+            .await
+            .unwrap();
+        eb.ingest_items(ea.items()).await.unwrap();
+        let parent = ea
+            .opaque_publish(tree, vec![], b"parent".to_vec())
+            .await
+            .unwrap();
+        let child = ea
+            .opaque_publish(tree, vec![parent], b"child".to_vec())
+            .await
+            .unwrap();
+        let mut child_only: Vec<_> = ea
+            .items()
+            .into_iter()
+            .filter(|item| item.tree == *polyvisor_engine::keyhive_tree().as_bytes())
+            .collect();
+        child_only.extend(
+            tree_items(&ea, tree)
+                .into_iter()
+                .filter(|item| item.commit == child),
+        );
+        eb.ingest_items(child_only).await.unwrap();
+        assert_eq!(eb.opaque_read(tree).await.unwrap().len(), 1);
+        assert!(
+            eb.has_opaque_entry_point(tree, parent),
+            "missing ancestor key was not retained"
+        );
+        eb.opaque_disable("missing-parent").await.unwrap();
+        assert!(
+            !eb.has_opaque_entry_point(tree, parent),
+            "retirement retained the missing ancestor key"
+        );
+        assert!(
+            !eb.has_opaque_entry_point(tree, child),
+            "retirement retained the child key"
+        );
+    });
 }
 
 type TestEngine = Engine<MemoryTransport>;
@@ -819,6 +1467,7 @@ fn commits_at_rest_are_envelopes_a_stranger_cannot_open() {
         name_key: None,
         keyhive: None,
         vault: None,
+        opaque: Vec::new(),
     };
     let mut pool = LocalPool::new();
     let outsider = device(&pool, 13, Some(stranger));
