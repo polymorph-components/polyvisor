@@ -176,6 +176,55 @@ nothing.
 
 ## Component-owned data models (direction)
 
+### Contacts v0: trusted identity management
+
+Contacts belong to the trusted runtime and visor. Identity establishment,
+key bindings, merges, and introductions signed as the user are permission
+decisions; an ordinary app must not silently perform them. A contacts app
+API waits for an actual consumer. The contact store is a new encrypted
+user document, not part of the plaintext `polyvisor:us` device-membership
+document. Its user signing identity is distinct from device transport
+identities and follows the user's device group.
+
+An introduction is a Protobuf payload containing an issuer `Party`, zero
+or more additional parties, and an issuer-asserted timestamp. Each party
+contains its Ed25519 public key and name/value claims. All assertions are
+the issuer's, including self-claims; inclusion establishes neither the
+subject's consent nor any relationship between other subjects. An issuer
+alone is a self-introduction. The signature covers the domain
+`polyvisor:introduction:v0`, one NUL byte, and the exact payload bytes;
+verification never depends on protobuf reserialization. V0 has no
+additional secrecy beyond transport encryption.
+
+The visor previews and selects claims before signing. Keys are mandatory,
+only name is selected by default, and all other claims require selection.
+A local petname must not silently become a shared name. "Meet now" uses a
+separate encrypted connection, QR/link bootstrap, and explicit mutual
+comparison and acceptance; it never enrolls either participant into the
+other's device group. "Share my contact" exports a portable introduction
+for asynchronous exchange. Temporary rendezvous data belongs to the
+meeting wrapper, not the introduction. Incoming links are processed only
+after unseal and never accept contacts automatically.
+
+On receipt the runtime verifies the introduction transiently, then stores
+only selected extracted observations. Original payloads and signatures
+must never enter document history or checkpoints. The store preserves
+provenance, not transferable proof: claims identify their subject, issuer,
+asserted time, and a stable meeting ID. A separate meeting collection
+records receipt time, source/method, and verification performed. Manual
+edits and contact-list imports have their own provenance; imports cannot
+claim remote authentication. Sharing later creates the user's own signed
+assertions rather than forwarding an earlier issuer's proof.
+
+Local petnames and preferred values are distinct from observed claims and
+are not overwritten by newer third-party assertions. Imported contacts
+can exist without a public key. Key matches can establish identical
+subjects; names, email addresses, and phone numbers alone cannot justify
+an automatic identity merge. The contact screen presents preferred values
+with an inspectable claim and meeting history.
+
+### Domain providers
+
 Task semantics will move out of the engine into an ordinary service component.
 There is no special "data model component" kind or elevated runtime trust tier.
 
@@ -441,6 +490,13 @@ runs under a native shell.
 A Dioxus component that writes a signal it never reads does not subscribe
 to updates. Native tests cannot catch the resulting frozen UI, so visor
 changes require browser verification.
+
+Drawer navigation uses a responsive, collapsible left-side menu for Visor,
+App, and Contacts. The sidebar is contained vertically by the drawer and
+never extends past the strip alongside the app. Sections replace a single
+content pane without horizontal transitions. The strip's left and right
+buttons open App and Visor settings respectively; they are navigation
+shortcuts, not tabs.
 
 ## Routing
 

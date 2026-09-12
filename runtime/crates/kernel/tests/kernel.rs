@@ -12,9 +12,10 @@ use futures::future::LocalBoxFuture;
 use futures::stream::StreamExt as _;
 use futures::{executor::LocalPool, task::LocalSpawnExt as _};
 use polyvisor_kernel::{
-    Accepted, BootConfig, Bound, Clock, Dialed, EngineTransport, Error, ErrorCode, Event, Fetch,
-    Files, HttpResponse, IndexRow, Kernel, LEASE_TTL_MS, LocalFuture, Locks, MetaScope, Net,
-    NetHandle, Phase, Platform, Rest, Rng, Seams, Spawn, State, Tier,
+    Accepted, BootConfig, Bound, Claim, Clock, Dialed, EngineTransport, Error, ErrorCode, Event,
+    Fetch, Files, HttpResponse, IndexRow, Introduction, Kernel, LEASE_TTL_MS, LocalFuture, Locks,
+    MetaScope, Net, NetHandle, Party, Phase, Platform, Rest, Rng, Seams, Selection, Spawn, State,
+    Tier,
 };
 
 // -- harness -----------------------------------------------------------------
@@ -1296,6 +1297,161 @@ impl World {
 /// The default world booted once: the shape most app/session tests want.
 fn boot() -> Rc<Kernel> {
     World::default().boot()
+}
+
+#[test]
+fn contacts_boot_reuses_identity_and_share_signs_the_exact_card() {
+    let world = World::default();
+    let kernel = world.boot();
+    let first = block_on(kernel.contacts_profile()).unwrap().public_key;
+    let card = Party {
+        public_key: first,
+        claims: vec![Claim {
+            name: "name".into(),
+            value: "Ada".into(),
+        }],
+    };
+    let signed = block_on(kernel.contacts_share(Introduction {
+        issuer: card.clone(),
+        parties: Vec::new(),
+        issued_at: polyvisor_kernel::ClaimedTime {
+            seconds: 0,
+            nanos: 0,
+        },
+    }))
+    .unwrap();
+    let verified = polyvisor_contacts_model::verify(&signed).unwrap();
+    assert_eq!(verified.issuer, card);
+    drop(kernel);
+    let second = world.boot();
+    assert_eq!(
+        block_on(second.contacts_profile()).unwrap().public_key,
+        first
+    );
+}
+
+#[test]
+fn contacts_import_selects_claims_and_shares_one_meeting() {
+    let kernel = boot();
+    let json = br#"[{"claims":[{"name":"name","value":"Ada"},{"name":"email","value":"a@example.test"}]},{"claims":[{"name":"name","value":"Grace"}]}]"#.to_vec();
+    let ids = block_on(kernel.contacts_import_accept(
+        json,
+        "contacts.json".into(),
+        vec![
+            Selection {
+                index: 0,
+                claims: vec![("email".into(), "a@example.test".into())],
+            },
+            Selection {
+                index: 1,
+                claims: vec![("name".into(), "Grace".into())],
+            },
+        ],
+    ))
+    .unwrap();
+    assert_eq!(ids.len(), 2);
+    let contacts = block_on(kernel.contacts_items()).unwrap();
+    assert_eq!(
+        contacts.iter().map(|c| c.observations.len()).sum::<usize>(),
+        2
+    );
+    let meeting_ids: BTreeSet<_> = contacts
+        .iter()
+        .flat_map(|c| c.observations.iter().map(|o| o.meeting.clone()))
+        .collect();
+    assert_eq!(meeting_ids.len(), 1);
+    assert_eq!(block_on(kernel.contacts_meetings()).unwrap().len(), 1);
+}
+
+#[test]
+fn concurrent_contacts_mutations_wait_for_the_durable_followup() {
+    let world = World::default();
+    let kernel = world.boot();
+    world.forget_writes();
+    block_on(async {
+        let writes = async {
+            let first = kernel.contacts_create(Vec::new(), "one".into());
+            let second = kernel.contacts_create(Vec::new(), "two".into());
+            let (first, second) = futures::future::join(first, second).await;
+            first.unwrap();
+            second.unwrap();
+        };
+        let timeout = async {
+            for _ in 0..8192 {
+                yield_now().await;
+            }
+        };
+        futures::pin_mut!(writes, timeout);
+        match futures::future::select(writes, timeout).await {
+            futures::future::Either::Left(_) => {}
+            futures::future::Either::Right(_) => panic!("durable checkpoint callers deadlocked"),
+        }
+    });
+    assert_eq!(world.peak_writes(), 1);
+    assert_eq!(
+        world.checkpoints(),
+        2,
+        "the coalesced caller awaited its follow-up pass"
+    );
+    assert_eq!(block_on(kernel.contacts_items()).unwrap().len(), 2);
+}
+
+#[test]
+fn coalesced_durable_contact_writer_receives_the_checkpoint_failure() {
+    let world = World::default();
+    let kernel = world.boot();
+    world.forget_writes();
+    block_on(async {
+        let first = kernel.contacts_create(Vec::new(), "one".into());
+        let coalesced = async {
+            while world.files.in_flight.get() == 0 {
+                yield_now().await;
+            }
+            // The active checkpoint's state write is already in flight. Fail
+            // its next write while a second mutation joins that checkpoint.
+            world.files.fail_next_writes(1);
+            kernel.contacts_create(Vec::new(), "two".into()).await
+        };
+        let (first, second) = futures::future::join(first, coalesced).await;
+        assert_eq!(
+            first.unwrap_err().message,
+            "this device's state could not be written"
+        );
+        assert_eq!(
+            second.unwrap_err().message,
+            "this device's state could not be written"
+        );
+    });
+    assert_eq!(
+        world.pointer(ID),
+        2,
+        "the failed checkpoint was not committed"
+    );
+}
+
+#[test]
+fn pairing_adopts_the_founders_contacts_identity_and_document() {
+    let here = World::default();
+    let there = here.peer();
+    let joiner = here.boot();
+    let adder = there.boot();
+    settle();
+
+    let founder_key = block_on(adder.contacts_profile()).unwrap().public_key;
+    let contact_id = block_on(adder.contacts_create(Vec::new(), "friend".into())).unwrap();
+    let joiner_before = block_on(joiner.contacts_profile()).unwrap().public_key;
+    assert_ne!(joiner_before, founder_key);
+
+    pair(&joiner, &adder);
+
+    assert_eq!(
+        block_on(joiner.contacts_profile()).unwrap().public_key,
+        founder_key
+    );
+    assert_eq!(
+        block_on(joiner.contacts_get(contact_id)).unwrap().petname,
+        "friend"
+    );
 }
 
 fn session(kernel: &Kernel) -> u32 {
@@ -2791,7 +2947,7 @@ fn pairing_enrolls_the_joiner_and_the_two_devices_then_sync() {
             .into_iter()
             .filter_map(|event| match event {
                 Event::PairingChanged(phase) => Some(phase),
-                Event::PersonalizationChanged => None,
+                Event::PersonalizationChanged | Event::ContactsChanged => None,
                 other => panic!("unexpected event: {other:?}"),
             })
             .collect();

@@ -4,31 +4,17 @@
 /// What the drawer is showing when it is open. A closed set, so this is an
 /// enum and not an abstraction. `Apps`/`AppInfo` are what the strip's left
 /// half raises and `Settings` what its right half does; `Unseal` and
-/// `Devices` are ceremonies the boot may raise on its own, and `Devices` is
-/// additionally reachable from `Settings`.
+/// `Contacts` is the third top-level section. `Unseal` and `Devices` are
+/// ceremonies the boot may raise on its own, and `Devices` is additionally
+/// reachable from `Settings`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Tenant {
     Apps,
     AppInfo,
     Settings,
+    Contacts,
     Unseal,
     Devices,
-}
-
-impl Tenant {
-    /// Where this tenant sits on the one axis the drawer slides along, so a
-    /// switch has a direction: a sheet reached from the strip's left half
-    /// enters from the left of one reached from its right half, and
-    /// "Other devices" — reached from Settings — enters from the right of
-    /// it. Ties (`Apps`/`AppInfo`, which are the same half) slide the same
-    /// way as any other rightward move; only the sign is read.
-    pub(crate) fn ordinal(self) -> u8 {
-        match self {
-            Tenant::Apps | Tenant::AppInfo => 0,
-            Tenant::Settings | Tenant::Unseal => 1,
-            Tenant::Devices => 2,
-        }
-    }
 }
 
 /// `device.state` from internal.wit, as a plain value: the reducer decides
@@ -285,18 +271,6 @@ mod tests {
         ] {
             assert_eq!(open.reduce(Action::Close, false), Drawer::Closed);
         }
-    }
-
-    /// The slide direction is a sign, and it has to be the one the strip
-    /// implies: the left half's sheets sit left of the right half's, and
-    /// "Other devices" sits right of Settings, which is where it is
-    /// reached from.
-    #[test]
-    fn ordinals_order_the_sheets_left_to_right() {
-        assert_eq!(Tenant::Apps.ordinal(), Tenant::AppInfo.ordinal());
-        assert!(Tenant::Apps.ordinal() < Tenant::Settings.ordinal());
-        assert_eq!(Tenant::Unseal.ordinal(), Tenant::Settings.ordinal());
-        assert!(Tenant::Settings.ordinal() < Tenant::Devices.ordinal());
     }
 
     #[test]

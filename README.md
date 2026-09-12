@@ -27,7 +27,8 @@ confinement.
 |---|---|
 | `wit/` | `polyvisor:app` — the public contract, versioned deliberately |
 | `runtime/wit/` | `polyvisor:internal` — the private contract between this repo's own components and glue |
-| `runtime/` | the `runtime` component: `crates/kernel` (devices, sealing, checkpoints, pairing, sessions), `crates/engine` (history sync over subduction's sans-IO node), `crates/document-history` (shared Automerge adapter), `crates/todo-model` and `crates/visor-model` (domain schemas), `component/` (the world, the iroh transport) |
+| `runtime/` | the `runtime` component: `crates/kernel` (devices, sealing, checkpoints, pairing, contacts, sessions), `crates/engine` (history sync over subduction's sans-IO node), `crates/document-history` (shared Automerge adapter), `crates/{todo,visor,contacts}-model` (domain schemas), `component/` (the world, the iroh transport) |
+| `proto/` | signed introduction wire schema; Rust bindings generated with prost |
 | `visor/` | the `visor` component (trusted pixels) |
 | `apps/` | example/reference apps (`todomvc`) |
 | `web/` | glue TypeScript |
@@ -38,7 +39,40 @@ confinement.
 read it before arguing with anything here.
 
 Run `just --list` for the available recipes; `just e2e` runs the Playwright
-suite against a local iroh relay.
+suite against a local iroh relay. Building the introduction codec requires
+`protoc` (`protobuf-compiler` on Debian/Ubuntu).
+
+## Contacts
+
+The visor's Contacts section manages a private address book shared among
+your paired devices. It records who asserted each claim and how it arrived,
+with local petnames and preferred values kept separately. Original signed
+introductions are verified on import and discarded; only selected claims
+and their provenance are saved.
+
+Use **Share** to choose claims, review an introduction, and export a contact
+file or link. Keys are always included; name is the default shared claim.
+**Meet now** exchanges self-introductions over a live encrypted connection:
+share the QR/link, compare the displayed code, and confirm on both devices.
+Meeting another user does not pair their device into your private group.
+
+**Import** also accepts an unsigned JSON contact list, with optional public
+keys encoded as 64 hexadecimal characters:
+
+```json
+[
+  {
+    "claims": [
+      { "name": "name", "value": "Carol" },
+      { "name": "email", "value": "carol@example.test" }
+    ]
+  }
+]
+```
+
+Unsigned imports are labeled as imported information, not authenticated
+claims from those contacts. Review which identities and claims to keep.
+Keyless entries can be explicitly merged into an established keyed contact.
 
 **Implemented:** three realms with TodoMVC; devices with two
 tiers of rest, sealed OPFS checkpoints and a swept index; `tasks` as an
@@ -48,6 +82,6 @@ that is the sync policy; shared visor personalization in the same sealed
 app-document machinery, with device-specific member labels;
 app content sealed as keyhive/BeeKEM envelopes; Google Drive as a dumb
 ciphertext store (OAuth split between kernel and shell; a fake Drive in
-e2e); app history rolled up as sedimentree fragments. Passkey unseal
-(#166) and recovery kits (#167) are parked as issues. The settings UI is
-deliberately minimal pending a redesign.
+e2e); app history rolled up as sedimentree fragments; private contacts and
+signed introductions in a drawer with responsive sidebar navigation.
+Passkey unseal (#166) and recovery kits (#167) are parked as issues.

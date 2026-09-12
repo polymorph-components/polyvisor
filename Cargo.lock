@@ -1715,6 +1715,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "polyvisor-contacts-model"
+version = "0.1.0"
+dependencies = [
+ "automerge",
+ "ed25519-dalek",
+ "polyvisor-document-history",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "sedimentree_core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "polyvisor-document-history"
 version = "0.1.0"
 dependencies = [
@@ -1766,15 +1782,19 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "argon2",
+ "automerge",
  "blake3",
  "data-encoding",
  "ed25519-dalek",
  "futures",
  "hmac",
+ "polyvisor-contacts-model",
+ "polyvisor-document-history",
  "polyvisor-engine",
  "polyvisor-petname",
  "polyvisor-todo-model",
  "polyvisor-visor-model",
+ "sedimentree_core",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1824,6 +1844,7 @@ dependencies = [
  "dioxus",
  "emojis",
  "polyvisor-petname",
+ "qrcode",
  "stream-dom-dioxus",
  "stream-dom-guest",
  "unicode-segmentation",
@@ -1969,6 +1990,12 @@ dependencies = [
  "prost-types",
  "thiserror 2.0.20",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quote"

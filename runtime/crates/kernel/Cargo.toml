@@ -14,10 +14,13 @@ blake3.workspace = true
 data-encoding.workspace = true
 hmac.workspace = true
 polyvisor-engine = { path = "../engine" }
+polyvisor-contacts-model = { path = "../contacts-model" }
+polyvisor-document-history = { path = "../document-history" }
 polyvisor-petname.workspace = true
 polyvisor-todo-model = { path = "../todo-model" }
 polyvisor-visor-model = { path = "../visor-model" }
 futures.workspace = true
+ed25519-dalek.workspace = true
 subduction_protocol.workspace = true
 argon2.workspace = true
 serde = { version = "1", features = ["derive"] }
@@ -25,5 +28,6 @@ serde_json = "1"
 sha2 = "0.10"
 
 [dev-dependencies]
+automerge.workspace = true
 futures = { workspace = true, features = ["executor"] }
-ed25519-dalek.workspace = true
+sedimentree_core.workspace = true

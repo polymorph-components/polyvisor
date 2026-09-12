@@ -504,6 +504,382 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Provenance {
+    Local,
+    Imported,
+    Verified,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct ClaimedTime {
+    pub(crate) seconds: i64,
+    pub(crate) nanos: u32,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct Observation {
+    pub(crate) name: AppText,
+    pub(crate) value: AppText,
+    pub(crate) provenance: Provenance,
+    pub(crate) issuer: Vec<u8>,
+    pub(crate) claimed: Option<ClaimedTime>,
+    pub(crate) received: u64,
+    pub(crate) meeting: String,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct Contact {
+    pub(crate) id: String,
+    pub(crate) public_key: Vec<u8>,
+    pub(crate) petname: String,
+    pub(crate) observations: Vec<Observation>,
+    pub(crate) preferred: Vec<(String, String)>,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct SelfProfile {
+    pub(crate) public_key: Vec<u8>,
+    pub(crate) observations: Vec<Observation>,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct Party {
+    pub(crate) public_key: Vec<u8>,
+    pub(crate) claims: Vec<(String, String)>,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct Introduction {
+    pub(crate) issuer: Party,
+    pub(crate) parties: Vec<Party>,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct MeetingRecord {
+    pub(crate) id: String,
+    pub(crate) method: String,
+    pub(crate) source: String,
+    pub(crate) source_key: Vec<u8>,
+    pub(crate) occurred: u64,
+    pub(crate) verified: bool,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct ImportParty {
+    pub(crate) index: u32,
+    pub(crate) public_key: Vec<u8>,
+    pub(crate) issuer: Vec<u8>,
+    pub(crate) claimed: Option<ClaimedTime>,
+    pub(crate) provenance: Provenance,
+    pub(crate) claims: Vec<(AppText, AppText)>,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct ImportReview {
+    pub(crate) parties: Vec<ImportParty>,
+    pub(crate) signed: bool,
+    pub(crate) summary: String,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct Selection {
+    pub(crate) index: u32,
+    pub(crate) claims: Vec<(String, String)>,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) enum MeetingPhase {
+    Idle,
+    Offering {
+        generation: u32,
+        link: String,
+    },
+    Dialing(u32),
+    AwaitingConfirm {
+        generation: u32,
+        sas: String,
+        peer_key: Vec<u8>,
+        claims: Vec<(AppText, AppText)>,
+    },
+    AwaitingPeer(u32),
+    Done(String),
+    Failed(String),
+}
+
+impl MeetingPhase {
+    pub(crate) fn generation(&self) -> Option<u32> {
+        match self {
+            Self::Offering { generation, .. }
+            | Self::Dialing(generation)
+            | Self::AwaitingConfirm { generation, .. }
+            | Self::AwaitingPeer(generation) => Some(*generation),
+            Self::Idle | Self::Done(_) | Self::Failed(_) => None,
+        }
+    }
+}
+
+fn provenance(value: api::contacts::Provenance) -> Provenance {
+    match value {
+        api::contacts::Provenance::Local => Provenance::Local,
+        api::contacts::Provenance::Imported => Provenance::Imported,
+        api::contacts::Provenance::Verified => Provenance::Verified,
+    }
+}
+fn observation(value: api::contacts::Observation) -> Observation {
+    Observation {
+        name: AppText::from_kernel(value.name),
+        value: AppText::from_kernel(value.value),
+        provenance: provenance(value.provenance),
+        issuer: value.issuer,
+        claimed: value.claimed.map(|t| ClaimedTime {
+            seconds: t.seconds,
+            nanos: t.nanos,
+        }),
+        received: value.received,
+        meeting: value.meeting,
+    }
+}
+fn contact(value: api::contacts::Contact) -> Contact {
+    Contact {
+        id: value.id,
+        public_key: value.public_key,
+        petname: value.petname,
+        observations: value.observations.into_iter().map(observation).collect(),
+        preferred: value.preferred,
+    }
+}
+fn raw_party(value: Party) -> api::contacts::Party {
+    api::contacts::Party {
+        public_key: value.public_key,
+        claims: value.claims,
+    }
+}
+fn meeting_phase(status: api::types::MeetingStatus) -> MeetingPhase {
+    match status.phase {
+        api::types::MeetingPhase::Idle => MeetingPhase::Idle,
+        api::types::MeetingPhase::Offering(link) => MeetingPhase::Offering {
+            generation: status
+                .generation
+                .expect("active meeting status has a generation"),
+            link,
+        },
+        api::types::MeetingPhase::Dialing => MeetingPhase::Dialing(
+            status
+                .generation
+                .expect("active meeting status has a generation"),
+        ),
+        api::types::MeetingPhase::AwaitingConfirm(review) => MeetingPhase::AwaitingConfirm {
+            generation: status
+                .generation
+                .expect("active meeting status has a generation"),
+            sas: review.sas,
+            peer_key: review.peer_key,
+            claims: review
+                .claims
+                .into_iter()
+                .map(|(n, v)| (AppText::from_kernel(n), AppText::from_kernel(v)))
+                .collect(),
+        },
+        api::types::MeetingPhase::AwaitingPeer => MeetingPhase::AwaitingPeer(
+            status
+                .generation
+                .expect("active meeting status has a generation"),
+        ),
+        api::types::MeetingPhase::Done(id) => MeetingPhase::Done(id),
+        api::types::MeetingPhase::Failed(error) => MeetingPhase::Failed(error),
+    }
+}
+
+pub(crate) async fn contacts_items() -> Result<Vec<Contact>, String> {
+    Ok(api::contacts::items()
+        .await
+        .map_err(message)?
+        .into_iter()
+        .map(contact)
+        .collect())
+}
+pub(crate) async fn contacts_profile() -> Result<SelfProfile, String> {
+    api::contacts::profile()
+        .await
+        .map_err(message)
+        .map(|p| SelfProfile {
+            public_key: p.public_key,
+            observations: p.observations.into_iter().map(observation).collect(),
+        })
+}
+pub(crate) async fn contacts_meetings() -> Result<Vec<MeetingRecord>, String> {
+    Ok(api::contacts::meetings()
+        .await
+        .map_err(message)?
+        .into_iter()
+        .map(|m| MeetingRecord {
+            id: m.id,
+            method: m.method,
+            source: m.source,
+            source_key: m.source_key,
+            occurred: m.occurred,
+            verified: m.verified,
+        })
+        .collect())
+}
+pub(crate) async fn contacts_create(key: Vec<u8>, petname: String) -> Result<String, String> {
+    api::contacts::create(key, petname).await.map_err(message)
+}
+pub(crate) async fn contacts_set_petname(id: String, value: String) -> Result<(), String> {
+    api::contacts::set_petname(id, value).await.map_err(message)
+}
+pub(crate) async fn contacts_set_observation(
+    id: String,
+    name: String,
+    value: String,
+) -> Result<(), String> {
+    api::contacts::set_observation(id, name, value)
+        .await
+        .map_err(message)
+}
+pub(crate) async fn contacts_remove_observation(
+    id: String,
+    name: String,
+    value: String,
+) -> Result<(), String> {
+    api::contacts::remove_observation(id, name, value)
+        .await
+        .map_err(message)
+}
+pub(crate) async fn contacts_set_preferred(
+    id: String,
+    name: String,
+    value: Option<String>,
+) -> Result<(), String> {
+    api::contacts::set_preferred(id, name, value)
+        .await
+        .map_err(message)
+}
+pub(crate) async fn contacts_delete(id: String) -> Result<(), String> {
+    api::contacts::delete(id).await.map_err(message)
+}
+pub(crate) async fn contacts_merge(from: String, into: String) -> Result<(), String> {
+    api::contacts::merge(from, into).await.map_err(message)
+}
+pub(crate) async fn contacts_set_self_observation(
+    name: String,
+    value: String,
+) -> Result<(), String> {
+    api::contacts::set_self_observation(name, value)
+        .await
+        .map_err(message)
+}
+pub(crate) async fn contacts_remove_self_observation(
+    name: String,
+    value: String,
+) -> Result<(), String> {
+    api::contacts::remove_self_observation(name, value)
+        .await
+        .map_err(message)
+}
+pub(crate) async fn contacts_share(value: Introduction) -> Result<Vec<u8>, String> {
+    api::contacts::share(api::contacts::Introduction {
+        issuer: raw_party(value.issuer),
+        parties: value.parties.into_iter().map(raw_party).collect(),
+    })
+    .await
+    .map_err(message)
+}
+pub(crate) async fn contacts_import_preview(bytes: &[u8]) -> Result<ImportReview, String> {
+    api::contacts::import_preview(bytes.to_vec())
+        .await
+        .map_err(message)
+        .map(|r| ImportReview {
+            parties: r
+                .parties
+                .into_iter()
+                .map(|p| ImportParty {
+                    index: p.index,
+                    public_key: p.public_key,
+                    issuer: p.issuer,
+                    claimed: p.claimed.map(|t| ClaimedTime {
+                        seconds: t.seconds,
+                        nanos: t.nanos,
+                    }),
+                    provenance: provenance(p.provenance),
+                    claims: p
+                        .claims
+                        .into_iter()
+                        .map(|(n, v)| (AppText::from_kernel(n), AppText::from_kernel(v)))
+                        .collect(),
+                })
+                .collect(),
+            signed: r.signed,
+            summary: r.summary,
+        })
+}
+pub(crate) async fn decode_link(body: String) -> Result<Vec<u8>, String> {
+    api::contacts::decode_link(body).await.map_err(message)
+}
+pub(crate) async fn contacts_import_accept(
+    bytes: &[u8],
+    source: String,
+    selections: Vec<Selection>,
+) -> Result<Vec<String>, String> {
+    api::contacts::import_accept(
+        bytes.to_vec(),
+        source,
+        selections
+            .into_iter()
+            .map(|s| api::contacts::Selection {
+                index: s.index,
+                claims: s.claims,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .map_err(message)
+}
+pub(crate) async fn meeting_offer(card: Party) -> Result<MeetingPhase, String> {
+    api::meeting::offer(raw_party(card))
+        .await
+        .map_err(message)
+        .map(meeting_phase)
+}
+pub(crate) async fn meeting_join(fragment: String, card: Party) -> Result<MeetingPhase, String> {
+    api::meeting::join(fragment, raw_party(card))
+        .await
+        .map_err(message)
+        .map(meeting_phase)
+}
+pub(crate) async fn meeting_confirm(
+    generation: u32,
+    keep: Vec<(String, String)>,
+) -> Result<(), String> {
+    api::meeting::confirm(generation, keep)
+        .await
+        .map_err(message)
+}
+pub(crate) async fn meeting_cancel(generation: u32) -> Result<(), String> {
+    api::meeting::cancel(generation).await.map_err(message)
+}
+pub(crate) async fn meeting_status() -> Result<MeetingPhase, String> {
+    api::meeting::status()
+        .await
+        .map_err(message)
+        .map(meeting_phase)
+}
+pub(crate) fn page_url() -> String {
+    api::shell::page_url()
+}
+pub(crate) async fn copy_text(text: String) -> Result<(), String> {
+    api::shell::copy_text(text).await.map_err(message)
+}
+pub(crate) async fn read_contact_file() -> Result<Option<(String, Vec<u8>)>, String> {
+    api::shell::read_contact_file().await.map_err(message)
+}
+pub(crate) async fn save_contact_file(name: String, bytes: &[u8]) -> Result<(), String> {
+    api::shell::save_contact_file(name, bytes.to_vec())
+        .await
+        .map_err(message)
+}
+
 /// The next kernel event.
 pub(crate) enum Event {
     /// The pairing ceremony moved (internal.wit `events.pairing-changed`).
@@ -518,6 +894,8 @@ pub(crate) enum Event {
     /// become an `AppText`.
     SessionEnded(SessionId, String),
     PersonalizationChanged,
+    ContactsChanged,
+    MeetingChanged(MeetingPhase),
 }
 
 pub(crate) async fn next_event() -> Event {
@@ -525,5 +903,7 @@ pub(crate) async fn next_event() -> Event {
         api::events::Event::SessionEnded((session, reason)) => Event::SessionEnded(session, reason),
         api::events::Event::PairingChanged(p) => Event::PairingChanged(phase(p)),
         api::events::Event::PersonalizationChanged => Event::PersonalizationChanged,
+        api::events::Event::ContactsChanged => Event::ContactsChanged,
+        api::events::Event::MeetingChanged(p) => Event::MeetingChanged(meeting_phase(p)),
     }
 }

@@ -613,6 +613,306 @@ impl guest::pairing::Guest for Component {
     }
 }
 
+fn contacts_party(value: guest::contacts::Party) -> Result<polyvisor_kernel::Party, Error> {
+    Ok(polyvisor_kernel::Party {
+        public_key: value.public_key.try_into().map_err(|_| Error {
+            code: ErrorCode::Refused,
+            message: "a contact public key must be 32 bytes".into(),
+        })?,
+        claims: value
+            .claims
+            .into_iter()
+            .map(|(name, value)| polyvisor_kernel::Claim { name, value })
+            .collect(),
+    })
+}
+
+fn contacts_provenance(value: polyvisor_kernel::Provenance) -> guest::contacts::Provenance {
+    match value {
+        polyvisor_kernel::Provenance::Local => guest::contacts::Provenance::Local,
+        polyvisor_kernel::Provenance::Imported => guest::contacts::Provenance::Imported,
+        polyvisor_kernel::Provenance::Verified => guest::contacts::Provenance::Verified,
+    }
+}
+
+fn contacts_time(value: polyvisor_kernel::ClaimedTime) -> guest::contacts::ClaimedTime {
+    guest::contacts::ClaimedTime {
+        seconds: value.seconds,
+        nanos: value.nanos,
+    }
+}
+
+fn contacts_observation(value: polyvisor_kernel::Observation) -> guest::contacts::Observation {
+    guest::contacts::Observation {
+        name: value.name,
+        value: value.value,
+        provenance: contacts_provenance(value.provenance),
+        issuer: value.issuer.map(|key| key.to_vec()).unwrap_or_default(),
+        claimed: value.claimed.map(contacts_time),
+        received: value.received,
+        meeting: value.meeting,
+    }
+}
+
+fn contacts_contact(value: polyvisor_kernel::Contact) -> guest::contacts::Contact {
+    guest::contacts::Contact {
+        id: value.id,
+        public_key: value.public_key.map(|key| key.to_vec()).unwrap_or_default(),
+        petname: value.petname,
+        observations: value
+            .observations
+            .into_iter()
+            .map(contacts_observation)
+            .collect(),
+        preferred: value.preferred,
+    }
+}
+
+impl guest::contacts::Guest for Component {
+    async fn items() -> Result<Vec<guest::contacts::Contact>, Error> {
+        Ok(kernel()?
+            .contacts_items()
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .map(contacts_contact)
+            .collect())
+    }
+    async fn get(id: String) -> Result<guest::contacts::Contact, Error> {
+        kernel()?
+            .contacts_get(id)
+            .await
+            .map(contacts_contact)
+            .map_err(map_error)
+    }
+    async fn profile() -> Result<guest::contacts::SelfProfile, Error> {
+        let value = kernel()?.contacts_profile().await.map_err(map_error)?;
+        Ok(guest::contacts::SelfProfile {
+            public_key: value.public_key.to_vec(),
+            observations: value
+                .observations
+                .into_iter()
+                .map(contacts_observation)
+                .collect(),
+        })
+    }
+    async fn meetings() -> Result<Vec<guest::contacts::MeetingRecord>, Error> {
+        Ok(kernel()?
+            .contacts_meetings()
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .map(|value| guest::contacts::MeetingRecord {
+                id: value.id,
+                method: value.method,
+                source: value.source,
+                source_key: value.source_key.map(|key| key.to_vec()).unwrap_or_default(),
+                occurred: value.occurred,
+                verified: value.verified,
+            })
+            .collect())
+    }
+    async fn create(public_key: Vec<u8>, petname: String) -> Result<String, Error> {
+        kernel()?
+            .contacts_create(public_key, petname)
+            .await
+            .map_err(map_error)
+    }
+    async fn set_petname(id: String, petname: String) -> Result<(), Error> {
+        kernel()?
+            .contacts_set_petname(id, petname)
+            .await
+            .map_err(map_error)
+    }
+    async fn set_observation(id: String, name: String, value: String) -> Result<(), Error> {
+        kernel()?
+            .contacts_set_observation(id, name, value)
+            .await
+            .map_err(map_error)
+    }
+    async fn remove_observation(id: String, name: String, value: String) -> Result<(), Error> {
+        kernel()?
+            .contacts_remove_observation(id, name, value)
+            .await
+            .map_err(map_error)
+    }
+    async fn set_preferred(id: String, name: String, value: Option<String>) -> Result<(), Error> {
+        kernel()?
+            .contacts_set_preferred(id, name, value)
+            .await
+            .map_err(map_error)
+    }
+    async fn delete(id: String) -> Result<(), Error> {
+        kernel()?.contacts_delete(id).await.map_err(map_error)
+    }
+    async fn merge(keyless: String, into: String) -> Result<(), Error> {
+        kernel()?
+            .contacts_merge(keyless, into)
+            .await
+            .map_err(map_error)
+    }
+    async fn set_self_observation(name: String, value: String) -> Result<(), Error> {
+        kernel()?
+            .contacts_set_self_observation(name, value)
+            .await
+            .map_err(map_error)
+    }
+    async fn remove_self_observation(name: String, value: String) -> Result<(), Error> {
+        kernel()?
+            .contacts_remove_self_observation(name, value)
+            .await
+            .map_err(map_error)
+    }
+    async fn share(value: guest::contacts::Introduction) -> Result<Vec<u8>, Error> {
+        let issuer = contacts_party(value.issuer)?;
+        let parties = value
+            .parties
+            .into_iter()
+            .map(contacts_party)
+            .collect::<Result<Vec<_>, _>>()?;
+        kernel()?
+            .contacts_share(polyvisor_kernel::Introduction {
+                issuer,
+                parties,
+                issued_at: polyvisor_kernel::ClaimedTime {
+                    seconds: 0,
+                    nanos: 0,
+                },
+            })
+            .await
+            .map_err(map_error)
+    }
+    async fn decode_link(body: String) -> Result<Vec<u8>, Error> {
+        kernel()?
+            .contacts_decode_link(body)
+            .await
+            .map_err(map_error)
+    }
+    async fn import_preview(bytes: Vec<u8>) -> Result<guest::contacts::ImportReview, Error> {
+        let value = kernel()?
+            .contacts_import_preview(bytes)
+            .await
+            .map_err(map_error)?;
+        Ok(guest::contacts::ImportReview {
+            parties: value
+                .parties
+                .into_iter()
+                .map(|party| guest::contacts::ImportParty {
+                    index: party.index,
+                    public_key: party.public_key.map(|key| key.to_vec()).unwrap_or_default(),
+                    issuer: party.issuer.map(|key| key.to_vec()).unwrap_or_default(),
+                    claimed: party.claimed.map(contacts_time),
+                    provenance: contacts_provenance(party.provenance),
+                    claims: party
+                        .claims
+                        .into_iter()
+                        .map(|claim| (claim.name, claim.value))
+                        .collect(),
+                })
+                .collect(),
+            signed: value.signed,
+            summary: value.summary,
+        })
+    }
+    async fn import_accept(
+        bytes: Vec<u8>,
+        source: String,
+        selections: Vec<guest::contacts::Selection>,
+    ) -> Result<Vec<String>, Error> {
+        kernel()?
+            .contacts_import_accept(
+                bytes,
+                source,
+                selections
+                    .into_iter()
+                    .map(|selection| polyvisor_kernel::Selection {
+                        index: selection.index,
+                        claims: selection.claims,
+                    })
+                    .collect(),
+            )
+            .await
+            .map_err(map_error)
+    }
+}
+
+fn meeting_phase(
+    value: polyvisor_kernel::MeetingPhase,
+) -> polyvisor::internal::types::MeetingPhase {
+    use polyvisor::internal::types::{MeetingPhase as Wit, MeetingReview};
+    match value {
+        polyvisor_kernel::MeetingPhase::Idle => Wit::Idle,
+        polyvisor_kernel::MeetingPhase::Offering(offer) => Wit::Offering(offer.link),
+        polyvisor_kernel::MeetingPhase::Dialing(_) => Wit::Dialing,
+        polyvisor_kernel::MeetingPhase::AwaitingConfirm(review) => {
+            Wit::AwaitingConfirm(MeetingReview {
+                sas: review.sas,
+                peer_key: review.peer_key,
+                claims: review.claims,
+            })
+        }
+        polyvisor_kernel::MeetingPhase::AwaitingPeer => Wit::AwaitingPeer,
+        polyvisor_kernel::MeetingPhase::Done(id) => Wit::Done(id),
+        polyvisor_kernel::MeetingPhase::Failed(why) => Wit::Failed(why),
+    }
+}
+
+fn meeting_status(
+    value: polyvisor_kernel::MeetingStatus,
+) -> polyvisor::internal::types::MeetingStatus {
+    let generation = match value.phase {
+        polyvisor_kernel::MeetingPhase::Idle
+        | polyvisor_kernel::MeetingPhase::Done(_)
+        | polyvisor_kernel::MeetingPhase::Failed(_) => None,
+        _ => Some(value.generation),
+    };
+    polyvisor::internal::types::MeetingStatus {
+        generation,
+        phase: meeting_phase(value.phase),
+    }
+}
+
+impl guest::meeting::Guest for Component {
+    async fn offer(
+        card: guest::contacts::Party,
+    ) -> Result<polyvisor::internal::types::MeetingStatus, Error> {
+        kernel()?
+            .meeting_offer(contacts_party(card)?)
+            .await
+            .map(meeting_status)
+            .map_err(map_error)
+    }
+    async fn join(
+        fragment: String,
+        card: guest::contacts::Party,
+    ) -> Result<polyvisor::internal::types::MeetingStatus, Error> {
+        kernel()?
+            .meeting_join(fragment, contacts_party(card)?)
+            .await
+            .map(meeting_status)
+            .map_err(map_error)
+    }
+    async fn confirm(generation: u32, keep: Vec<(String, String)>) -> Result<(), Error> {
+        kernel()?
+            .meeting_confirm(generation, keep)
+            .await
+            .map_err(map_error)
+    }
+    async fn cancel(generation: u32) -> Result<(), Error> {
+        kernel()?
+            .meeting_cancel(generation)
+            .await
+            .map_err(map_error)
+    }
+    async fn status() -> Result<polyvisor::internal::types::MeetingStatus, Error> {
+        kernel()?
+            .meeting_status()
+            .await
+            .map(meeting_status)
+            .map_err(map_error)
+    }
+}
+
 impl guest::storage::Guest for Component {
     async fn status() -> Result<guest::storage::Binding, Error> {
         let binding = kernel()?.storage_status().map_err(map_error)?;
@@ -746,6 +1046,10 @@ impl guest::events::Guest for Component {
             }
             polyvisor_kernel::Event::PersonalizationChanged => {
                 guest::events::Event::PersonalizationChanged
+            }
+            polyvisor_kernel::Event::ContactsChanged => guest::events::Event::ContactsChanged,
+            polyvisor_kernel::Event::MeetingChanged(status) => {
+                guest::events::Event::MeetingChanged(meeting_status(status))
             }
         }
     }
