@@ -55,7 +55,7 @@
 //! key per commit. See [`Vault::advance`].
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use beekem::encrypted::EncryptedContent;
@@ -458,6 +458,10 @@ impl Vault {
         self.heads.borrow().len()
     }
 
+    pub fn holds_entry_point(&self, cref: &Cref) -> bool {
+        self.heads.borrow().contains_key(cref)
+    }
+
     // -- content -------------------------------------------------------------
 
     /// Seal one automerge change as the sedimentree blob that carries it.
@@ -532,6 +536,16 @@ impl Vault {
     /// outside the fragment is not carried by it and must keep its key.
     pub fn cover(&self, members: impl Iterator<Item = Cref>) {
         self.advance(&[], members);
+    }
+
+    /// Remove cached ciphertext and frontier keys belonging to a retired raw
+    /// tree. The sedimentree remains authoritative; retirement makes these
+    /// content references permanently ineligible.
+    pub async fn forget(&self, crefs: impl IntoIterator<Item = Cref>) {
+        for cref in crefs {
+            let _removed = self.store.remove_all(&cref).await;
+            let _key = self.heads.borrow_mut().remove(&cref);
+        }
     }
 
     /// Open as many of `blobs` as this device can.
@@ -712,6 +726,128 @@ impl Vault {
         Ok(opened)
     }
 
+    /// Open caller-authenticated raw commits without letting their envelopes
+    /// name content outside that raw tree.
+    ///
+    /// `parents` is derived from the signed sedimentree metadata and is already
+    /// mapped into the raw tree's scoped content-reference namespace. The
+    /// public ciphertext metadata must name exactly those parents, while an
+    /// envelope may carry keys for only the subset this writer held. Unlike
+    /// [`Vault::open`], this walk does not populate the shared ciphertext store:
+    /// every edge is checked before it is followed, and frontier changes are
+    /// applied only after the whole decryptable batch validates.
+    pub async fn open_raw(
+        &self,
+        blobs: Vec<(Cref, Vec<u8>)>,
+        parents: &BTreeMap<Cref, BTreeSet<Cref>>,
+    ) -> Result<Vec<(Cref, Vec<u8>)>, String> {
+        let Some(doc) = self.kh.get_document(self.doc.get()).await else {
+            return Ok(Vec::new());
+        };
+        let wanted = decode(blobs);
+        let mut encrypted_by_ref = HashMap::new();
+        for (expected, encrypted) in wanted {
+            if encrypted.content_ref != expected {
+                return Err("raw ciphertext content reference does not match signed commit".into());
+            }
+            let expected_parents = parents
+                .get(&expected)
+                .ok_or_else(|| "raw ciphertext has no signed parent metadata".to_string())?;
+            let expected_vec: Vec<_> = expected_parents.iter().copied().collect();
+            if encrypted.pred_refs != keyhive_crypto::digest::Digest::hash(&expected_vec) {
+                return Err("raw ciphertext parents do not match signed commit".into());
+            }
+            encrypted_by_ref.insert(expected, encrypted);
+        }
+
+        let validate = |cref: Cref, plain: &[u8]| -> Result<Envelope<Cref, Vec<u8>>, String> {
+            let envelope: Envelope<Cref, Vec<u8>> =
+                bincode::deserialize(plain).map_err(|e| format!("raw chunk envelope: {e}"))?;
+            let allowed = parents
+                .get(&cref)
+                .ok_or_else(|| "raw envelope has no signed parent metadata".to_string())?;
+            if !envelope
+                .ancestors
+                .keys()
+                .all(|ancestor| allowed.contains(ancestor))
+            {
+                return Err("raw envelope contains an unsigned ancestor".into());
+            }
+            Ok(envelope)
+        };
+
+        let mut opened = BTreeMap::new();
+        let mut reached = Vec::new();
+        let mut ancestors = HashMap::new();
+        let mut queue = VecDeque::new();
+
+        // First use the current epoch. Decryption may populate keyhive's
+        // private, nonserialized decryption-key cache, but no shared content
+        // cache or global frontier changes until all opened envelopes pass the
+        // signed-parent checks below.
+        for (cref, encrypted) in &encrypted_by_ref {
+            if let Ok((plain, key)) = self
+                .kh
+                .try_decrypt_content_keyed(doc.clone(), encrypted)
+                .await
+            {
+                let envelope = validate(*cref, &plain)?;
+                reached.push((*cref, key));
+                for (ancestor, ancestor_key) in envelope.ancestors {
+                    ancestors.insert(ancestor, ancestor_key);
+                    queue.push_back((ancestor, ancestor_key));
+                }
+                opened.insert(*cref, envelope.plaintext);
+            }
+        }
+
+        // Held heads are entry points for commits sealed before this device's
+        // current epoch. Ancestor keys discovered above provide the same entry
+        // point for an older parent in this batch.
+        {
+            let held = self.heads.borrow();
+            for cref in encrypted_by_ref.keys() {
+                if !opened.contains_key(cref)
+                    && let Some(key) = held.get(cref)
+                {
+                    queue.push_back((*cref, *key));
+                }
+            }
+        }
+        while let Some((cref, key)) = queue.pop_front() {
+            if opened.contains_key(&cref) {
+                continue;
+            }
+            let Some(encrypted) = encrypted_by_ref.get(&cref) else {
+                continue;
+            };
+            let Ok(plain) = encrypted.try_decrypt(key) else {
+                continue;
+            };
+            let envelope = validate(cref, &plain)?;
+            for (ancestor, ancestor_key) in envelope.ancestors {
+                ancestors.insert(ancestor, ancestor_key);
+                queue.push_back((ancestor, ancestor_key));
+            }
+            opened.insert(cref, envelope.plaintext);
+        }
+
+        let held: HashSet<_> = self.heads.borrow().keys().copied().collect();
+        let mut covered = HashSet::new();
+        for (cref, key) in ancestors {
+            if opened.contains_key(&cref) || held.contains(&cref) {
+                covered.insert(cref);
+            } else {
+                // Preserve an authenticated parent key whose ciphertext has
+                // not arrived yet; it is the only future entry point.
+                reached.push((cref, key));
+            }
+        }
+        reached.retain(|(cref, _)| !covered.contains(cref));
+        self.advance(&reached, covered.into_iter());
+        Ok(opened.into_iter().collect())
+    }
+
     // -- internals -----------------------------------------------------------
 
     /// Move the readable frontier: `arrived` become heads, `covered` stop
@@ -821,4 +957,81 @@ fn digest<T: Serialize>(value: &T) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&keyhive_crypto::digest::Digest::hash(value).as_slice()[..32]);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::executor::block_on;
+    use keyhive_core::crypto::envelope::Envelope;
+    use keyhive_core::store::ciphertext::CiphertextStore;
+    use keyhive_crypto::symmetric_key::SymmetricKey;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::{Ciphertext, Cref, Local, Vault};
+
+    #[test]
+    fn raw_open_rejects_wrong_identity_and_unsigned_ancestor_without_side_effects() {
+        block_on(async {
+            let vault = Vault::create([1; 32], [2; 32]).await.unwrap();
+            let cref: Cref = [3; 32];
+            let sealed = vault.seal(cref, &[], b"payload".to_vec()).await.unwrap();
+            let mut ciphertext: Ciphertext = bincode::deserialize(&sealed.blob).unwrap();
+            assert!(vault.store.remove_all(&cref).await);
+
+            ciphertext.content_ref = [4; 32];
+            let wrong_blob = bincode::serialize(&ciphertext).unwrap();
+            let parents = BTreeMap::from([(cref, BTreeSet::new())]);
+            assert!(
+                vault
+                    .open_raw(vec![(cref, wrong_blob)], &parents)
+                    .await
+                    .is_err()
+            );
+            assert!(!vault.holds_entry_point(&cref));
+            assert!(
+                CiphertextStore::<Local, Cref, Vec<u8>>::get_ciphertext(&vault.store, &cref)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            let sealed = vault.seal(cref, &[], b"payload".to_vec()).await.unwrap();
+            let mut ciphertext: Ciphertext = bincode::deserialize(&sealed.blob).unwrap();
+            assert!(vault.store.remove_all(&cref).await);
+            let plain = ciphertext.try_decrypt(sealed.key).unwrap();
+            let mut envelope: Envelope<Cref, Vec<u8>> = bincode::deserialize(&plain).unwrap();
+            let unrelated = [9; 32];
+            envelope
+                .ancestors
+                .insert(unrelated, SymmetricKey::from([7; 32]));
+            let mut poisoned = bincode::serialize(&envelope).unwrap();
+            sealed
+                .key
+                .try_encrypt(ciphertext.nonce, &mut poisoned)
+                .unwrap();
+            ciphertext.ciphertext = poisoned;
+
+            let poisoned_blob = bincode::serialize(&ciphertext).unwrap();
+            assert!(
+                vault
+                    .open_raw(vec![(cref, poisoned_blob)], &parents)
+                    .await
+                    .is_err()
+            );
+            assert!(!vault.holds_entry_point(&cref));
+            assert!(!vault.holds_entry_point(&unrelated));
+            assert!(
+                CiphertextStore::<Local, Cref, Vec<u8>>::get_ciphertext(&vault.store, &cref)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                CiphertextStore::<Local, Cref, Vec<u8>>::get_ciphertext(&vault.store, &unrelated)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
 }

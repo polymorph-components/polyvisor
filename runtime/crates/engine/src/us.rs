@@ -19,11 +19,12 @@
 //! with another descends from one founder's, and the `members` object is
 //! that founder's, shared by construction.
 
-use automerge::{ObjType, ROOT, ReadDoc, transaction::Transactable};
+use automerge::{ObjType, ROOT, ReadDoc, ScalarValue, Value, transaction::Transactable};
 use sedimentree_core::{id::SedimentreeId, loose_commit::id::CommitId};
 use sha2::{Digest as _, Sha256};
 use subduction_protocol::command::NewCommit;
 
+use crate::opaque::{RegisterValue, slot_hash};
 use crate::storage::SnapshotStorage;
 use polyvisor_document_history::{Document, actor};
 
@@ -47,6 +48,7 @@ const ENROLLED: &str = "enrolled";
 const KEYHIVE: &str = "keyhive";
 const GROUP: &str = "group";
 const DOC: &str = "doc";
+const OPAQUE_SLOT_PREFIX: &str = "opaque:";
 
 /// The tree every device of one user keeps its group in.
 #[must_use]
@@ -216,6 +218,56 @@ impl UsDoc {
         Some((read(GROUP)?, read(DOC)?))
     }
 
+    /// Winning opaque register values, one per slot. Automerge conflicts are
+    /// deliberately retained; the maximum `(sequence, nonce, mode)` is the
+    /// total-order winner, independent of arrival order.
+    pub(crate) fn opaque_registers(&self) -> std::collections::BTreeMap<[u8; 12], RegisterValue> {
+        let doc = self.core.read();
+        let mut registers = std::collections::BTreeMap::new();
+        for key in doc
+            .keys(ROOT)
+            .filter(|key| key.starts_with(OPAQUE_SLOT_PREFIX))
+        {
+            let Some(slot) = unhex12(&key[OPAQUE_SLOT_PREFIX.len()..]) else {
+                continue;
+            };
+            let winner = doc
+                .get_all(ROOT, &key)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|(value, _)| match value {
+                    Value::Scalar(value) => match value.as_ref() {
+                        ScalarValue::Bytes(bytes) => RegisterValue::decode(bytes),
+                        _ => None,
+                    },
+                    Value::Object(_) => None,
+                })
+                .max();
+            if let Some(winner) = winner {
+                let _old = registers.insert(slot, winner);
+            }
+        }
+        registers
+    }
+
+    pub(crate) fn opaque_register(&self, slot: &str) -> Option<RegisterValue> {
+        self.opaque_registers().get(&slot_hash(slot)).copied()
+    }
+
+    pub(crate) fn set_opaque_register(
+        &mut self,
+        slot: &str,
+        value: RegisterValue,
+    ) -> Result<(), String> {
+        let key = format!("{OPAQUE_SLOT_PREFIX}{}", hex(&slot_hash(slot)));
+        self.core.transact(move |tx| {
+            tx.put(ROOT, key, ScalarValue::Bytes(value.encode()))
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+    }
+
     /// Record the keyhive group and document. Written once, by the device that
     /// founded the group; a joiner adopts the whole document rather than
     /// writing this.
@@ -281,6 +333,27 @@ impl UsDoc {
                 .ok_or_else(|| "this device is not in its group".to_string())?;
             tx.put(&entry, PETNAME, petname).map_err(|e| e.to_string())
         })
+    }
+}
+
+fn unhex12(value: &str) -> Option<[u8; 12]> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 24 {
+        return None;
+    }
+    let mut decoded = [0; 12];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        let pair = bytes.get(index * 2..index * 2 + 2)?;
+        *byte = (nibble(*pair.first()?)? << 4) | nibble(*pair.get(1)?)?;
+    }
+    Some(decoded)
+}
+
+fn nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
     }
 }
 

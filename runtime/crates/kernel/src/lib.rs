@@ -39,7 +39,7 @@ pub use meeting::{
     MEETING_ALPN, MeetingOffer, MeetingReview, Phase as MeetingPhase, Status as MeetingStatus,
 };
 pub use pairing::Phase;
-pub use polyvisor_engine::EngineTransport;
+pub use polyvisor_engine::{EngineTransport, OpaqueItem, OpaqueMode};
 pub use polyvisor_todo_model::{Snapshot, TodoItem};
 pub use store::LEASE_TTL_MS;
 pub use sync::{Member, Peer};
@@ -1319,6 +1319,70 @@ impl Kernel {
     }
 
     // -- app services --------------------------------------------------------
+
+    /// Mint a fresh opaque tree for `slot`, replacing any current tree, and
+    /// durably record the lifecycle mutation before returning it.
+    pub async fn opaque_replace(&self, slot: &str, mode: OpaqueMode) -> Result<[u8; 32], Error> {
+        self.open()?;
+        let tree = self
+            .engine()?
+            .opaque_replace(slot, mode)
+            .await
+            .map_err(engine_failed)?;
+        self.checkpoint_durable().await?;
+        Ok(tree)
+    }
+
+    /// Disable `slot`. The disabled register remains in the user-system
+    /// history; only its retired payload is removed from engine snapshots.
+    pub async fn opaque_disable(&self, slot: &str) -> Result<(), Error> {
+        self.open()?;
+        self.engine()?
+            .opaque_disable(slot)
+            .await
+            .map_err(engine_failed)?;
+        self.checkpoint_durable().await
+    }
+
+    pub async fn opaque_current(&self, slot: &str) -> Result<Option<[u8; 32]>, Error> {
+        self.open()?;
+        self.engine()?
+            .opaque_current(slot)
+            .await
+            .map_err(engine_failed)
+    }
+
+    pub async fn opaque_open(&self, tree: [u8; 32]) -> Result<(), Error> {
+        self.open()?;
+        self.engine()?
+            .opaque_open(tree)
+            .await
+            .map_err(engine_failed)
+    }
+
+    pub async fn opaque_publish(
+        &self,
+        tree: [u8; 32],
+        parents: Vec<[u8; 32]>,
+        bytes: Vec<u8>,
+    ) -> Result<[u8; 32], Error> {
+        self.open()?;
+        let id = self
+            .engine()?
+            .opaque_publish(tree, parents, bytes)
+            .await
+            .map_err(engine_failed)?;
+        self.checkpoint_durable().await?;
+        Ok(id)
+    }
+
+    pub async fn opaque_read(&self, tree: [u8; 32]) -> Result<Vec<OpaqueItem>, Error> {
+        self.open()?;
+        self.engine()?
+            .opaque_read(tree)
+            .await
+            .map_err(engine_failed)
+    }
 
     pub async fn tasks_items(&self, session: SessionId) -> Result<Snapshot, String> {
         let (app, engine) = self.app_engine(session)?;

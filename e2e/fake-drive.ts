@@ -6,8 +6,8 @@
 // the files-API subset `runtime/crates/kernel/src/drive.rs`'s module doc
 // documents and this fake mirrors exactly: `files.list` restricted to the
 // `q` clauses the kernel builds, a JSON folder create, a multipart create,
-// an `alt=media` read — and answers anything else with a 400 naming the
-// shape it was given. A permissive stub would let a store that outgrew
+// an `alt=media` read, and an idempotent object delete — and answers anything
+// else with a 400 naming the shape it was given. A permissive stub would let a store that outgrew
 // this fake pass here and fail at Google; a loud 400 is the whole point.
 //
 // EVERY TOKEN AND CODE HERE IS SYNTHETIC AND LABELLED AS SUCH
@@ -383,6 +383,14 @@ export function startFakeDrive(): FakeDrive {
         status: 200,
         headers: { "content-type": "application/octet-stream" },
       });
+    }
+    if (one && req.method === "DELETE") {
+      // Drive answers 404 when another cleanup pass won the race. The kernel
+      // treats that as the idempotent success it is.
+      const existed = store.delete(decodeURIComponent(one[1]));
+      return existed
+        ? new Response(null, { status: 204 })
+        : driveError(404, "File not found");
     }
     // Everything else, named: a store that grew a request this fake does
     // not implement fails here rather than passing against a stub that

@@ -30,12 +30,13 @@ pub type Members = Rc<RefCell<BTreeSet<[u8; 32]>>>;
 #[derive(Debug, Clone)]
 pub struct GroupPolicy {
     members: Members,
+    lifecycle: crate::opaque::Lifecycle,
 }
 
 impl GroupPolicy {
     #[must_use]
-    pub fn new(members: Members) -> GroupPolicy {
-        GroupPolicy { members }
+    pub fn new(members: Members, lifecycle: crate::opaque::Lifecycle) -> GroupPolicy {
+        GroupPolicy { members, lifecycle }
     }
 }
 
@@ -43,16 +44,25 @@ impl Policy<Local> for GroupPolicy {
     fn authorize(
         &self,
         provenance: &Provenance,
-        _tree: SedimentreeId,
-        _action: StorageAction,
+        tree: SedimentreeId,
+        action: StorageAction,
     ) -> <Local as future_form::FutureForm>::Future<'_, Verdict> {
-        let verdict = match provenance {
-            Provenance::Local => Verdict::Allow,
-            Provenance::Remote(peer) => {
-                if self.members.borrow().contains(peer.as_bytes()) {
-                    Verdict::Allow
-                } else {
-                    Verdict::Deny
+        let retired = crate::opaque::is_opaque_tree(tree.as_bytes())
+            && crate::opaque::status(&self.lifecycle, tree.as_bytes()) != Some(true);
+        let peer_not_ready = matches!(provenance, Provenance::Remote(peer)
+            if crate::opaque::is_opaque_tree(tree.as_bytes())
+                && !self.lifecycle.borrow().ready_peers.contains_key(peer.as_bytes()));
+        let verdict = if (retired || peer_not_ready) && action != StorageAction::Delete {
+            Verdict::Deny
+        } else {
+            match provenance {
+                Provenance::Local => Verdict::Allow,
+                Provenance::Remote(peer) => {
+                    if self.members.borrow().contains(peer.as_bytes()) {
+                        Verdict::Allow
+                    } else {
+                        Verdict::Deny
+                    }
                 }
             }
         };
@@ -78,7 +88,10 @@ mod tests {
         let members: Members = Rc::new(RefCell::new(
             [*member.as_bytes()].into_iter().collect::<BTreeSet<_>>(),
         ));
-        let policy = GroupPolicy::new(Rc::clone(&members));
+        let policy = GroupPolicy::new(
+            Rc::clone(&members),
+            Rc::new(RefCell::new(Default::default())),
+        );
         let tree = SedimentreeId::new([9u8; 32]);
 
         for action in [
@@ -108,6 +121,39 @@ mod tests {
         assert_eq!(
             block_on(policy.authorize(&Provenance::Remote(stranger), tree, StorageAction::Read)),
             Verdict::Allow,
+        );
+    }
+
+    #[test]
+    fn locally_completed_control_allows_opaque_without_catalog_pump_progress() {
+        let member = peer(3);
+        let members: Members = Rc::new(RefCell::new([*member.as_bytes()].into_iter().collect()));
+        let lifecycle = Rc::new(RefCell::new(crate::opaque::LifecycleState::default()));
+        let slot = crate::opaque::slot_hash("paused-pump");
+        let nonce = [5; 16];
+        lifecycle.borrow_mut().registers.insert(
+            slot,
+            crate::opaque::RegisterValue {
+                sequence: 1,
+                nonce,
+                mode: Some(crate::OpaqueMode::CallerEncrypted),
+            },
+        );
+        // This is set by the local SyncFinished phase before catalog send.
+        // Catalog receipt belongs to discovery and is deliberately absent:
+        // a paused app pump on the peer cannot race local admission.
+        lifecycle
+            .borrow_mut()
+            .ready_peers
+            .insert(*member.as_bytes(), 1);
+        let policy = GroupPolicy::new(members, lifecycle);
+        assert_eq!(
+            block_on(policy.authorize(
+                &Provenance::Remote(member),
+                SedimentreeId::new(crate::opaque::tree_id(slot, nonce)),
+                StorageAction::Write,
+            )),
+            Verdict::Allow
         );
     }
 }

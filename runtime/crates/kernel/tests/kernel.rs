@@ -14,8 +14,8 @@ use futures::{executor::LocalPool, task::LocalSpawnExt as _};
 use polyvisor_kernel::{
     Accepted, BootConfig, Bound, Claim, Clock, Dialed, EngineTransport, Error, ErrorCode, Event,
     Fetch, Files, HttpResponse, IndexRow, Introduction, Kernel, LEASE_TTL_MS, LocalFuture, Locks,
-    MetaScope, Net, NetHandle, Party, Phase, Platform, Rest, Rng, Seams, Selection, Spawn, State,
-    Tier,
+    MetaScope, Net, NetHandle, OpaqueMode, Party, Phase, Platform, Rest, Rng, Seams, Selection,
+    Spawn, State, Tier,
 };
 
 // -- harness -----------------------------------------------------------------
@@ -618,6 +618,16 @@ struct FakeFetch {
     /// worlds by cloning the `Rc`: that is what "the same Google account" is
     /// here.
     drive: Option<Rc<FakeDrive>>,
+    upload_gate: Rc<UploadGate>,
+}
+
+#[derive(Default)]
+struct UploadGate {
+    tree: RefCell<Option<[u8; 32]>>,
+    read_tree: RefCell<Option<[u8; 32]>>,
+    waiting: Cell<bool>,
+    open: Cell<bool>,
+    wake: RefCell<Option<std::task::Waker>>,
 }
 
 impl FakeFetch {
@@ -634,6 +644,29 @@ impl FakeFetch {
             ..self
         }
     }
+
+    fn hold_upload(&self, tree: [u8; 32]) {
+        *self.upload_gate.tree.borrow_mut() = Some(tree);
+        self.upload_gate.waiting.set(false);
+        self.upload_gate.open.set(false);
+    }
+
+    fn upload_waiting(&self) -> bool {
+        self.upload_gate.waiting.get()
+    }
+
+    fn hold_read(&self, tree: [u8; 32]) {
+        *self.upload_gate.read_tree.borrow_mut() = Some(tree);
+        self.upload_gate.waiting.set(false);
+        self.upload_gate.open.set(false);
+    }
+
+    fn release_upload(&self) {
+        self.upload_gate.open.set(true);
+        if let Some(wake) = self.upload_gate.wake.borrow_mut().take() {
+            wake.wake();
+        }
+    }
 }
 
 impl Fetch for FakeFetch {
@@ -644,25 +677,68 @@ impl Fetch for FakeFetch {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
     ) -> LocalFuture<'_, Result<HttpResponse, String>> {
-        let answer = match &self.drive {
-            Some(drive) if !url.starts_with(ORIGIN) => drive.answer(&method, &url, &headers, &body),
-            _ => {
-                let found = self.routes.borrow().get(&url).cloned();
-                match found {
-                    Some(body) => HttpResponse {
-                        status: 200,
-                        headers: Vec::new(),
-                        body,
-                    },
-                    None => HttpResponse {
-                        status: 404,
-                        headers: Vec::new(),
-                        body: Vec::new(),
-                    },
-                }
+        let held = method == "POST"
+            && url.contains("/upload/drive/v3/files")
+            && multipart(&body)
+                .and_then(|(_, bytes)| {
+                    serde_json::from_slice::<polyvisor_engine::StoreItem>(&bytes).ok()
+                })
+                .is_some_and(|item| self.upload_gate.tree.borrow().as_ref() == Some(&item.tree));
+        let drive = self.drive.clone();
+        let gate = Rc::clone(&self.upload_gate);
+        Box::pin(async move {
+            if held {
+                futures::future::poll_fn(|cx| {
+                    gate.waiting.set(true);
+                    if gate.open.get() {
+                        Poll::Ready(())
+                    } else {
+                        *gate.wake.borrow_mut() = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                })
+                .await;
+                *gate.tree.borrow_mut() = None;
             }
-        };
-        Box::pin(async move { Ok(answer) })
+            let answer = match &drive {
+                Some(drive) if !url.starts_with(ORIGIN) => {
+                    drive.answer(&method, &url, &headers, &body)
+                }
+                _ => {
+                    let found = self.routes.borrow().get(&url).cloned();
+                    match found {
+                        Some(body) => HttpResponse {
+                            status: 200,
+                            headers: Vec::new(),
+                            body,
+                        },
+                        None => HttpResponse {
+                            status: 404,
+                            headers: Vec::new(),
+                            body: Vec::new(),
+                        },
+                    }
+                }
+            };
+            let held_read = method == "GET"
+                && url.contains("/drive/v3/files/")
+                && serde_json::from_slice::<polyvisor_engine::StoreItem>(&answer.body)
+                    .is_ok_and(|item| gate.read_tree.borrow().as_ref() == Some(&item.tree));
+            if held_read {
+                futures::future::poll_fn(|cx| {
+                    gate.waiting.set(true);
+                    if gate.open.get() {
+                        Poll::Ready(())
+                    } else {
+                        *gate.wake.borrow_mut() = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                })
+                .await;
+                *gate.read_tree.borrow_mut() = None;
+            }
+            Ok(answer)
+        })
     }
 }
 
@@ -737,6 +813,15 @@ struct FakeDrive {
     refresh: RefCell<BTreeSet<String>>,
     /// Every request, as `METHOD path`, so a test can count uploads.
     log: RefCell<Vec<String>>,
+    fail_deletes: Cell<bool>,
+    delete_as_missing: Cell<bool>,
+    events: RefCell<Vec<DriveEvent>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriveEvent {
+    Uploaded([u8; 32]),
+    Deleted,
 }
 
 #[derive(Clone)]
@@ -768,6 +853,18 @@ impl FakeDrive {
         self.refresh.borrow_mut().clear();
     }
 
+    fn fail_next_delete(&self) {
+        self.fail_deletes.set(true);
+    }
+
+    fn allow_deletes(&self) {
+        self.fail_deletes.set(false);
+    }
+
+    fn next_delete_is_already_missing(&self) {
+        self.delete_as_missing.set(true);
+    }
+
     /// How many objects in the store are sedimentree *fragments*. Decoded
     /// rather than matched by name: an object's name is an HMAC of the item
     /// id, and a fragment's id is whatever automerge's change hash happened
@@ -792,6 +889,39 @@ impl FakeDrive {
             .filter(|file| !file.folder)
             .map(|file| file.name.clone())
             .collect()
+    }
+
+    fn objects_for_tree(&self, tree: [u8; 32]) -> usize {
+        self.files
+            .borrow()
+            .values()
+            .filter(|file| !file.folder)
+            .filter(|file| {
+                serde_json::from_slice::<polyvisor_engine::StoreItem>(&file.body)
+                    .is_ok_and(|item| item.tree == tree)
+            })
+            .count()
+    }
+
+    fn objects_named(&self, name: &str) -> usize {
+        self.files
+            .borrow()
+            .values()
+            .filter(|file| !file.folder && file.name == name)
+            .count()
+    }
+
+    fn object_for_tree(&self, tree: [u8; 32]) -> (String, Vec<u8>) {
+        self.files
+            .borrow()
+            .values()
+            .find_map(|file| {
+                (!file.folder
+                    && serde_json::from_slice::<polyvisor_engine::StoreItem>(&file.body)
+                        .is_ok_and(|item| item.tree == tree))
+                .then(|| (file.name.clone(), file.body.clone()))
+            })
+            .expect("an object for the tree")
     }
 
     fn folders(&self) -> Vec<String> {
@@ -855,6 +985,10 @@ impl FakeDrive {
             .count()
     }
 
+    fn events(&self) -> Vec<DriveEvent> {
+        self.events.borrow().clone()
+    }
+
     fn mint(&self, what: &str) -> String {
         self.minted.set(self.minted.get() + 1);
         format!("synthetic-{what}-{}", self.minted.get())
@@ -885,6 +1019,9 @@ impl FakeDrive {
                     ("POST", "/upload/drive/v3/files") => self.create_object(body),
                     ("GET", _) if path.starts_with("/drive/v3/files/") => {
                         self.read(&path["/drive/v3/files/".len()..], query)
+                    }
+                    ("DELETE", _) if path.starts_with("/drive/v3/files/") => {
+                        self.delete(&path["/drive/v3/files/".len()..])
                     }
                     _ => json_response(400, r#"{"error":{"message":"no such Drive request"}}"#),
                 }
@@ -1004,6 +1141,11 @@ impl FakeDrive {
         let name = meta["name"].as_str().unwrap_or_default().to_string();
         let parent = meta["parents"][0].as_str().unwrap_or_default().to_string();
         let id = self.mint("id");
+        if let Ok(item) = serde_json::from_slice::<polyvisor_engine::StoreItem>(&content) {
+            self.events
+                .borrow_mut()
+                .push(DriveEvent::Uploaded(item.tree));
+        }
         self.files.borrow_mut().insert(
             id.clone(),
             FakeFile {
@@ -1025,6 +1167,25 @@ impl FakeDrive {
                 status: 200,
                 headers: Vec::new(),
                 body: file.body.clone(),
+            },
+            None => json_response(404, r#"{"error":{"message":"no such file"}}"#),
+        }
+    }
+
+    fn delete(&self, id: &str) -> HttpResponse {
+        self.events.borrow_mut().push(DriveEvent::Deleted);
+        if self.fail_deletes.get() {
+            return json_response(500, r#"{"error":{"message":"retry deletion"}}"#);
+        }
+        if self.delete_as_missing.replace(false) {
+            let _gone = self.files.borrow_mut().remove(id);
+            return json_response(404, r#"{"error":{"message":"already gone"}}"#);
+        }
+        match self.files.borrow_mut().remove(id) {
+            Some(_) => HttpResponse {
+                status: 204,
+                headers: Vec::new(),
+                body: Vec::new(),
             },
             None => json_response(404, r#"{"error":{"message":"no such file"}}"#),
         }
@@ -3383,6 +3544,310 @@ fn connect_store(kernel: &Rc<Kernel>) -> String {
     block_on(kernel.oauth_complete("synthetic-code-1".to_string(), state)).unwrap();
     settle();
     url
+}
+
+#[test]
+fn opaque_roundtrip_and_lifecycle_survive_checkpoint_restore() {
+    let world = World::default();
+    let kernel = world.boot();
+    let tree = block_on(kernel.opaque_replace("test-slot", OpaqueMode::CallerEncrypted)).unwrap();
+    let id =
+        block_on(kernel.opaque_publish(tree, Vec::new(), b"opaque envelope".to_vec())).unwrap();
+    assert_eq!(
+        block_on(kernel.opaque_read(tree)).unwrap(),
+        vec![polyvisor_kernel::OpaqueItem {
+            id,
+            parents: Vec::new(),
+            bytes: b"opaque envelope".to_vec(),
+        }]
+    );
+
+    drop(kernel);
+    let restored = world.boot();
+    assert_eq!(
+        block_on(restored.opaque_current("test-slot")).unwrap(),
+        Some(tree)
+    );
+    assert_eq!(block_on(restored.opaque_read(tree)).unwrap()[0].id, id);
+
+    block_on(restored.opaque_disable("test-slot")).unwrap();
+    drop(restored);
+    let disabled = world.boot();
+    assert_eq!(
+        block_on(disabled.opaque_current("test-slot")).unwrap(),
+        None
+    );
+    assert!(block_on(disabled.opaque_read(tree)).is_err());
+}
+
+#[test]
+fn drive_deletes_a_replaced_opaque_tree_and_preserves_unrelated_objects() {
+    let drive = FakeDrive::shared();
+    let world = World::default().with_drive(&drive);
+    let kernel = world.boot();
+    settle();
+    connect_store(&kernel);
+
+    let old = block_on(kernel.opaque_replace("drive-slot", OpaqueMode::CallerEncrypted)).unwrap();
+    block_on(kernel.opaque_publish(old, Vec::new(), b"old envelope".to_vec())).unwrap();
+    settle();
+    let old_object = drive.object_for_tree(old);
+    drive.plant(&old_object.0, &old_object.1);
+    drive.plant("misnamed-signed-item", &old_object.1);
+    drive.plant("unrelated", b"not a sedimentree object");
+    drive.fail_next_delete();
+
+    let new = block_on(kernel.opaque_replace("drive-slot", OpaqueMode::CallerEncrypted)).unwrap();
+    block_on(kernel.opaque_publish(new, Vec::new(), b"new envelope".to_vec())).unwrap();
+    settle();
+
+    assert_eq!(
+        drive.objects_named(&old_object.0),
+        2,
+        "failed DELETEs leave every duplicate retryable"
+    );
+    drop(kernel);
+    drive.allow_deletes();
+    let restored = world.boot();
+    block_on(restored.sync_now()).unwrap();
+    settle();
+
+    assert_eq!(
+        block_on(restored.opaque_read(new)).unwrap()[0].bytes,
+        b"new envelope"
+    );
+    assert!(block_on(restored.opaque_read(old)).is_err());
+    assert_eq!(drive.objects_named(&old_object.0), 0);
+    assert_eq!(drive.objects_for_tree(new), 1);
+    assert!(drive.objects().iter().any(|name| name == "unrelated"));
+    assert!(
+        drive
+            .objects()
+            .iter()
+            .any(|name| name == "misnamed-signed-item"),
+        "valid signed bytes under the wrong HMAC name are not ours to delete"
+    );
+
+    // A stale peer/store copy can reappear after cleanup. Lifecycle is in the
+    // checkpoint, not a process-local rejection cache, so a restarted kernel
+    // validates and deletes it again without ingesting it.
+    drive.plant(&old_object.0, &old_object.1);
+    drive.next_delete_is_already_missing();
+    block_on(restored.sync_now()).unwrap();
+    settle();
+    assert_eq!(drive.objects_named(&old_object.0), 0);
+    assert_eq!(
+        block_on(restored.opaque_current("drive-slot")).unwrap(),
+        Some(new)
+    );
+    assert!(drive.objects().iter().any(|name| name == "unrelated"));
+}
+
+#[test]
+fn retirement_during_opaque_post_uploads_control_before_deleting_payload() {
+    let drive = FakeDrive::shared();
+    let world = World::default().with_drive(&drive);
+    let kernel = world.boot();
+    settle();
+    connect_store(&kernel);
+
+    let tree = block_on(kernel.opaque_replace("in-flight", OpaqueMode::CallerEncrypted)).unwrap();
+    block_on(kernel.opaque_publish(tree, Vec::new(), b"pending envelope".to_vec())).unwrap();
+    // Remove the already-pushed copy so this pass must POST this exact tree.
+    let (name, _) = drive.object_for_tree(tree);
+    let id = drive
+        .files
+        .borrow()
+        .iter()
+        .find(|(_, file)| file.name == name)
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    drive.files.borrow_mut().remove(&id);
+    world.fetch.hold_upload(tree);
+
+    let syncing = {
+        let kernel = Rc::clone(&kernel);
+        async move { kernel.sync_now().await }
+    };
+    block_on(async {
+        futures::pin_mut!(syncing);
+        futures::future::poll_fn(|cx| {
+            if world.fetch.upload_waiting() {
+                return Poll::Ready(());
+            }
+            let _ = syncing.as_mut().poll(cx);
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        })
+        .await;
+        let disabling = kernel.opaque_disable("in-flight");
+        futures::pin_mut!(disabling);
+        let completed = futures::future::poll_fn(|cx| {
+            Poll::Ready(match disabling.as_mut().poll(cx) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+            })
+        })
+        .await;
+        assert!(
+            completed.is_none(),
+            "disable must still be awaiting engine retirement/control durability"
+        );
+        world.fetch.release_upload();
+        let (synced, disabled) = futures::future::join(syncing, disabling).await;
+        synced.unwrap();
+        disabled.unwrap();
+    });
+    settle();
+
+    let events = drive.events();
+    let payload = events
+        .iter()
+        .rposition(|event| *event == DriveEvent::Uploaded(tree))
+        .expect("the gated payload POST completed");
+    let deleted = events[payload + 1..]
+        .iter()
+        .position(|event| *event == DriveEvent::Deleted)
+        .map(|i| payload + 1 + i)
+        .expect("the raced payload was deleted");
+    let us = *polyvisor_engine::us_tree().as_bytes();
+    assert!(
+        events[payload + 1..deleted].contains(&DriveEvent::Uploaded(us)),
+        "retiring control must physically reach Drive before DELETE"
+    );
+    assert_eq!(drive.objects_for_tree(tree), 0);
+
+    drop(kernel);
+    let restored = world.boot();
+    assert_eq!(
+        block_on(restored.opaque_current("in-flight")).unwrap(),
+        None
+    );
+    assert!(block_on(restored.opaque_read(tree)).is_err());
+}
+
+#[test]
+fn two_offline_peers_roundtrip_both_opaque_modes_and_stale_cannot_republish() {
+    let drive = FakeDrive::shared();
+    let here = World::default().with_drive(&drive);
+    let there = here.peer().with_drive(&drive);
+    let a = here.boot();
+    let b = there.boot();
+    settle();
+    pair(&b, &a);
+    connect_store(&a);
+    connect_store(&b);
+    settle();
+    let (ida, idb) = (
+        a.device_status().unwrap().endpoint_id,
+        b.device_status().unwrap().endpoint_id,
+    );
+    here.net.unplug(&ida);
+    here.net.unplug(&idb);
+    settle();
+
+    for (slot, mode, bytes) in [
+        (
+            "sealed-drive",
+            OpaqueMode::GroupSealed,
+            b"group plaintext".as_slice(),
+        ),
+        (
+            "caller-drive",
+            OpaqueMode::CallerEncrypted,
+            b"caller envelope".as_slice(),
+        ),
+    ] {
+        let tree = block_on(a.opaque_replace(slot, mode)).unwrap();
+        block_on(a.opaque_publish(tree, Vec::new(), bytes.to_vec())).unwrap();
+        settle();
+
+        // B did not know the slot before this Drive pass. The same listed
+        // batch contains control and payload; control must land first.
+        block_on(b.sync_now()).unwrap();
+        settle();
+        assert_eq!(block_on(b.opaque_current(slot)).unwrap(), Some(tree));
+        assert_eq!(block_on(b.opaque_read(tree)).unwrap()[0].bytes, bytes);
+
+        let replacement = block_on(a.opaque_replace(slot, mode)).unwrap();
+        block_on(a.opaque_publish(replacement, Vec::new(), b"new".to_vec())).unwrap();
+        settle();
+        block_on(b.sync_now()).unwrap();
+        settle();
+        assert_eq!(block_on(b.opaque_current(slot)).unwrap(), Some(replacement));
+        assert!(block_on(b.opaque_read(tree)).is_err());
+        block_on(b.sync_now()).unwrap();
+        settle();
+        assert_eq!(
+            drive.objects_for_tree(tree),
+            0,
+            "the stale replica must not republish its retired payload"
+        );
+    }
+}
+
+#[test]
+fn opaque_retired_while_drive_read_is_pending_is_not_ingested() {
+    let drive = FakeDrive::shared();
+    let here = World::default().with_drive(&drive);
+    let there = here.peer().with_drive(&drive);
+    let a = here.boot();
+    let b = there.boot();
+    settle();
+    pair(&b, &a);
+    connect_store(&a);
+    connect_store(&b);
+    settle();
+    let (ida, idb) = (
+        a.device_status().unwrap().endpoint_id,
+        b.device_status().unwrap().endpoint_id,
+    );
+    here.net.unplug(&ida);
+    here.net.unplug(&idb);
+    settle();
+
+    let tree = block_on(a.opaque_replace("pull-race", OpaqueMode::CallerEncrypted)).unwrap();
+    block_on(a.opaque_publish(tree, Vec::new(), b"stale".to_vec())).unwrap();
+    settle();
+    let stale = drive.object_for_tree(tree);
+    let ids: Vec<String> = drive
+        .files
+        .borrow()
+        .iter()
+        .filter(|(_, file)| file.name == stale.0)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in ids {
+        drive.files.borrow_mut().remove(&id);
+    }
+    block_on(b.sync_now()).unwrap();
+    settle();
+    assert_eq!(block_on(b.opaque_current("pull-race")).unwrap(), Some(tree));
+
+    drive.plant(&stale.0, &stale.1);
+    there.fetch.hold_read(tree);
+    let syncing = {
+        let b = Rc::clone(&b);
+        async move { b.sync_now().await }
+    };
+    block_on(async {
+        futures::pin_mut!(syncing);
+        futures::future::poll_fn(|cx| {
+            if there.fetch.upload_waiting() {
+                return Poll::Ready(());
+            }
+            let _ = syncing.as_mut().poll(cx);
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        })
+        .await;
+        b.opaque_disable("pull-race").await.unwrap();
+        there.fetch.release_upload();
+        syncing.await.unwrap();
+    });
+    settle();
+    assert!(block_on(b.opaque_read(tree)).is_err());
+    assert_eq!(drive.objects_for_tree(tree), 0);
 }
 
 #[test]
