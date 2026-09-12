@@ -1370,8 +1370,8 @@ fn concurrent_contacts_mutations_wait_for_the_durable_followup() {
     world.forget_writes();
     block_on(async {
         let writes = async {
-            let first = kernel.contacts_create(Vec::new(), "one".into());
-            let second = kernel.contacts_create(Vec::new(), "two".into());
+            let first = kernel.contacts_create(Vec::new(), "one".into(), String::new());
+            let second = kernel.contacts_create(Vec::new(), "two".into(), String::new());
             let (first, second) = futures::future::join(first, second).await;
             first.unwrap();
             second.unwrap();
@@ -1402,7 +1402,7 @@ fn coalesced_durable_contact_writer_receives_the_checkpoint_failure() {
     let kernel = world.boot();
     world.forget_writes();
     block_on(async {
-        let first = kernel.contacts_create(Vec::new(), "one".into());
+        let first = kernel.contacts_create(Vec::new(), "one".into(), String::new());
         let coalesced = async {
             while world.files.in_flight.get() == 0 {
                 yield_now().await;
@@ -1410,7 +1410,9 @@ fn coalesced_durable_contact_writer_receives_the_checkpoint_failure() {
             // The active checkpoint's state write is already in flight. Fail
             // its next write while a second mutation joins that checkpoint.
             world.files.fail_next_writes(1);
-            kernel.contacts_create(Vec::new(), "two".into()).await
+            kernel
+                .contacts_create(Vec::new(), "two".into(), String::new())
+                .await
         };
         let (first, second) = futures::future::join(first, coalesced).await;
         assert_eq!(
@@ -1438,7 +1440,8 @@ fn pairing_adopts_the_founders_contacts_identity_and_document() {
     settle();
 
     let founder_key = block_on(adder.contacts_profile()).unwrap().public_key;
-    let contact_id = block_on(adder.contacts_create(Vec::new(), "friend".into())).unwrap();
+    let contact_id =
+        block_on(adder.contacts_create(Vec::new(), "friend".into(), "🐈".into())).unwrap();
     let joiner_before = block_on(joiner.contacts_profile()).unwrap().public_key;
     assert_ne!(joiner_before, founder_key);
 
@@ -1448,10 +1451,9 @@ fn pairing_adopts_the_founders_contacts_identity_and_document() {
         block_on(joiner.contacts_profile()).unwrap().public_key,
         founder_key
     );
-    assert_eq!(
-        block_on(joiner.contacts_get(contact_id)).unwrap().petname,
-        "friend"
-    );
+    let adopted = block_on(joiner.contacts_get(contact_id)).unwrap();
+    assert_eq!(adopted.petname, "friend");
+    assert_eq!(adopted.glyph, "🐈");
 }
 
 fn session(kernel: &Kernel) -> u32 {

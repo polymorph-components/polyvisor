@@ -354,7 +354,7 @@ const CONTACTS_METHODS = [
   "meetings",
   "decodeLink",
   "create",
-  "setPetname",
+  "setLabel",
   "setObservation",
   "removeObservation",
   "setPreferred",

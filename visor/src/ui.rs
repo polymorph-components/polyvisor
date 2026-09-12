@@ -131,7 +131,7 @@ fn roll_petname(
         RollTarget::Device => d.name = value,
         RollTarget::User => set_field(&mut d.user, PETNAME, value),
         RollTarget::App(_) => set_field(&mut d.app, PETNAME, value),
-        RollTarget::Picker => {}
+        RollTarget::Picker | RollTarget::Contact(_) => {}
     }
     draft.set(d);
 }
@@ -1439,34 +1439,27 @@ pub(crate) fn Visor() -> Element {
                                 span { class: "{Voice::Framework.class()}", "nothing running" }
                             },
                         }
-                        div { class: "petname-control",
-                            label {
-                                span { class: "{Voice::Framework.class()}", "petname" }
-                            // Controlled, unlike the fields this replaced.
-                            // `value` is volatile in dioxus-html — written
-                            // on every diff — which is why the old fields
-                            // read the kernel once and let the DOM own the
-                            // text: a status re-read landing mid-typing
-                            // reset them. Nothing re-reads a draft, so the
-                            // signal is the field's only writer and the
-                            // volatility has nothing to overwrite with.
-                                input {
-                                r#type: "text",
-                                value: "{info_petname}",
-                                oninput: move |e| {
-                                    if let Some((_, app)) = live.as_ref() {
-                                        rolls.write().invalidate(&RollTarget::App(app.id.clone()));
+                        if let Some((_, app)) = live.clone() {
+                            LabelControl {
+                                petname_label: "petname",
+                                glyph_label: "glyph",
+                                petname: info_petname.clone(),
+                                glyph: info_glyph,
+                                roll_label: "Re-roll app petname",
+                                roll_enabled: info_petname.is_empty() || rolls.read().is_active(&RollTarget::App(app.id.clone()), &info_petname),
+                                onpetname: {
+                                    let target = RollTarget::App(app.id.clone());
+                                    move |value| {
+                                        rolls.write().invalidate(&target);
+                                        let mut d = draft.write();
+                                        set_field(&mut d.app, PETNAME, value);
                                     }
-                                    let mut d = draft.write();
-                                    set_field(&mut d.app, PETNAME, e.value());
                                 },
-                                }
-                            }
-                            if let Some((_, app)) = live.as_ref() {
-                                RollButton {
-                                    label: "Re-roll app petname",
-                                    enabled: info_petname.is_empty() || rolls.read().is_active(&RollTarget::App(app.id.clone()), &info_petname),
-                                    onclick: {
+                                onglyph: move |value| {
+                                    let mut d = draft.write();
+                                    set_field(&mut d.app, GLYPH, value);
+                                },
+                                onroll: {
                                         let target = RollTarget::App(app.id.clone());
                                         let previous = info_petname.clone();
                                         move |_| {
@@ -1477,21 +1470,12 @@ pub(crate) fn Visor() -> Element {
                                                 roll_petname(target, previous, rolls, draft, session)
                                             }
                                         }
-                                    }
-                                }
+                                },
+                                focus_return: focus_glyph.clone(),
+                                focus_search: focus_glyph_search.clone(),
+                                onreturn: move |_| ask_focus.call(FocusWant::Glyph),
+                                onsearch: move |_| ask_focus.call(FocusWant::GlyphSearch),
                             }
-                        }
-                        GlyphPicker {
-                            label: "glyph",
-                            value: info_glyph,
-                            focus_return: focus_glyph.clone(),
-                            focus_search: focus_glyph_search.clone(),
-                            onchange: move |value| {
-                                let mut d = draft.write();
-                                set_field(&mut d.app, GLYPH, value);
-                            },
-                            onreturn: move |_| ask_focus.call(FocusWant::Glyph),
-                            onsearch: move |_| ask_focus.call(FocusWant::GlyphSearch),
                         }
                         if let Some(id) = live_id {
                             button {
@@ -1542,6 +1526,11 @@ pub(crate) fn Visor() -> Element {
                         on_meeting_join,
                         pending_submission,
                         incoming,
+                        rolls,
+                        focus_glyph: focus_glyph.clone(),
+                        focus_glyph_search: focus_glyph_search.clone(),
+                        on_glyph_return: move |_| ask_focus.call(FocusWant::Glyph),
+                        on_glyph_search: move |_| ask_focus.call(FocusWant::GlyphSearch),
                     }
                 },
 
@@ -1979,7 +1968,7 @@ fn DevicesSheet(entries: Vec<Entry>, self_id: String, on_stay: EventHandler<()>)
 }
 
 #[component]
-fn RollButton(label: &'static str, enabled: bool, onclick: EventHandler<()>) -> Element {
+fn RollButton(label: String, enabled: bool, onclick: EventHandler<()>) -> Element {
     let mut explain = use_signal(|| false);
     let tooltip_id = use_hook(|| {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -2591,7 +2580,7 @@ const GLYPH_PAGE: usize = 96;
 /// result is the act that changes the draft.
 #[component]
 fn GlyphPicker(
-    label: &'static str,
+    label: String,
     value: String,
     onchange: EventHandler<String>,
     focus_return: Option<String>,
@@ -2770,6 +2759,48 @@ fn GlyphPicker(
     }
 }
 
+/// The shared private-label editor used whenever a petname and glyph are paired.
+#[component]
+pub(crate) fn LabelControl(
+    petname_label: String,
+    glyph_label: String,
+    petname: String,
+    glyph: String,
+    roll_label: String,
+    roll_enabled: bool,
+    onpetname: EventHandler<String>,
+    onglyph: EventHandler<String>,
+    onroll: EventHandler<()>,
+    focus_return: Option<String>,
+    focus_search: Option<String>,
+    onreturn: EventHandler<()>,
+    onsearch: EventHandler<()>,
+) -> Element {
+    rsx! {
+        div { class: "label-control",
+            GlyphPicker {
+                label: glyph_label,
+                value: glyph,
+                onchange: move |value| onglyph.call(value),
+                focus_return,
+                focus_search,
+                onreturn,
+                onsearch,
+            }
+            label {
+                span { class: "visually-hidden {Voice::Framework.class()}", "{petname_label}" }
+                input {
+                    r#type: "text",
+                    aria_label: petname_label,
+                    value: "{petname}",
+                    oninput: move |event| onpetname.call(event.value()),
+                }
+            }
+            RollButton { label: roll_label, enabled: roll_enabled, onclick: onroll }
+        }
+    }
+}
+
 /// Everything about this device, and the user, that is a field rather
 /// than a ceremony.
 ///
@@ -2860,23 +2891,23 @@ fn SettingsSheet(
                 },
             }
         }
-        div { class: "petname-control",
-            label {
-                span { class: "{Voice::Framework.class()}", "your petname" }
-                input {
-                r#type: "text",
-                value: "{user_petname}",
-                oninput: move |e| {
+        LabelControl {
+            petname_label: "your petname",
+            glyph_label: "your glyph",
+            petname: user_petname.clone(),
+            glyph: user_glyph,
+            roll_label: "Re-roll user petname",
+            roll_enabled: user_petname.is_empty() || rolls.read().is_active(&RollTarget::User, &user_petname),
+            onpetname: move |value| {
                     rolls.write().invalidate(&RollTarget::User);
                     let mut d = draft.write();
-                    set_field(&mut d.user, PETNAME, e.value());
+                    set_field(&mut d.user, PETNAME, value);
                 },
-                }
-            }
-            RollButton {
-                label: "Re-roll user petname",
-                enabled: user_petname.is_empty() || rolls.read().is_active(&RollTarget::User, &user_petname),
-                onclick: {
+            onglyph: move |value| {
+                let mut d = draft.write();
+                set_field(&mut d.user, GLYPH, value);
+            },
+            onroll: {
                     let previous = user_petname.clone();
                     move |_| {
                         let previous = previous.clone();
@@ -2887,18 +2918,9 @@ fn SettingsSheet(
                             }
                         }
                     }
-                }
-            }
-        }
-        GlyphPicker {
-            label: "your glyph",
-            value: user_glyph,
+            },
             focus_return: focus_glyph,
             focus_search: focus_glyph_search,
-            onchange: move |value| {
-                let mut d = draft.write();
-                set_field(&mut d.user, GLYPH, value);
-            },
             onreturn: move |_| on_glyph_return.call(()),
             onsearch: move |_| on_glyph_search.call(()),
         }

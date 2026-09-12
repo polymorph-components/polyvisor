@@ -7,10 +7,13 @@ use crate::contacts::{
     issuer_display, key_short, name_claim, qr_matrix, received_label, selected, should_rebase,
     status_response_is_current,
 };
+use crate::draft::{RollState, RollTarget};
+use crate::glyph::normalize_glyph;
 use crate::kernel::{
     self, Contact, ImportReview, Introduction, MeetingPhase, MeetingRecord, Party, Provenance,
     Selection, SelfProfile,
 };
+use crate::ui::LabelControl;
 use crate::voice::{AppText, AppVoice, Voice};
 
 #[derive(Clone, PartialEq)]
@@ -147,6 +150,11 @@ pub(crate) fn ContactsSheet(
     on_meeting_join: EventHandler<(String, Party)>,
     pending_submission: Signal<Option<(u64, Party)>>,
     mut incoming: Signal<Option<Incoming>>,
+    rolls: CopyValue<RollState>,
+    focus_glyph: Option<String>,
+    focus_glyph_search: Option<String>,
+    on_glyph_return: EventHandler<()>,
+    on_glyph_search: EventHandler<()>,
 ) -> Element {
     let mut view = use_signal(|| View::List);
     let mut error = use_signal(|| None::<String>);
@@ -211,10 +219,22 @@ pub(crate) fn ContactsSheet(
             match view() {
                 View::List => rsx! { ContactList { contacts, view } },
                 View::Detail(id) => rsx! {
-                    ContactDetail { id, contacts, profile, records, error, view }
+                    ContactDetail {
+                        key: "{id}", id, contacts, profile, records, error, view, rolls,
+                        focus_glyph: focus_glyph.clone(),
+                        focus_glyph_search: focus_glyph_search.clone(),
+                        on_glyph_return,
+                        on_glyph_search,
+                    }
                 },
                 View::Profile => rsx! { ProfileView { contacts, profile, records, error } },
-                View::Create => rsx! { CreateView { contacts, profile, records, error, view } },
+                View::Create => rsx! { CreateView {
+                    contacts, profile, records, error, view, rolls,
+                    focus_glyph: focus_glyph.clone(),
+                    focus_glyph_search: focus_glyph_search.clone(),
+                    on_glyph_return,
+                    on_glyph_search,
+                } },
                 View::Share => rsx! { ShareView { contacts, profile, error } },
                 View::Import => rsx! {
                     ImportView {
@@ -261,7 +281,10 @@ fn ContactList(contacts: Signal<Vec<Contact>>, mut view: Signal<View>) -> Elemen
                         let id = contact.id.clone();
                         move |_| view.set(View::Detail(id.clone()))
                     },
-                    span { class: "user", "{contact.petname}" }
+                    span { class: "contact-label user",
+                        if !contact.glyph.is_empty() { span { class: "glyph-face", "{contact.glyph}" } }
+                        span { "{contact.petname}" }
+                    }
                     if let Some((_, value)) = contact.preferred.iter().find(|(name, _)| name == "name") {
                         span { class: "user", "{value}" }
                     } else if let Some(item) = contact.observations.iter().find(|item| item.name.expose() == "name") {
@@ -282,12 +305,19 @@ fn ContactDetail(
     records: Signal<Vec<MeetingRecord>>,
     mut error: Signal<Option<String>>,
     mut view: Signal<View>,
+    rolls: CopyValue<RollState>,
+    focus_glyph: Option<String>,
+    focus_glyph_search: Option<String>,
+    on_glyph_return: EventHandler<()>,
+    on_glyph_search: EventHandler<()>,
 ) -> Element {
     let mut petname = use_signal(String::new);
+    let mut glyph = use_signal(String::new);
     let mut claim_name = use_signal(String::new);
     let mut claim_value = use_signal(String::new);
     let mut merge_target = use_signal(String::new);
     let mut petname_seed = use_signal(|| None::<String>);
+    let mut glyph_seed = use_signal(|| None::<String>);
     let contact = contacts().into_iter().find(|contact| contact.id == id);
 
     use_effect({
@@ -304,37 +334,108 @@ fn ContactDetail(
             _ => {}
         }
     });
+    use_effect({
+        let id = id.clone();
+        move || {
+            if let Some(contact) = contacts().into_iter().find(|contact| contact.id == id)
+                && should_rebase(&glyph(), glyph_seed().as_deref())
+                && glyph_seed().as_deref() != Some(contact.glyph.as_str())
+            {
+                glyph.set(contact.glyph.clone());
+                glyph_seed.set(Some(contact.glyph));
+            }
+        }
+    });
 
     let Some(contact) = contact else {
         return rsx! { div { class: "contact-details", "Contact no longer exists." } };
     };
     let contact_id = contact.id.clone();
+    let input_target = RollTarget::Contact(contact_id.clone());
+    let roll_target = input_target.clone();
+    let save_target = input_target.clone();
+    let revert_target = input_target.clone();
     rsx! {
         div { class: "contact-details",
             button { onclick: move |_| view.set(View::List), "Back" }
             div { class: "key-full", code { "{full_key(&contact.public_key)}" } }
-            label {
-                span { "Petname" }
-                input { value: "{petname}", oninput: move |event| petname.set(event.value()) }
+            LabelControl {
+                petname_label: "Petname",
+                glyph_label: "contact glyph",
+                petname: petname(),
+                glyph: glyph(),
+                roll_label: "Re-roll contact petname",
+                roll_enabled: petname().is_empty() || rolls.read().is_active(&RollTarget::Contact(contact_id.clone()), &petname()),
+                onpetname: move |value| {
+                    rolls.write().invalidate(&input_target);
+                    petname.set(value);
+                },
+                onglyph: move |value: String| glyph.set(normalize_glyph(&value).to_string()),
+                onroll: move |_| {
+                    let target = roll_target.clone();
+                    let previous = petname();
+                    let value = polyvisor_petname::generate(|| {
+                        let bytes = crate::component::wasi::random::random::get_random_bytes(4);
+                        u32::from_le_bytes(bytes.try_into().expect("wasi:random returned four bytes"))
+                    }, &previous);
+                    rolls.write().activate(target, value.clone());
+                    petname.set(value);
+                },
+                focus_return: focus_glyph,
+                focus_search: focus_glyph_search,
+                onreturn: on_glyph_return,
+                onsearch: on_glyph_search,
             }
             button {
                 onclick: {
                     let id = contact_id.clone();
+                    let contact_id = contact_id.clone();
                     move |_| {
                         let id = id.clone();
+                        let contact_id = contact_id.clone();
+                        let save_target = save_target.clone();
                         async move {
                             let saved = petname();
-                            match kernel::contacts_set_petname(id, saved.clone()).await {
+                            let saved_glyph = normalize_glyph(&glyph()).to_string();
+                            match kernel::contacts_set_label(id, saved.clone(), saved_glyph.clone()).await {
                                 Ok(()) => {
-                                    petname_seed.set(Some(saved));
-                                    refresh_contacts(contacts, profile, records);
+                                    rolls.write().invalidate(&save_target);
+                                    match kernel::contacts_items().await {
+                                    Ok(updated) => {
+                                        let Some(item) = updated.iter().find(|item| item.id == contact_id) else {
+                                            error.set(Some("saved contact is no longer available".into()));
+                                            return;
+                                        };
+                                        let latest_petname = item.petname.clone();
+                                        let latest_glyph = item.glyph.clone();
+                                        if petname() == saved {
+                                            petname.set(latest_petname.clone());
+                                        }
+                                        if glyph() == saved_glyph {
+                                            glyph.set(latest_glyph.clone());
+                                        }
+                                        petname_seed.set(Some(latest_petname));
+                                        glyph_seed.set(Some(latest_glyph));
+                                        contacts.set(updated);
+                                    }
+                                    Err(message) => error.set(Some(message)),
+                                    }
                                 }
                                 Err(message) => error.set(Some(message)),
                             }
                         }
                     }
                 },
-                "Save petname"
+                "Save label"
+            }
+            button {
+                disabled: petname_seed().as_deref() == Some(petname().as_str()) && glyph_seed().as_deref() == Some(glyph().as_str()),
+                onclick: move |_| {
+                    petname.set(petname_seed().unwrap_or_default());
+                    glyph.set(glyph_seed().unwrap_or_default());
+                    rolls.write().invalidate(&revert_target);
+                },
+                "Revert label"
             }
             div { class: "contact-history",
                 if contact.observations.is_empty() {
@@ -455,7 +556,7 @@ fn ContactDetail(
                     select { value: "{merge_target}", onchange: move |event| merge_target.set(event.value()),
                         option { value: "", "Choose a keyed contact" }
                         for target in contacts().into_iter().filter(|target| !target.public_key.is_empty()) {
-                            option { value: "{target.id}", "{target.petname} · {key_short(&target.public_key)}" }
+                            option { value: "{target.id}", "{target.glyph} {target.petname} · {key_short(&target.public_key)}" }
                         }
                     }
                 }
@@ -560,20 +661,51 @@ fn CreateView(
     records: Signal<Vec<MeetingRecord>>,
     mut error: Signal<Option<String>>,
     mut view: Signal<View>,
+    rolls: CopyValue<RollState>,
+    focus_glyph: Option<String>,
+    focus_glyph_search: Option<String>,
+    on_glyph_return: EventHandler<()>,
+    on_glyph_search: EventHandler<()>,
 ) -> Element {
     let mut key = use_signal(String::new);
     let mut petname = use_signal(String::new);
+    let mut glyph = use_signal(String::new);
     rsx! {
         div { class: "contacts-create",
             label { span { "Public key (hex, optional)" } input { value: "{key}", oninput: move |event| key.set(event.value()) } }
-            label { span { "Petname" } input { value: "{petname}", oninput: move |event| petname.set(event.value()) } }
+            LabelControl {
+                petname_label: "Petname",
+                glyph_label: "contact glyph",
+                petname: petname(),
+                glyph: glyph(),
+                roll_label: "Re-roll contact petname",
+                roll_enabled: petname().is_empty() || rolls.read().is_active(&RollTarget::Contact("new".into()), &petname()),
+                onpetname: move |value| { rolls.write().invalidate(&RollTarget::Contact("new".into())); petname.set(value) },
+                onglyph: move |value: String| glyph.set(normalize_glyph(&value).to_string()),
+                onroll: move |_| {
+                    let previous = petname();
+                    let value = polyvisor_petname::generate(|| {
+                        let bytes = crate::component::wasi::random::random::get_random_bytes(4);
+                        u32::from_le_bytes(bytes.try_into().expect("wasi:random returned four bytes"))
+                    }, &previous);
+                    rolls.write().activate(RollTarget::Contact("new".into()), value.clone());
+                    petname.set(value);
+                },
+                focus_return: focus_glyph,
+                focus_search: focus_glyph_search,
+                onreturn: on_glyph_return,
+                onsearch: on_glyph_search,
+            }
             button {
                 onclick: move |_| async move {
                     match parse_key(&key()) {
                         Err(message) => error.set(Some(message)),
-                        Ok(bytes) => match kernel::contacts_create(bytes, petname()).await {
+                        Ok(bytes) => match kernel::contacts_create(bytes, petname(), normalize_glyph(&glyph()).to_string()).await {
                             Ok(id) => match refresh_contacts_now(contacts, profile, records).await {
-                                Ok(()) => view.set(View::Detail(id)),
+                                Ok(()) => {
+                                    rolls.write().invalidate(&RollTarget::Contact("new".into()));
+                                    view.set(View::Detail(id))
+                                },
                                 Err(message) => error.set(Some(message)),
                             },
                             Err(message) => error.set(Some(message)),
@@ -739,7 +871,10 @@ fn ShareView(
                             }
                         },
                     }
-                    span { class: "user", "{contact.petname}" }
+                    span { class: "contact-label user",
+                        if !contact.glyph.is_empty() { span { class: "glyph-face", "{contact.glyph}" } }
+                        span { "{contact.petname}" }
+                    }
                 }
                 if included().contains(&contact.id) {
                     ShareName { id: contact.id.clone(), names, signed, share_gen, signing }

@@ -94,6 +94,7 @@ pub struct Contact {
     pub id: String,
     pub public_key: Option<[u8; 32]>,
     pub petname: String,
+    pub glyph: String,
     pub observations: Vec<Observation>,
     pub preferred: Vec<(String, String)>,
 }
@@ -428,6 +429,7 @@ pub fn create_contact(
     doc: &mut Document,
     public_key: Option<[u8; 32]>,
     petname: String,
+    glyph: String,
     entropy: [u8; 32],
 ) -> Result<String, String> {
     if let Some(key) = public_key {
@@ -439,11 +441,15 @@ pub fn create_contact(
     let existed = contact(doc, &id).is_some();
     let marker = contact_key(&id, "exists");
     let pet = contact_key(&id, "petname");
+    let glyph_key = contact_key(&id, "glyph");
     let key = contact_key(&id, "public-key");
     doc.transact(|tx| {
         tx.put(ROOT, marker, true).map_err(|e| e.to_string())?;
         if !existed && !petname.is_empty() {
             tx.put(ROOT, pet, petname).map_err(|e| e.to_string())?;
+        }
+        if !existed && !glyph.is_empty() {
+            tx.put(ROOT, glyph_key, glyph).map_err(|e| e.to_string())?;
         }
         if let Some(k) = public_key {
             tx.put(ROOT, key, hex(&k)).map_err(|e| e.to_string())?;
@@ -452,10 +458,20 @@ pub fn create_contact(
     })?;
     Ok(id)
 }
-pub fn set_petname(doc: &mut Document, id: &str, petname: String) -> Result<(), String> {
+pub fn set_label(
+    doc: &mut Document,
+    id: &str,
+    petname: String,
+    glyph: String,
+) -> Result<(), String> {
     require_contact(doc, id)?;
-    let key = contact_key(id, "petname");
-    doc.transact(move |tx| tx.put(ROOT, key, petname).map_err(|e| e.to_string()))
+    let petname_key = contact_key(id, "petname");
+    let glyph_key = contact_key(id, "glyph");
+    doc.transact(move |tx| {
+        tx.put(ROOT, petname_key, petname)
+            .map_err(|e| e.to_string())?;
+        tx.put(ROOT, glyph_key, glyph).map_err(|e| e.to_string())
+    })
 }
 pub fn create_meeting(
     doc: &mut Document,
@@ -621,10 +637,12 @@ pub fn contact(doc: &Document, id: &str) -> Option<Contact> {
     let public_key =
         root_string(doc, &contact_key(id, "public-key")).and_then(|s| decode_key(&s).ok());
     let petname = root_string(doc, &contact_key(id, "petname")).unwrap_or_default();
+    let glyph = root_string(doc, &contact_key(id, "glyph")).unwrap_or_default();
     Some(Contact {
         id: id.into(),
         public_key,
         petname,
+        glyph,
         observations: observations(doc, id),
         preferred: preferred_values(doc, id),
     })
@@ -711,11 +729,24 @@ pub fn merge(doc: &mut Document, keyless: &str, into: &str) -> Result<(), String
         return Err("contacts can only merge from keyless into keyed".into());
     }
     let source_petname = from.petname.clone();
+    let source_glyph = from.glyph.clone();
     let alias = format!("{ALIAS_PREFIX}{keyless}");
     let destination = into.to_string();
     doc.transact(|tx| tx.put(ROOT, alias, destination).map_err(|e| e.to_string()))?;
-    if target.petname.is_empty() && !source_petname.is_empty() {
-        set_petname(doc, into, source_petname)?;
+    let label_changed = (target.petname.is_empty() && !source_petname.is_empty())
+        || (target.glyph.is_empty() && !source_glyph.is_empty());
+    let petname = if target.petname.is_empty() {
+        source_petname
+    } else {
+        target.petname
+    };
+    let glyph = if target.glyph.is_empty() {
+        source_glyph
+    } else {
+        target.glyph
+    };
+    if label_changed {
+        set_label(doc, into, petname, glyph)?;
     }
     let keys: Vec<_> = doc
         .read()
@@ -1108,7 +1139,7 @@ mod tests {
         let envelope = proto::SignedIntroduction::decode(signed.as_slice()).unwrap();
         let review = parse_import(&signed).unwrap();
         let key = review.parties[0].public_key.unwrap();
-        let id = create_contact(&mut d, Some(key), "pet".into(), [1; 32]).unwrap();
+        let id = create_contact(&mut d, Some(key), "pet".into(), "🐈".into(), [1; 32]).unwrap();
         let m = create_meeting(
             &mut d,
             "imported from a file".into(),
@@ -1169,7 +1200,7 @@ mod tests {
     #[test]
     fn observation_tuple_encoding_is_unambiguous() {
         let mut d = doc(1);
-        let id = create_contact(&mut d, None, String::new(), [1; 32]).unwrap();
+        let id = create_contact(&mut d, None, String::new(), String::new(), [1; 32]).unwrap();
         let meeting = create_meeting(
             &mut d,
             "entered by hand".into(),
@@ -1200,7 +1231,8 @@ mod tests {
     fn concurrent_claims_preserve_local_choices() {
         let key = signer(4).verifying_key().to_bytes();
         let mut local = doc(1);
-        let id = create_contact(&mut local, Some(key), "friend".into(), [1; 32]).unwrap();
+        let id =
+            create_contact(&mut local, Some(key), "friend".into(), "🐕".into(), [1; 32]).unwrap();
         let local_meeting = create_meeting(
             &mut local,
             "entered by hand".into(),
@@ -1230,7 +1262,14 @@ mod tests {
         set_preferred(&mut local, &id, "name", Some("Local".into())).unwrap();
 
         let mut remote = doc(2);
-        create_contact(&mut remote, Some(key), String::new(), [3; 32]).unwrap();
+        create_contact(
+            &mut remote,
+            Some(key),
+            String::new(),
+            String::new(),
+            [3; 32],
+        )
+        .unwrap();
         let remote_meeting = create_meeting(
             &mut remote,
             "imported from a file".into(),
@@ -1264,19 +1303,52 @@ mod tests {
         let merged = contact(&local, &id).unwrap();
         assert_eq!(merged.observations.len(), 2);
         assert_eq!(merged.petname, "friend");
+        assert_eq!(merged.glyph, "🐕");
         assert_eq!(merged.preferred, vec![("name".into(), "Local".into())]);
+    }
+    #[test]
+    fn label_fields_persist_independently_and_existing_import_does_not_replace_them() {
+        let mut d = doc(1);
+        let key = signer(9).verifying_key().to_bytes();
+        let id = create_contact(&mut d, Some(key), "friend".into(), "🐈".into(), [1; 32]).unwrap();
+        set_label(&mut d, &id, "renamed".into(), "🐕".into()).unwrap();
+        create_contact(&mut d, Some(key), String::new(), String::new(), [2; 32]).unwrap();
+        let restored = Document::load(&d.save(), ActorId::from(&[2][..]), d.tree());
+        let label = contact(&restored, &id).unwrap();
+        assert_eq!(
+            (label.petname.as_str(), label.glyph.as_str()),
+            ("renamed", "🐕")
+        );
+
+        let keyed = signer(10).verifying_key().to_bytes();
+        let target = create_contact(
+            &mut d,
+            Some(keyed),
+            "target name".into(),
+            String::new(),
+            [3; 32],
+        )
+        .unwrap();
+        let source =
+            create_contact(&mut d, None, "source name".into(), "🐇".into(), [4; 32]).unwrap();
+        merge(&mut d, &source, &target).unwrap();
+        let merged = contact(&d, &target).unwrap();
+        assert_eq!(
+            (merged.petname.as_str(), merged.glyph.as_str()),
+            ("target name", "🐇")
+        );
     }
     #[test]
     fn convergence_keyless_merge_and_identity_adoption() {
         let key = signer(4).verifying_key().to_bytes();
         let mut a = doc(1);
         let mut b = doc(2);
-        let ida = create_contact(&mut a, Some(key), "a".into(), [1; 32]).unwrap();
-        let idb = create_contact(&mut b, Some(key), "b".into(), [2; 32]).unwrap();
+        let ida = create_contact(&mut a, Some(key), "a".into(), String::new(), [1; 32]).unwrap();
+        let idb = create_contact(&mut b, Some(key), "b".into(), String::new(), [2; 32]).unwrap();
         assert_eq!(ida, idb);
         a.merge_snapshot(&b.save()).unwrap();
         assert_eq!(contacts(&a).len(), 1);
-        let kid = create_contact(&mut a, None, "old".into(), [5; 32]).unwrap();
+        let kid = create_contact(&mut a, None, "old".into(), "🐁".into(), [5; 32]).unwrap();
         let meeting = create_meeting(
             &mut a,
             "entered by hand".into(),
@@ -1304,12 +1376,15 @@ mod tests {
         )
         .unwrap();
         set_preferred(&mut a, &kid, "name", Some("Old".into())).unwrap();
-        set_petname(&mut a, &ida, String::new()).unwrap();
+        set_label(&mut a, &ida, String::new(), String::new()).unwrap();
         merge(&mut a, &kid, &ida).unwrap();
         assert!(contact(&a, &kid).is_none());
         let merged = contact(&a, &ida).unwrap();
         assert_eq!(merged.observations.len(), 1);
-        assert_eq!(merged.petname, "old");
+        assert_eq!(
+            (merged.petname.as_str(), merged.glyph.as_str()),
+            ("old", "🐁")
+        );
         assert_eq!(merged.preferred, vec![("name".into(), "Old".into())]);
         let first = identity_or_create(&mut a, [7; 32], [8; 32]).unwrap();
         assert!(first.1);
@@ -1385,7 +1460,7 @@ mod tests {
     #[test]
     fn removing_observation_clears_its_preference() {
         let mut d = doc(1);
-        let id = create_contact(&mut d, None, String::new(), [1; 32]).unwrap();
+        let id = create_contact(&mut d, None, String::new(), String::new(), [1; 32]).unwrap();
         let meeting = create_meeting(
             &mut d,
             "entered by hand".into(),
@@ -1420,7 +1495,7 @@ mod tests {
     #[test]
     fn empty_preferred_value_is_distinct_from_clear() {
         let mut d = doc(1);
-        let id = create_contact(&mut d, None, String::new(), [1; 32]).unwrap();
+        let id = create_contact(&mut d, None, String::new(), String::new(), [1; 32]).unwrap();
         let meeting = create_meeting(
             &mut d,
             "entered by hand".into(),
@@ -1460,8 +1535,10 @@ mod tests {
     fn alias_preserves_observation_added_concurrently_to_keyless_source() {
         let mut base = doc(1);
         let key = signer(5).verifying_key().to_bytes();
-        let keyed = create_contact(&mut base, Some(key), "known".into(), [1; 32]).unwrap();
-        let keyless = create_contact(&mut base, None, "import".into(), [2; 32]).unwrap();
+        let keyed =
+            create_contact(&mut base, Some(key), "known".into(), String::new(), [1; 32]).unwrap();
+        let keyless =
+            create_contact(&mut base, None, "import".into(), String::new(), [2; 32]).unwrap();
         let snapshot = base.save();
         let tree = base.tree();
         let mut merger = Document::load(&snapshot, ActorId::from(&[2_u8][..]), tree);
@@ -1519,12 +1596,14 @@ mod tests {
             let key = signer(if source_before_destination { 6 } else { 7 })
                 .verifying_key()
                 .to_bytes();
-            let destination = create_contact(&mut d, Some(key), String::new(), [1; 32]).unwrap();
+            let destination =
+                create_contact(&mut d, Some(key), String::new(), String::new(), [1; 32]).unwrap();
             let source = (0_u16..=u8::MAX as u16)
                 .find_map(|n| {
                     let mut entropy = [0; 32];
                     entropy[0] = n as u8;
-                    let id = create_contact(&mut d, None, String::new(), entropy).unwrap();
+                    let id = create_contact(&mut d, None, String::new(), String::new(), entropy)
+                        .unwrap();
                     ((id < destination) == source_before_destination).then_some(id)
                 })
                 .unwrap();
@@ -1569,8 +1648,9 @@ mod tests {
     fn delete_and_recreate_does_not_resurrect_aliased_claims() {
         let mut d = doc(1);
         let key = signer(8).verifying_key().to_bytes();
-        let destination = create_contact(&mut d, Some(key), "known".into(), [1; 32]).unwrap();
-        let source = create_contact(&mut d, None, "import".into(), [2; 32]).unwrap();
+        let destination =
+            create_contact(&mut d, Some(key), "known".into(), String::new(), [1; 32]).unwrap();
+        let source = create_contact(&mut d, None, "import".into(), String::new(), [2; 32]).unwrap();
         let meeting = create_meeting(
             &mut d,
             "entered by hand".into(),
@@ -1601,7 +1681,7 @@ mod tests {
         merge(&mut d, &source, &destination).unwrap();
         let before_delete = d.save();
         delete_contact(&mut d, &destination).unwrap();
-        create_contact(&mut d, Some(key), "new".into(), [4; 32]).unwrap();
+        create_contact(&mut d, Some(key), "new".into(), String::new(), [4; 32]).unwrap();
         let tree = d.tree();
         let mut reloaded = Document::load(&d.save(), ActorId::from(&[5_u8][..]), tree);
         reloaded.merge_snapshot(&before_delete).unwrap();
@@ -1613,7 +1693,7 @@ mod tests {
     #[test]
     fn concurrent_removal_hides_dangling_preference() {
         let mut base = doc(1);
-        let id = create_contact(&mut base, None, String::new(), [1; 32]).unwrap();
+        let id = create_contact(&mut base, None, String::new(), String::new(), [1; 32]).unwrap();
         let meeting = create_meeting(
             &mut base,
             "entered by hand".into(),

@@ -533,6 +533,7 @@ pub(crate) struct Contact {
     pub(crate) id: String,
     pub(crate) public_key: Vec<u8>,
     pub(crate) petname: String,
+    pub(crate) glyph: String,
     pub(crate) observations: Vec<Observation>,
     pub(crate) preferred: Vec<(String, String)>,
 }
@@ -645,6 +646,7 @@ fn contact(value: api::contacts::Contact) -> Contact {
         id: value.id,
         public_key: value.public_key,
         petname: value.petname,
+        glyph: crate::glyph::normalize_glyph(&value.glyph).to_string(),
         observations: value.observations.into_iter().map(observation).collect(),
         preferred: value.preferred,
     }
@@ -723,11 +725,23 @@ pub(crate) async fn contacts_meetings() -> Result<Vec<MeetingRecord>, String> {
         })
         .collect())
 }
-pub(crate) async fn contacts_create(key: Vec<u8>, petname: String) -> Result<String, String> {
-    api::contacts::create(key, petname).await.map_err(message)
+pub(crate) async fn contacts_create(
+    key: Vec<u8>,
+    petname: String,
+    glyph: String,
+) -> Result<String, String> {
+    api::contacts::create(key, petname, glyph)
+        .await
+        .map_err(message)
 }
-pub(crate) async fn contacts_set_petname(id: String, value: String) -> Result<(), String> {
-    api::contacts::set_petname(id, value).await.map_err(message)
+pub(crate) async fn contacts_set_label(
+    id: String,
+    petname: String,
+    glyph: String,
+) -> Result<(), String> {
+    api::contacts::set_label(id, petname, glyph)
+        .await
+        .map_err(message)
 }
 pub(crate) async fn contacts_set_observation(
     id: String,
