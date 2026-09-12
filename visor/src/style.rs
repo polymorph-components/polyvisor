@@ -340,6 +340,17 @@ pub(crate) const CSS: &str = r#"
   align-self: flex-start; max-width: 100%;
 }
 #visor-root .petname-control > label { flex: 0 1 auto; min-width: 0; margin-bottom: 0; }
+#visor-root .label-control {
+  display: flex; align-items: flex-end; flex-wrap: wrap; gap: 8px;
+  align-self: flex-start; max-width: 100%; margin-bottom: 12px;
+}
+#visor-root .label-control > .glyph-control { width: auto; margin: 0; }
+#visor-root .label-control > .glyph-control .glyph-control-row > span { position: absolute; clip: rect(0 0 0 0); }
+#visor-root .label-control > label { flex: 0 1 auto; min-width: 0; margin: 0; }
+#visor-root .visually-hidden {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
 #visor-root .roll-control { position: relative; flex: none; }
 #visor-root .roll-button { min-width: 44px; min-height: 44px; padding: 6px 10px; }
 #visor-root .roll-glyph {

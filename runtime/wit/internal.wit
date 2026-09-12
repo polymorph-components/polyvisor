@@ -586,6 +586,8 @@ interface contacts {
         /// received "name" claim (never overwritten by a third party), never
         /// secretly exported.
         petname: string,
+        /// The user's private glyph label. Never exported as an observation.
+        glyph: string,
         /// Every recorded observation, in a stable order.
         observations: list<observation>,
         /// The user's preferred value per claim name — the `set-preferred`
@@ -694,9 +696,9 @@ interface contacts {
     /// Create a contact by hand. `public-key` empty makes a keyless record
     /// (random id); a key makes a keyed record (deterministic id, converging
     /// with any same-key import). Returns the contact's local id.
-    create: async func(public-key: list<u8>, petname: string) -> result<string, error>;
-    /// Set the local, visible petname. Never a "name" claim; never exported.
-    set-petname: async func(id: string, petname: string) -> result<_, error>;
+    create: async func(public-key: list<u8>, petname: string, glyph: string) -> result<string, error>;
+    /// Atomically set the private local label. Never exported as claims.
+    set-label: async func(id: string, petname: string, glyph: string) -> result<_, error>;
     /// Add or replace a manual (`local`) observation on a contact.
     set-observation: async func(id: string, name: string, value: string) -> result<_, error>;
     /// Remove an observation by exact `(name, value)`. Allowed for any

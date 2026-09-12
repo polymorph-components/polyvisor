@@ -116,15 +116,19 @@ impl Kernel {
     pub async fn contacts_create(
         &self,
         public_key: Vec<u8>,
-        petname: String,
+        mut petname: String,
+        glyph: String,
     ) -> Result<String, Error> {
         self.open()?;
+        if petname.is_empty() {
+            petname = crate::device::generate_petname(self.seams.rng.as_ref(), "");
+        }
         let public_key = optional_key(public_key)?;
         let entropy = self.fresh_contacts_entropy();
         let id = self
             .engine()?
             .document_mutate(CONTACTS_APP, move |doc| {
-                model::create_contact(doc, public_key, petname, entropy)
+                model::create_contact(doc, public_key, petname, glyph, entropy)
             })
             .await
             .map_err(refused)?;
@@ -132,8 +136,25 @@ impl Kernel {
         Ok(id)
     }
 
-    pub async fn contacts_set_petname(&self, id: String, petname: String) -> Result<(), Error> {
-        self.contacts_mutate(move |doc| model::set_petname(doc, &id, petname))
+    pub async fn contacts_set_label(
+        &self,
+        id: String,
+        mut petname: String,
+        glyph: String,
+    ) -> Result<(), Error> {
+        self.open()?;
+        if petname.is_empty() {
+            let id_for_read = id.clone();
+            let previous = self
+                .engine()?
+                .document_read(CONTACTS_APP, move |doc| model::contact(doc, &id_for_read))
+                .await
+                .map_err(engine_failed)?
+                .ok_or_else(|| Error::new(ErrorCode::NotFound, "no such contact"))?
+                .petname;
+            petname = crate::device::generate_petname(self.seams.rng.as_ref(), &previous);
+        }
+        self.contacts_mutate(move |doc| model::set_label(doc, &id, petname, glyph))
             .await
     }
 
@@ -370,7 +391,13 @@ impl Kernel {
                 )?;
                 for (selection, entropy) in selections.into_iter().zip(entropies) {
                     let party = parties.get(&selection.index).expect("validated above");
-                    let id = model::create_contact(doc, party.public_key, String::new(), entropy)?;
+                    let id = model::create_contact(
+                        doc,
+                        party.public_key,
+                        String::new(),
+                        String::new(),
+                        entropy,
+                    )?;
                     let observations = selection
                         .claims
                         .into_iter()
@@ -448,7 +475,13 @@ impl Kernel {
                 if self.meeting_identity(generation) != model::identity_public_key(doc) {
                     return Err("the contacts identity changed during this meeting".into());
                 }
-                let id = model::create_contact(doc, Some(peer_key), String::new(), entropy)?;
+                let id = model::create_contact(
+                    doc,
+                    Some(peer_key),
+                    String::new(),
+                    String::new(),
+                    entropy,
+                )?;
                 let meeting = model::create_meeting(
                     doc,
                     "met in real time".into(),
@@ -640,6 +673,7 @@ mod tests {
                 &mut document,
                 party.public_key,
                 String::new(),
+                String::new(),
                 [10 + index as u8; 32],
             )
             .unwrap();
@@ -673,7 +707,8 @@ mod tests {
     #[test]
     fn preferred_value_survives_document_reload() {
         let mut document = doc(3);
-        let id = model::create_contact(&mut document, None, "friend".into(), [1; 32]).unwrap();
+        let id = model::create_contact(&mut document, None, "friend".into(), "🐈".into(), [1; 32])
+            .unwrap();
         let meeting = model::create_meeting(
             &mut document,
             "entered by hand".into(),
@@ -710,5 +745,6 @@ mod tests {
             model::contact(&restored, &id).unwrap().preferred,
             vec![("name".into(), "Ada".into())]
         );
+        assert_eq!(model::contact(&restored, &id).unwrap().glyph, "🐈");
     }
 }

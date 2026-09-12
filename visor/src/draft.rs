@@ -5,6 +5,7 @@ pub(crate) enum RollTarget {
     Device,
     User,
     App(String),
+    Contact(String),
     Picker,
 }
 

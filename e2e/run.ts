@@ -3612,6 +3612,32 @@ const scenarios: Scenario[] = [
       try {
         const recipient = await open(recipientCtx, origin);
         await visorReady(recipient);
+        await openContactsView(recipient, "Create", ".contacts-create");
+        const create = contactsSheet(recipient).locator(".contacts-create");
+        const createName = create.getByRole("textbox", { name: "Petname", exact: true });
+        await create.getByRole("button", { name: "Re-roll contact petname", exact: true }).click();
+        check((await createName.inputValue()).length > 0, "contact create Random left the petname empty");
+        await createName.fill("created friend");
+        await create.getByRole("button", { name: "Choose contact glyph", exact: true }).click();
+        await create.locator(".glyph-picker").getByRole("searchbox", { name: "Enter glyph or search" }).fill("🐕");
+        await create.locator(".glyph-picker").getByRole("button", { name: "Use 🐕", exact: true }).click();
+        await create.getByRole("button", { name: "Create contact", exact: true }).click();
+        const createdDetail = contactsSheet(recipient).locator(".contact-details");
+        await createdDetail.waitFor({ timeout: 10_000 });
+        eq(await createdDetail.getByRole("textbox", { name: "Petname", exact: true }).inputValue(), "created friend", "contact create lost its label");
+        eq((await createdDetail.getByRole("button", { name: "Choose contact glyph", exact: true }).textContent())?.trim(), "🐕", "contact create lost its glyph");
+        await createdDetail.getByRole("textbox", { name: "Petname", exact: true }).fill("discard me");
+        await createdDetail.getByRole("button", { name: "Choose contact glyph", exact: true }).click();
+        const createdPicker = createdDetail.locator(".glyph-picker");
+        const createdSearch = createdPicker.getByRole("searchbox", { name: "Enter glyph or search" });
+        await createdSearch.waitFor();
+        check(await createdSearch.evaluate((input) => input === document.activeElement), "contact picker did not focus search");
+        await createdSearch.fill("🐇");
+        await createdPicker.getByRole("button", { name: "Use 🐇", exact: true }).click();
+        check(await createdDetail.getByRole("button", { name: "Choose contact glyph", exact: true }).evaluate((button) => button === document.activeElement), "contact picker did not return focus to glyph tile");
+        await createdDetail.getByRole("button", { name: "Revert label", exact: true }).click();
+        eq(await createdDetail.getByRole("textbox", { name: "Petname", exact: true }).inputValue(), "created friend", "contact Revert did not restore the saved petname");
+        eq((await createdDetail.getByRole("button", { name: "Choose contact glyph", exact: true }).textContent())?.trim(), "🐕", "contact Revert did not restore the saved glyph");
         await openContactsView(recipient, "Import", ".contacts-import-review");
         const importView = contactsSheet(recipient).locator(".contacts-import-review");
 
@@ -3641,14 +3667,32 @@ const scenarios: Scenario[] = [
         const row = contactsSheet(recipient).locator(".contact-row").filter({ hasText: "Ada Portable" }).first();
         await row.waitFor({ timeout: 10_000 });
         await row.click();
-      const detail = contactsSheet(recipient).locator(".contact-details");
-      await detail.waitFor({ timeout: 10_000 });
-      check(await detail.getByText("Ada Portable").count() > 0, "imported contact detail did not keep the selected name");
-      eq(await detail.getByText("ada-portable@example.test").count(), 0, "import stored an unselected email claim");
-      await detail.getByText("verified assertion", { exact: false }).waitFor({ timeout: 10_000 });
-      await shot(recipient, "contacts-detail");
-      await recipient.setViewportSize({ width: 390, height: 844 });
-      await shot(recipient, "contacts-detail-mobile");
+        const detail = contactsSheet(recipient).locator(".contact-details");
+        await detail.waitFor({ timeout: 10_000 });
+        const petname = detail.getByRole("textbox", { name: "Petname", exact: true });
+        await petname.fill("portable friend");
+        const glyph = detail.getByRole("button", { name: "Choose contact glyph", exact: true });
+        await glyph.click();
+        const picker = detail.locator(".glyph-picker");
+        await picker.getByRole("searchbox", { name: "Enter glyph or search" }).fill("🐈");
+        await picker.getByRole("button", { name: "Use 🐈", exact: true }).click();
+        await detail.getByRole("button", { name: "Save label", exact: true }).click();
+        check(await detail.getByText("Ada Portable").count() > 0, "imported contact detail did not keep the selected name");
+        eq(await detail.getByText("ada-portable@example.test").count(), 0, "import stored an unselected email claim");
+        await detail.getByText("verified assertion", { exact: false }).waitFor({ timeout: 10_000 });
+        await shot(recipient, "contacts-detail");
+        await recipient.setViewportSize({ width: 390, height: 844 });
+        const mobileLabel = detail.locator(".label-control");
+        const mobileGlyph = detail.getByRole("button", { name: "Choose contact glyph", exact: true });
+        const mobileName = detail.getByRole("textbox", { name: "Petname", exact: true });
+        const [controlBox, glyphBox, nameBox] = await Promise.all([mobileLabel.boundingBox(), mobileGlyph.boundingBox(), mobileName.boundingBox()]);
+        check(controlBox !== null && glyphBox !== null && nameBox !== null, "mobile contact label control was not visible");
+        check(glyphBox.x >= controlBox.x && nameBox.x + nameBox.width <= controlBox.x + controlBox.width + 1, "mobile contact label escaped its compound control");
+        check(Math.abs(glyphBox.y - nameBox.y) <= 1, "mobile contact glyph and petname were not aligned");
+        await shot(recipient, "contacts-detail-mobile");
+
+        await contactsSheet(recipient).getByRole("button", { name: "Contacts", exact: true }).click();
+        await contactsSheet(recipient).locator(".contact-row").filter({ hasText: "portable friend" }).waitFor({ timeout: 10_000 });
 
         await recipient.reload();
         await visorReady(recipient);
@@ -3656,7 +3700,10 @@ const scenarios: Scenario[] = [
         const again = contactsSheet(recipient).locator(".contact-row").filter({ hasText: "Ada Portable" }).first();
         await again.waitFor({ timeout: 10_000 });
         await again.click();
-        await contactsSheet(recipient).locator(".contact-details").getByText("verified assertion", { exact: false }).waitFor({ timeout: 10_000 });
+        const restored = contactsSheet(recipient).locator(".contact-details");
+        await restored.getByText("verified assertion", { exact: false }).waitFor({ timeout: 10_000 });
+        eq(await restored.getByRole("textbox", { name: "Petname", exact: true }).inputValue(), "portable friend", "contact petname did not survive reload");
+        eq((await restored.getByRole("button", { name: "Choose contact glyph", exact: true }).textContent())?.trim(), "🐈", "contact glyph did not survive reload");
       } finally {
         await recipientCtx.close();
       }

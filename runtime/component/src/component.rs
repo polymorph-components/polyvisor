@@ -659,6 +659,7 @@ fn contacts_contact(value: polyvisor_kernel::Contact) -> guest::contacts::Contac
         id: value.id,
         public_key: value.public_key.map(|key| key.to_vec()).unwrap_or_default(),
         petname: value.petname,
+        glyph: value.glyph,
         observations: value
             .observations
             .into_iter()
@@ -712,15 +713,15 @@ impl guest::contacts::Guest for Component {
             })
             .collect())
     }
-    async fn create(public_key: Vec<u8>, petname: String) -> Result<String, Error> {
+    async fn create(public_key: Vec<u8>, petname: String, glyph: String) -> Result<String, Error> {
         kernel()?
-            .contacts_create(public_key, petname)
+            .contacts_create(public_key, petname, glyph)
             .await
             .map_err(map_error)
     }
-    async fn set_petname(id: String, petname: String) -> Result<(), Error> {
+    async fn set_label(id: String, petname: String, glyph: String) -> Result<(), Error> {
         kernel()?
-            .contacts_set_petname(id, petname)
+            .contacts_set_label(id, petname, glyph)
             .await
             .map_err(map_error)
     }
