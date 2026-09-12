@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "runtime/component",
+    "runtime/crates/contacts-model",
     "runtime/crates/document-history",
     "runtime/crates/engine",
     "runtime/crates/kernel",
@@ -55,6 +56,12 @@ future_form = "0.3.0"
 # sedimentree commit. Version matches subduction's own automerge pin so the
 # ChangeHash/CommitId correspondence stays byte-identical across peers.
 automerge = "0.11.0"
+# Contacts introductions use checked-in protobuf as their wire-format source of
+# truth; prost-build generates Rust at build time and prost-types supplies
+# google.protobuf.Timestamp.
+prost = "0.14"
+prost-build = "0.14"
+prost-types = "0.14"
 # The engine's signing identity (internal.wit `world runtime`: the seed
 # posture). Same major as subduction's, so `Signature`/`VerifyingKey` unify
 # across the trait boundary. `default-features = false` keeps `getrandom`

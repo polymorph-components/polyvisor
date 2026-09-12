@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package polyvisor.introduction.v0;
+
+import "google/protobuf/timestamp.proto";
+
+message SignedIntroduction {
+  bytes introduction = 1;
+  bytes signature = 2;
+}
+
+message Introduction {
+  Party issuer = 1;
+  repeated Party parties = 2;
+  google.protobuf.Timestamp issued_at = 3;
+}
+
+message Party {
+  bytes public_key = 1;
+  repeated Claim claims = 2;
+}
+
+message Claim {
+  string name = 1;
+  string value = 2;
+}

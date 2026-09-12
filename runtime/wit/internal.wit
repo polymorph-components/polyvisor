@@ -81,6 +81,45 @@ interface types {
         /// Framework voice.
         failed(string),
     }
+
+    /// Where a real-time meeting stands: a live exchange of signed
+    /// introductions between two devices of *different* users (never
+    /// enrollment; the outcome is a contact) over a distinct ALPN. In
+    /// `types` because exported `meeting` and `events` both carry it.
+    variant meeting-phase {
+        idle,
+        /// Host: showing the bootstrap link/QR the peer scans or opens.
+        offering(string),
+        /// Guest: dialing the host named in a bootstrap link.
+        dialing,
+        /// Both: the SAS to compare and the peer's card to review.
+        awaiting-confirm(meeting-review),
+        /// Confirmed here, waiting for the other side.
+        awaiting-peer,
+        /// Completed: the resulting contact's local id.
+        done(string),
+        /// Framework voice: wrong code, cancelled peer, bad signature.
+        failed(string),
+    }
+
+    /// A phase plus its session generation: `some` for every active phase,
+    /// `none` for idle/terminal. `confirm`/`cancel` carry it so a tab acting
+    /// on a meeting a newer `offer`/`join` replaced is rejected as stale.
+    /// `u32` matches `session-id` — the kernel counter must be `u32`.
+    record meeting-status {
+        generation: option<u32>,
+        phase: meeting-phase,
+    }
+
+    /// The peer's card to review before confirming, extracted from its
+    /// *verified* signed self-introduction: the SAS both devices display, the
+    /// peer's user signing key (the identity the contact is keyed to, not any
+    /// endpoint key), and the claims it offered.
+    record meeting-review {
+        sas: string,
+        peer-key: list<u8>,
+        claims: list<tuple<string, string>>,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -430,7 +469,7 @@ interface apps {
 /// an enrollment landing, a peer closing) reaches the visor with no press
 /// on this device.
 interface events {
-    use types.{session-id, phase};
+    use types.{session-id, phase, meeting-status};
 
     variant event {
         /// A session ended other than through `apps.close`. The string is
@@ -450,6 +489,14 @@ interface events {
         /// Sealed shared personalization or group membership changed. The
         /// visor re-reads authoritative snapshots and rebases clean fields.
         personalization-changed,
+        /// The contacts document changed: a contact created/edited/deleted,
+        /// an import accepted, or a meeting wrote one. The visor re-reads
+        /// `contacts.list`. Born of network activity too — a paired device's
+        /// edit lands here with nothing pressed on this device.
+        contacts-changed,
+        /// The meeting ceremony moved (like `pairing-changed`): the kernel
+        /// emits this on every transition, including ones the peer caused.
+        meeting-changed(meeting-status),
     }
 
     /// Resolves with the next event; parks while there is none.
@@ -469,6 +516,284 @@ interface app-services {
     tasks-set-completed: async func(session: session-id, id: string, completed: bool) -> result<_, string>;
     tasks-set-title: async func(session: session-id, id: string, title: string) -> result<_, string>;
     tasks-remove: async func(session: session-id, id: string) -> result<_, string>;
+}
+
+/// The user's private contacts: identity bindings, signed disclosures, and
+/// the meetings that produced them. Runtime and visor own this; there is no
+/// public contacts app service (internal only).
+///
+/// The store is a new encrypted user document (keyhive-sealed, synced and
+/// checkpointed like any app tree, *not* plaintext `polyvisor:us`). Only
+/// verified *extracted* observations are persisted; the original signed
+/// introduction payload and signature are NEVER stored, logged, or
+/// checkpointed. It also holds the user's contact **signing identity** (a
+/// seed): a user-level identity synced inside the document, distinct from the
+/// device endpoint key, adopted from the established group on pairing.
+interface contacts {
+    use types.{error};
+
+    /// How a value came to be recorded. `verified` (signature-backed) is the
+    /// only third-party-verified category; `local` (manual edit) and
+    /// `imported` (unsigned JSON list, no authenticated issuer) are this
+    /// device's own assertions.
+    enum provenance {
+        local,
+        imported,
+        verified,
+    }
+
+    /// A protobuf `google.protobuf.Timestamp`, preserved faithfully rather
+    /// than flattened to millis, so no durable precision/range is lost.
+    record claimed-time {
+        seconds: s64,
+        nanos: u32,
+    }
+
+    /// One recorded observation: a descriptive claim (issuer assertion, never
+    /// consent/authorization) plus its provenance. The user owns the store —
+    /// any observation, `verified` included, may be removed; no signature is
+    /// retained to contradict, so a removal is a store edit. A historical
+    /// correction is a new observation.
+    record observation {
+        name: string,
+        value: string,
+        provenance: provenance,
+        /// The asserting signing key for a `verified` observation; empty
+        /// otherwise. Ed25519, 32 bytes.
+        issuer: list<u8>,
+        /// The issuer's asserted time for a `verified` observation; `none`
+        /// for `local`/`imported` (no authenticated time).
+        claimed: option<claimed-time>,
+        /// Epoch milliseconds this device recorded it (receipt time).
+        received: u64,
+        /// The provenance record this references (a stable id from
+        /// `meetings`). A meeting, import, and manual edit all make one, so
+        /// this is never empty.
+        meeting: string,
+    }
+
+    /// A contact as the visor lists and inspects it.
+    record contact {
+        /// Stable, kernel-minted, never reused. 16 bytes lowercase hex. A
+        /// keyed contact's id is derived deterministically from its public
+        /// key (so two devices importing the same key converge on one
+        /// contact); a keyless import gets a random id.
+        id: string,
+        /// The contact's user signing public key (Ed25519, 32 bytes), or
+        /// empty for a keyless imported record.
+        public-key: list<u8>,
+        /// The user's editable label. Local, visible, independent of any
+        /// received "name" claim (never overwritten by a third party), never
+        /// secretly exported.
+        petname: string,
+        /// Every recorded observation, in a stable order.
+        observations: list<observation>,
+        /// The user's preferred value per claim name — the `set-preferred`
+        /// override, surfaced so it survives reload. `(name, value)` pairs;
+        /// a name absent here has no preference.
+        preferred: list<tuple<string, string>>,
+    }
+
+    /// The user's own contact identity: the signing public key others key a
+    /// contact to, and the user's self-authored claims. A user-level identity
+    /// synced inside the document, separate from the device endpoint id.
+    record self-profile {
+        public-key: list<u8>,
+        observations: list<observation>,
+    }
+
+    /// A party in an introduction: the public key and its asserted claims.
+    /// The structure `share` signs — the runtime requires the issuer's key to
+    /// equal this user's own signing key (mismatch refused, never
+    /// overwritten, so a stale value held across an identity adoption cannot
+    /// be signed under an unexpected identity) and stamps `issued-at` itself.
+    record party {
+        /// Ed25519, 32 bytes. Mandatory — a party is never keyless.
+        public-key: list<u8>,
+        claims: list<tuple<string, string>>,
+    }
+
+    /// The exact parties and claims to sign. The visor assembles this from
+    /// `items`/`profile` and hands it to `share`; nothing is re-derived from
+    /// the mutable store between assembly and signature.
+    record introduction {
+        issuer: party,
+        parties: list<party>,
+    }
+
+    /// How and when a value's source happened, and whether it verified. A
+    /// separate stable-id collection every observation references — meeting,
+    /// import, and manual edit all make one, so provenance is queryable here.
+    record meeting-record {
+        /// Stable id, kernel-minted. Observations name it.
+        id: string,
+        /// Framework voice: "met in real time" / "imported from a file" /
+        /// "entered by hand".
+        method: string,
+        /// Local, unauthenticated label (a filename for an import, or a
+        /// channel label); empty when there is none.
+        source: string,
+        /// The peer/issuer signing key for a meeting or signed import; empty
+        /// for an unsigned import or manual edit. Ed25519, 32 bytes.
+        source-key: list<u8>,
+        /// Epoch milliseconds this device recorded the exchange.
+        occurred: u64,
+        /// Whether a signature was verified over the source bytes.
+        verified: bool,
+    }
+
+    /// One party of a parsed import, addressable by `index` so a keyless
+    /// party (empty key) is still selectable. A signed introduction's parties
+    /// verify; an unsigned JSON list's do not (`provenance` says which).
+    record import-party {
+        /// Stable within this review only; what `selection` addresses.
+        index: u32,
+        /// Ed25519, 32 bytes, or empty for a keyless party.
+        public-key: list<u8>,
+        /// The asserting signing key for a signed import; empty for unsigned
+        /// JSON. Ed25519, 32 bytes.
+        issuer: list<u8>,
+        /// The issuer's asserted time for a signed import; `none` unsigned.
+        claimed: option<claimed-time>,
+        /// `verified` for a signed introduction, `imported` for JSON.
+        provenance: provenance,
+        claims: list<tuple<string, string>>,
+    }
+
+    /// A contact-file import, parsed (and, when signed, verified) but not yet
+    /// written. `import-accept` writes only the selected observations; raw
+    /// signed bytes are never surfaced or retained.
+    record import-review {
+        parties: list<import-party>,
+        /// Whether the file was a signed introduction or the unsigned JSON
+        /// contact list.
+        signed: bool,
+        /// Framework voice: what the file is and how it verified.
+        summary: string,
+    }
+
+    /// Exact observations to keep, addressed by review `index` and exact
+    /// `(name, value)` tuples — never by name alone, which is ambiguous when
+    /// a party asserts several values for one name.
+    record selection {
+        index: u32,
+        claims: list<tuple<string, string>>,
+    }
+
+    // -- reads ---------------------------------------------------------------
+
+    items: async func() -> result<list<contact>, error>;
+    get: async func(id: string) -> result<contact, error>;
+    profile: async func() -> result<self-profile, error>;
+    /// Every meeting record, newest first — the provenance collection the
+    /// visor shows for method/source/time/verification detail.
+    meetings: async func() -> result<list<meeting-record>, error>;
+
+    // -- manual CRUD ---------------------------------------------------------
+
+    /// Create a contact by hand. `public-key` empty makes a keyless record
+    /// (random id); a key makes a keyed record (deterministic id, converging
+    /// with any same-key import). Returns the contact's local id.
+    create: async func(public-key: list<u8>, petname: string) -> result<string, error>;
+    /// Set the local, visible petname. Never a "name" claim; never exported.
+    set-petname: async func(id: string, petname: string) -> result<_, error>;
+    /// Add or replace a manual (`local`) observation on a contact.
+    set-observation: async func(id: string, name: string, value: string) -> result<_, error>;
+    /// Remove an observation by exact `(name, value)`. Allowed for any
+    /// provenance including `verified`: the user owns the store and no
+    /// signature is retained to contradict.
+    remove-observation: async func(id: string, name: string, value: string) -> result<_, error>;
+    /// Mark one observed value the user's preferred one for `(id, name)`, a
+    /// local override that survives remote claims and is never overwritten by
+    /// a third party. `value` is `none` to clear the preference; a `some`
+    /// value that is not among the contact's observations for `name` is
+    /// `refused`. `none`, not an empty string, clears — an empty observed
+    /// value is a valid value and may be preferred.
+    set-preferred: async func(id: string, name: string, value: option<string>) -> result<_, error>;
+    delete: async func(id: string) -> result<_, error>;
+    /// Fold a keyless imported record into an established keyed identity.
+    /// Explicit by ruling: different keys are never silently merged.
+    /// `keyless` must be keyless; `into` must be keyed.
+    merge: async func(keyless: string, into: string) -> result<_, error>;
+
+    // -- self profile edits --------------------------------------------------
+
+    set-self-observation: async func(name: string, value: string) -> result<_, error>;
+    remove-self-observation: async func(name: string, value: string) -> result<_, error>;
+
+    // -- introduction share --------------------------------------------------
+
+    /// Sign and serialize the exact `introduction` the user assembled, as a
+    /// portable `polyvisor.introduction.v0` card. Takes the immutable value
+    /// rather than re-reading the store. The runtime requires
+    /// `issuer.public-key` to equal this user's signing key (mismatch
+    /// `refused`), stamps `issued-at`, and validates every party's key is
+    /// present, non-weak and unique before signing.
+    share: async func(introduction: introduction) -> result<list<u8>, error>;
+
+    // -- import --------------------------------------------------------------
+
+    /// Decode a `#contact/<body>` fragment body (base64url text) into the raw
+    /// bytes `import-preview` takes. The runtime owns link encoding; the
+    /// visor never protocol-decodes. `refused` for invalid base64url. (The
+    /// `#meet/<body>` fragment goes to `meeting.join` verbatim.)
+    decode-link: async func(body: string) -> result<list<u8>, error>;
+    /// Parse a contact file for review: a signed `polyvisor.introduction.v0`
+    /// introduction (verified over the original bytes, never a
+    /// reserialization) or the unsigned JSON contact list (no authenticated
+    /// issuer/time). `import-review.signed` says which. `refused` for a
+    /// signed introduction that does not verify or bytes that are neither
+    /// form. Nothing is written.
+    import-preview: async func(bytes: list<u8>) -> result<import-review, error>;
+    /// Accept a reviewed import, re-parsing/re-verifying `bytes` and writing
+    /// only the observations in `selections`. `source` is a local
+    /// unauthenticated label (a filename or channel label) kept on the
+    /// meeting-record. Unselected claims and raw signed bytes are never
+    /// persisted. Contacts are created or (same key) merged automatically;
+    /// different keys never silently. Returns the affected contact ids.
+    import-accept: async func(bytes: list<u8>, source: string, selections: list<selection>) -> result<list<string>, error>;
+}
+
+/// Real-time meeting: two devices of *different* users exchange signed
+/// self-introductions over a dedicated ALPN, compare a SAS, and each
+/// confirms. The outcome is a contact on each side, never a group member —
+/// not pairing (which enrols a device into one user's group with a shared
+/// seed); a meeting binds two independent identities and shares only the
+/// introductions the users chose to present.
+///
+/// The SAS transcript binds BOTH sides' signed self-introductions (and so
+/// their user signing keys) with the endpoint keys, token and nonces — not
+/// the transport keys alone — so a late issuer/self-introduction swap changes
+/// the digits and is caught. Bootstrap is a link the peer's system camera
+/// opens; the visor hands the fragment to `join` after unseal. Never
+/// auto-accepted: `join` reaches `awaiting-confirm`, and only an explicit
+/// `confirm` on each side completes it.
+interface meeting {
+    use types.{error, meeting-status};
+    use contacts.{party};
+
+    /// Host: mint a token and return the bootstrap link (an absolute URL with
+    /// the host endpoint and token in its fragment). Replaces any open offer.
+    /// `card` is the exact self-introduction party this user presents
+    /// (assembled from `profile`, not re-derived); its `public-key` must be
+    /// this user's own signing key. Returns this operation's own
+    /// `meeting-status` (generation + phase) so the caller binds to its own
+    /// session, not a racy latest-status read another tab may have replaced.
+    offer: async func(card: party) -> result<meeting-status, error>;
+    /// Guest: begin from a bootstrap link's fragment. Dials the host and runs
+    /// the exchange up to `awaiting-confirm`; never auto-accepts. `card` as
+    /// in `offer`. Returns this operation's own `meeting-status`.
+    join: async func(fragment: string, card: party) -> result<meeting-status, error>;
+    /// After comparing the SAS and reviewing the peer's card. `generation`
+    /// must match the current session (a stale one is `refused`, so a tab
+    /// confirming a replaced meeting cannot accept the new one). `keep` names
+    /// the exact `(name, value)` claims to record. Writes the contact once
+    /// the other side also confirms.
+    confirm: async func(generation: u32, keep: list<tuple<string, string>>) -> result<_, error>;
+    /// Either side, any time; the other sees `failed`. A stale `generation`
+    /// is ignored so it cannot tear down a replacement meeting.
+    cancel: async func(generation: u32) -> result<_, error>;
+    status: async func() -> result<meeting-status, error>;
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +840,26 @@ interface shell {
     /// the ceremony's browser half lives here and the kernel never sees a
     /// window.
     open-popup: async func(url: string) -> option<tuple<string, string>>;
+
+    /// This page's URL without query or fragment (the same value the kernel
+    /// received in `boot-config.page-url`). The visor needs it to compose a
+    /// meeting bootstrap link the peer's system camera can open back to this
+    /// origin. A plain `func`: it reads a property of the page the visor is
+    /// already in, crossing no realm.
+    page-url: func() -> string;
+    /// Put `text` on the system clipboard — a share-my-contact link or card.
+    /// A window capability, so it lives here; `refused` if the browser
+    /// denied the write.
+    copy-text: async func(text: string) -> result<_, error>;
+    /// Ask the user for a contact file to import and read its bytes. Answers
+    /// `none` when the user cancelled the picker (a settled non-error), or
+    /// the filename and bytes otherwise. Input is bounded by the glue before
+    /// it crosses; the kernel bounds it again before parsing.
+    read-contact-file: async func() -> result<option<tuple<string, list<u8>>>, error>;
+    /// Offer `bytes` to the user as a download named `name` — a portable
+    /// contact card the kernel signed. The glue mints and revokes the blob
+    /// URL; `refused` if the browser denied it.
+    save-contact-file: async func(name: string, bytes: list<u8>) -> result<_, error>;
 
     /// What the visor asks the page to install an app as: the fields of a
     /// web app manifest the glue cannot know. `title` is app voice, shown
@@ -616,6 +961,8 @@ world runtime {
     export apps;
     export events;
     export app-services;
+    export contacts;
+    export meeting;
 }
 
 /// The visor component: the trusted pixels, on the main thread.
@@ -631,4 +978,6 @@ world visor {
     import apps;
     import events;
     import shell;
+    import contacts;
+    import meeting;
 }

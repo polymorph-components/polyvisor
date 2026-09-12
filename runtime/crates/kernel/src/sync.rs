@@ -21,8 +21,8 @@ use polyvisor_engine::{
 use subduction_protocol::event::Direction;
 
 use crate::{
-    Clock, EngineTransport, Error, ErrorCode, Kernel, NetHandle, PAIRING_ALPN, SUBDUCTION_ALPN,
-    State, SyncEngine,
+    Clock, EngineTransport, Error, ErrorCode, Kernel, MEETING_ALPN, NetHandle, PAIRING_ALPN,
+    SUBDUCTION_ALPN, State, SyncEngine,
 };
 
 /// `polyvisor:internal/sync.member`.
@@ -161,6 +161,10 @@ impl Kernel {
                             }
                             let _ = kernel.refresh_personalization().await;
                             kernel.push_event(crate::Event::PersonalizationChanged);
+                            // Engine events do not identify the changed
+                            // partition; harmlessly prompt both authoritative
+                            // readers rather than miss a remote contacts edit.
+                            kernel.push_event(crate::Event::ContactsChanged);
                         }
                         EngineEvent::PeerClosed(peer) => kernel.close_peer(peer),
                     }
@@ -467,6 +471,16 @@ async fn accept_loop(kernel: Weak<Kernel>, endpoint: Rc<dyn NetHandle>) {
                         .spawn
                         .spawn(Box::pin(async move { transport.close().await }));
                 }
+            }
+            MEETING_ALPN => {
+                // Admission remains inside the meeting state machine; this
+                // read also keeps the offer predicate available to routing
+                // diagnostics without changing that unconditional handoff.
+                let _offering = kernel.meeting_offering();
+                let spawn = Rc::clone(&kernel.seams.spawn);
+                spawn.spawn(Box::pin(async move {
+                    kernel.meeting_accept(endpoint_id, key, transport).await;
+                }));
             }
             // An ALPN this device never advertised. The endpoint should not
             // deliver one; if something does, it is not a wire we speak.

@@ -16,9 +16,11 @@ use std::task::{Poll, Waker};
 
 mod apps;
 mod checkpoint;
+mod contacts;
 mod device;
 mod drive;
 mod events;
+mod meeting;
 mod pairing;
 mod route;
 mod seal;
@@ -26,9 +28,16 @@ mod store;
 mod sync;
 
 pub use apps::{AppInfo, AssetInfo, ComponentArtifacts};
+pub use contacts::{
+    Claim, ClaimedTime, Contact, ImportReview, Introduction, MeetingRecord, Observation, Party,
+    Provenance, Selection, SelfProfile,
+};
 pub use device::{DeviceStatus, IndexRow, MetaScope, Rest, State, Tier};
 pub use drive::{Binding, HttpResponse};
 pub use events::Event;
+pub use meeting::{
+    MEETING_ALPN, MeetingOffer, MeetingReview, Phase as MeetingPhase, Status as MeetingStatus,
+};
 pub use pairing::Phase;
 pub use polyvisor_engine::EngineTransport;
 pub use polyvisor_todo_model::{Snapshot, TodoItem};
@@ -371,8 +380,14 @@ pub struct Kernel {
     peers: RefCell<Vec<sync::PeerRecord>>,
     /// The pairing ceremony, when one is running (internal.wit `pairing`).
     pairing: RefCell<pairing::Pairing>,
+    /// The contact meeting ceremony, separate from device pairing.
+    meeting: RefCell<meeting::Meeting>,
     /// Serialises checkpoints — see [`Kernel::checkpoint`].
     checkpointing: RefCell<Checkpointing>,
+    /// Durable callers coalesced into the active checkpoint. Unlike ordinary
+    /// checkpoint callers, these wait until the pass carrying their mutation
+    /// has either committed or failed.
+    checkpoint_waiters: RefCell<Vec<futures::channel::oneshot::Sender<Result<(), Error>>>>,
     /// The durable store: tokens, the pending consent ceremony, and how the
     /// last sync went (internal.wit `storage`).
     drive: RefCell<drive::Drive>,
@@ -447,7 +462,9 @@ impl Kernel {
             bind_error: RefCell::new(None),
             peers: RefCell::new(Vec::new()),
             pairing: RefCell::new(pairing::Pairing::default()),
+            meeting: RefCell::new(meeting::Meeting::default()),
             checkpointing: RefCell::new(Checkpointing::default()),
+            checkpoint_waiters: RefCell::new(Vec::new()),
             drive: RefCell::new(drive),
             syncing: RefCell::new(Checkpointing::default()),
             next_watch: Cell::new(1),
@@ -458,7 +475,9 @@ impl Kernel {
         // endpoint until `unseal` (internal.wit `device`).
         if kernel.state() != State::Sealed {
             kernel.start_sync();
-            if kernel.initialize_personalization().await? {
+            let personalization_wrote = kernel.initialize_personalization().await?;
+            let contacts_wrote = kernel.initialize_contacts().await?;
+            if personalization_wrote || contacts_wrote {
                 kernel.checkpoint().await?;
             }
             // At boot, after `open`: a device that was off while its group
@@ -831,7 +850,9 @@ impl Kernel {
             state.wrapped = None;
         }
         self.start_sync();
-        if self.initialize_personalization().await? {
+        let personalization_wrote = self.initialize_personalization().await?;
+        let contacts_wrote = self.initialize_contacts().await?;
+        if personalization_wrote || contacts_wrote {
             self.checkpoint().await?;
         }
         // The boot trigger's other half: a device that rested under a
@@ -879,6 +900,7 @@ impl Kernel {
         *self.bind_error.borrow_mut() = None;
         self.peers.borrow_mut().clear();
         *self.pairing.borrow_mut() = pairing::Pairing::default();
+        *self.meeting.borrow_mut() = meeting::Meeting::default();
         Ok(())
     }
 
@@ -938,6 +960,9 @@ impl Kernel {
             gate.running = true;
         }
         let result = self.checkpoint_loop().await;
+        for waiter in self.checkpoint_waiters.borrow_mut().drain(..) {
+            let _ = waiter.send(result.clone());
+        }
         // Unconditionally, including on the error path: a gate left latched
         // would silently stop every later checkpoint.
         *self.checkpointing.borrow_mut() = Checkpointing::default();
@@ -953,6 +978,32 @@ impl Kernel {
             self.schedule_store_sync();
         }
         result
+    }
+
+    /// Checkpoint and do not return until this caller's in-memory mutation is
+    /// covered by a completed write. A caller arriving during another writer
+    /// joins its dirty follow-up pass and receives that pass's real result.
+    async fn checkpoint_durable(&self) -> Result<(), Error> {
+        let wait = {
+            let mut gate = self.checkpointing.borrow_mut();
+            if gate.running {
+                gate.dirty = true;
+                let (send, receive) = futures::channel::oneshot::channel();
+                self.checkpoint_waiters.borrow_mut().push(send);
+                Some(receive)
+            } else {
+                None
+            }
+        };
+        match wait {
+            Some(wait) => wait.await.unwrap_or_else(|_| {
+                Err(Error::new(
+                    ErrorCode::Failed,
+                    "the checkpoint writer stopped before completing",
+                ))
+            }),
+            None => self.checkpoint().await,
+        }
     }
 
     /// Write until nobody has asked again. `dirty` is cleared *before* the

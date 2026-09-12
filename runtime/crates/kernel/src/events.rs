@@ -31,6 +31,8 @@ pub enum Event {
     /// (internal.wit `events.pairing-changed`).
     PairingChanged(crate::pairing::Phase),
     PersonalizationChanged,
+    ContactsChanged,
+    MeetingChanged(crate::meeting::Status),
 }
 
 #[derive(Default)]

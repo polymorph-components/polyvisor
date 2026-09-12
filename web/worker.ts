@@ -58,6 +58,8 @@ const I = {
   appServices: "polyvisor:internal/app-services@0.1.0",
   locks: "polyvisor:internal/locks@0.1.0",
   tasks: "polyvisor:app/tasks@0.1.0",
+  contacts: "polyvisor:internal/contacts@0.1.0",
+  meeting: "polyvisor:internal/meeting@0.1.0",
 } as const;
 
 /** The runtime's exports, keyed by verbatim interface id. */
@@ -344,6 +346,53 @@ function mintSessionPort(
   return port2;
 }
 
+/// runtime/wit/internal.wit `interface contacts`'s methods, camelCase.
+const CONTACTS_METHODS = [
+  "items",
+  "get",
+  "profile",
+  "meetings",
+  "decodeLink",
+  "create",
+  "setPetname",
+  "setObservation",
+  "removeObservation",
+  "setPreferred",
+  "delete",
+  "merge",
+  "setSelfObservation",
+  "removeSelfObservation",
+  "share",
+  "importPreview",
+  "importAccept",
+] as const;
+
+/// runtime/wit/internal.wit `interface meeting`'s methods, camelCase.
+const MEETING_METHODS = ["offer", "join", "confirm", "cancel", "status"] as
+  const;
+
+/**
+ * Forward each of `names` verbatim to the runtime's own export of `iface`,
+ * exactly like the hand-written `(await ready)[I.x].method(...)` entries
+ * above but built from a list — `contacts` and `meeting` have too many
+ * members to repeat that line for each by hand. Control port only: neither
+ * interface is served to an app session (`mintSessionPort` above serves
+ * neither).
+ */
+function forwardMethods(
+  iface: string,
+  names: readonly string[],
+): Record<string, (...args: unknown[]) => unknown> {
+  return Object.fromEntries(
+    names.map((name) => [
+      name,
+      async (...args: unknown[]) =>
+        ((await ready)[iface] as Record<string, (...a: unknown[]) => unknown>)
+          [name](...args),
+    ]),
+  );
+}
+
 self.onconnect = (ev: MessageEvent) => {
   const port = ev.ports[0];
   const tab: Tab = { port, queue: [] };
@@ -508,6 +557,11 @@ self.onconnect = (ev: MessageEvent) => {
         });
       },
     },
+    // Control port only, like `sync`/`pairing`: contacts and meetings are
+    // trusted-runtime state, never reachable from an app session
+    // (`mintSessionPort` above does not serve either).
+    [I.contacts]: forwardMethods(I.contacts, CONTACTS_METHODS),
+    [I.meeting]: forwardMethods(I.meeting, MEETING_METHODS),
   });
 
   void ready.then(() => {

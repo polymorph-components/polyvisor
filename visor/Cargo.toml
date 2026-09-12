@@ -17,6 +17,7 @@ crate-type = ["cdylib"]
 dioxus = { workspace = true, features = ["hooks"] }
 emojis = "0.9"
 polyvisor-petname.workspace = true
+qrcode = { version = "0.14", default-features = false }
 stream-dom-dioxus.workspace = true
 stream-dom-guest.workspace = true
 unicode-segmentation = "1.13"

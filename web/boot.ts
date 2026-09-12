@@ -10,6 +10,11 @@ import { artifactsFromEnvelope } from "@polyengine/runtime/embedder";
 import { ComponentException } from "@polyengine/protocol";
 
 import { attachVisorFocus } from "./focus.ts";
+import {
+  copyText as clipboardCopyText,
+  readContactFile as pickContactFile,
+  saveContactFile as downloadContactFile,
+} from "./contact_files.ts";
 import { mountProducer } from "./mount.ts";
 import { popupReturn } from "./oauth.ts";
 import { proxyInterfaces } from "./rpc.ts";
@@ -148,6 +153,8 @@ const I = {
   storage: "polyvisor:internal/storage@0.1.0",
   events: "polyvisor:internal/events@0.1.0",
   shell: "polyvisor:internal/shell@0.1.0",
+  contacts: "polyvisor:internal/contacts@0.1.0",
+  meeting: "polyvisor:internal/meeting@0.1.0",
 } as const;
 
 interface ComponentArtifacts {
@@ -353,6 +360,12 @@ const kernel = proxyInterfaces(control, [
   I.pairing,
   I.storage,
   I.events,
+  // Contacts and meetings are trusted-runtime state, proxied over the same
+  // control port as `device`/`sync`/`pairing`: this list is what the visor
+  // imports directly, and it is never handed to an app session's
+  // `mintSessionPort` allowlist (web/worker.ts).
+  I.contacts,
+  I.meeting,
 ]);
 
 // The other end of the LAST pointer: `device.status`'s `tier` is the kernel's
@@ -939,6 +952,52 @@ async function main(): Promise<void> {
     fragment: (): string | undefined => {
       const hash = location.hash;
       return hash === "" || hash === "#" ? undefined : hash.slice(1);
+    },
+    // Sync (internal.wit `shell.page-url`): the page's own URL without
+    // query or fragment — same value the `hello` handshake already sent the
+    // worker as `pageUrl` (the OAuth redirect base), spelled here as a
+    // direct import so any consumer that needs "this page, plainly" (a
+    // contact/meeting link) does not have to round-trip through the worker
+    // to ask a window a question only a window can answer.
+    pageUrl: (): string => location.origin + location.pathname,
+    // internal.wit `shell.copy-text`: the system clipboard. Failure (a
+    // denied permission, an insecure context) surfaces as the WIT's
+    // `result<_, error>` error arm, same pattern as `open-frame`.
+    copyText: (text: string): Promise<void> =>
+      clipboardCopyText(text).catch((err: unknown) => {
+        throw new ComponentException({
+          code: "failed",
+          message: String((err as Error)?.message ?? err),
+        });
+      }),
+    // internal.wit `shell.read-contact-file`: the browser's file picker.
+    // `option<tuple<string, list<u8>>>` lowers as `[name, bytes] | undefined`
+    // (M1 "Value mapping"); a cancelled picker is the `none` arm, not an
+    // error — only an actual read failure reaches `result`'s error arm.
+    readContactFile: (): Promise<[string, Uint8Array] | undefined> =>
+      pickContactFile()
+        .then((picked): [string, Uint8Array] | undefined =>
+          picked === undefined ? undefined : [picked.name, picked.bytes]
+        )
+        .catch((err: unknown) => {
+          throw new ComponentException({
+            code: "failed",
+            message: String((err as Error)?.message ?? err),
+          });
+        }),
+    // internal.wit `shell.save-contact-file`: hand `bytes` to the browser as
+    // a download named `name`. Synchronous DOM work wrapped as the async
+    // result the WIT declares.
+    saveContactFile: (name: string, bytes: Uint8Array): Promise<void> => {
+      try {
+        downloadContactFile(name, bytes);
+        return Promise.resolve();
+      } catch (err) {
+        throw new ComponentException({
+          code: "failed",
+          message: String((err as Error)?.message ?? err),
+        });
+      }
     },
     // Also sync. Re-anchoring is all this does — the worker is named after
     // the anchor, so the reload is what actually moves the tab to the other

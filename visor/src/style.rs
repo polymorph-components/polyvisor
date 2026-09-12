@@ -109,7 +109,6 @@ pub(crate) const CSS: &str = r#"
   padding: 4px 8px; text-align: left;
 }
 #visor-root #visor-self { flex-direction: row-reverse; text-align: right; }
-#visor-root #visor-app[aria-pressed="true"], #visor-root #visor-self[aria-pressed="true"] { background: oklch(1 0 0 / 0.18); box-shadow: none; }
 #visor-divider { width: 1px; align-self: stretch; margin: 5px; background: var(--strip-edge); }
 #visor-root .glyph-tile-face, #visor-circle {
   flex: none;
@@ -155,11 +154,8 @@ pub(crate) const CSS: &str = r#"
   border-bottom: 1px solid var(--edge);
   animation: visor-drawer-open 180ms ease-out;
 }
-#visor-drawer.closing { animation: visor-drawer-close 180ms ease-in forwards; }
-
-/* One pane per tenant, stacked so two can be on screen at once while one
-   slides out. The drawer's height is fixed and the pane scrolls inside it,
-   so no sheet's length can move anything.
+/* Navigation and the one live content pane share the drawer's bounded body.
+   The pane scrolls inside it, so no sheet's length can move anything.
 
    `overflow-x: hidden`: the long machine texts each carry their own local
    horizontal scroll, so nothing may make the drawer or the page scroll
@@ -171,11 +167,36 @@ pub(crate) const CSS: &str = r#"
    content above or below, the cover has scrolled away and the shadow shows
    — so "there is more" is visible without a scrollbar being trusted to say
    it. */
-#visor-root .pane-host { position: relative; flex: 1 1 auto; min-height: 0; overflow: hidden; }
-#visor-root .pane {
-  position: absolute; inset: 0;
+#visor-drawer-body {
+  position: relative;
+  display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0;
+  overflow: hidden;
+}
+#visor-drawer-header { display: none; }
+#visor-sidebar-toggle { min-width: 44px; }
+#visor-drawer-main {
+  position: relative;
+  display: flex; flex: 1 1 auto; min-height: 0; overflow: hidden;
+}
+#visor-sidebar {
+  flex: 0 0 10rem;
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 12px 8px; box-sizing: border-box;
+  border-right: 1px solid var(--edge);
   overflow-y: auto; overflow-x: hidden;
-  padding: 12px var(--visor-gutter);
+}
+#visor-root #visor-sidebar button {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; background: none; border-color: transparent;
+  color: var(--plate-ink); text-align: left;
+}
+#visor-root #visor-sidebar button[aria-current="page"] {
+  background: var(--accent); border-color: var(--plate-ink); color: var(--accent-ink);
+}
+#visor-content {
+  flex: 1 1 auto; min-width: 0; min-height: 0;
+  overflow-y: auto; overflow-x: hidden;
+  padding: 12px;
   box-sizing: border-box;
   background:
     linear-gradient(var(--drawer) 30%, transparent) center top / 100% 32px,
@@ -186,27 +207,38 @@ pub(crate) const CSS: &str = r#"
   background-attachment: local, local, scroll, scroll;
   background-color: var(--drawer);
 }
+#visor-content > * { width: min(100%, 720px); margin-inline: auto; }
 /* Where the caret lands when a pane opens; quiet, since it is a container. */
-#visor-root .pane:focus-visible { outline: 2px dashed var(--quiet); outline-offset: -6px; }
-#visor-root .pane.enter-from-right { animation: visor-enter-right 200ms ease-out; }
-#visor-root .pane.enter-from-left { animation: visor-enter-left 200ms ease-out; }
-#visor-root .pane.leave-to-left { animation: visor-leave-left 200ms ease-in forwards; }
-#visor-root .pane.leave-to-right { animation: visor-leave-right 200ms ease-in forwards; }
+#visor-content:focus-visible { outline: 2px dashed var(--quiet); outline-offset: -6px; }
 
 @keyframes visor-drawer-open { from { height: 0; } }
-@keyframes visor-drawer-close { to { height: 0; } }
-@keyframes visor-enter-right { from { transform: translateX(100%); } }
-@keyframes visor-enter-left { from { transform: translateX(-100%); } }
-@keyframes visor-leave-left { to { transform: translateX(-100%); } }
-@keyframes visor-leave-right { to { transform: translateX(100%); } }
 
-/* Movement is decoration; the states it moves between are not. 1ms, not 0s:
-   a zero-duration animation can finish without ever dispatching the
-   `animationend` the visor unmounts on (observed 9 runs in 10 on a throttled
-   CPU, leaving the drawer stuck mid-switch), and 1ms is imperceptible while
-   still being an animation the browser reports the end of. */
+@media (max-width: 560px) {
+  #visor-drawer-header {
+    display: flex; flex: none; align-items: center;
+    min-height: 52px; padding: 4px 8px; box-sizing: border-box;
+    border-bottom: 1px solid var(--edge);
+  }
+  #visor-sidebar {
+    position: absolute; z-index: 1; inset-block: 0; inset-inline-start: 0;
+    width: min(16rem, calc(100% - 3rem));
+    background: var(--drawer); box-shadow: 4px 0 12px oklch(0 0 0 / 0.25);
+    transform: translateX(-100%); visibility: hidden;
+    transition: transform 160ms ease-out, visibility 0s linear 160ms;
+  }
+  #visor-drawer-body.open #visor-sidebar {
+    transform: translateX(0); visibility: visible;
+    transition-delay: 0s;
+  }
+}
+
+/* Movement is decoration; the states it moves between are not. */
 @media (prefers-reduced-motion: reduce) {
-  #visor-root * { animation-duration: 1ms !important; }
+  #visor-root * {
+    animation-duration: 1ms !important;
+    transition-duration: 0ms !important;
+    transition-delay: 0ms !important;
+  }
 }
 
 /* Unsaved changes, resting on the strip: the only thing in this tree that
@@ -236,8 +268,7 @@ pub(crate) const CSS: &str = r#"
   border-top: 1px solid var(--edge);
 }
 
-/* The line at the top of every pane. Only the pane that is staying
-   carries the id — during a slide there are two of these on screen. */
+/* The line at the top of the content pane. */
 #visor-root .notice { margin-bottom: 8px; min-height: 1.4em; overflow-wrap: break-word; }
 
 /* Controls are at least 44px on both axes; the strip's pinned 56px is
@@ -371,12 +402,12 @@ pub(crate) const CSS: &str = r#"
 }
 
 /* The device ceremonies: unseal, keep, the entry picker, erase. The
-   negative margin cancels `.pane`'s own gutter (viewport-relative, so it
-   doesn't compound), making the separator full-bleed under the column. */
+   negative margin cancels the content pane's fixed padding, making the
+   separator full-bleed under the centred column. */
 #visor-root .sheet {
   display: flex; flex-direction: column; gap: 8px; align-items: flex-start;
-  padding: 12px var(--visor-gutter);
-  margin: 0 calc(-1 * var(--visor-gutter));
+  padding: 12px;
+  margin: 0 -12px;
   box-sizing: border-box;
   border-top: 1px solid var(--edge);
 }
@@ -386,6 +417,48 @@ pub(crate) const CSS: &str = r#"
 #visor-root .sheet-head .framework, #visor-root .sheet-head .user { font-weight: 600; }
 #visor-root .sheet-error { margin-top: 2px; }
 #visor-root .choice { display: flex; flex-wrap: wrap; gap: 8px; }
+
+#visor-root .contacts-nav { display:flex; flex-wrap:wrap; gap:6px; }
+#visor-root .contacts-sheet { align-items: stretch; width: min(100%, 720px); margin-inline: auto; }
+#visor-root .contacts-list, #visor-root .contact-history,
+#visor-root .contacts-share, #visor-root .contacts-import-review,
+#visor-root .meet-now { display:flex; flex-direction:column; align-self:stretch; gap:10px; }
+#visor-root .contact-row, #visor-root .observation-row,
+#visor-root .import-party, #visor-root .share-party {
+  display:flex; align-items:center; flex-wrap:wrap; gap:8px;
+  padding:8px; border:1px solid var(--edge); border-radius:6px;
+}
+#visor-root .contact-row { justify-content:space-between; text-align:left; }
+#visor-root .contacts-share-preview { padding:8px; border:2px solid var(--edge); }
+#visor-root .claim-choices { display:flex; flex-direction:column; gap:4px; }
+#visor-root .contacts-sheet .claim-choices label,
+#visor-root .contacts-sheet .import-party > label,
+#visor-root .contacts-sheet .meet-own-claims label {
+  display: inline-flex; flex: none; width: auto; align-self: flex-start;
+  align-items: center; gap: 6px; margin: 0;
+}
+#visor-root .contacts-sheet input[type="checkbox"] {
+  flex: none; width: auto; min-width: 0;
+}
+#visor-root .contacts-sheet input:not([type="checkbox"]),
+#visor-root .contacts-sheet select {
+  font: inherit; color: inherit; background: var(--field);
+  border: 1px solid var(--edge); border-radius: 6px;
+  min-height: 44px; padding: 8px; box-sizing: border-box;
+  width: min(24rem, 100%); min-width: 0;
+}
+#visor-root .qr { width:min(18rem,100%); height:auto; padding:12px; background:white; color:black; }
+#visor-root .meet-sas { font:700 40px/1.2 ui-monospace,monospace; letter-spacing:6px; user-select:all; }
+#visor-root code { overflow-wrap:anywhere; }
+#visor-root .contacts-sheet .meeting-record {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 3px;
+  flex: 1 1 100%; padding: 6px 0;
+}
+#visor-root .contacts-sheet .meeting-record-summary,
+#visor-root .contacts-sheet .meeting-record-source,
+#visor-root .contacts-sheet .issuer-display {
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px;
+}
 
 /* Sync. An endpoint id is machine text, not a voice: monospace so it can be
    read off a screen character by character, and `user-select: all` so one

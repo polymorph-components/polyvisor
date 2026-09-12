@@ -517,6 +517,7 @@ impl Kernel {
                     }
                     let _ = self.refresh_personalization().await;
                     self.push_event(crate::Event::PersonalizationChanged);
+                    self.push_event(crate::Event::ContactsChanged);
                     // What the store handed back is now this device's, and a
                     // reload must not have to fetch it again. This checkpoint
                     // schedules one more pass through the gate above, which

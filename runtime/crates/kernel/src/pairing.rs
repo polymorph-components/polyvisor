@@ -399,6 +399,7 @@ impl Kernel {
         self.initialize_personalization()
             .await
             .map_err(|e| e.message)?;
+        self.initialize_contacts().await.map_err(|e| e.message)?;
         let enrolled = self.seams.clock.now_ms();
         engine.add_member(joiner_key, petname, enrolled).await?;
         // The keyhive half of the same grant, and in this order: the group
@@ -409,6 +410,7 @@ impl Kernel {
         let visor = engine
             .document_save(polyvisor_visor_model::VISOR_APP)
             .await?;
+        let contacts = engine.document_save(crate::contacts::CONTACTS_APP).await?;
         // The group's store-name key travels here and nowhere else: it is a
         // group secret, and this connection is the one the two users have
         // just compared six digits over. Without it the joiner would be a
@@ -425,6 +427,7 @@ impl Kernel {
                 read_back,
                 name_key: name_key.to_vec(),
                 visor,
+                contacts,
             },
         )
         .await?;
@@ -618,14 +621,15 @@ impl Kernel {
         send_frame(transport.as_ref(), &Frame::ConfirmJoin).await?;
         self.set_phase(Phase::AwaitingPeer);
 
-        let (us, keyhive, read_back, name_key, visor) = match frames.next().await {
+        let (us, keyhive, read_back, name_key, visor, contacts) = match frames.next().await {
             Some(Frame::Enroll {
                 us,
                 keyhive,
                 read_back,
                 name_key,
                 visor,
-            }) => (us, keyhive, read_back, name_key, visor),
+                contacts,
+            }) => (us, keyhive, read_back, name_key, visor, contacts),
             Some(Frame::Cancel) => return Err(cancelled()),
             Some(_) => return Err(out_of_order()),
             None => return Err(gone()),
@@ -642,6 +646,22 @@ impl Kernel {
                 polyvisor_visor_model::VISOR_APP,
                 &visor,
                 polyvisor_visor_model::adopt,
+            )
+            .await?;
+        let meeting_active = !matches!(
+            self.meeting_status().await.map_err(|e| e.message)?.phase,
+            crate::MeetingPhase::Idle
+                | crate::MeetingPhase::Done(_)
+                | crate::MeetingPhase::Failed(_)
+        );
+        if meeting_active {
+            self.meeting_invalidate().await;
+        }
+        engine
+            .document_adopt(
+                crate::contacts::CONTACTS_APP,
+                &contacts,
+                polyvisor_contacts_model::adopt,
             )
             .await?;
         self.refresh_personalization()
@@ -810,6 +830,9 @@ enum Frame {
         /// SAS-authenticated encrypted transport, never persisted plaintext;
         /// keyhive protects the document on sync and storage paths.
         visor: Vec<u8>,
+        /// Serialized contacts document, adopted so the established group's
+        /// user signing identity replaces any solo identity on the joiner.
+        contacts: Vec<u8>,
     },
     /// Joiner → adder, last: the enrollment has been adopted *and*
     /// checkpointed here. It carries nothing — the

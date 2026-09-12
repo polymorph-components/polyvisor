@@ -196,6 +196,91 @@ interface Scenario {
   ): Promise<void>;
 }
 
+function selectedScenarios(all: Scenario[]): Scenario[] {
+  const only = new Set(
+    Deno.args
+      .filter((arg) => arg.startsWith("--scenario="))
+      .map((arg) => arg.slice("--scenario=".length))
+      .filter((name) => name !== ""),
+  );
+  if (only.size === 0) return all;
+  const picked = all.filter((scenario) => only.has(scenario.name));
+  const missing = [...only].filter((name) => !all.some((scenario) => scenario.name === name));
+  if (missing.length > 0) {
+    throw new Failure(`unknown scenario(s): ${missing.join(", ")}`);
+  }
+  return picked;
+}
+
+async function withScenarioTimeout<T>(
+  name: string,
+  ms: number,
+  run: Promise<T>,
+): Promise<T> {
+  let timer: number | undefined;
+  try {
+    return await Promise.race([
+      run,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Failure(`${name} exceeded ${ms}ms`));
+        }, ms) as unknown as number;
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function withTimeout<T>(ms: number, label: string, run: Promise<T>): Promise<T> {
+  let timer: number | undefined;
+  try {
+    return await Promise.race([
+      run,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Failure(`${label} exceeded ${ms}ms`)), ms) as unknown as number;
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function hex(bytes: Uint8Array): string {
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256File(path: string): Promise<string> {
+  const bytes = await Deno.readFile(path);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return hex(new Uint8Array(digest));
+}
+
+async function currentBuildDigests(): Promise<Record<string, string>> {
+  return {
+    "runtime.component.wasm": await sha256File(join(BUILT, "runtime.component.wasm")),
+    "visor.component.wasm": await sha256File(join(BUILT, "visor.component.wasm")),
+  };
+}
+
+async function verifyServedBuild(
+  origin: string,
+  expected: Record<string, string>,
+): Promise<void> {
+  const checks = Object.entries(expected);
+  for (const [name, expected] of checks) {
+    const res = await fetch(`${origin}/${name}`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) throw new Failure(`served build is missing ${name}: ${res.status}`);
+    const digest = await crypto.subtle.digest("SHA-256", await res.arrayBuffer());
+    const got = hex(new Uint8Array(digest));
+    if (got !== expected) {
+      throw new Failure(`served ${name} digest mismatch: got ${got}, want ${expected}`);
+    }
+  }
+}
+
 /** Wait for the visor to have painted its strip, and fail loudly on the
  * framework's fatal text rather than on a 30s timeout. */
 async function visorReady(page: Page): Promise<void> {
@@ -237,33 +322,35 @@ async function open(ctx: BrowserContext, origin: string): Promise<Page> {
 // Every selector below is the visor's own tree (visor/src/ui.rs), kept in
 // one block so a rename there is one edit here. With nothing running, the
 // drawer is pinned open on the app list rather than closed, so pressing the
-// half whose sheet is already showing does nothing.
+// half whose section is already showing does nothing.
 // ---------------------------------------------------------------------------
 
 const strip = (page: Page) => page.locator("#visor-strip");
 const drawer = (page: Page) => page.locator("#visor-drawer");
+const drawerBody = (page: Page) => page.locator("#visor-drawer-body");
+const sidebar = (page: Page) => page.locator("#visor-sidebar");
+const sidebarToggle = (page: Page) => page.locator("#visor-sidebar-toggle");
+const content = (page: Page) => page.locator("#visor-content");
+const visorNav = (page: Page) => page.locator("#visor-nav-visor");
+const appNav = (page: Page) => page.locator("#visor-nav-app");
+const contactsNav = (page: Page) => page.locator("#visor-nav-contacts");
 /** The strip's left half: what is running (the app list, or the running
  * app's own sheet). */
 const appsButton = (page: Page) => page.locator("#visor-app");
 /** The strip's right half: who this is, and this device's settings. */
 const settingsButton = (page: Page) => page.locator("#visor-self");
 
-/** Wait for the drawer to hold exactly one settled pane: a tenant switch
- * renders two for the length of the slide, and a click into a moving target
- * lands wherever the animation had got to (visor/src/ui.rs `drawer_class`). */
+/** Wait for the drawer's one live content area to be present. */
 async function paneSettled(page: Page): Promise<void> {
   await drawer(page).waitFor({ timeout: 10_000 });
-  await page.waitForFunction(
-    () => {
-      const d = document.querySelector("#visor-drawer");
-      if (d === null || d.className.includes("closing")) return false;
-      const panes = d.querySelectorAll(".pane");
-      return panes.length === 1 &&
-        !(panes[0] as HTMLElement).className.includes("enter");
-    },
-    undefined,
-    { timeout: 10_000 },
-  );
+  await content(page).waitFor({ timeout: 10_000 });
+  await page.waitForFunction(() => {
+    const host = document.querySelector("#visor-drawer");
+    if (host === null) return false;
+    return host.getAnimations({ subtree: false }).every((animation) =>
+      animation.playState === "finished"
+    );
+  }, undefined, { timeout: 10_000 });
 }
 
 /** Press the strip's left half and wait for the pane it raises. With
@@ -369,6 +456,106 @@ async function waitForPageText(page: Page, text: string, ms = 30_000): Promise<v
     await page.waitForTimeout(100);
   }
   throw new Failure(`never saw ${text}`);
+}
+
+async function waitForSidebarState(page: Page, open: boolean): Promise<void> {
+  await page.waitForFunction(
+    (wantOpen) => {
+      const body = document.querySelector("#visor-drawer-body");
+      if (body === null) return false;
+      if (body.classList.contains("open") !== wantOpen) return false;
+      return document.getAnimations().every((animation) => {
+        const target = (animation.effect as KeyframeEffect | null)?.target;
+        return !(target instanceof Element) || !body.contains(target) ||
+          animation.playState === "finished";
+      });
+    },
+    open,
+    { timeout: 10_000 },
+  );
+}
+
+function activeElementVisible(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement)) return false;
+    const box = active.getBoundingClientRect();
+    return box.width > 0 && box.height > 0 && box.bottom > 0 &&
+      box.right > 0 && box.top < innerHeight && box.left < innerWidth;
+  });
+}
+
+const contactsSheet = (page: Page) => content(page).locator(".contacts-sheet");
+
+function contactsTool(page: Page, name: string) {
+  return contactsSheet(page).locator(".contacts-nav").getByRole("button", {
+    name,
+    exact: true,
+  });
+}
+
+async function openContactsSection(page: Page): Promise<void> {
+  await paneSettled(page);
+  const mobile = await page.evaluate(() => matchMedia("(max-width: 560px)").matches);
+  if (mobile && await sidebarToggle(page).isVisible() &&
+    await sidebarToggle(page).getAttribute("aria-expanded") !== "true") {
+    await sidebarToggle(page).click();
+    await waitForSidebarState(page, true);
+  }
+  await contactsNav(page).click();
+  await page.waitForFunction(
+    () => document.querySelector("#visor-content")?.getAttribute("aria-label") === "contacts",
+    undefined,
+    { timeout: 10_000 },
+  );
+  await contactsSheet(page).waitFor({ timeout: 10_000 });
+}
+
+async function openContactsView(
+  page: Page,
+  name: string,
+  selector: string,
+): Promise<void> {
+  await openContactsSection(page);
+  await contactsTool(page, name).click();
+  await contactsSheet(page).locator(selector).waitFor({ timeout: 10_000 });
+}
+
+async function addProfileClaim(
+  page: Page,
+  name: string,
+  value: string,
+): Promise<void> {
+  await openContactsView(page, "My profile", ".contacts-profile");
+  const profile = contactsSheet(page).locator(".contacts-profile");
+  await profile.locator("label").filter({ hasText: "Claim name" }).locator("input")
+    .fill(name);
+  await profile.locator("label").filter({ hasText: "Claim value" }).locator("input")
+    .fill(value);
+  await profile.getByRole("button", { name: "Add to my profile", exact: true })
+    .click();
+  await profile.getByText(value, { exact: false }).waitFor({ timeout: 10_000 });
+}
+
+function claimCheckbox(scope: Locator, text: string): Locator {
+  return scope.locator(".claim-choices label").filter({ hasText: text }).locator(
+    'input[type="checkbox"]',
+  ).first();
+}
+
+function importClaimCheckbox(scope: Locator, text: string): Locator {
+  return scope.locator(".import-party label").filter({ hasText: text }).locator(
+    'input[type="checkbox"]:not(.import-party-include)',
+  ).first();
+}
+
+function meetClaimCheckbox(scope: Locator, value: string): Locator {
+  return scope.locator("label").filter({ hasText: value })
+    .locator('input[type="checkbox"]').first();
+}
+
+function labeledInput(scope: Locator, label: string | RegExp): Locator {
+  return scope.locator("label").filter({ hasText: label }).locator("input").first();
 }
 
 /**
@@ -837,10 +1024,16 @@ function sidewaysOverflow(page: Page): Promise<string[]> {
         `the page scrolls sideways: ${document.documentElement.scrollWidth} > ${innerWidth}`,
       );
     }
-    const pane = document.querySelector<HTMLElement>("#visor-drawer .pane");
-    if (pane !== null && pane.scrollWidth > pane.clientWidth) {
+    const body = document.querySelector<HTMLElement>("#visor-drawer-body");
+    if (body !== null && body.scrollWidth > body.clientWidth) {
       bad.push(
-        `the drawer scrolls sideways: ${pane.scrollWidth} > ${pane.clientWidth}`,
+        `the drawer body scrolls sideways: ${body.scrollWidth} > ${body.clientWidth}`,
+      );
+    }
+    const content = document.querySelector<HTMLElement>("#visor-content");
+    if (content !== null && content.scrollWidth > content.clientWidth) {
+      bad.push(
+        `the content scrolls sideways: ${content.scrollWidth} > ${content.clientWidth}`,
       );
     }
     const clipped = (el: Element): boolean => {
@@ -872,9 +1065,29 @@ async function shot(page: Page, name: string): Promise<void> {
   // Long enough for the drawer's own open/close animation, which is not
   // what `paneSettled` waits on: a shot taken mid-slide is a picture of an
   // animation rather than of a layout.
-  await page.waitForTimeout(400);
+  await withTimeout(5_000, `settling screenshot ${name}`, page.waitForTimeout(400));
   await Deno.mkdir(dir, { recursive: true });
-  await page.screenshot({ path: join(dir, `${name}.png`) });
+  await withTimeout(5_000, `screenshot ${name}`, page.screenshot({ path: join(dir, `${name}.png`) }));
+}
+
+async function dumpPage(page: Page): Promise<object> {
+  return await withTimeout(5_000, `page dump ${page.url()}`, page.evaluate(() => ({
+    strip: document.querySelector("#visor-strip")?.textContent ?? "<none>",
+    drawer: document.querySelector("#visor-drawer")?.textContent ?? "<none>",
+  }))).catch((e) => ({ error: String(e) }));
+}
+
+async function closeContext(ctx: BrowserContext, name: string): Promise<void> {
+  await withTimeout(5_000, `close context ${name}`, ctx.close()).catch((e) => {
+    console.error(`  cleanup ${name}: ${String(e)}`);
+  });
+}
+
+async function closeBrowser(browser: Browser | undefined): Promise<void> {
+  if (browser === undefined) return;
+  await withTimeout(5_000, "close browser", browser.close()).catch((e) => {
+    console.error(`  cleanup browser: ${String(e)}`);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2411,7 +2624,8 @@ const scenarios: Scenario[] = [
         eq(await mobileDialog.count(), 0, "touch outside kept the glyph modal open");
         eq(await mobileGlyph.textContent(), beforeGlyph, "touch outside changed the draft glyph");
         check(await mobileGlyph.evaluate((button) => button === document.activeElement), "touch outside did not return focus to the glyph tile");
-        eq(await drawer(mobile).locator(".pane").getAttribute("aria-label"), "settings", "touch outside activated the underlying self button");
+        eq(await content(mobile).getAttribute("aria-label"), "settings", "touch outside activated the underlying self button");
+        eq(await visorNav(mobile).getAttribute("aria-current"), "page", "touch outside changed the current section");
       } finally {
         await touch.close();
       }
@@ -2926,11 +3140,8 @@ const scenarios: Scenario[] = [
             "Save",
           ),
       );
-      eq(
-        await drawer(page).locator(".pane").getAttribute("aria-label"),
-        "settings",
-        "navigation escaped while Save was in flight",
-      );
+      eq(await content(page).getAttribute("aria-label"), "settings", "navigation escaped while Save was in flight");
+      eq(await visorNav(page).getAttribute("aria-current"), "page", "navigation changed the current section while Save was in flight");
       eq(
         await confirm.count(),
         0,
@@ -3003,7 +3214,8 @@ const scenarios: Scenario[] = [
       eq(await glyphDialog.count(), 0, "an outside click kept the glyph modal open");
       eq(await glyph.textContent(), glyphBeforeDismiss, "outside dismissal changed the draft glyph");
       check(await glyph.evaluate((button) => button === document.activeElement), "outside dismissal did not return focus to the glyph tile");
-      eq(await drawer(page).locator(".pane").getAttribute("aria-label"), "settings", "outside dismissal closed the drawer");
+      eq(await content(page).getAttribute("aria-label"), "settings", "outside dismissal closed the drawer");
+      eq(await visorNav(page).getAttribute("aria-current"), "page", "outside dismissal changed the current section");
       await glyph.click();
       await picker.getByRole("button", { name: "Close", exact: true }).click();
       eq(await glyph.textContent(), glyphBeforeDismiss, "Close changed the draft glyph");
@@ -3123,11 +3335,8 @@ const scenarios: Scenario[] = [
         await glyph.evaluate((button) => button === document.activeElement),
         "Escape did not return focus to the glyph tile",
       );
-      eq(
-        await drawer(page).locator(".pane").getAttribute("aria-label"),
-        "settings",
-        "Escape closed the drawer with the picker",
-      );
+      eq(await content(page).getAttribute("aria-label"), "settings", "Escape closed the drawer with the picker");
+      eq(await visorNav(page).getAttribute("aria-current"), "page", "Escape changed the current section with the picker open");
       await glyph.click();
       await search.fill(compoundQuery);
       await results.first().click();
@@ -3208,6 +3417,333 @@ const scenarios: Scenario[] = [
   },
 
   {
+    // The sidebar replaces the old horizontal drawer panes. The claim here is
+    // purely layout and semantics: it stays bounded by the drawer on desktop
+    // and mobile, the strip no longer speaks in pressed-state tab language,
+    // the narrow menu closes on selection, and the content area keeps a real
+    // usable box.
+    name: "sidebar-geometry",
+    async run(ctx, origin, browser) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+      await paneSettled(page);
+
+      eq(await appsButton(page).getAttribute("aria-pressed"), null, "#visor-app kept pressed semantics");
+      eq(await settingsButton(page).getAttribute("aria-pressed"), null, "#visor-self kept pressed semantics");
+      eq(await appNav(page).getAttribute("aria-current"), "page", "the resting drawer did not mark App current");
+      eq(await visorNav(page).getAttribute("aria-current"), null, "Visor started current unexpectedly");
+      eq(await contactsNav(page).count(), 1, "Contacts navigation button is missing");
+
+      const desktopDrawer = await drawer(page).boundingBox();
+      const desktopSidebar = await sidebar(page).boundingBox();
+      const desktopContent = await content(page).boundingBox();
+      const desktopStrip = await strip(page).boundingBox();
+      check(
+        desktopDrawer !== null && desktopSidebar !== null && desktopContent !== null &&
+          desktopStrip !== null,
+        "desktop sidebar geometry is missing",
+      );
+      check(
+        desktopSidebar.x >= desktopDrawer.x - 0.5 &&
+          desktopSidebar.y >= desktopDrawer.y - 0.5 &&
+          desktopSidebar.x + desktopSidebar.width <= desktopDrawer.x + desktopDrawer.width + 0.5 &&
+          desktopSidebar.y + desktopSidebar.height <= desktopDrawer.y + desktopDrawer.height + 0.5,
+        `desktop sidebar escaped the drawer: ${JSON.stringify({ desktopDrawer, desktopSidebar })}`,
+      );
+      check(
+        Math.abs(desktopSidebar.x - desktopDrawer.x) <= 0.5,
+        `desktop sidebar did not start at the drawer's left edge: ${JSON.stringify({ desktopDrawer, desktopSidebar })}`,
+      );
+      check(
+        desktopContent.x >= desktopSidebar.x + desktopSidebar.width - 0.5,
+        `desktop content did not stay to the right of the sidebar: ${JSON.stringify({ desktopSidebar, desktopContent })}`,
+      );
+      check(
+        Math.abs(desktopDrawer.y + desktopDrawer.height - desktopStrip.y) <= 1,
+        `desktop drawer did not stay attached above the strip: ${JSON.stringify({ desktopDrawer, desktopStrip })}`,
+      );
+      check(desktopContent.height > 0 && desktopContent.width > 0, `desktop content has no usable box: ${JSON.stringify(desktopContent)}`);
+      await shot(page, "sidebar-desktop");
+      await visorNav(page).click();
+      eq(await content(page).getAttribute("aria-label"), "settings", "Visor nav did not switch the content pane to settings");
+      eq(await visorNav(page).getAttribute("aria-current"), "page", "Visor nav did not become current");
+      check(await content(page).locator('input[type="range"]').count() > 0, "settings content did not remain usable on desktop");
+      await appNav(page).click();
+      eq(await content(page).getAttribute("aria-label"), "apps", "App nav did not switch back to apps");
+      await content(page).locator(".app-row").first().waitFor({ timeout: 10_000 });
+      let over = await sidewaysOverflow(page);
+      check(over.length === 0, `desktop sidebar layout overflowed: ${over.join("; ")}`);
+
+      const mobile = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true });
+      try {
+        const narrow = await open(mobile, origin);
+        await visorReady(narrow);
+        await paneSettled(narrow);
+        await sidebarToggle(narrow).waitFor({ timeout: 10_000 });
+        eq(await sidebarToggle(narrow).getAttribute("aria-expanded"), "false", "mobile nav toggle started open");
+        const before = await content(narrow).boundingBox();
+        check(before !== null && before.height > 0 && before.width > 0, `mobile content started unusable: ${JSON.stringify(before)}`);
+
+        await sidebarToggle(narrow).click();
+        await waitForSidebarState(narrow, true);
+        eq(await sidebarToggle(narrow).getAttribute("aria-expanded"), "true", "mobile nav toggle did not open the menu");
+        const mobileDrawer = await drawer(narrow).boundingBox();
+        const mobileSidebar = await sidebar(narrow).boundingBox();
+        const mobileContent = await content(narrow).boundingBox();
+        const mobileStrip = await strip(narrow).boundingBox();
+        check(
+          mobileDrawer !== null && mobileSidebar !== null && mobileContent !== null &&
+            mobileStrip !== null,
+          "mobile sidebar geometry is missing",
+        );
+        check(
+          mobileSidebar.x >= mobileDrawer.x - 0.5 &&
+            mobileSidebar.y >= mobileDrawer.y - 0.5 &&
+            mobileSidebar.x + mobileSidebar.width <= mobileDrawer.x + mobileDrawer.width + 0.5 &&
+            mobileSidebar.y + mobileSidebar.height <= mobileDrawer.y + mobileDrawer.height + 0.5,
+          `mobile sidebar escaped the drawer: ${JSON.stringify({ mobileDrawer, mobileSidebar })}`,
+        );
+        check(
+          Math.abs(mobileSidebar.x - mobileDrawer.x) <= 0.5,
+          `mobile sidebar did not open from the drawer's left edge: ${JSON.stringify({ mobileDrawer, mobileSidebar })}`,
+        );
+        check(
+          Math.abs(mobileDrawer.y + mobileDrawer.height - mobileStrip.y) <= 1,
+          `mobile drawer did not stay attached above the strip: ${JSON.stringify({ mobileDrawer, mobileStrip })}`,
+        );
+        check(
+          mobileSidebar.height > 0 && mobileSidebar.height <= mobileDrawer.height + 0.5,
+          `mobile sidebar height escaped the drawer: ${JSON.stringify({ mobileDrawer, mobileSidebar })}`,
+        );
+        check(mobileContent.height > 0 && mobileContent.width > 0, `mobile content collapsed under the open sidebar: ${JSON.stringify(mobileContent)}`);
+        over = await sidewaysOverflow(narrow);
+        check(over.length === 0, `mobile sidebar layout overflowed while open: ${over.join("; ")}`);
+        await shot(narrow, "sidebar-mobile-open");
+
+        await contactsNav(narrow).focus();
+        check(await activeElementVisible(narrow), "mobile current nav item was not visibly focusable while open");
+        await narrow.keyboard.press("Tab");
+        const afterTab = await focused(narrow);
+        await waitForSidebarState(narrow, false);
+        check(await focusIn(narrow, "#visor-content"), `Tab from the last mobile nav item did not move into content: ${afterTab}`);
+        check(await activeElementVisible(narrow), "mobile content focus after dismissing the menu was not visible");
+
+        await sidebarToggle(narrow).click();
+        await waitForSidebarState(narrow, true);
+        await visorNav(narrow).click();
+        await waitForSidebarState(narrow, false);
+        eq(await sidebarToggle(narrow).getAttribute("aria-expanded"), "false", "mobile nav selection did not close the menu");
+        eq(await content(narrow).getAttribute("aria-label"), "settings", "mobile Visor nav did not switch the content pane to settings");
+        eq(await visorNav(narrow).getAttribute("aria-current"), "page", "mobile Visor nav did not become current");
+        check(await content(narrow).locator('input[type="range"]').count() > 0, "mobile settings content did not remain usable");
+        check(await activeElementVisible(narrow), "mobile focus after selecting a nav section was not visible");
+
+        const settingsField = content(narrow).locator("label").filter({ hasText: /^device petname$/ }).locator("input");
+        await settingsField.fill("mobile draft");
+        await sidebarToggle(narrow).click();
+        await waitForSidebarState(narrow, true);
+        await appNav(narrow).click();
+        const confirm = narrow.locator("#visor-confirm");
+        await confirm.waitFor({ timeout: 10_000 });
+        await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+        await confirm.waitFor({ state: "detached", timeout: 10_000 });
+        eq(await content(narrow).getAttribute("aria-label"), "settings", "dirty-draft cancel left the wrong section visible");
+        check(await activeElementVisible(narrow), "dirty-draft cancel did not return visible focus");
+        eq(await settingsField.inputValue(), "mobile draft", "dirty-draft cancel lost the typed value");
+        await drawer(narrow).getByRole("button", { name: "Revert", exact: true }).click();
+
+        await sidebarToggle(narrow).click();
+        await waitForSidebarState(narrow, true);
+        await appNav(narrow).click();
+        await waitForSidebarState(narrow, false);
+        eq(await content(narrow).getAttribute("aria-label"), "apps", "mobile App nav did not switch back to apps");
+        await content(narrow).locator(".app-row").first().waitFor({ timeout: 10_000 });
+        const after = await content(narrow).boundingBox();
+        check(after !== null && after.height > 0 && after.width > 0, `mobile content ended unusable: ${JSON.stringify(after)}`);
+        over = await sidewaysOverflow(narrow);
+        check(over.length === 0, `mobile sidebar layout overflowed after selection: ${over.join("; ")}`);
+        await shot(narrow, "sidebar-mobile-closed");
+      } finally {
+        await mobile.close();
+      }
+    },
+  },
+
+  {
+    name: "contacts-portable-file-import",
+    async run(ctx, origin, browser) {
+      const author = await open(ctx, origin);
+      await visorReady(author);
+      await addProfileClaim(author, "name", "Ada Portable");
+      await addProfileClaim(author, "email", "ada-portable@example.test");
+      await openContactsView(author, "Share", ".contacts-share");
+      const share = contactsSheet(author).locator(".contacts-share");
+      const preview = share.locator(".contacts-share-preview");
+      eq(await labeledInput(share, /^Shared name$/).inputValue(), "Ada Portable", "shared name did not default from the profile name");
+      eq(await claimCheckbox(share, "ada-portable@example.test").isChecked(), false, "non-name claim started selected for sharing");
+      check(await preview.getByText("Ada Portable").count() > 0, "share preview did not include the default name claim");
+      eq(await preview.getByText("ada-portable@example.test").count(), 0, "share preview included email before it was selected");
+      await claimCheckbox(share, "ada-portable@example.test").check();
+      await preview.getByText("ada-portable@example.test").waitFor({ timeout: 10_000 });
+      await shot(author, "contacts-share-preview");
+      await share.getByRole("button", { name: "Sign contact card", exact: true }).click();
+      await share.getByRole("button", { name: "Save contact file", exact: true }).waitFor({ timeout: 10_000 });
+
+      await Deno.mkdir("/tmp/opencode", { recursive: true });
+      const cardPath = "/tmp/opencode/contacts-portable-file-import.polycontact";
+      const downloadPromise = author.waitForEvent("download");
+      await share.getByRole("button", { name: "Save contact file", exact: true }).click();
+      const download = await downloadPromise;
+      await download.saveAs(cardPath);
+      await Deno.stat(cardPath);
+
+      await claimCheckbox(share, "ada-portable@example.test").uncheck();
+      eq(await preview.getByText("ada-portable@example.test").count(), 0, "share preview kept email after it was deselected");
+      eq(await share.getByRole("button", { name: "Save contact file", exact: true }).count(), 0, "changing claim selection left a stale signed export available");
+      eq(await share.getByRole("button", { name: "Copy share link", exact: true }).count(), 0, "changing claim selection left a stale signed share link available");
+
+      const tamperedPath = "/tmp/opencode/contacts-portable-file-import-tampered.polycontact";
+      const tampered = await Deno.readFile(cardPath);
+      check(tampered.length > 0, "saved contact card was empty");
+      tampered[tampered.length - 1] ^= 0x01;
+      await Deno.writeFile(tamperedPath, tampered);
+
+      const recipientCtx = await browser.newContext();
+      try {
+        const recipient = await open(recipientCtx, origin);
+        await visorReady(recipient);
+        await openContactsView(recipient, "Import", ".contacts-import-review");
+        const importView = contactsSheet(recipient).locator(".contacts-import-review");
+
+        let fileChooserPromise = recipient.waitForEvent("filechooser");
+        await importView.getByRole("button", { name: "Choose contact file", exact: true }).click();
+        let fileChooser = await fileChooserPromise;
+        await fileChooser.setFiles(tamperedPath);
+        await contactsSheet(recipient).locator(".sheet-error").waitFor({ timeout: 10_000 });
+        eq(await contactsSheet(recipient).locator(".import-party").count(), 0, "tampered contact file still produced an import review");
+        await openContactsView(recipient, "Contacts", ".contacts-list");
+        eq(await contactsSheet(recipient).locator(".contact-row").filter({ hasText: "Ada Portable" }).count(), 0, "tampered contact file created a contact");
+
+        await openContactsView(recipient, "Import", ".contacts-import-review");
+        fileChooserPromise = recipient.waitForEvent("filechooser");
+        await importView.getByRole("button", { name: "Choose contact file", exact: true }).click();
+        fileChooser = await fileChooserPromise;
+        await fileChooser.setFiles(cardPath);
+        await importView.getByText(/Signature verified/i).waitFor({ timeout: 10_000 });
+        check(await importView.getByText("Ada Portable").count() > 0, "import review did not show the shared name");
+        check(await importView.getByText("ada-portable@example.test").count() > 0, "import review did not show the shared email");
+        await shot(recipient, "contacts-import-review");
+        await importView.locator(".import-party-include").first().check();
+        await importClaimCheckbox(importView, "Ada Portable").check();
+        await importView.getByRole("button", { name: "Import selected claims", exact: true }).click();
+
+        await openContactsView(recipient, "Contacts", ".contacts-list");
+        const row = contactsSheet(recipient).locator(".contact-row").filter({ hasText: "Ada Portable" }).first();
+        await row.waitFor({ timeout: 10_000 });
+        await row.click();
+      const detail = contactsSheet(recipient).locator(".contact-details");
+      await detail.waitFor({ timeout: 10_000 });
+      check(await detail.getByText("Ada Portable").count() > 0, "imported contact detail did not keep the selected name");
+      eq(await detail.getByText("ada-portable@example.test").count(), 0, "import stored an unselected email claim");
+      await detail.getByText("verified assertion", { exact: false }).waitFor({ timeout: 10_000 });
+      await shot(recipient, "contacts-detail");
+      await recipient.setViewportSize({ width: 390, height: 844 });
+      await shot(recipient, "contacts-detail-mobile");
+
+        await recipient.reload();
+        await visorReady(recipient);
+        await openContactsView(recipient, "Contacts", ".contacts-list");
+        const again = contactsSheet(recipient).locator(".contact-row").filter({ hasText: "Ada Portable" }).first();
+        await again.waitFor({ timeout: 10_000 });
+        await again.click();
+        await contactsSheet(recipient).locator(".contact-details").getByText("verified assertion", { exact: false }).waitFor({ timeout: 10_000 });
+      } finally {
+        await recipientCtx.close();
+      }
+    },
+  },
+
+  {
+    name: "contacts-meet-now",
+    async run(ctx, origin, browser) {
+      const ctxB = await browser.newContext();
+      let a: Page | undefined;
+      let b: Page | undefined;
+      try {
+        a = await open(ctx, origin);
+        b = await open(ctxB, origin);
+        await visorReady(a);
+        await visorReady(b);
+        const idA = await endpointId(a);
+        const idB = await endpointId(b);
+        check(idA !== idB, "meeting peers share one endpoint id");
+
+        await addProfileClaim(a, "name", "Ada Meeting");
+        await addProfileClaim(b, "name", "Bob Meeting");
+        await openContactsView(a, "Meet now", ".meet-now");
+        const meetA = contactsSheet(a).locator(".meet-now");
+        eq(await labeledInput(meetA.locator(".meet-own-claims"), /^Shared name$/).inputValue(), "Ada Meeting", "meeting shared name did not default from the profile name");
+        await meetA.getByRole("button", { name: "Offer meeting", exact: true }).click();
+        const offer = contactsSheet(a).locator(".meet-offer");
+        await offer.waitFor({ timeout: 30_000 });
+        eq(await offer.locator("svg.qr").count(), 1, "meeting offer did not render a QR");
+        const link = (await offer.locator("code").textContent() ?? "").trim();
+        check(link.startsWith(origin + "/#meet/"), `meeting offer did not expose a meet link: ${link}`);
+        await shot(a, "meet-offer");
+
+        await b.goto("about:blank");
+        await b.goto(link);
+        await visorReady(b);
+        await contactsSheet(b).waitFor({ timeout: 10_000 });
+        const meetB = contactsSheet(b).locator(".meet-now");
+        await meetB.waitFor({ timeout: 10_000 });
+        await meetB.locator(".meet-join-review").waitFor({ timeout: 10_000 });
+        await meetB.getByRole("button", { name: "Join meeting", exact: true }).click();
+
+        const confirmA = contactsSheet(a).locator(".meet-confirm");
+        const confirmB = contactsSheet(b).locator(".meet-confirm");
+        await confirmA.waitFor({ timeout: 30_000 });
+        await confirmB.waitFor({ timeout: 30_000 });
+        const sasA = (await confirmA.locator(".meet-sas").textContent() ?? "").trim();
+        const sasB = (await confirmB.locator(".meet-sas").textContent() ?? "").trim();
+        eq(sasA, sasB, "meeting peers showed different SAS values");
+        await shot(a, "meet-confirm-host");
+        await shot(b, "meet-confirm-joiner");
+
+        await meetClaimCheckbox(confirmA, "Bob Meeting").check();
+        await meetClaimCheckbox(confirmB, "Ada Meeting").check();
+        await confirmA.getByRole("button", { name: "Confirm", exact: true }).click();
+        await contactsSheet(a).getByText("Waiting for the other person…", { exact: true }).waitFor({ timeout: 10_000 });
+        await confirmB.getByRole("button", { name: "Confirm", exact: true }).click();
+        await contactsSheet(a).getByText(/^Meeting complete\. Contact /).waitFor({ timeout: 30_000 });
+        await contactsSheet(b).getByText(/^Meeting complete\. Contact /).waitFor({ timeout: 30_000 });
+
+        await contactsTool(a, "Contacts").click();
+        await contactsSheet(a).locator(".contacts-list").waitFor({ timeout: 10_000 });
+        await contactsSheet(a).locator(".contact-row").filter({ hasText: "Bob Meeting" }).first().waitFor({ timeout: 10_000 });
+        await contactsTool(b, "Contacts").click();
+        await contactsSheet(b).locator(".contacts-list").waitFor({ timeout: 10_000 });
+        await contactsSheet(b).locator(".contact-row").filter({ hasText: "Ada Meeting" }).first().waitFor({ timeout: 10_000 });
+
+        await openSettings(a);
+        eq(await devicesSheet(a).locator(`.member-row[data-endpoint-id="${idB}"]`).count(), 0, "meeting enrolled the peer into A's group membership");
+        await openSettings(b);
+        eq(await devicesSheet(b).locator(`.member-row[data-endpoint-id="${idA}"]`).count(), 0, "meeting enrolled the peer into B's group membership");
+      } catch (err) {
+        if (a !== undefined) {
+          await shot(a, "meet-fail-host").catch(() => {});
+        }
+        if (b !== undefined) {
+          await shot(b, "meet-fail-joiner").catch(() => {});
+        }
+        throw err;
+      } finally {
+        await closeContext(ctxB, "contacts-meet-now-joiner");
+      }
+    },
+  },
+
+  {
     // Both realms on this side, named: the visor on the main thread and the
     // runtime in the SharedWorker. The worker is worth spelling out — a
     // page can see its own realm fail, but a worker that throws while
@@ -3267,7 +3803,7 @@ const scenarios: Scenario[] = [
       await page.keyboard.press("Enter");
       await paneSettled(page);
       check(
-        await focusIn(page, "#visor-drawer .pane"),
+        await focusIn(page, "#visor-content"),
         `opening a pane left the keyboard at ${await focused(page)}`,
       );
 
@@ -3299,7 +3835,7 @@ const scenarios: Scenario[] = [
 
       // Escape is that button by another name, and the caret goes back to
       // the half of the strip that raised the pane.
-      await drawer(page).locator(".pane").focus();
+      await content(page).focus();
       await page.keyboard.press("Escape");
       await page.waitForFunction(
         () => document.querySelector("#visor-drawer") === null,
@@ -3318,7 +3854,7 @@ const scenarios: Scenario[] = [
       await page.keyboard.press("Enter");
       await paneSettled(page);
       check(
-        await focusIn(page, "#visor-drawer .pane"),
+        await focusIn(page, "#visor-content"),
         `reopening left the keyboard at ${await focused(page)}`,
       );
       await shot(page, "desktop-app-sheet");
@@ -3352,7 +3888,7 @@ const scenarios: Scenario[] = [
           "a pinned settings sheet offered no way back",
         );
         check(
-          await focusIn(page, "#visor-drawer .pane"),
+          await focusIn(page, "#visor-content"),
           `opening settings left the keyboard at ${await focused(page)}`,
         );
 
@@ -3365,7 +3901,7 @@ const scenarios: Scenario[] = [
           "Escape from a pinned sheet did not land on the app list",
         );
         check(
-          await focusIn(page, "#visor-drawer .pane"),
+          await focusIn(page, "#visor-content"),
           `the switch left the keyboard at ${await focused(page)}`,
         );
 
@@ -3438,11 +3974,8 @@ const scenarios: Scenario[] = [
         "cancelling by Escape left the keyboard nowhere",
       );
       // The sheet the draft belongs to is still the one on screen.
-      eq(
-        await drawer(page).locator(".pane").getAttribute("aria-label"),
-        "settings",
-        "Escape took the transition it was asked about",
-      );
+      eq(await content(page).getAttribute("aria-label"), "settings", "Escape took the section change it was asked about");
+      eq(await visorNav(page).getAttribute("aria-current"), "page", "Escape changed the current section under the dialog");
 
       // Held: with everything else inert there is nowhere for Tab to go but
       // the three answers. (Past the last it leaves for the browser's own
@@ -3481,9 +4014,10 @@ const scenarios: Scenario[] = [
         "Revert did not go on to the transition it was asked about",
       );
       check(
-        await focusIn(page, "#visor-drawer .pane"),
+        await focusIn(page, "#visor-content"),
         `Revert left the keyboard at ${await focused(page)}`,
       );
+      eq(await appNav(page).getAttribute("aria-current"), "page", "Revert did not leave the App section current");
 
       // Save, likewise, and the kernel is the one that remembers it. The
       // transition waits on the kernel here — `save_draft` calls one
@@ -3502,9 +4036,10 @@ const scenarios: Scenario[] = [
       });
       await paneSettled(page);
       check(
-        await focusIn(page, "#visor-drawer .pane"),
+        await focusIn(page, "#visor-content"),
         `Save left the keyboard at ${await focused(page)}`,
       );
+      eq(await appNav(page).getAttribute("aria-current"), "page", "Save did not leave the App section current");
       await strip(page).getByText("the workbench").waitFor({ timeout: 15_000 });
 
       // With an app running there is a scrim as well, and it is a press
@@ -3526,11 +4061,8 @@ const scenarios: Scenario[] = [
       await confirm.getByRole("button", { name: "Revert", exact: true })
         .click();
       await paneSettled(page);
-      eq(
-        await drawer(page).locator(".pane").getAttribute("aria-label"),
-        "the running app",
-        "the scrim press replaced the transition the dialog was asked about",
-      );
+      eq(await content(page).getAttribute("aria-label"), "the running app", "the scrim press replaced the section the dialog was asked about");
+      eq(await appNav(page).getAttribute("aria-current"), "page", "the scrim press left the wrong section current");
     },
   },
 
@@ -3563,7 +4095,7 @@ const scenarios: Scenario[] = [
 
       // Where the long identifiers are, and so what the pictures show.
       await devicesSheet(page).scrollIntoViewIfNeeded();
-      await drawer(page).locator(".pane").evaluate((el) =>
+      await content(page).evaluate((el) =>
         el.scrollTo(0, el.scrollHeight)
       );
       const actionBox = await drawer(page).locator("#visor-actions")
@@ -3767,12 +4299,12 @@ const scenarios: Scenario[] = [
             });
             await install.scrollIntoViewIfNeeded();
             const box = await install.boundingBox();
-            const pane = await drawer(page).locator(".pane").boundingBox();
-            check(box !== null && pane !== null, "no box to check scroll");
+            const panel = await content(page).boundingBox();
+            check(box !== null && panel !== null, "no box to check scroll");
             check(
-              box.y >= pane.y && box.y + box.height <= pane.y + pane.height,
+              box.y >= panel.y && box.y + box.height <= panel.y + panel.height,
               `"Install as app" did not scroll into the pane: ${
-                JSON.stringify({ box, pane })
+                JSON.stringify({ box, panel })
               }`,
             );
           }
@@ -3808,26 +4340,47 @@ async function main(): Promise<void> {
   // makes that assertion stronger rather than weaker.
   const drive = startFakeDrive();
   console.log(`e2e: fake drive at ${drive.url}`);
+  const buildDigests = await currentBuildDigests();
   const dist = await stageSite(relay.url, drive.url);
   const server = serve(dist);
   console.log(`e2e: serving ${dist} at ${server.origin}`);
+  await verifyServedBuild(server.origin, buildDigests);
+  const planned = selectedScenarios(scenarios);
+  console.log(`e2e: running ${planned.map((scenario) => scenario.name).join(", ")}`);
   let browser: Browser | undefined;
   let failures = 0;
   try {
     browser = await chromium.launch();
-    for (const scenario of scenarios) {
+    for (const scenario of planned) {
       // A fresh context per scenario: a device is per browser context, so
       // scenarios must not inherit each other's IndexedDB or SharedWorker.
       const ctx = await browser.newContext();
+      ctx.setDefaultTimeout(30_000);
+      ctx.setDefaultNavigationTimeout(30_000);
       const t0 = performance.now();
       try {
-        await scenario.run(ctx, server.origin, browser, drive);
+        await withScenarioTimeout(
+          scenario.name,
+          120_000,
+          scenario.run(ctx, server.origin, browser, drive),
+        );
         console.log(
           `ok   ${scenario.name} (${(performance.now() - t0).toFixed(0)}ms)`,
         );
       } catch (err) {
         failures++;
         console.error(`FAIL ${scenario.name}: ${(err as Error).message}`);
+        const dir = Deno.env.get("VISOR_SHOTS");
+        if (dir !== undefined) {
+          await Deno.mkdir(dir, { recursive: true });
+          for (const [index, page] of (browser?.contexts().flatMap((c) => c.pages()) ?? []).entries()) {
+            await withTimeout(
+              5_000,
+              `failure screenshot ${scenario.name}-${index}`,
+              page.screenshot({ path: join(dir, `${scenario.name}-fail-${index}.png`) }),
+            ).catch(() => {});
+          }
+        }
         // What the visor was showing when the wait gave up, per open page —
         // EVERY context, not just this scenario's own: a scenario with a
         // second device fails at that device as often as at this one, and
@@ -3835,20 +4388,15 @@ async function main(): Promise<void> {
         for (
           const page of browser?.contexts().flatMap((c) => c.pages()) ?? []
         ) {
-          const dump = await page.evaluate(() => ({
-            strip: document.querySelector("#visor-strip")?.textContent ??
-              "<none>",
-            drawer: document.querySelector("#visor-drawer")?.textContent ??
-              "<none>",
-          })).catch((e) => ({ error: String(e) }));
+          const dump = await dumpPage(page);
           console.error(`  page ${page.url()}: ${JSON.stringify(dump)}`);
         }
       } finally {
-        await ctx.close();
+        await closeContext(ctx, scenario.name);
       }
     }
   } finally {
-    await browser?.close();
+    await closeBrowser(browser);
     await server.stop();
     await drive.stop();
     await relay.stop();
@@ -3858,7 +4406,7 @@ async function main(): Promise<void> {
     console.error(`e2e: ${failures} scenario(s) failed`);
     Deno.exit(1);
   }
-  console.log(`e2e: ${scenarios.length} scenario(s) passed`);
+  console.log(`e2e: ${planned.length} scenario(s) passed`);
 }
 
 await main();

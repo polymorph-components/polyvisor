@@ -29,6 +29,8 @@
 use dioxus::html::Key;
 use dioxus::prelude::*;
 
+use crate::contacts::{FragmentRoute, classify_fragment};
+use crate::contacts_ui::{ContactsSheet, Incoming};
 use crate::draft::{RollState, RollTarget, rebase_map};
 use crate::glyph::{normalize_glyph, roll_animal};
 use crate::kernel::{
@@ -302,7 +304,10 @@ enum FocusWant {
 /// keyboard returns to when its drawer closes: `Devices` is reached from
 /// `Settings` (the right half's) and `AppInfo` from the app list.
 fn raised_by_self_half(t: Tenant) -> bool {
-    matches!(t, Tenant::Settings | Tenant::Unseal | Tenant::Devices)
+    matches!(
+        t,
+        Tenant::Settings | Tenant::Contacts | Tenant::Unseal | Tenant::Devices
+    )
 }
 
 /// The way out of a pane, in words — a scrim press is a mouse gesture and
@@ -326,6 +331,7 @@ fn pane_label(t: Tenant) -> &'static str {
         Tenant::Apps => "apps",
         Tenant::AppInfo => "the running app",
         Tenant::Settings => "settings",
+        Tenant::Contacts => "contacts",
         Tenant::Unseal => "unseal this device",
         Tenant::Devices => "other devices",
     }
@@ -417,6 +423,7 @@ async fn restore_bookmark(
     app_meta: Signal<Meta>,
     mut notice: Signal<Option<Notice>>,
     apply: Callback<Action>,
+    mut incoming: Signal<Option<Incoming>>,
 ) {
     if FRAGMENT_SPENT.with(|spent| spent.replace(true)) {
         return;
@@ -424,6 +431,19 @@ async fn restore_bookmark(
     let Some(f) = kernel::fragment() else {
         return;
     };
+    match classify_fragment(&f) {
+        FragmentRoute::Meet(body) => {
+            incoming.set(Some(Incoming::Meet(format!("meet/{body}"))));
+            apply.call(Action::Show(Tenant::Contacts));
+            return;
+        }
+        FragmentRoute::Contact(body) => {
+            incoming.set(Some(Incoming::Contact(body)));
+            apply.call(Action::Show(Tenant::Contacts));
+            return;
+        }
+        FragmentRoute::Other => {}
+    }
     match kernel::route_decode(&f).await {
         Err(e) => notice.set(Some(Notice::Plain(e))),
         Ok((app, route)) => open_app(app, route, session, app_meta, notice, apply).await,
@@ -454,6 +474,7 @@ async fn read_identity(
     session: Signal<Option<(SessionId, App)>>,
     app_meta: Signal<Meta>,
     apply: Callback<Action>,
+    incoming: Signal<Option<Incoming>>,
 ) {
     let token = gate.peek().begin();
     match kernel::status().await {
@@ -498,10 +519,9 @@ async fn read_identity(
     // superseded is not the one to spend the fragment, and the newer read
     // will spend it instead.
     if gate.peek().apply(token) {
-        restore_bookmark(session, app_meta, notice, apply).await;
+        restore_bookmark(session, app_meta, notice, apply, incoming).await;
     }
 }
-
 /// Re-read the device identity alone, and only write it if it actually
 /// changed.
 ///
@@ -648,6 +668,87 @@ pub(crate) fn Visor() -> Element {
     let mut members = use_signal(Vec::<Member>::new);
     let pairing_phase = use_signal(Phase::default);
     let binding = use_signal(|| None::<Binding>);
+    let contacts = use_signal(Vec::<kernel::Contact>::new);
+    let contacts_profile = use_signal(|| None::<kernel::SelfProfile>);
+    let contact_records = use_signal(Vec::<kernel::MeetingRecord>::new);
+    let meeting_phase = use_signal(|| kernel::MeetingPhase::Idle);
+    let mut meeting_epoch = use_signal(|| 0u64);
+    let offered_card = use_signal(|| None::<(u32, kernel::Party)>);
+    let mut meeting_request = use_signal(|| 0u64);
+    let mut pending_submission = use_signal(|| None::<(u64, kernel::Party)>);
+    let incoming = use_signal(|| None::<Incoming>);
+    let on_meeting_offer = use_callback(move |card: kernel::Party| {
+        if pending_submission().is_some() {
+            return;
+        }
+        meeting_request.set(meeting_request().wrapping_add(1));
+        let request = meeting_request();
+        pending_submission.set(Some((request, card.clone())));
+        let captured_epoch = meeting_epoch();
+        spawn(async move {
+            match kernel::meeting_offer(card.clone()).await {
+                Ok(returned) => {
+                    if crate::contacts::submission_is_current(request, meeting_request())
+                        && let Some(generation) = returned.generation()
+                    {
+                        let mut offered_card = offered_card;
+                        offered_card.set(Some((generation, card)));
+                    }
+                    if crate::contacts::submission_is_current(request, meeting_request())
+                        && meeting_epoch() == captured_epoch
+                    {
+                        let mut meeting_phase = meeting_phase;
+                        meeting_phase.set(returned);
+                    }
+                }
+                Err(message)
+                    if crate::contacts::submission_is_current(request, meeting_request()) =>
+                {
+                    notice.set(Some(Notice::Plain(message)));
+                }
+                Err(_) => {}
+            }
+            if crate::contacts::submission_is_current(request, meeting_request()) {
+                pending_submission.set(None);
+            }
+        });
+    });
+    let on_meeting_join = use_callback(move |(fragment, card): (String, kernel::Party)| {
+        if pending_submission().is_some() {
+            return;
+        }
+        meeting_request.set(meeting_request().wrapping_add(1));
+        let request = meeting_request();
+        pending_submission.set(Some((request, card.clone())));
+        let captured_epoch = meeting_epoch();
+        spawn(async move {
+            match kernel::meeting_join(fragment, card.clone()).await {
+                Ok(returned) => {
+                    if crate::contacts::submission_is_current(request, meeting_request())
+                        && let Some(generation) = returned.generation()
+                    {
+                        let mut offered_card = offered_card;
+                        offered_card.set(Some((generation, card)));
+                    }
+                    if crate::contacts::submission_is_current(request, meeting_request())
+                        && meeting_epoch() == captured_epoch
+                    {
+                        let mut meeting_phase = meeting_phase;
+                        meeting_phase.set(returned);
+                    }
+                }
+                Err(message)
+                    if crate::contacts::submission_is_current(request, meeting_request()) =>
+                {
+                    notice.set(Some(Notice::Plain(message)));
+                }
+                Err(_) => {}
+            }
+            if crate::contacts::submission_is_current(request, meeting_request()) {
+                pending_submission.set(None);
+            }
+        });
+    });
     // The user's own labels, and the running app's. Kernel state, like
     // everything else here — and written back only by a save, so the strip
     // never shows a label the kernel has not been told about.
@@ -664,17 +765,15 @@ pub(crate) fn Visor() -> Element {
     // A transition the user asked for while the draft was dirty. It waits
     // on `#visor-confirm` rather than happening.
     let mut pending = use_signal(|| None::<Action>);
+    let mut pending_from_sidebar = use_signal(|| false);
     let mut saving = use_signal(|| false);
     // Whether the async bar Save still owns focus. A user who moves back to
     // a field while it is in flight keeps the caret there, even if their
     // newer text happens to equal the captured snapshot when it lands.
     let mut bar_save_focused = use_signal(|| false);
-    // Shut, but still on screen playing its close animation. The drawer
-    // stays `Open(t)` throughout — this is what says the tenant showing is
-    // the one on its way out — and `onanimationend` is what finally closes.
-    let mut closing = use_signal(|| false);
-    // The tenant sliding out under the new one, and whether it goes left.
-    let mut leaving = use_signal(|| None::<(Tenant, bool)>);
+    // CSS decides whether this state expands the narrow sidebar. Wide
+    // layouts always show navigation, independent of the value.
+    let mut sidebar_open = use_signal(|| false);
     // Where the keyboard should be, and a generation that advances only
     // when the visor itself caused the move (see [`FocusWant`]).
     let mut focus = use_signal(|| (0u32, FocusWant::default()));
@@ -744,25 +843,11 @@ pub(crate) fn Visor() -> Element {
         draft.set(next);
     });
 
-    // Every drawer transition, and the only writer of `drawer`, `closing`
-    // and `leaving` other than the two animation handlers and the boot.
-    //
-    // The animation bookkeeping is here rather than in the reducer because
-    // it is about the two renders either side of a transition, which is not
-    // something a plain value can know. Three shapes:
-    //
-    // * shutting — the drawer stays mounted with `closing`, and the
-    //   `onanimationend` below is what sets `Closed`. Any pane in mid-slide
-    //   is dropped first: the bridge carries no animation name
-    //   (stream-dom-dioxus `convert_animation_data` answers ""), so
-    //   `closing` has to be the whole discriminator, and that only holds if
-    //   the drawer's own animation is the only one under it.
-    // * switching — the old tenant keeps rendering as a second pane until
-    //   its own animation ends, and the direction is the sign of the
-    //   ordinals.
-    // * opening — nothing to slide out of the way.
+    // Every drawer transition. Tenant changes replace the one live content
+    // pane immediately; there is no transition copy to keep mounted.
     let apply = use_callback(move |action: Action| {
         drawer_gate.write().bump();
+        sidebar_open.set(false);
         // Pinned is "nothing is running": with no app on screen the drawer
         // has nothing to be in the way of, so it rests on the app list.
         let pinned = session.read().is_none();
@@ -770,28 +855,22 @@ pub(crate) fn Visor() -> Element {
         let next = drawer().reduce(action, pinned);
         match (from, next.tenant()) {
             (Some(t), None) => {
-                leaving.set(None);
-                closing.set(true);
+                drawer.set(next);
                 ask_focus.call(FocusWant::Strip {
                     self_half: raised_by_self_half(t),
                 });
             }
             (Some(a), Some(b)) if a != b => {
-                closing.set(false);
-                leaving.set(Some((a, b.ordinal() > a.ordinal())));
                 drawer.set(next);
                 ask_focus.call(FocusWant::Pane);
             }
             (None, Some(_)) => {
-                closing.set(false);
                 drawer.set(next);
                 ask_focus.call(FocusWant::Pane);
             }
-            // The tenant showing is the one asked for. Still cancels a
-            // close in flight: pressing the half you just left reopens it.
             // No focus move: a press that changes nothing must not take the
             // caret off whatever the user was in.
-            _ => closing.set(false),
+            _ => {}
         }
         if from == next.tenant() {
             return;
@@ -826,12 +905,30 @@ pub(crate) fn Visor() -> Element {
             return;
         }
         if draft() != seed() {
+            pending_from_sidebar.set(false);
             pending.set(Some(action));
             // Everything else is inert under the dialog, so the keyboard has
             // to be put inside it or there is nothing focusable on screen.
             ask_focus.call(FocusWant::Confirm);
         } else {
             apply.call(action);
+        }
+    });
+
+    let cancel_pending = use_callback(move |()| {
+        let action = pending();
+        pending.set(None);
+        if pending_from_sidebar() {
+            pending_from_sidebar.set(false);
+            ask_focus.call(FocusWant::Pane);
+        } else if let Some(action) = action {
+            let raised_from = match action {
+                Action::Show(t) => t,
+                Action::Close => drawer().tenant().unwrap_or(Tenant::Apps),
+            };
+            ask_focus.call(FocusWant::Strip {
+                self_half: raised_by_self_half(raised_from),
+            });
         }
     });
 
@@ -911,6 +1008,7 @@ pub(crate) fn Visor() -> Element {
             session,
             app_meta,
             apply,
+            incoming,
         )
         .await;
         let index = kernel::devices().await.unwrap_or_default();
@@ -1023,6 +1121,23 @@ pub(crate) fn Visor() -> Element {
                     draft.set(rebased);
                     break;
                 },
+                Event::ContactsChanged => {
+                    crate::contacts_ui::refresh_contacts(
+                        contacts,
+                        contacts_profile,
+                        contact_records,
+                    );
+                }
+                Event::MeetingChanged(next) => {
+                    meeting_epoch.set(meeting_epoch().wrapping_add(1));
+                    let mut meeting_phase = meeting_phase;
+                    meeting_phase.set(next);
+                    crate::contacts_ui::refresh_contacts(
+                        contacts,
+                        contacts_profile,
+                        contact_records,
+                    );
+                }
             }
         }
     });
@@ -1113,9 +1228,21 @@ pub(crate) fn Visor() -> Element {
                 session,
                 app_meta,
                 apply,
+                incoming,
             )
             .await;
-            apply.call(Action::Close);
+            // Unseal normally rests the drawer on the app list. But
+            // `read_identity` may have consumed this page's fragment into an
+            // incoming contact/meet route and raised the Contacts tenant for
+            // it (`restore_bookmark`); an unconditional `Close` would reduce
+            // that straight back to the app list and drop the route the URL
+            // carried. So close only when no incoming route was applied. An
+            // app-route fragment opens its own frame through `open_app` and
+            // leaves no `incoming`, so it still rests on the app list, which
+            // is where a launched app belongs.
+            if incoming.read().is_none() {
+                apply.call(Action::Close);
+            }
         });
     });
 
@@ -1138,6 +1265,7 @@ pub(crate) fn Visor() -> Element {
                 session,
                 app_meta,
                 apply,
+                incoming,
             )
             .await;
         });
@@ -1205,14 +1333,11 @@ pub(crate) fn Visor() -> Element {
     };
 
     let on_apps = tenant == Some(Tenant::Apps) || tenant == Some(Tenant::AppInfo);
-    let on_self = tenant == Some(Tenant::Settings);
-    let shutting = closing();
-    let drawer_class = if shutting { "closing" } else { "" };
-    let entering = match leaving() {
-        Some((_, true)) => "pane enter-from-right",
-        Some((_, false)) => "pane enter-from-left",
-        None => "pane",
-    };
+    // Devices is a child destination of Visor; Unseal is a boot ceremony
+    // and deliberately has no active top-level navigation item.
+    let on_self = matches!(tenant, Some(Tenant::Settings | Tenant::Devices));
+    let on_contacts = tenant == Some(Tenant::Contacts);
+    let sidebar_class = if sidebar_open() { "open" } else { "" };
 
     // At most one element carries `data-visor-focus`, so the glue never has
     // to choose; its value is the generation `web/focus.ts` acts on.
@@ -1232,17 +1357,13 @@ pub(crate) fn Visor() -> Element {
     let confirming = pending().is_some();
     // The app zone is the page's element, not this tree's, so the glue
     // mirrors this marker onto it (`web/focus.ts`). True throughout the
-    // drawer's open and close animations, since it is on screen for both.
+    // drawer's open state.
     let app_inert = flag(tenant.is_some() || confirming);
     // The exit the pane offers, which Escape is the keyboard spelling of.
     let escape = tenant.and_then(|t| dismissal(t, running));
 
-    // One pane's worth of drawer. Rendered twice while a switch is
-    // animating — the tenant coming in and the one going out — so it is a
-    // closure rather than an arm inlined in the tree. `current` is which of
-    // the two this is: only the pane that is staying carries the ids, since
-    // two elements with one id is a tree nobody can query.
-    let sheet_for = move |t: Tenant, current: bool| -> Element {
+    // The contents of the drawer's one live content element.
+    let sheet_for = move |t: Tenant| -> Element {
         let (self_id, tier, rest, petname, endpoint_id, hue) = match status.read().as_ref() {
             Some(s) => (
                 s.id.clone(),
@@ -1275,7 +1396,7 @@ pub(crate) fn Visor() -> Element {
             // Whatever happened that the user did not ask for. It lives at
             // the top of every pane because the strip has no room to say
             // it any more and no business moving to make some.
-            div { id: if current { Some("visor-notice") } else { None }, class: "notice",
+            div { id: "visor-notice", class: "notice",
                 match &*notice.read() {
                     Some(Notice::Ended { app, reason }) => rsx! {
                         AppVoice { text: app.clone() }
@@ -1363,8 +1484,8 @@ pub(crate) fn Visor() -> Element {
                         GlyphPicker {
                             label: "glyph",
                             value: info_glyph,
-                            focus_return: current.then(|| focus_glyph.clone()).flatten(),
-                            focus_search: current.then(|| focus_glyph_search.clone()).flatten(),
+                            focus_return: focus_glyph.clone(),
+                            focus_search: focus_glyph_search.clone(),
                             onchange: move |value| {
                                 let mut d = draft.write();
                                 set_field(&mut d.app, GLYPH, value);
@@ -1409,6 +1530,21 @@ pub(crate) fn Visor() -> Element {
                     }
                 },
 
+                Tenant::Contacts => rsx! {
+                    ContactsSheet {
+                        contacts,
+                        profile: contacts_profile,
+                        records: contact_records,
+                        meeting: meeting_phase,
+                        meeting_epoch,
+                        offered_card,
+                        on_meeting_offer,
+                        on_meeting_join,
+                        pending_submission,
+                        incoming,
+                    }
+                },
+
                 Tenant::Settings => rsx! {
                     SettingsSheet {
                         draft,
@@ -1427,8 +1563,8 @@ pub(crate) fn Visor() -> Element {
                         on_kept,
                         device_name: draft().name,
                         on_devices: show_devices,
-                        focus_glyph: current.then(|| focus_glyph.clone()).flatten(),
-                        focus_glyph_search: current.then(|| focus_glyph_search.clone()).flatten(),
+                        focus_glyph: focus_glyph.clone(),
+                        focus_glyph_search: focus_glyph_search.clone(),
                         on_glyph_return: move |_| ask_focus.call(FocusWant::Glyph),
                         on_glyph_search: move |_| ask_focus.call(FocusWant::GlyphSearch),
                     }
@@ -1464,7 +1600,7 @@ pub(crate) fn Visor() -> Element {
                 // transition is not taken and the draft is untouched.
                 if pending().is_some() {
                     e.stop_propagation();
-                    pending.set(None);
+                    cancel_pending.call(());
                     return;
                 }
                 // Otherwise it is the dismissal button by another name, and
@@ -1494,39 +1630,88 @@ pub(crate) fn Visor() -> Element {
                 }
                 div {
                     id: "visor-drawer",
-                    class: "{drawer_class}",
-                    // Under the dialog, or shut but still sliding: Tab must
-                    // not walk into a pane that is leaving.
-                    inert: flag(confirming || shutting),
-                    onanimationend: move |_| {
-                        // `closing` is the whole discriminator: the bridge
-                        // reports no animation name, and the close path
-                        // drops any pane still sliding, so the drawer's own
-                        // animation is the only one that can be ending
-                        // under it while this is true.
-                        if closing() {
-                            closing.set(false);
-                            drawer.set(Drawer::Closed);
-                        }
-                    },
-                    div { class: "pane-host",
-                        if let Some((from, forward)) = leaving() {
-                            div {
-                                key: "{from:?}",
-                                class: if forward { "pane leave-to-left" } else { "pane leave-to-right" },
-                                inert: flag(true),
-                                onanimationend: move |_| leaving.set(None),
-                                {sheet_for(from, false)}
+                    inert: flag(confirming),
+                    div { id: "visor-drawer-body", class: "{sidebar_class}",
+                        div { id: "visor-drawer-header",
+                            button {
+                                id: "visor-sidebar-toggle",
+                                aria_label: "Navigation",
+                                aria_controls: "visor-sidebar",
+                                aria_expanded: "{sidebar_open()}",
+                                onclick: move |_| sidebar_open.toggle(),
+                                "☰"
                             }
                         }
-                        div {
-                            key: "{t:?}",
-                            class: "{entering}",
-                            tabindex: "-1",
-                            role: "group",
-                            aria_label: pane_label(t),
-                            "data-visor-focus": focus_pane,
-                            {sheet_for(t, true)}
+                        div { id: "visor-drawer-main",
+                            nav { id: "visor-sidebar", aria_label: "Sections",
+                                button {
+                                    id: "visor-nav-visor",
+                                    aria_label: "Visor",
+                                    disabled: "{locked}",
+                                    aria_current: on_self.then_some("page"),
+                                    onclick: move |_| {
+                                        sidebar_open.set(false);
+                                        if on_self {
+                                            ask_focus.call(FocusWant::Pane);
+                                        } else {
+                                            request.call(Action::Show(Tenant::Settings));
+                                            if pending().is_some() {
+                                                pending_from_sidebar.set(true);
+                                            }
+                                        }
+                                    },
+                                    span { aria_hidden: "true", "●" }
+                                    span { class: "nav-label", "Visor" }
+                                }
+                                button {
+                                    id: "visor-nav-app",
+                                    aria_label: "App",
+                                    disabled: "{locked}",
+                                    aria_current: on_apps.then_some("page"),
+                                    onclick: move |_| {
+                                        sidebar_open.set(false);
+                                        if on_apps {
+                                            ask_focus.call(FocusWant::Pane);
+                                        } else {
+                                            request.call(Action::Show(if running { Tenant::AppInfo } else { Tenant::Apps }));
+                                            if pending().is_some() {
+                                                pending_from_sidebar.set(true);
+                                            }
+                                        }
+                                    },
+                                    span { aria_hidden: "true", "▣" }
+                                    span { class: "nav-label", "App" }
+                                }
+                                button {
+                                    id: "visor-nav-contacts",
+                                    aria_label: "Contacts",
+                                    disabled: "{locked}",
+                                    aria_current: on_contacts.then_some("page"),
+                                    onclick: move |_| {
+                                        sidebar_open.set(false);
+                                        if on_contacts {
+                                            ask_focus.call(FocusWant::Pane);
+                                        } else {
+                                            request.call(Action::Show(Tenant::Contacts));
+                                            if pending().is_some() {
+                                                pending_from_sidebar.set(true);
+                                            }
+                                        }
+                                    },
+                                    span { aria_hidden: "true", "◆" }
+                                    span { class: "nav-label", "Contacts" }
+                                }
+                            }
+                            div {
+                                id: "visor-content",
+                                key: "{t:?}",
+                                tabindex: "-1",
+                                role: "group",
+                                aria_label: pane_label(t),
+                                "data-visor-focus": focus_pane,
+                                onfocusin: move |_| sidebar_open.set(false),
+                                {sheet_for(t)}
+                            }
                         }
                     }
 
@@ -1569,7 +1754,6 @@ pub(crate) fn Visor() -> Element {
                 button {
                     id: "visor-app",
                     disabled: "{locked}",
-                    aria_pressed: "{on_apps}",
                     "data-visor-focus": focus_app_half,
                     onclick: move |_| {
                         request.call(Action::Show(if running { Tenant::AppInfo } else { Tenant::Apps }))
@@ -1598,7 +1782,6 @@ pub(crate) fn Visor() -> Element {
                 button {
                     id: "visor-self",
                     disabled: "{locked}",
-                    aria_pressed: "{on_self}",
                     "data-visor-focus": focus_self_half,
                     onclick: move |_| request.call(Action::Show(Tenant::Settings)),
                     div { id: "visor-circle", "{user_glyph}" }
@@ -1649,7 +1832,10 @@ pub(crate) fn Visor() -> Element {
                         },
                         "Revert"
                     }
-                    button { onclick: move |_| pending.set(None), "Cancel" }
+                    button {
+                        onclick: move |_| cancel_pending.call(()),
+                        "Cancel"
+                    }
                 }
             }
         }
