@@ -44,6 +44,10 @@ interface tasks {
     set-completed: async func(id: string, completed: bool) -> result<_, string>;
     set-title: async func(id: string, title: string) -> result<_, string>;
     remove: async func(id: string) -> result<_, string>;
+    /// Ask the trusted visor to share this session's list. The application
+    /// supplies no document, recipient, or authority; this returns once the
+    /// trusted prompt is durably queued, not when a grant is delivered.
+    share: async func() -> result<_, string>;
 }
 
 /// Raw Automerge history for one application-private document partition.

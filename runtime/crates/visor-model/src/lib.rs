@@ -52,6 +52,7 @@
 use automerge::{ObjType, ROOT, ReadDoc, transaction::Transactable};
 
 use polyvisor_document_history::Document;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 /// The reserved app id the visor's own document lives under.
@@ -63,9 +64,244 @@ const INSTALL_PREFIX: &str = "install:";
 const HUE: &str = "identity:hue";
 const USER_PREFIX: &str = "user:";
 const APP_PREFIX: &str = "app:";
+const SHARE_PROMPT_PREFIX: &str = "share:prompt:";
+const SHARE_OUT_PREFIX: &str = "share:out:";
+const SHARE_INBOX_PREFIX: &str = "share:inbox:";
+const SHARE_INSTANCE_PREFIX: &str = "share:instance:";
+const PERSONAL_INSTANCE_PREFIX: &str = "share:personal:";
 
 /// The field an install entry names its app in.
 const APP: &str = "app";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharePromptRecord {
+    pub id: String,
+    pub partition: String,
+    pub app: String,
+    pub label: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareOutgoingRecord {
+    pub id: String,
+    pub label: String,
+    pub recipient: String,
+    pub edit: bool,
+    pub state: String,
+    pub detail: String,
+    pub endpoint: String,
+    pub envelope: Vec<u8>,
+    /// Signed invitation body input retained when final framing could not be
+    /// prepared. Retry rebuilds the same semantic invitation from this value.
+    pub rebuild_body: Vec<u8>,
+    pub recipient_device: [u8; 32],
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareInboxRecord {
+    pub id: String,
+    pub label: String,
+    pub sender: String,
+    pub app: String,
+    pub edit: bool,
+    pub envelope: Vec<u8>,
+    pub adopted_instance: Option<String>,
+    pub sender_endpoint: String,
+    pub sender_device: [u8; 32],
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareInstanceRecord {
+    pub partition: String,
+    pub app: String,
+    pub label: String,
+    pub edit: bool,
+    pub sender_endpoint: String,
+    pub sender_device: [u8; 32],
+}
+
+fn put_record<T: Serialize>(doc: &mut Document, key: String, value: &T) -> Result<(), String> {
+    let value = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    doc.transact(move |tx| tx.put(ROOT, key, value).map_err(|e| e.to_string()))
+}
+fn record<T: for<'a> Deserialize<'a>>(doc: &Document, key: &str) -> Option<T> {
+    doc.read()
+        .get(ROOT, key)
+        .ok()
+        .flatten()?
+        .0
+        .to_str()
+        .and_then(|s| serde_json::from_str(s).ok())
+}
+fn records<T: for<'a> Deserialize<'a>>(doc: &Document, prefix: &str) -> Vec<T> {
+    doc.read()
+        .keys(ROOT)
+        .filter(|k| k.starts_with(prefix))
+        .filter_map(|k| record(doc, &k))
+        .collect()
+}
+fn remove_record(doc: &mut Document, key: &str) -> Result<(), String> {
+    doc.transact(|tx| tx.delete(ROOT, key).map_err(|e| e.to_string()))
+}
+
+pub fn queue_share_prompt(doc: &mut Document, value: SharePromptRecord) -> Result<(), String> {
+    put_record(doc, format!("{SHARE_PROMPT_PREFIX}{}", value.id), &value)
+}
+pub fn share_prompt(doc: &Document, id: &str) -> Option<SharePromptRecord> {
+    record(doc, &format!("{SHARE_PROMPT_PREFIX}{id}"))
+}
+pub fn share_prompts(doc: &Document) -> Vec<SharePromptRecord> {
+    records(doc, SHARE_PROMPT_PREFIX)
+}
+pub fn remove_share_prompt(doc: &mut Document, id: &str) -> Result<(), String> {
+    remove_record(doc, &format!("{SHARE_PROMPT_PREFIX}{id}"))
+}
+pub fn finish_share_prompt(
+    doc: &mut Document,
+    id: &str,
+    value: ShareOutgoingRecord,
+) -> Result<(), String> {
+    let prompt = share_prompt(doc, id).ok_or_else(|| "share prompt disappeared".to_string())?;
+    let mut value = value;
+    value.id = id.into();
+    value.label = prompt.label;
+    put_record(doc, format!("{SHARE_OUT_PREFIX}{id}"), &value)?;
+    remove_share_prompt(doc, id)
+}
+pub fn share_outgoing(doc: &Document) -> Vec<ShareOutgoingRecord> {
+    records(doc, SHARE_OUT_PREFIX)
+}
+pub fn share_outgoing_record(doc: &Document, id: &str) -> Option<ShareOutgoingRecord> {
+    record(doc, &format!("{SHARE_OUT_PREFIX}{id}"))
+}
+pub fn set_share_delivery(doc: &mut Document, id: &str, delivered: bool) -> Result<(), String> {
+    let mut value = share_outgoing_record(doc, id)
+        .ok_or_else(|| "outgoing invitation disappeared".to_string())?;
+    value.state = if delivered { "delivered" } else { "failed" }.into();
+    value.detail = if delivered {
+        String::new()
+    } else {
+        "the recipient did not checkpoint the invitation".into()
+    };
+    put_record(doc, format!("{SHARE_OUT_PREFIX}{id}"), &value)
+}
+pub fn set_share_delivery_detail(
+    doc: &mut Document,
+    id: &str,
+    delivered: bool,
+    detail: String,
+) -> Result<(), String> {
+    let mut value = share_outgoing_record(doc, id)
+        .ok_or_else(|| "outgoing invitation disappeared".to_string())?;
+    value.state = if delivered { "delivered" } else { "failed" }.into();
+    value.detail = detail;
+    put_record(doc, format!("{SHARE_OUT_PREFIX}{id}"), &value)
+}
+pub fn set_share_envelope(doc: &mut Document, id: &str, envelope: Vec<u8>) -> Result<(), String> {
+    let mut value = share_outgoing_record(doc, id)
+        .ok_or_else(|| "outgoing invitation disappeared".to_string())?;
+    value.envelope = envelope;
+    value.state = "queued".into();
+    value.detail.clear();
+    put_record(doc, format!("{SHARE_OUT_PREFIX}{id}"), &value)
+}
+pub fn receive_share_invitation(doc: &mut Document, value: ShareInboxRecord) -> Result<(), String> {
+    let key = format!("{SHARE_INBOX_PREFIX}{}", value.id);
+    if record::<ShareInboxRecord>(doc, &key).is_some() {
+        return Ok(());
+    }
+    put_record(doc, key, &value)
+}
+pub fn share_inbox(doc: &Document) -> Vec<ShareInboxRecord> {
+    records(doc, SHARE_INBOX_PREFIX)
+}
+pub fn share_inbox_record(doc: &Document, id: &str) -> Option<ShareInboxRecord> {
+    record(doc, &format!("{SHARE_INBOX_PREFIX}{id}"))
+}
+pub fn remove_share_invitation(doc: &mut Document, id: &str) -> Result<(), String> {
+    remove_record(doc, &format!("{SHARE_INBOX_PREFIX}{id}"))
+}
+pub fn adopt_share_invitation(
+    doc: &mut Document,
+    id: &str,
+    instance: String,
+    partition: String,
+    app: String,
+) -> Result<(), String> {
+    let mut inbox =
+        share_inbox_record(doc, id).ok_or_else(|| "invitation disappeared".to_string())?;
+    inbox.adopted_instance = Some(instance.clone());
+    put_record(doc, format!("{SHARE_INBOX_PREFIX}{id}"), &inbox)?;
+    put_record(
+        doc,
+        format!("{SHARE_INSTANCE_PREFIX}{instance}"),
+        &ShareInstanceRecord {
+            partition,
+            app,
+            label: inbox.label,
+            edit: inbox.edit,
+            sender_endpoint: inbox.sender_endpoint,
+            sender_device: inbox.sender_device,
+        },
+    )
+}
+pub fn share_instance(doc: &Document, id: &str) -> Option<ShareInstanceRecord> {
+    record(doc, &format!("{SHARE_INSTANCE_PREFIX}{id}"))
+}
+pub fn share_instances(doc: &Document) -> Vec<(String, ShareInstanceRecord)> {
+    doc.read()
+        .keys(ROOT)
+        .filter_map(|key| {
+            let id = key.strip_prefix(SHARE_INSTANCE_PREFIX)?.to_string();
+            Some((id, record(doc, &key)?))
+        })
+        .collect()
+}
+pub fn instance_for_partition(doc: &Document, partition: &str) -> Option<String> {
+    doc.read()
+        .keys(ROOT)
+        .filter_map(|key| {
+            let id = key.strip_prefix(SHARE_INSTANCE_PREFIX)?;
+            (record::<ShareInstanceRecord>(doc, &key)?.partition == partition)
+                .then(|| id.to_string())
+        })
+        .min()
+}
+pub fn label_for_partition(doc: &Document, partition: &str) -> Option<String> {
+    share_instances(doc)
+        .into_iter()
+        .find_map(|(_, row)| (row.partition == partition).then_some(row.label))
+}
+/// Authenticated peers needed for document sync after restart: senders of
+/// adopted instances and recipients of durable outgoing grants.
+pub fn share_peer_hints(doc: &Document) -> Vec<([u8; 32], String)> {
+    let mut values: Vec<_> = records::<ShareInstanceRecord>(doc, SHARE_INSTANCE_PREFIX)
+        .into_iter()
+        .map(|record| (record.sender_device, record.sender_endpoint))
+        .collect();
+    values.extend(
+        records::<ShareOutgoingRecord>(doc, SHARE_OUT_PREFIX)
+            .into_iter()
+            .map(|record| (record.recipient_device, record.endpoint)),
+    );
+    values.sort();
+    values.dedup();
+    values
+}
+pub fn personal_partition(doc: &Document, app: &str) -> Option<String> {
+    record(
+        doc,
+        &format!("{PERSONAL_INSTANCE_PREFIX}{}", hex(app.as_bytes())),
+    )
+}
+pub fn set_personal_partition(
+    doc: &mut Document,
+    app: &str,
+    partition: String,
+) -> Result<(), String> {
+    put_record(
+        doc,
+        format!("{PERSONAL_INSTANCE_PREFIX}{}", hex(app.as_bytes())),
+        &partition,
+    )
+}
 
 pub fn route_key_or_create(
     doc: &mut Document,
@@ -254,6 +490,38 @@ pub fn adopt(current: &mut Document, source: &Document) -> Result<(), String> {
     }
     let before = personalization(current);
     current.merge_snapshot(&source.save())?;
+    // Personal and adopted document bindings belong to the established user,
+    // just like the route key. A joining device must not retain a separately
+    // minted solo personal list after adopting the group's visor document.
+    let before_personal: Vec<String> = current
+        .read()
+        .keys(ROOT)
+        .filter(|key| key.starts_with(PERSONAL_INSTANCE_PREFIX))
+        .collect();
+    let wanted_personal: BTreeSet<String> = source
+        .read()
+        .keys(ROOT)
+        .filter(|key| key.starts_with(PERSONAL_INSTANCE_PREFIX))
+        .collect();
+    current.transact(|tx| {
+        for key in before_personal {
+            if !wanted_personal.contains(&key) {
+                tx.delete(ROOT, key).map_err(|error| error.to_string())?;
+            }
+        }
+        for key in &wanted_personal {
+            let value = source
+                .read()
+                .get(ROOT, key)
+                .ok()
+                .flatten()
+                .and_then(|(value, _)| value.to_str().map(str::to_string))
+                .ok_or_else(|| "the established personal binding is malformed".to_string())?;
+            tx.put(ROOT, key, value)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })?;
     let mut fields = Vec::new();
     let mut user_keys: BTreeSet<String> = before.user.keys().cloned().collect();
     user_keys.extend(wanted.user.keys().cloned());

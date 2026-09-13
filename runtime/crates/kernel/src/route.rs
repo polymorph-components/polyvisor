@@ -6,7 +6,8 @@
 //! ```text
 //! fragment := "app/" token
 //! token    := base64url-nopad( 0x01 ‖ nonce(12) ‖ AES-256-GCM ciphertext )
-//! plaintext:= install-id(16) ‖ route-len(u16 BE) ‖ route ‖ zero pad to 256
+//! plaintext:= install-id(16) ‖ instance-len(u8) ‖ instance(32-byte cap)
+//!             ‖ route-len(u16 BE) ‖ route ‖ zero pad to 256
 //! ```
 //!
 //! `app/` is a *kind* prefix, not a path: a later kind is a new prefix, and a
@@ -78,7 +79,8 @@ const PLAINTEXT_LEN: usize = 256;
 
 /// The longest route that fits: the padded plaintext less the install id and
 /// the length prefix (internal.wit `apps.route-encode`).
-pub const MAX_ROUTE: usize = PLAINTEXT_LEN - INSTALL_LEN - 2;
+const INSTANCE_CAP: usize = 32;
+pub const MAX_ROUTE: usize = PLAINTEXT_LEN - INSTALL_LEN - 1 - INSTANCE_CAP - 2;
 
 /// Why a fragment did not encode or decode. Two variants because the kernel
 /// answers them differently: a route the caller can shorten is `refused` and
@@ -94,18 +96,36 @@ pub enum RouteError {
 
 /// The whole fragment text for `install` at `route` — `app/<token>`, without
 /// the `#`, which belongs to whoever writes the URL.
+#[cfg(test)]
 pub fn encode(
     key: &[u8; 32],
     install: [u8; INSTALL_LEN],
     route: &str,
 ) -> Result<String, RouteError> {
+    encode_instance(key, install, None, route)
+}
+
+pub fn encode_instance(
+    key: &[u8; 32],
+    install: [u8; INSTALL_LEN],
+    instance: Option<&str>,
+    route: &str,
+) -> Result<String, RouteError> {
     if route.len() > MAX_ROUTE {
+        return Err(RouteError::TooLong);
+    }
+    let instance = instance.unwrap_or_default();
+    if instance.len() > INSTANCE_CAP {
         return Err(RouteError::TooLong);
     }
     let mut plaintext = [0u8; PLAINTEXT_LEN];
     plaintext[..INSTALL_LEN].copy_from_slice(&install);
-    plaintext[INSTALL_LEN..INSTALL_LEN + 2].copy_from_slice(&(route.len() as u16).to_be_bytes());
-    plaintext[INSTALL_LEN + 2..INSTALL_LEN + 2 + route.len()].copy_from_slice(route.as_bytes());
+    plaintext[INSTALL_LEN] = instance.len() as u8;
+    plaintext[INSTALL_LEN + 1..INSTALL_LEN + 1 + instance.len()]
+        .copy_from_slice(instance.as_bytes());
+    let route_len_at = INSTALL_LEN + 1 + INSTANCE_CAP;
+    plaintext[route_len_at..route_len_at + 2].copy_from_slice(&(route.len() as u16).to_be_bytes());
+    plaintext[route_len_at + 2..route_len_at + 2 + route.len()].copy_from_slice(route.as_bytes());
 
     let (k_enc, k_siv) = subkeys(key);
     let nonce = siv(&k_siv, &plaintext);
@@ -129,7 +149,16 @@ pub fn encode(
 }
 
 /// The inverse: the install id the fragment names and the route it carries.
+#[cfg(test)]
 pub fn decode(key: &[u8; 32], fragment: &str) -> Result<([u8; INSTALL_LEN], String), RouteError> {
+    let (install, _instance, route) = decode_instance(key, fragment)?;
+    Ok((install, route))
+}
+
+pub fn decode_instance(
+    key: &[u8; 32],
+    fragment: &str,
+) -> Result<([u8; INSTALL_LEN], Option<String>, String), RouteError> {
     let token = fragment.strip_prefix(KIND).ok_or(RouteError::Unreadable)?;
     let blob = BASE64URL_NOPAD
         .decode(token.as_bytes())
@@ -155,17 +184,32 @@ pub fn decode(key: &[u8; 32], fragment: &str) -> Result<([u8; INSTALL_LEN], Stri
 
     let mut install = [0u8; INSTALL_LEN];
     install.copy_from_slice(&plaintext[..INSTALL_LEN]);
-    let len = u16::from_be_bytes([plaintext[INSTALL_LEN], plaintext[INSTALL_LEN + 1]]) as usize;
+    let instance_len = plaintext[INSTALL_LEN] as usize;
+    if instance_len > INSTANCE_CAP {
+        return Err(RouteError::Unreadable);
+    }
+    let instance_body = &plaintext[INSTALL_LEN + 1..INSTALL_LEN + 1 + INSTANCE_CAP];
+    if instance_body[instance_len..].iter().any(|b| *b != 0) {
+        return Err(RouteError::Unreadable);
+    }
+    let instance =
+        std::str::from_utf8(&instance_body[..instance_len]).map_err(|_| RouteError::Unreadable)?;
+    let route_len_at = INSTALL_LEN + 1 + INSTANCE_CAP;
+    let len = u16::from_be_bytes([plaintext[route_len_at], plaintext[route_len_at + 1]]) as usize;
     if len > MAX_ROUTE {
         return Err(RouteError::Unreadable);
     }
-    let body = &plaintext[INSTALL_LEN + 2..];
+    let body = &plaintext[route_len_at + 2..];
     let (route, pad) = body.split_at(len);
     if pad.iter().any(|b| *b != 0) {
         return Err(RouteError::Unreadable);
     }
     let route = std::str::from_utf8(route).map_err(|_| RouteError::Unreadable)?;
-    Ok((install, route.to_string()))
+    Ok((
+        install,
+        (!instance.is_empty()).then(|| instance.to_string()),
+        route.to_string(),
+    ))
 }
 
 /// The second kind's prefix (module docs): plaintext, keyless, no token.
@@ -221,6 +265,35 @@ mod tests {
         assert_eq!(
             decode(&KEY, &fragment).unwrap(),
             (INSTALL, "todo/active".to_string())
+        );
+    }
+
+    #[test]
+    fn adopted_instance_round_trips_and_is_authenticated() {
+        let fragment = encode_instance(
+            &KEY,
+            INSTALL,
+            Some("00112233445566778899aabbccddeeff"),
+            "active",
+        )
+        .unwrap();
+        assert_eq!(
+            decode_instance(&KEY, &fragment).unwrap(),
+            (
+                INSTALL,
+                Some("00112233445566778899aabbccddeeff".into()),
+                "active".into()
+            )
+        );
+        let mut changed = fragment.into_bytes();
+        *changed.last_mut().unwrap() = if *changed.last().unwrap() == b'A' {
+            b'B'
+        } else {
+            b'A'
+        };
+        assert_eq!(
+            decode_instance(&KEY, std::str::from_utf8(&changed).unwrap()),
+            Err(RouteError::Unreadable)
         );
     }
 

@@ -18,6 +18,8 @@ mod contacts_ui;
 pub(crate) mod draft;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) mod glyph;
+#[cfg(target_arch = "wasm32")]
+mod sharing_ui;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) mod state;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]

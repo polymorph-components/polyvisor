@@ -12,7 +12,7 @@
 //! `RefCell`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -50,6 +50,7 @@ use sedimentree_core::{
     id::SedimentreeId,
     loose_commit::id::CommitId,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use subduction_crypto::signer::memory::MemorySigner;
 use subduction_protocol::{
@@ -63,6 +64,68 @@ use subduction_runtime::{
 /// A future that borrows its owner and is never sent between threads — the
 /// shape every seam in this crate and in the kernel speaks.
 pub type LocalFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+pub(crate) const SHARED_TREE_TAG: u8 = 2;
+pub(crate) const SHARED_AUTHORITY_TREE_TAG: u8 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DocumentAccess {
+    Read,
+    Edit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedDocument {
+    pub partition: String,
+    pub document: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentGrant {
+    pub document: SharedDocument,
+    pub recipient_group: [u8; 32],
+    pub access: DocumentAccess,
+    pub authority: Vec<u8>,
+    pub frontier: Vec<u8>,
+}
+
+fn shared_partition(document: [u8; 32]) -> String {
+    let mut value = String::with_capacity(73);
+    value.push_str("document:");
+    for byte in document {
+        use std::fmt::Write as _;
+        let _written = write!(value, "{byte:02x}");
+    }
+    value
+}
+
+fn shared_document(partition: &str) -> Result<Option<[u8; 32]>, String> {
+    let Some(hex) = partition.strip_prefix("document:") else {
+        return Ok(None);
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("shared document partition is not canonical lowercase hex".into());
+    }
+    let mut document = [0; 32];
+    for (index, byte) in document.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "shared document partition is not hexadecimal".to_string())?;
+    }
+    Ok(Some(document))
+}
+
+fn shared_authority_tree(partition: &str) -> SedimentreeId {
+    let mut tree: [u8; 32] = Sha256::new()
+        .chain_update(b"polyvisor:document-authority:v0:")
+        .chain_update(partition.as_bytes())
+        .finalize()
+        .into();
+    tree[0] = SHARED_AUTHORITY_TREE_TAG;
+    SedimentreeId::new(tree)
+}
 
 /// What [`Engine::pump_events`] reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +171,11 @@ pub fn document_tree(partition: &str) -> SedimentreeId {
     let mut tree = digest;
     // The first byte is a namespace tag, not hash output. Opaque ids use a
     // different tag and therefore cannot alias a document tree.
-    tree[0] = 0;
+    tree[0] = if partition.starts_with("document:") {
+        SHARED_TREE_TAG
+    } else {
+        0
+    };
     SedimentreeId::new(tree)
 }
 
@@ -159,6 +226,7 @@ pub struct Engine<T: Transport<Local> + 'static> {
     /// The member keys, mirrored out of the user-system document so the
     /// policy can read them without borrowing it.
     members: Members,
+    shared_authorities: policy::SharedAuthorities,
     /// Every live authenticated connection, so a tree first touched after a
     /// peer was dialed still gets subscribed on it. Entries are removed when
     /// the driver reports the connection closed (see [`Engine::pump_events`]).
@@ -201,6 +269,9 @@ pub struct Engine<T: Transport<Local> + 'static> {
     >,
     remote_catalogs: RefCell<BTreeMap<subduction_protocol::id::ConnId, Vec<SedimentreeId>>>,
     pending_catalogs: RefCell<BTreeMap<subduction_protocol::id::ConnId, Vec<SedimentreeId>>>,
+    foreign_sync: RefCell<
+        BTreeMap<subduction_protocol::id::ConnId, BTreeMap<SedimentreeId, Vec<SedimentreeId>>>,
+    >,
     catalog_sent: RefCell<BTreeSet<subduction_protocol::id::ConnId>>,
     control_write: futures::lock::Mutex<()>,
     control_revision: Cell<u64>,
@@ -210,6 +281,77 @@ pub struct Engine<T: Transport<Local> + 'static> {
 }
 
 impl<T: Transport<Local> + 'static> Engine<T> {
+    async fn refresh_shared_authority(&self, partition: &str) -> Result<(), String> {
+        let Some(document) = shared_document(partition)? else {
+            return Ok(());
+        };
+        let vault = self.require_vault()?;
+        let mut authority = policy::TreeAuthority::default();
+        for (member, access) in vault.document_members(document).await? {
+            if access >= keyhive_core::access::Access::Read {
+                authority.readers.insert(member);
+            }
+            if access >= keyhive_core::access::Access::Edit {
+                authority.editors.insert(member);
+            }
+        }
+        self.shared_authorities
+            .borrow_mut()
+            .insert(document_tree(partition), authority.clone());
+        self.shared_authorities
+            .borrow_mut()
+            .insert(shared_authority_tree(partition), authority);
+        Ok(())
+    }
+
+    async fn sync_shared_partition(&self, partition: &str) -> Result<(), String> {
+        let tree = document_tree(partition);
+        let authority = shared_authority_tree(partition);
+        let conns: Vec<_> = self.conns.borrow().clone();
+        for conn in conns {
+            if let Some(pending) = self.foreign_sync.borrow().get(&conn.id()) {
+                // Foreign connections are phased authority -> content. While
+                // the initial authority request is pending, its completion
+                // queues content from the then-current tree. Once that map is
+                // empty, later document mutations may request content
+                // directly; re-requesting authority and content together
+                // races the receiver's authority ingestion.
+                if pending.contains_key(&authority) {
+                    continue;
+                }
+            } else {
+                conn.sync_tree(authority, true)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            conn.sync_tree(tree, true)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn broadcast_shared_partition(&self, partition: &str) -> Result<(), String> {
+        if shared_document(partition)?.is_none() {
+            return Ok(());
+        }
+        self.sync_shared_partition(partition).await
+    }
+
+    async fn refresh_all_shared_authorities(&self) -> Result<(), String> {
+        let partitions: Vec<_> = self
+            .documents
+            .borrow()
+            .keys()
+            .filter(|partition| shared_document(partition).ok().flatten().is_some())
+            .cloned()
+            .collect();
+        for partition in partitions {
+            self.refresh_shared_authority(&partition).await?;
+        }
+        Ok(())
+    }
+
     /// Build an engine and the driver future the caller must spawn.
     ///
     /// `storage_state` restores a snapshot taken by [`Engine::snapshot`]; its
@@ -246,6 +388,11 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 let tree = document_tree(&app.app);
                 storage.restore(tree, app.state.commits, app.state.fragments);
                 hydrate.push(tree);
+                if !app.authority.is_empty() {
+                    let authority_tree = shared_authority_tree(&app.app);
+                    storage.restore(authority_tree, app.authority, Vec::new());
+                    hydrate.push(authority_tree);
+                }
                 // The document and its tree are checkpointed together, but a
                 // crash between a commit landing in storage and the document
                 // being saved leaves the tree ahead. Closing that gap is
@@ -290,6 +437,8 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 .map(|doc| doc.members().into_iter().map(|m| m.key).collect())
                 .unwrap_or_default(),
         ));
+        let shared_authorities = Rc::new(RefCell::new(BTreeMap::new()));
+        storage.set_shared_authorities(Rc::clone(&shared_authorities));
 
         let (driver, handle) = Driver::new(
             // The node's entropy is its own — fingerprint seeds for set
@@ -300,7 +449,11 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             ClockAdapter::new(Rc::clone(&clock)),
             MemorySigner::from_bytes(&seed),
             Rc::clone(&storage),
-            Policy::new(Rc::clone(&members), Rc::clone(&opaque)),
+            Policy::new(
+                Rc::clone(&members),
+                Rc::clone(&opaque),
+                Rc::clone(&shared_authorities),
+            ),
         );
 
         let engine = Engine {
@@ -320,6 +473,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             name_key_seed: mix(b"polyvisor:name-key", &seed, &entropy),
             model_entropy: entropy,
             members,
+            shared_authorities,
             conns: RefCell::new(Vec::new()),
             pending_hydration: RefCell::new((!hydrate.is_empty()).then_some(hydrate)),
             opaque,
@@ -329,6 +483,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             connection_predecessors: RefCell::new(BTreeMap::new()),
             remote_catalogs: RefCell::new(BTreeMap::new()),
             pending_catalogs: RefCell::new(BTreeMap::new()),
+            foreign_sync: RefCell::new(BTreeMap::new()),
             catalog_sent: RefCell::new(BTreeSet::new()),
             control_write: futures::lock::Mutex::new(()),
             control_revision: Cell::new(0),
@@ -402,6 +557,246 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         self.model_entropy
     }
 
+    pub async fn create_shared_document(&self) -> Result<SharedDocument, String> {
+        self.open_us().await?;
+        let vault = self.require_vault()?;
+        let document = vault.create_document().await?;
+        let partition = shared_partition(document);
+        self.open_document(&partition).await?;
+        self.refresh_shared_authority(&partition).await?;
+        self.publish_shared_authority(&partition).await?;
+        self.sync_shared_partition(&partition).await?;
+        Ok(SharedDocument {
+            partition,
+            document,
+        })
+    }
+
+    pub async fn grant_document(
+        &self,
+        partition: &str,
+        recipient_group: [u8; 32],
+        recipient_device: [u8; 32],
+        recipient_proof: &[u8],
+        access: DocumentAccess,
+    ) -> Result<DocumentGrant, String> {
+        self.open_document(partition).await?;
+        let document = shared_document(partition)?
+            .ok_or_else(|| "private partitions cannot be granted".to_string())?;
+        let vault = self.require_vault()?;
+        vault
+            .import_group_proof(recipient_proof, recipient_group, recipient_device)
+            .await?;
+        vault
+            .grant_document(
+                document,
+                recipient_group,
+                match access {
+                    DocumentAccess::Read => keyhive_core::access::Access::Read,
+                    DocumentAccess::Edit => keyhive_core::access::Access::Edit,
+                },
+            )
+            .await?;
+        self.refresh_shared_authority(partition).await?;
+        self.publish_shared_authority(partition).await?;
+        self.sync_shared_partition(partition).await?;
+        Ok(DocumentGrant {
+            document: SharedDocument {
+                partition: partition.to_string(),
+                document,
+            },
+            recipient_group,
+            access,
+            authority: vault.document_authority(document).await?,
+            frontier: vault.export_shared_frontier(document)?,
+        })
+    }
+
+    pub async fn adopt_document(
+        &self,
+        grant: &DocumentGrant,
+        sender_group: [u8; 32],
+        sender_device: [u8; 32],
+    ) -> Result<(), String> {
+        self.validate_document_grant(grant, sender_group, sender_device)
+            .await?;
+        let document = shared_document(&grant.document.partition)?
+            .ok_or_else(|| "a document grant names a private partition".to_string())?;
+        if document != grant.document.document {
+            return Err("document grant partition does not match its keyhive document".into());
+        }
+        self.open_us().await?;
+        let vault = self.require_vault()?;
+        vault
+            .adopt_document_authority(&grant.authority, document)
+            .await?;
+        vault.import_shared_frontier(document, &grant.frontier)?;
+        self.open_document(&grant.document.partition).await?;
+        self.refresh_shared_authority(&grant.document.partition)
+            .await?;
+        self.sync_shared_partition(&grant.document.partition).await
+    }
+
+    /// Validate an invitation in isolated Keyhive state. This has no effect on
+    /// the live vault and is suitable for receipt-time checks before trusted UI.
+    pub async fn validate_document_grant(
+        &self,
+        grant: &DocumentGrant,
+        sender_group: [u8; 32],
+        sender_device: [u8; 32],
+    ) -> Result<(), String> {
+        let document = shared_document(&grant.document.partition)?
+            .ok_or_else(|| "a document grant names a private partition".to_string())?;
+        if document != grant.document.document {
+            return Err("document grant partition does not match its keyhive document".into());
+        }
+        self.open_us().await?;
+        if grant.recipient_group != self.authority_group().await? {
+            return Err("document grant is for another recipient group".into());
+        }
+        Vault::validate_document_authority(
+            &grant.authority,
+            document,
+            grant.recipient_group,
+            sender_group,
+            sender_device,
+            match grant.access {
+                DocumentAccess::Read => keyhive_core::access::Access::Read,
+                DocumentAccess::Edit => keyhive_core::access::Access::Edit,
+            },
+        )
+        .await
+    }
+
+    /// Same-user pairing imports scoped descriptors/frontiers without replacing
+    /// the recipient's personal group. Authority dependencies may be spread
+    /// across records and are retained by Keyhive until a later call resolves them.
+    pub async fn adopt_shared_documents(&self, grants: &[DocumentGrant]) -> Result<(), String> {
+        self.open_us().await?;
+        let local_group = self.authority_group().await?;
+        let vault = self.require_vault()?;
+        for grant in grants {
+            let document = shared_document(&grant.document.partition)?
+                .ok_or_else(|| "shared descriptor names a private partition".to_string())?;
+            if document != grant.document.document || grant.recipient_group != local_group {
+                return Err("shared descriptor does not bind this group and document".into());
+            }
+            vault.ingest_document_authority(&grant.authority).await?;
+            vault.import_shared_frontier(document, &grant.frontier)?;
+            if vault
+                .document_access(document, self.verifying_key().to_bytes())
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                self.open_document(&grant.document.partition).await?;
+                self.sync_shared_partition(&grant.document.partition)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn shared_documents(&self) -> Result<Vec<DocumentGrant>, String> {
+        self.open_us().await?;
+        let recipient_group = self.authority_group().await?;
+        let vault = self.require_vault()?;
+        let partitions: Vec<_> = self
+            .documents
+            .borrow()
+            .keys()
+            .filter_map(|partition| {
+                shared_document(partition)
+                    .ok()
+                    .flatten()
+                    .map(|document| (partition.clone(), document))
+            })
+            .collect();
+        let mut grants = Vec::with_capacity(partitions.len());
+        for (partition, document) in partitions {
+            grants.push(DocumentGrant {
+                document: SharedDocument {
+                    partition,
+                    document,
+                },
+                recipient_group,
+                access: DocumentAccess::Edit,
+                authority: vault.document_authority(document).await?,
+                frontier: vault.export_shared_frontier(document)?,
+            });
+        }
+        Ok(grants)
+    }
+
+    pub async fn can_sync_peer(&self, key: [u8; 32]) -> Result<bool, String> {
+        self.open_us().await?;
+        let shared: Vec<_> = self
+            .documents
+            .borrow()
+            .keys()
+            .filter(|partition| shared_document(partition).ok().flatten().is_some())
+            .cloned()
+            .collect();
+        for partition in shared {
+            self.refresh_shared_authority(&partition).await?;
+        }
+        Ok(self.members.borrow().contains(&key)
+            || self
+                .shared_authorities
+                .borrow()
+                .values()
+                .any(|authority| authority.readers.contains(&key)))
+    }
+
+    pub async fn document_inline_items(
+        &self,
+        partition: &str,
+        budget: usize,
+    ) -> Result<Option<Vec<StoreItem>>, String> {
+        self.open_document(partition).await?;
+        let tree = document_tree(partition);
+        self.storage.inline_items(tree, budget)
+    }
+
+    /// Inline delivery intentionally enters through the same signature,
+    /// authority, tree, item-id, blob and ciphertext checks as Drive import.
+    pub async fn document_import_inline(
+        &self,
+        partition: &str,
+        items: Vec<StoreItem>,
+    ) -> Result<bool, String> {
+        self.open_document(partition).await?;
+        let tree = *document_tree(partition).as_bytes();
+        if items.iter().any(|item| item.tree != tree) {
+            return Err("inline item is for another document tree".into());
+        }
+        let authors = self.item_authors(document_tree(partition));
+        if items
+            .iter()
+            .any(|item| item.kind == ItemKind::Fragment || !valid_item(&authors, item))
+        {
+            return Err("inline batch contains an invalid or unsupported item".into());
+        }
+        let mut parents = BTreeMap::new();
+        for item in &items {
+            let signed = subduction_crypto::signed::Signed::<
+                sedimentree_core::loose_commit::LooseCommit,
+            >::try_decode(&item.signed)
+            .map_err(|_| "inline commit envelope is malformed".to_string())?;
+            let commit = signed
+                .try_verify()
+                .map_err(|_| "inline commit signature is invalid".to_string())?;
+            parents.insert(commit.payload().head(), commit.payload().parents().clone());
+        }
+        if shared_document(partition)?.is_some()
+            && !valid_shared_ciphertexts_from_parents(document_tree(partition), &items, &parents)
+        {
+            return Err("inline batch contains a ciphertext with invalid scope".into());
+        }
+        self.ingest_items(items).await
+    }
+
     /// Wait until every local `us` mutation submitted before this call has
     /// crossed the driver's storage barrier.
     pub async fn control_barrier(&self) -> Result<(), String> {
@@ -433,8 +828,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     /// novelty. Drive uses this before deleting a correctly named obsolete
     /// object, so eligibility must deliberately not be part of the answer.
     pub fn valid_store_item(&self, item: &StoreItem) -> bool {
-        let members = self.members.borrow();
-        valid_item(&members, item)
+        self.valid_ingest_item(item)
     }
 
     pub async fn opaque_current(&self, slot: &str) -> Result<Option<[u8; 32]>, String> {
@@ -717,6 +1111,20 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             document_tree(partition),
         )?;
         self.open_document(partition).await?;
+        if shared_document(partition)?.is_some() {
+            // Pairing already carries the source's signed loose items and
+            // scoped frontier separately. Merge the snapshot only into the
+            // local materialized view and discard the synthetic merge change:
+            // publishing it would create a new encrypted dependency before
+            // the peer connection exists, and the next real edit would depend
+            // on an item the established device never received.
+            self.with_document(partition, |doc| {
+                adopt(doc, &source)?;
+                let _synthetic = doc.drain_local_commits();
+                Ok(())
+            })?;
+            return Ok(());
+        }
         self.mutate(partition, |doc| adopt(doc, &source)).await?;
         self.adopt_app_fragment(partition).await
     }
@@ -845,6 +1253,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         self.open_us().await?;
         let vault = self.require_vault()?;
         let events = vault.enroll(card, joiner_key).await?;
+        self.refresh_all_shared_authorities().await?;
         let keys = vault.export_content_keys()?;
         // Also onto the wire: a third device that pairs later learns of the
         // second one from the tree, not from a frame it never saw.
@@ -867,11 +1276,23 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         self.require_vault()?
             .adopt(events, content_keys, group, doc)
             .await?;
+        self.refresh_all_shared_authorities().await?;
+        // Pairing installs the established group's shared descriptors in the
+        // immediately following `adopt_shared_documents` call. Do not walk
+        // every pre-adoption local document here: a joiner's old personal
+        // shareable document belongs to its abandoned group, so the newly
+        // adopted identity correctly has no access to it.
         self.publish_keyhive().await?;
         // Everything already in storage was unopenable a moment ago.
         let apps: Vec<String> = self.documents.borrow().keys().cloned().collect();
         for app in apps {
-            let _landed = self.absorb_app(&app).await;
+            // Shared descriptors are adopted next by the pairing payload.
+            // A pre-adoption shared document belongs to the joiner's old
+            // group and must not abort adoption merely because the new group
+            // (correctly) lacks access to it.
+            if shared_document(&app)?.is_none() {
+                let _landed = self.absorb_app(&app).await;
+            }
         }
         Ok(())
     }
@@ -952,6 +1373,37 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             .await
             .map_err(|e| e.to_string())?;
         self.storage.forget_tree(tree);
+
+        // A founder's shareable documents belong to its abandoned group of
+        // one. Pairing supplies the established group's descriptors after
+        // `adopt_keyhive`; retaining these old documents makes an intermediate
+        // device try to re-export authority it no longer has when it enrolls
+        // a third device. Private partitions remain and are adopted normally.
+        let abandoned: Vec<_> = self
+            .documents
+            .borrow()
+            .keys()
+            .filter(|partition| shared_document(partition).ok().flatten().is_some())
+            .cloned()
+            .collect();
+        for partition in abandoned {
+            let content = document_tree(&partition);
+            let authority = shared_authority_tree(&partition);
+            for retired in [content, authority] {
+                self.handle
+                    .remove_tree(retired)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let _heads = self
+                    .handle
+                    .tree_heads(retired)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.storage.forget_tree(retired);
+                self.shared_authorities.borrow_mut().remove(&retired);
+            }
+            self.documents.borrow_mut().remove(&partition);
+        }
 
         *self.us.borrow_mut() = Some(adopted);
         *self.name_key.borrow_mut() = Some(name_key);
@@ -1086,10 +1538,60 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         // read loop is feeding the driver.
         (self.spawn)(Box::pin(read_loop));
         let conn = pending.authenticated().await.map_err(|e| e.to_string())?;
+        let shared: Vec<_> = self
+            .documents
+            .borrow()
+            .keys()
+            .filter(|partition| shared_document(partition).ok().flatten().is_some())
+            .cloned()
+            .collect();
+        for partition in shared {
+            self.refresh_shared_authority(&partition).await?;
+        }
+        if !self.can_sync_peer(*conn.peer().as_bytes()).await? {
+            return Err("peer has no document authority".into());
+        }
         // Register before requesting control: a fast in-memory peer can return
         // SyncFinished before this future is polled again, and the event pump
         // needs the capability to schedule the next (keyhive) phase.
         self.conns.borrow_mut().push(conn.clone());
+        let remote = *conn.peer().as_bytes();
+        if !self.members.borrow().contains(&remote) {
+            let partitions: Vec<_> = self
+                .shared_authorities
+                .borrow()
+                .iter()
+                .filter_map(|(tree, authority)| {
+                    (tree.as_bytes()[0] == SHARED_TREE_TAG && authority.readers.contains(&remote))
+                        .then_some(*tree)
+                })
+                .collect();
+            if partitions.is_empty() {
+                return Err("peer has no shared document authority".into());
+            }
+            self.control_phases
+                .borrow_mut()
+                .insert(conn.id(), ControlPhase::Ready);
+            let mut pending = BTreeMap::new();
+            for tree in partitions {
+                let partition = self
+                    .documents
+                    .borrow()
+                    .iter()
+                    .find_map(|(partition, doc)| (doc.tree() == tree).then_some(partition.clone()))
+                    .ok_or_else(|| "shared authority has no local document".to_string())?;
+                let authority_tree = shared_authority_tree(&partition);
+                pending
+                    .entry(authority_tree)
+                    .or_insert_with(Vec::new)
+                    .push(tree);
+                conn.sync_tree(authority_tree, true)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            self.foreign_sync.borrow_mut().insert(conn.id(), pending);
+            return Ok(conn.peer());
+        }
         let same_peer_predecessors = self
             .conns
             .borrow()
@@ -1153,6 +1655,25 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                     }
                     if changed {
                         notify(EngineEvent::Changed).await;
+                    }
+                }
+                AppEvent::SyncFinished { conn, tree, status }
+                    if tree.as_bytes()[0] == SHARED_AUTHORITY_TREE_TAG
+                        && status == subduction_protocol::effect::SyncStatus::Completed =>
+                {
+                    let _barrier = self.handle.tree_heads(tree).await;
+                    let _absorbed = self.absorb(tree).await;
+                    let content = self
+                        .foreign_sync
+                        .borrow_mut()
+                        .get_mut(&conn)
+                        .and_then(|pending| pending.remove(&tree))
+                        .unwrap_or_default();
+                    let connection = self.conns.borrow().iter().find(|c| c.id() == conn).cloned();
+                    if let Some(connection) = connection {
+                        for tree in content {
+                            let _queued = connection.sync_tree(tree, true).await;
+                        }
                     }
                 }
                 AppEvent::SyncFinished { conn, tree, status }
@@ -1448,11 +1969,10 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             if *self.name_key.borrow() != group_generation {
                 return Err("group changed during store import".to_string());
             }
-            let members = self.members.borrow().clone();
             let mut commits = Vec::new();
             let mut fragments = Vec::new();
             for item in by_tree.remove(&tree).unwrap_or_default() {
-                if !self.accept(&members, &item) {
+                if !self.accept(&item) {
                     continue;
                 }
                 fresh = true;
@@ -1531,16 +2051,17 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     ///
     /// A failing item is skipped, not fatal: the folder is the user's own
     /// Drive and one bad object must not stop the rest from landing.
-    fn accept(&self, members: &std::collections::BTreeSet<[u8; 32]>, item: &StoreItem) -> bool {
-        if !valid_item(members, item) || !self.item_publishable(item) {
+    fn accept(&self, item: &StoreItem) -> bool {
+        if !self.valid_ingest_item(item) || !self.item_publishable(item) {
             return false;
         }
         if is_opaque_tree(&item.tree)
             && opaque::mode(&self.opaque, &item.tree) == Some(OpaqueMode::CallerEncrypted)
         {
-            let Some(payload) =
-                verify::<sedimentree_core::loose_commit::LooseCommit>(&item.signed, members)
-            else {
+            let Some(payload) = verify::<sedimentree_core::loose_commit::LooseCommit>(
+                &item.signed,
+                &self.item_authors(SedimentreeId::new(item.tree)),
+            ) else {
                 return false;
             };
             let parents: Vec<_> = payload.parents().iter().map(|id| *id.as_bytes()).collect();
@@ -1557,7 +2078,8 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 // (or never held loose at all, having arrived inside somebody
                 // else's fragment). Reinstating it would undo the compaction
                 // on every pass. See [`Engine::read_not_held`].
-                !self.storage.holds(tree, id) && !self.read(tree, id)
+                !self.storage.holds(tree, id)
+                    && (tree.as_bytes()[0] == SHARED_TREE_TAG || !self.read(tree, id))
             }
             ItemKind::Fragment => !self.storage.holds_fragment(tree, id),
         }
@@ -1620,6 +2142,67 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 }),
         );
         trees
+    }
+
+    fn item_authors(&self, tree: SedimentreeId) -> BTreeSet<[u8; 32]> {
+        let shared = self.shared_authorities.borrow();
+        if let Some(authority) = shared.get(&tree) {
+            authority.editors.clone()
+        } else if matches!(
+            tree.as_bytes()[0],
+            SHARED_TREE_TAG | SHARED_AUTHORITY_TREE_TAG
+        ) {
+            BTreeSet::new()
+        } else {
+            self.members.borrow().clone()
+        }
+    }
+
+    fn shared_document_for_tree(&self, tree: SedimentreeId) -> Option<[u8; 32]> {
+        self.documents.borrow().keys().find_map(|partition| {
+            (document_tree(partition) == tree || shared_authority_tree(partition) == tree)
+                .then(|| shared_document(partition).ok().flatten())
+                .flatten()
+        })
+    }
+
+    fn valid_ingest_item(&self, item: &StoreItem) -> bool {
+        let tree = SedimentreeId::new(item.tree);
+        let authors = self.item_authors(tree);
+        if item.kind == ItemKind::Fragment
+            && matches!(
+                tree.as_bytes()[0],
+                SHARED_TREE_TAG | SHARED_AUTHORITY_TREE_TAG
+            )
+        {
+            return false;
+        }
+        if !valid_item(&authors, item) {
+            return false;
+        }
+        if tree.as_bytes()[0] == SHARED_AUTHORITY_TREE_TAG {
+            return self.shared_document_for_tree(tree).is_some_and(|document| {
+                vault::valid_document_authority_scope(&item.blob, document)
+            });
+        }
+        if tree.as_bytes()[0] == SHARED_TREE_TAG {
+            let Ok(signed) = subduction_crypto::signed::Signed::<
+                sedimentree_core::loose_commit::LooseCommit,
+            >::try_decode(&item.signed) else {
+                return false;
+            };
+            let Ok(commit) = signed.try_verify() else {
+                return false;
+            };
+            let parents =
+                BTreeMap::from([(commit.payload().head(), commit.payload().parents().clone())]);
+            return valid_shared_ciphertexts_from_parents(
+                tree,
+                std::slice::from_ref(item),
+                &parents,
+            );
+        }
+        true
     }
 
     /// Make sure this device holds a user-system document, and that every
@@ -1744,6 +2327,31 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         let _heads = self
             .handle
             .tree_heads(keyhive_tree())
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    async fn publish_shared_authority(&self, partition: &str) -> Result<(), String> {
+        let document = shared_document(partition)?
+            .ok_or_else(|| "private partition has no scoped authority".to_string())?;
+        let bytes = self.require_vault()?.document_authority(document).await?;
+        let id = Sha256::digest(&bytes).into();
+        let tree = shared_authority_tree(partition);
+        self.handle
+            .add_commits(
+                tree,
+                vec![subduction_protocol::command::NewCommit {
+                    head: CommitId::new(id),
+                    parents: BTreeSet::new(),
+                    blob: Blob::new(bytes),
+                }],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let _heads = self
+            .handle
+            .tree_heads(tree)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -2040,13 +2648,26 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             .clone();
         let _serial = serial.lock().await;
         self.open_document(app).await?;
+        if let Some(document) = shared_document(app)?
+            && !self
+                .require_vault()?
+                .document_access(document, self.verifying_key().to_bytes())
+                .await?
+                .is_some_and(|access| access >= keyhive_core::access::Access::Edit)
+        {
+            return Err("this device has read-only access to the shared document".into());
+        }
         let (answer, tree, commits) = self.with_document(app, |doc| {
             let answer = change(doc);
             Ok((answer, doc.tree(), doc.drain_local_commits()))
         })?;
         if !commits.is_empty() {
             for commit in commits {
-                let (commit, sealed) = self.seal(commit).await?;
+                let (commit, sealed) = if let Some(document) = shared_document(app)? {
+                    self.seal_shared(document, commit).await?
+                } else {
+                    self.seal(commit).await?
+                };
                 self.handle
                     .add_commits(tree, vec![commit])
                     .await
@@ -2063,7 +2684,12 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             }
             // Encrypting may have advanced the document's CGKA epoch, and the
             // update op is what lets the other devices follow.
-            self.publish_keyhive().await?;
+            if shared_document(app)?.is_some() {
+                self.publish_shared_authority(app).await?;
+                self.broadcast_shared_partition(app).await?;
+            } else {
+                self.publish_keyhive().await?;
+            }
             // One commit in ~256 closes a level-1 fragment (its hash starts
             // with a zero byte); the other 255 times this walks the change
             // graph, finds every fragment already held, and stops before
@@ -2100,6 +2726,22 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     /// its commits *are* the state, unordered and content-addressed (see
     /// [`keyhive_tree`]) — so there is no change graph to fragment.
     async fn compact(&self, tree: SedimentreeId) -> Result<(), String> {
+        if self
+            .documents
+            .borrow()
+            .values()
+            .any(|doc| doc.tree() == tree)
+            && self.documents.borrow().keys().any(|partition| {
+                document_tree(partition) == tree
+                    && shared_document(partition).ok().flatten().is_some()
+            })
+        {
+            // CONTRACT: shared fragments need the same tree-scoped content
+            // references and authority checks as commits. V0 keeps shared
+            // histories loose rather than allowing the private-scope fragment
+            // path to bypass those checks.
+            return Ok(());
+        }
         if tree == keyhive_tree() {
             return Ok(());
         }
@@ -2269,6 +2911,31 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         ))
     }
 
+    async fn seal_shared(
+        &self,
+        document: [u8; 32],
+        commit: subduction_protocol::command::NewCommit,
+    ) -> Result<(subduction_protocol::command::NewCommit, vault::Sealed), String> {
+        let vault = self.require_vault()?;
+        let tree = document_tree(&shared_partition(document));
+        let preds: Vec<_> = commit
+            .parents
+            .iter()
+            .map(|id| shared_cref(tree, *id.as_bytes()))
+            .collect();
+        let cref = shared_cref(tree, *commit.head.as_bytes());
+        let sealed = vault
+            .seal_shared(document, cref, &preds, commit.blob.as_slice().to_vec())
+            .await?;
+        Ok((
+            subduction_protocol::command::NewCommit {
+                blob: Blob::new(sealed.blob.clone()),
+                ..commit
+            },
+            sealed,
+        ))
+    }
+
     /// Make sure this device holds a document for `app`, and that every live
     /// peer is syncing and subscribed to its tree.
     ///
@@ -2284,7 +2951,23 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         // sealed to, so it is opened first even for a device whose caller only
         // ever asked about tasks.
         self.open_us().await?;
+        if let Some(document) = shared_document(app)? {
+            if shared_partition(document) != app {
+                return Err("shared document partition is not canonical".into());
+            }
+            if self
+                .require_vault()?
+                .document_access(document, self.verifying_key().to_bytes())
+                .await?
+                .is_none()
+            {
+                return Err("this device has no access to the shared document".into());
+            }
+        }
         if self.documents.borrow().contains_key(app) {
+            if shared_document(app)?.is_some() {
+                self.refresh_shared_authority(app).await?;
+            }
             return Ok(());
         }
         let tree = document_tree(app);
@@ -2307,6 +2990,11 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         // network. A later service read observes what the event pump applies.
         let conns: Vec<_> = self.conns.borrow().clone();
         for conn in conns {
+            if shared_document(app)?.is_some() {
+                conn.sync_tree(shared_authority_tree(app), true)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             conn.sync_tree(tree, true)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -2357,6 +3045,32 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         if tree == keyhive_tree() {
             return self.absorb_keyhive().await;
         }
+        if tree.as_bytes()[0] == SHARED_AUTHORITY_TREE_TAG {
+            let partition = self.documents.borrow().keys().find_map(|partition| {
+                (shared_authority_tree(partition) == tree).then_some(partition.clone())
+            });
+            let Some(partition) = partition else {
+                return false;
+            };
+            let Some(document) = shared_document(&partition).ok().flatten() else {
+                return false;
+            };
+            let Some(vault) = self.vault() else {
+                return false;
+            };
+            let mut changed = false;
+            for (_, bytes) in self.storage.commit_blobs(tree) {
+                changed |= vault
+                    .ingest_scoped_document_authority(&bytes, document)
+                    .await
+                    .is_ok();
+            }
+            if changed {
+                let _refreshed = self.refresh_shared_authority(&partition).await;
+                return self.absorb_app(&partition).await;
+            }
+            return false;
+        }
         let Some(app) = self
             .documents
             .borrow()
@@ -2399,9 +3113,33 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 doc.applied_ids()
                     .into_iter()
                     .map(|id| *id.as_bytes())
-                    .collect(),
+                    .collect::<HashSet<_>>(),
             )
         };
+        let shared = shared_document(app).ok().flatten();
+        let shared_known: HashSet<_> = known.iter().map(|id| shared_cref(tree, *id)).collect();
+        let shared_parents: BTreeMap<_, BTreeSet<_>> = self
+            .storage
+            .metadata(tree)
+            .0
+            .into_iter()
+            .map(|commit| {
+                (
+                    shared_cref(tree, *commit.head().as_bytes()),
+                    commit
+                        .parents()
+                        .iter()
+                        .map(|parent| shared_cref(tree, *parent.as_bytes()))
+                        .collect(),
+                )
+            })
+            .collect();
+        if shared.is_some() && !bundles.is_empty() {
+            return false;
+        }
+        if shared.is_some() && !valid_shared_ciphertexts(tree, &wanted, &self.storage) {
+            return false;
+        }
         if wanted.is_empty() && bundles.is_empty() {
             return false;
         }
@@ -2418,16 +3156,18 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         let opened_bundles = if bundles.is_empty() {
             Vec::new()
         } else {
-            match vault
-                .open(
-                    bundles
-                        .into_iter()
-                        .map(|(head, blob)| (fragment_cref(tree, head), blob))
-                        .collect(),
-                    &known,
-                )
-                .await
-            {
+            let request = bundles
+                .into_iter()
+                .map(|(head, blob)| (fragment_cref(tree, head), blob))
+                .collect();
+            let opened = if let Some(document) = shared {
+                vault
+                    .open_shared(document, request, &shared_known, &shared_parents)
+                    .await
+            } else {
+                vault.open(request, &known).await
+            };
+            match opened {
                 Ok(opened) => opened
                     .into_iter()
                     .filter_map(|(cref, bundle)| Some((*by_cref.get(&cref)?, bundle)))
@@ -2435,16 +3175,21 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 Err(_) => Vec::new(),
             }
         };
-        let Ok(opened) = vault
-            .open(
-                wanted
-                    .into_iter()
-                    .map(|(id, blob)| (*id.as_bytes(), blob))
-                    .collect(),
-                &known,
-            )
-            .await
-        else {
+        let request = wanted
+            .into_iter()
+            .map(|(id, blob)| {
+                let cref = shared.map_or(*id.as_bytes(), |_| shared_cref(tree, *id.as_bytes()));
+                (cref, blob)
+            })
+            .collect();
+        let opened = if let Some(document) = shared {
+            vault
+                .open_shared(document, request, &shared_known, &shared_parents)
+                .await
+        } else {
+            vault.open(request, &known).await
+        };
+        let Ok(opened) = opened else {
             return false;
         };
         let (absorbed, tree, anchor) = {
@@ -2456,7 +3201,13 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             let mut absorbed = doc.apply(
                 opened
                     .into_iter()
-                    .map(|(id, change)| (CommitId::new(id), change))
+                    .filter_map(|(cref, change)| {
+                        if shared.is_some() {
+                            wanted_commit_for_cref(tree, cref, &self.storage).map(|id| (id, change))
+                        } else {
+                            Some((CommitId::new(cref), change))
+                        }
+                    })
                     .collect(),
             );
             absorbed.landed |= from_fragments.landed;
@@ -2474,19 +3225,39 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             // nothing but somebody else's anchor is not a reason to author
             // one, which is what stops two devices anchoring each other
             // forever.
-            let anchor = (absorbed.content && doc.diverged())
+            let can_anchor = match shared {
+                Some(document) => self
+                    .shared_authorities
+                    .borrow()
+                    .get(&document_tree(&shared_partition(document)))
+                    .is_some_and(|authority| {
+                        authority.editors.contains(&self.verifying_key().to_bytes())
+                    }),
+                None => true,
+            };
+            let anchor = (absorbed.content && doc.diverged() && can_anchor)
                 .then(|| doc.merge_anchor())
                 .flatten();
             (absorbed, doc.tree(), anchor)
         };
-        if let Some(anchor) = anchor
-            && let Ok((anchor, sealed)) = self.seal(anchor).await
-        {
+        if let Some(anchor) = anchor {
+            let sealed = if let Some(document) = shared {
+                self.seal_shared(document, anchor).await
+            } else {
+                self.seal(anchor).await
+            };
+            let Ok((anchor, sealed)) = sealed else {
+                return absorbed.landed;
+            };
             let pushed = self.handle.add_commits(tree, vec![anchor]).await;
             if pushed.is_ok() {
                 let _heads = self.handle.tree_heads(tree).await;
                 vault.confirm(&sealed);
-                let _published = self.publish_keyhive().await;
+                if shared.is_some() {
+                    let _published = self.publish_shared_authority(app).await;
+                } else {
+                    let _published = self.publish_keyhive().await;
+                }
             }
         }
         absorbed.landed
@@ -2508,6 +3279,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         if !ingested {
             return false;
         }
+        let _refreshed = self.refresh_all_shared_authorities().await;
         let apps: Vec<String> = self.documents.borrow().keys().cloned().collect();
         let mut landed = false;
         for app in apps {
@@ -2552,6 +3324,80 @@ fn fragment_cref(tree: SedimentreeId, head: CommitId) -> [u8; 32] {
         .update(head.as_bytes())
         .finalize()
         .as_bytes()
+}
+
+pub(crate) fn shared_cref(tree: SedimentreeId, id: [u8; 32]) -> [u8; 32] {
+    *blake3::Hasher::new()
+        .update(b"polyvisor:shared-content:v0")
+        .update(tree.as_bytes())
+        .update(&id)
+        .finalize()
+        .as_bytes()
+}
+
+fn wanted_commit_for_cref(
+    tree: SedimentreeId,
+    cref: [u8; 32],
+    storage: &SnapshotStorage,
+) -> Option<CommitId> {
+    storage
+        .metadata(tree)
+        .0
+        .into_iter()
+        .map(|commit| commit.head())
+        .find(|id| shared_cref(tree, *id.as_bytes()) == cref)
+}
+
+fn valid_shared_ciphertexts(
+    tree: SedimentreeId,
+    blobs: &[(CommitId, Vec<u8>)],
+    storage: &SnapshotStorage,
+) -> bool {
+    let parents: BTreeMap<_, _> = storage
+        .metadata(tree)
+        .0
+        .into_iter()
+        .map(|commit| {
+            let scoped: Vec<_> = commit
+                .parents()
+                .iter()
+                .map(|parent| shared_cref(tree, *parent.as_bytes()))
+                .collect();
+            (commit.head(), scoped)
+        })
+        .collect();
+    blobs.iter().all(|(id, blob)| {
+        let Ok(ciphertext) = bincode::deserialize::<vault::Ciphertext>(blob) else {
+            return false;
+        };
+        let Some(expected_parents) = parents.get(id) else {
+            return false;
+        };
+        ciphertext.content_ref == shared_cref(tree, *id.as_bytes())
+            && ciphertext.pred_refs == keyhive_crypto::digest::Digest::hash(expected_parents)
+    })
+}
+
+fn valid_shared_ciphertexts_from_parents(
+    tree: SedimentreeId,
+    items: &[StoreItem],
+    parents: &BTreeMap<CommitId, BTreeSet<CommitId>>,
+) -> bool {
+    items.iter().all(|item| {
+        let Ok(ciphertext) = bincode::deserialize::<vault::Ciphertext>(&item.blob) else {
+            return false;
+        };
+        let id = CommitId::new(item.commit);
+        let Some(parent_ids) = parents.get(&id) else {
+            return false;
+        };
+        let scoped: Vec<_> = parent_ids
+            .iter()
+            .map(|parent| shared_cref(tree, *parent.as_bytes()))
+            .collect();
+        ciphertext.content_ref == shared_cref(tree, item.commit)
+            && ciphertext.pred_refs == keyhive_crypto::digest::Digest::hash(&scoped)
+    })
 }
 
 /// Decode a store object's envelope, check the signature, and check the

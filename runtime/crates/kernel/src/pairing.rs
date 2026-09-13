@@ -42,12 +42,17 @@ use std::rc::Rc;
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use futures::future::Either;
+use polyvisor_engine::{DocumentGrant, StoreItem};
 use serde::{Deserialize, Serialize};
 
 use crate::{EngineTransport, Error, ErrorCode, Kernel, PAIRING_ALPN};
 
 /// How long an offer stands.
 const OFFER_TTL_MS: u64 = 120_000;
+const PAIRING_FRAME_BUDGET: usize = 8 * 1024 * 1024;
+// JSON expands byte arrays, so leave substantial framing headroom rather than
+// asking the engine for the full wire cap.
+const PAIRING_SHARED_ITEMS_BUDGET: usize = 2 * 1024 * 1024;
 
 /// The code's version byte. A different first byte is a different ceremony,
 /// and is refused rather than guessed at.
@@ -99,6 +104,7 @@ struct AdoptionPayload<'a> {
     read_back: &'a [u8],
     visor: &'a [u8],
     contacts: &'a [u8],
+    shared: &'a [(DocumentGrant, Vec<StoreItem>)],
 }
 
 /// A bound session's three handles: the shared transport, the frames its
@@ -421,6 +427,14 @@ impl Kernel {
             .document_save(polyvisor_visor_model::VISOR_APP)
             .await?;
         let contacts = engine.document_save(crate::contacts::CONTACTS_APP).await?;
+        let mut shared = Vec::new();
+        for grant in engine.shared_documents().await? {
+            let items = engine
+                .document_inline_items(&grant.document.partition, PAIRING_SHARED_ITEMS_BUDGET)
+                .await?
+                .ok_or_else(|| "shared documents exceed the pairing transfer bound".to_string())?;
+            shared.push((grant, items));
+        }
         // The group's store-name key travels here and nowhere else: it is a
         // group secret, and this connection is the one the two users have
         // just compared six digits over. Without it the joiner would be a
@@ -438,6 +452,7 @@ impl Kernel {
                 name_key: name_key.to_vec(),
                 visor,
                 contacts,
+                shared,
             },
         )
         .await?;
@@ -631,7 +646,8 @@ impl Kernel {
         send_frame(transport.as_ref(), &Frame::ConfirmJoin).await?;
         self.set_phase(Phase::AwaitingPeer);
 
-        let (us, keyhive, read_back, name_key, visor, contacts) = match frames.next().await {
+        let (us, keyhive, read_back, name_key, visor, contacts, shared) = match frames.next().await
+        {
             Some(Frame::Enroll {
                 us,
                 keyhive,
@@ -639,7 +655,8 @@ impl Kernel {
                 name_key,
                 visor,
                 contacts,
-            }) => (us, keyhive, read_back, name_key, visor, contacts),
+                shared,
+            }) => (us, keyhive, read_back, name_key, visor, contacts, shared),
             Some(Frame::Cancel) => return Err(cancelled()),
             Some(_) => return Err(out_of_order()),
             None => return Err(gone()),
@@ -674,6 +691,7 @@ impl Kernel {
         if meeting_active {
             self.meeting_invalidate().await;
         }
+        let _sharing = self.sharing_write.lock().await;
         let adoption = self
             .begin_identity_adoption()
             .map_err(|error| error.message)?;
@@ -686,6 +704,7 @@ impl Kernel {
                 read_back: &read_back,
                 visor: &visor,
                 contacts: &contacts,
+                shared: &shared,
             })
             .await;
         self.finish_identity_adoption(adoption, outcome.is_ok());
@@ -719,6 +738,31 @@ impl Kernel {
                 polyvisor_visor_model::adopt,
             )
             .await?;
+        let grants: Vec<_> = payload
+            .shared
+            .iter()
+            .map(|(grant, _)| grant.clone())
+            .collect();
+        engine.adopt_shared_documents(&grants).await?;
+        for (grant, items) in payload.shared {
+            engine
+                .document_import_inline(&grant.document.partition, items.clone())
+                .await?;
+        }
+        if let Some(personal) = engine
+            .document_read(polyvisor_visor_model::VISOR_APP, |doc| {
+                polyvisor_visor_model::personal_partition(doc, "todomvc")
+            })
+            .await?
+        {
+            for (session, app) in self.sessions.borrow().iter() {
+                if app == "todomvc" {
+                    self.session_documents
+                        .borrow_mut()
+                        .insert(*session, personal.clone());
+                }
+            }
+        }
         engine
             .document_adopt(
                 crate::contacts::CONTACTS_APP,
@@ -884,6 +928,7 @@ enum Frame {
         /// Serialized contacts document, adopted so the established group's
         /// user signing identity replaces any solo identity on the joiner.
         contacts: Vec<u8>,
+        shared: Vec<(DocumentGrant, Vec<StoreItem>)>,
     },
     /// Joiner → adder, last: the enrollment has been adopted *and*
     /// checkpointed here. It carries nothing — the
@@ -901,6 +946,9 @@ enum Frame {
 
 async fn send_frame(transport: &dyn EngineTransport, frame: &Frame) -> Result<(), String> {
     let bytes = serde_json::to_vec(frame).map_err(|e| e.to_string())?;
+    if bytes.len() > PAIRING_FRAME_BUDGET {
+        return Err("the pairing frame exceeds 8 MiB".into());
+    }
     transport.send(bytes).await
 }
 
@@ -908,6 +956,9 @@ async fn send_frame(transport: &dyn EngineTransport, frame: &Frame) -> Result<()
 /// that are not a frame at all. Unknown frames are rejected.
 async fn recv_frame(transport: &dyn EngineTransport) -> Option<Frame> {
     let bytes = transport.recv().await?;
+    if bytes.len() > PAIRING_FRAME_BUDGET {
+        return None;
+    }
     serde_json::from_slice(&bytes).ok()
 }
 

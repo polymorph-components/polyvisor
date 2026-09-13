@@ -59,6 +59,7 @@ const I = {
   appServices: "polyvisor:internal/app-services@0.1.0",
   locks: "polyvisor:internal/locks@0.1.0",
   tasks: "polyvisor:app/tasks@0.1.0",
+  sharing: "polyvisor:internal/sharing@0.1.0",
   history: "polyvisor:app/history@0.1.0",
   contacts: "polyvisor:internal/contacts@0.1.0",
   meeting: "polyvisor:internal/meeting@0.1.0",
@@ -389,6 +390,7 @@ function mintSessionPort(
       setTitle: (id: string, title: string) =>
         svc.tasksSetTitle(session, id, title),
       remove: (id: string) => svc.tasksRemove(session, id),
+      share: () => svc.tasksShare(session),
     },
     [I.history]: {
       read: () => svc.historyRead(session),
@@ -430,6 +432,17 @@ const CONTACTS_METHODS = [
 /// runtime/wit/internal.wit `interface meeting`'s methods, camelCase.
 const MEETING_METHODS = ["offer", "join", "confirm", "cancel", "status"] as
   const;
+const SHARING_METHODS = [
+  "prompts",
+  "confirm",
+  "cancel",
+  "outgoing",
+  "retry",
+  "inbox",
+  "instances",
+  "adopt",
+  "dismiss",
+] as const;
 
 /// runtime/wit/internal.wit `interface identity`'s methods, camelCase.
 const IDENTITY_METHODS = [
@@ -604,6 +617,8 @@ self.onconnect = (ev: MessageEvent) => {
     [I.apps]: {
       installed: async () => (await ready)[I.apps].installed(),
       launch: async (app: string) => (await ready)[I.apps].launch(app),
+      launchInstance: async (app: string, instance: string) =>
+        (await ready)[I.apps].launchInstance(app, instance),
       // Control port only, both: `route-encode` names a session the tab's
       // glue owns the URL bar for, and `route-decode` resolves a fragment
       // the visor read off the page (internal.wit `apps`). A session port
@@ -655,6 +670,7 @@ self.onconnect = (ev: MessageEvent) => {
     // session (`mintSessionPort` above serves none of them).
     [I.contacts]: forwardMethods(I.contacts, CONTACTS_METHODS),
     [I.meeting]: forwardMethods(I.meeting, MEETING_METHODS),
+    [I.sharing]: forwardMethods(I.sharing, SHARING_METHODS),
     [I.identity]: {
       ...forwardMethods(I.identity, IDENTITY_METHODS),
       backupExport: async (passphrase: string) =>

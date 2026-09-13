@@ -391,3 +391,16 @@ html .clear-completed:active {
   box-shadow: 0 0 2px 2px #CF7D7D;
   outline: 0;
 }
+
+/* Sharing controls: no upstream TodoMVC equivalent, so a plain block below
+   `.main` (see lib.rs's comment on why not above it) rather than styling
+   that mimics the rest of the sheet. */
+.sharing-controls {
+  padding: 10px 16px;
+  text-align: center;
+}
+
+.sharing-controls .error {
+  margin: 8px 0 0;
+  color: #b00;
+}

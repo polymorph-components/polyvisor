@@ -1760,6 +1760,7 @@ dependencies = [
  "rand_chacha",
  "sedimentree_core",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "subduction_crypto",
  "subduction_protocol",
@@ -1791,6 +1792,7 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "automerge",
+ "bincode",
  "blake3",
  "data-encoding",
  "ed25519-dalek",
@@ -1882,6 +1884,8 @@ dependencies = [
  "automerge",
  "polyvisor-document-history",
  "sedimentree_core",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
 ]
 

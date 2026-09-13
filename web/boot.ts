@@ -157,6 +157,7 @@ const I = {
   shell: "polyvisor:internal/shell@0.1.0",
   contacts: "polyvisor:internal/contacts@0.1.0",
   meeting: "polyvisor:internal/meeting@0.1.0",
+  sharing: "polyvisor:internal/sharing@0.1.0",
 } as const;
 
 interface ComponentArtifacts {
@@ -396,6 +397,10 @@ const kernel = proxyInterfaces(control, [
   // `mintSessionPort` allowlist (web/worker.ts).
   I.contacts,
   I.meeting,
+  // Trusted document-sharing controls (internal.wit `sharing`): recipient
+  // choice, consent and adoption are visor acts, so this is proxied the
+  // same as `contacts`/`meeting` and never handed to an app session.
+  I.sharing,
 ]);
 
 // The other end of the LAST pointer: `device.status`'s `tier` is the kernel's
