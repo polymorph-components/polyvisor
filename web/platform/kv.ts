@@ -55,3 +55,14 @@ export const kv = {
     return all.map(String).filter((k) => k.startsWith(prefix));
   },
 };
+
+/** Remove the browser-owned records for one device. This is deliberately
+ * narrower than clearing the store: boot recovery must leave every other
+ * device in this browser profile alone (docs/design.md "Devices"). */
+export async function deleteDeviceRecords(device: string): Promise<void> {
+  const keys = await kv.keys(`dev/${device}/`);
+  await Promise.all([
+    ...keys.map((key) => kv.delete(key)),
+    kv.delete(`index/${device}`),
+  ]);
+}
