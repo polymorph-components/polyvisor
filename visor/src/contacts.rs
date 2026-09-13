@@ -35,14 +35,6 @@ pub(crate) fn selected(claims: &[ClaimChoice]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Meeting acceptance is whole-profile: preserve every displayed value while
-/// matching the kernel's set comparison (sort + deduplicate).
-pub(crate) fn complete_claims(mut claims: Vec<(String, String)>) -> Vec<(String, String)> {
-    claims.sort();
-    claims.dedup();
-    claims
-}
-
 /// An incoming fragment's kind. The visor routes; it never decodes the body.
 pub(crate) enum FragmentRoute {
     Meet(String),
@@ -88,10 +80,6 @@ pub(crate) fn accept_signed(captured: u64, current: u64) -> bool {
 
 pub(crate) fn artifact_matches<T: PartialEq>(stored: &T, current: &T) -> bool {
     stored == current
-}
-
-pub(crate) fn generation_changed(previous: Option<u32>, current: u32) -> bool {
-    previous != Some(current)
 }
 
 pub(crate) fn draft_is_clean(draft: &str, baseline: &str) -> bool {
@@ -187,23 +175,6 @@ mod tests {
     }
 
     #[test]
-    fn meeting_acceptance_keeps_every_reviewed_value_canonically() {
-        assert_eq!(
-            complete_claims(vec![
-                ("phone".into(), "2".into()),
-                ("name".into(), "Ada".into()),
-                ("phone".into(), "2".into()),
-                ("email".into(), "a@example".into()),
-            ]),
-            vec![
-                ("email".into(), "a@example".into()),
-                ("name".into(), "Ada".into()),
-                ("phone".into(), "2".into()),
-            ]
-        );
-    }
-
-    #[test]
     fn short_keys_are_safe_for_empty_and_long_values() {
         assert_eq!(key_short(&[]), "no key");
         assert_eq!(key_short(&[0, 1, 2, 3, 4, 5, 6]), "000102030405");
@@ -219,13 +190,6 @@ mod tests {
     fn signed_artifact_only_matches_its_exact_preview() {
         assert!(artifact_matches(&("name", "Ada"), &("name", "Ada")));
         assert!(!artifact_matches(&("name", "Ada"), &("name", "Grace")));
-    }
-
-    #[test]
-    fn peer_selection_resets_only_for_a_new_generation() {
-        assert!(!generation_changed(Some(4), 4));
-        assert!(generation_changed(Some(4), 5));
-        assert!(generation_changed(None, 1));
     }
 
     #[test]

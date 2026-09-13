@@ -3,7 +3,7 @@
 //! Meetings have their own ALPN and never enroll an endpoint or transfer a
 //! document. Both peers sign the exact card selected by their user, verify the
 //! other's signed self-introduction before showing it, compare a transcript-
-//! bound SAS, and persist only the claims selected at confirmation.
+//! bound SAS, and persist that whole authenticated issuer identity.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -11,7 +11,7 @@ use std::rc::Rc;
 use futures::channel::{mpsc, oneshot};
 use futures::future::Either;
 use futures::{SinkExt as _, StreamExt as _};
-use polyvisor_contacts_model::{Claim, Introduction, Party};
+use polyvisor_contacts_model::{Claim, Introduction};
 use serde::{Deserialize, Serialize};
 
 use crate::{EngineTransport, Error, ErrorCode, Kernel};
@@ -77,14 +77,14 @@ struct Offer {
 struct Session {
     generation: u32,
     transport: Rc<dyn EngineTransport>,
-    confirm: Option<oneshot::Sender<Vec<(String, String)>>>,
+    confirm: Option<oneshot::Sender<()>>,
     cancelled: Rc<Cell<bool>>,
 }
 
 type Bound = (
     Rc<dyn EngineTransport>,
     mpsc::Receiver<Frame>,
-    oneshot::Receiver<Vec<(String, String)>>,
+    oneshot::Receiver<()>,
 );
 
 enum Join {
@@ -111,7 +111,7 @@ impl Kernel {
     /// Host one meeting and return its absolute bootstrap link.
     pub async fn meeting_offer(
         self: &Rc<Self>,
-        card: Party,
+        expected_root: [u8; 32],
         expected_profiles: Vec<Vec<u8>>,
     ) -> Result<Status, Error> {
         self.identity_open()?;
@@ -122,9 +122,17 @@ impl Kernel {
                 "this device is still binding its endpoint; try again in a moment",
             ));
         }
-        let expected_card = card.clone();
-        let generation = self.meeting_reserve(card.public_key)?;
-        let introduction = match self.contacts_sign_card(card, expected_profiles).await {
+        let generation = self.meeting_reserve()?;
+        let introduction = match self
+            .contacts_share(
+                expected_root,
+                expected_profiles,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+        {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.meeting_set_phase(generation, Phase::Failed(error.message.clone()));
@@ -133,15 +141,6 @@ impl Kernel {
         };
         if !self.meeting_is_current(generation) {
             return Err(Error::new(ErrorCode::Refused, "that meeting was replaced"));
-        }
-        let signed = self
-            .contacts_validate_meeting_introduction(&introduction)
-            .await?;
-        if review(0, String::new(), signed.introduction()).peer_key != expected_card.public_key {
-            return Err(Error::new(
-                ErrorCode::Failed,
-                "the signed meeting card did not match the selected card",
-            ));
         }
         let mut token = [0; 16];
         self.seams.rng.fill(&mut token);
@@ -176,7 +175,7 @@ impl Kernel {
     pub async fn meeting_join(
         self: &Rc<Self>,
         fragment: String,
-        card: Party,
+        expected_root: [u8; 32],
         expected_profiles: Vec<Vec<u8>>,
     ) -> Result<Status, Error> {
         self.identity_open()?;
@@ -195,10 +194,18 @@ impl Kernel {
                 "that is this device's own meeting link",
             ));
         }
-        let expected_card = card.clone();
-        let generation = self.meeting_reserve(card.public_key)?;
+        let generation = self.meeting_reserve()?;
         self.meeting_set_phase(generation, Phase::Dialing(generation));
-        let introduction = match self.contacts_sign_card(card, expected_profiles).await {
+        let introduction = match self
+            .contacts_share(
+                expected_root,
+                expected_profiles,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+        {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.meeting_set_phase(generation, Phase::Failed(error.message.clone()));
@@ -207,15 +214,6 @@ impl Kernel {
         };
         if !self.meeting_is_current(generation) {
             return Err(Error::new(ErrorCode::Refused, "that meeting was replaced"));
-        }
-        let signed = self
-            .contacts_validate_meeting_introduction(&introduction)
-            .await?;
-        if review(0, String::new(), signed.introduction()).peer_key != expected_card.public_key {
-            return Err(Error::new(
-                ErrorCode::Failed,
-                "the signed meeting card did not match the selected card",
-            ));
         }
         let expires = self.seams.clock.now_ms().saturating_add(MEETING_TTL_MS);
         self.meeting_arm_expiry(generation, expires);
@@ -246,12 +244,8 @@ impl Kernel {
         self.meeting_status_for(generation)
     }
 
-    /// Confirm exactly the reviewed generation and a subset of its claims.
-    pub async fn meeting_confirm(
-        &self,
-        generation: u32,
-        keep: Vec<(String, String)>,
-    ) -> Result<(), Error> {
+    /// Confirm exactly the reviewed generation and its whole issuer identity.
+    pub async fn meeting_confirm(&self, generation: u32) -> Result<(), Error> {
         self.identity_open()?;
         let mut meeting = self.meeting.borrow_mut();
         let Phase::AwaitingConfirm(review) = &meeting.phase else {
@@ -263,14 +257,13 @@ impl Kernel {
         if generation != meeting.generation || generation != review.generation {
             return Err(Error::new(ErrorCode::Refused, "that meeting was replaced"));
         }
-        validate_keep(&review.claims, &keep).map_err(|why| Error::new(ErrorCode::Refused, why))?;
         let Some(confirm) = meeting.session.as_mut().and_then(|s| s.confirm.take()) else {
             return Err(Error::new(
                 ErrorCode::Refused,
                 "there is nothing to confirm",
             ));
         };
-        let _sent = confirm.send(keep);
+        let _sent = confirm.send(());
         Ok(())
     }
 
@@ -584,7 +577,7 @@ impl Kernel {
         generation: u32,
         transport: Rc<dyn EngineTransport>,
         frames: &mut mpsc::Receiver<Frame>,
-        confirm: &mut oneshot::Receiver<Vec<(String, String)>>,
+        confirm: &mut oneshot::Receiver<()>,
         sas: String,
         peer_intro: polyvisor_contacts_model::VerifiedIntroduction,
     ) -> Result<String, String> {
@@ -592,9 +585,9 @@ impl Kernel {
         if !self.meeting_set_phase(generation, Phase::AwaitingConfirm(review)) {
             return Err("that meeting was replaced".into());
         }
-        let (mut keep, mut peer_confirmed) = (None, false);
-        while keep.is_none() || !peer_confirmed {
-            let woke = if keep.is_some() {
+        let (mut confirmed, mut peer_confirmed) = (false, false);
+        while !confirmed || !peer_confirmed {
+            let woke = if confirmed {
                 Wake::Frame(frames.next().await)
             } else {
                 wait(confirm, frames).await
@@ -603,8 +596,8 @@ impl Kernel {
                 return Err("that meeting was replaced".into());
             }
             match woke {
-                Wake::Confirmed(selected) => {
-                    keep = Some(selected);
+                Wake::Confirmed => {
+                    confirmed = true;
                     send_frame(transport.as_ref(), &Frame::Confirm).await?;
                     if !peer_confirmed {
                         self.meeting_set_phase(generation, Phase::AwaitingPeer);
@@ -617,14 +610,13 @@ impl Kernel {
             }
         }
 
-        let keep = keep.expect("loop requires local confirmation");
         if !self.meeting_is_current(generation) {
             return Err("that meeting was replaced".into());
         }
         // The hook repeats the generation check inside its document mutation,
         // then checkpoints before returning the local contact id.
         let contact_id = self
-            .contacts_accept_meeting(generation, peer_intro, keep)
+            .contacts_accept_meeting(generation, peer_intro)
             .await
             .map_err(|error| error.message)?;
         if !self.meeting_is_current(generation) {
@@ -693,13 +685,12 @@ impl Kernel {
         Ok((transport, rx, confirm_rx))
     }
 
-    fn meeting_reserve(&self, issuer: [u8; 32]) -> Result<u32, Error> {
+    fn meeting_reserve(&self) -> Result<u32, Error> {
         let (generation, old) = {
             let mut meeting = self.meeting.borrow_mut();
             meeting.generation = next_generation(meeting.generation)?;
             meeting.offer = None;
             meeting.phase = Phase::Idle;
-            let _issuer = issuer;
             (meeting.generation, meeting.session.take())
         };
         self.meeting_dispose(old);
@@ -893,16 +884,13 @@ async fn next_reveal(frames: &mut mpsc::Receiver<Frame>) -> Result<[u8; 32], Str
 }
 
 enum Wake {
-    Confirmed(Vec<(String, String)>),
+    Confirmed,
     Frame(Option<Frame>),
 }
 
-async fn wait(
-    confirm: &mut oneshot::Receiver<Vec<(String, String)>>,
-    frames: &mut mpsc::Receiver<Frame>,
-) -> Wake {
+async fn wait(confirm: &mut oneshot::Receiver<()>, frames: &mut mpsc::Receiver<Frame>) -> Wake {
     match futures::future::select(confirm, frames.next()).await {
-        Either::Left((Ok(keep), _)) => Wake::Confirmed(keep),
+        Either::Left((Ok(()), _)) => Wake::Confirmed,
         Either::Left((Err(_), _)) => Wake::Frame(None),
         Either::Right((frame, _)) => Wake::Frame(frame),
     }
@@ -931,14 +919,6 @@ fn claim_pairs(claims: &[Claim]) -> Vec<(String, String)> {
         .iter()
         .map(|claim| (claim.name.clone(), claim.value.clone()))
         .collect()
-}
-
-fn validate_keep(reviewed: &[(String, String)], keep: &[(String, String)]) -> Result<(), String> {
-    if keep.iter().all(|selected| reviewed.contains(selected)) {
-        Ok(())
-    } else {
-        Err("a selected claim was not in the reviewed meeting card".into())
-    }
 }
 
 fn next_generation(current: u32) -> Result<u32, Error> {
@@ -1070,16 +1050,6 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&frame).unwrap();
         assert_eq!(serde_json::from_slice::<Frame>(&encoded).unwrap(), frame);
-    }
-
-    #[test]
-    fn keep_must_be_a_subset_of_reviewed_claims() {
-        let reviewed = vec![
-            ("name".into(), "Ada".into()),
-            ("email".into(), "a@b".into()),
-        ];
-        assert!(validate_keep(&reviewed, &[reviewed[1].clone()]).is_ok());
-        assert!(validate_keep(&reviewed, &[("name".into(), "Mallory".into())]).is_err());
     }
 
     #[test]
