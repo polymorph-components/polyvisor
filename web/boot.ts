@@ -183,14 +183,106 @@ function el(id: string): HTMLElement {
  * that landed while the visor was still being fetched or mounted must not be
  * painted over by the mount that followed it. */
 let fatalMessage: string | undefined;
+let failedDeviceCanErase = false;
+let failedDeviceErased = false;
+let nextRecoveryRequest = 0;
+const recoveryWaiters = new Map<
+  number,
+  { resolve(): void; reject(error: Error): void }
+>();
+
+function switchToNewDevice(): void {
+  departWorker();
+  // Commit the new tab anchor before reload. Merely removing the old anchor
+  // would let deviceId() adopt a durable LAST that another tab selected while
+  // this failure screen was open.
+  sessionStorage.setItem(ANCHOR, mintDeviceId());
+  if (localStorage.getItem(LAST) === device) localStorage.removeItem(LAST);
+  history.replaceState(null, "", location.pathname + location.search);
+  location.reload();
+}
+
+function requestFailedDeviceErase(): Promise<void> {
+  const request = ++nextRecoveryRequest;
+  return new Promise((resolve, reject) => {
+    recoveryWaiters.set(request, { resolve, reject });
+    control.postMessage({ t: "erase-failed-device", request });
+  });
+}
 
 function paintFatal(): void {
   if (fatalMessage === undefined) return;
   const visor = document.getElementById("visor");
   if (visor !== null) {
-    visor.textContent =
-      `This device could not start its visor. ${fatalMessage}`;
+    visor.textContent = "";
+    const notice = document.createElement("section");
+    notice.id = "boot-notice";
+    notice.setAttribute("aria-labelledby", "boot-notice-title");
+    const title = document.createElement("h1");
+    title.id = "boot-notice-title";
+    title.textContent = failedDeviceErased
+      ? "This device has been erased"
+      : "This device could not start";
+    const detail = document.createElement("p");
+    detail.textContent = failedDeviceErased
+      ? "Use a new device to continue."
+      : componentErrorMessage(fatalMessage);
+    notice.append(title, detail);
+    const actions = document.createElement("div");
+    actions.id = "boot-recovery";
+
+    if (!failedDeviceErased) {
+      const retry = document.createElement("button");
+      retry.id = "boot-retry";
+      retry.textContent = "Retry";
+      retry.addEventListener("click", () => location.reload());
+      actions.append(retry);
+    }
+
+    const fresh = document.createElement("button");
+    fresh.id = "boot-new-device";
+    fresh.textContent = "Use a new device";
+    fresh.addEventListener("click", switchToNewDevice);
+    actions.append(fresh);
+
+    if (failedDeviceCanErase) {
+      const erase = document.createElement("button");
+      erase.id = "boot-erase-device";
+      erase.textContent = "Erase this device";
+      erase.addEventListener("click", () => {
+        if (
+          !confirm(
+            "Erase this device from this browser? Local changes and root keys on this device will be lost. Other devices are not affected.",
+          )
+        ) return;
+        erase.disabled = true;
+        void requestFailedDeviceErase().then(switchToNewDevice).catch(
+          (error: unknown) => {
+            erase.disabled = false;
+            fatal(String((error as Error)?.message ?? error));
+          },
+        );
+      });
+      actions.append(erase);
+    }
+    notice.append(actions);
+    visor.append(notice);
   }
+}
+
+function componentErrorMessage(message: string): string {
+  const prefix = "component error: ";
+  if (!message.startsWith(prefix)) return message;
+  try {
+    const payload = JSON.parse(message.slice(prefix.length)) as {
+      message?: unknown;
+    };
+    if (typeof payload.message === "string") return payload.message;
+  } catch {
+    // Keep the original diagnostic when the exception is not the expected
+    // structured ComponentException spelling.
+  }
+  return message;
 }
 
 /** The framework's own voice, for when there are no trusted pixels to say
@@ -224,6 +316,11 @@ const LAST = "polyvisor.last-device";
  * profile's last kept device (adopted and anchored here so the rest of this
  * tab's life reads the same sessionStorage path), else a fresh mint. 16
  * random bytes as hex: the id is only ever an opaque name. */
+function mintDeviceId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 function deviceId(): string {
   const anchored = sessionStorage.getItem(ANCHOR);
   if (anchored !== null && anchored !== "") return anchored;
@@ -232,9 +329,7 @@ function deviceId(): string {
     sessionStorage.setItem(ANCHOR, last);
     return last;
   }
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  const fresh = Array.from(bytes, (b) => b.toString(16).padStart(2, "0"))
-    .join("");
+  const fresh = mintDeviceId();
   sessionStorage.setItem(ANCHOR, fresh);
   return fresh;
 }
@@ -353,7 +448,21 @@ control.addEventListener("message", (ev: MessageEvent) => {
   if (t === "booted") {
     marks.workerBooted = true;
   } else if (t === "fatal") {
+    failedDeviceCanErase = (data as { canErase?: unknown }).canErase === true;
     fatal(String((data as { message: string }).message));
+  } else if (t === "erase-failed-device-result") {
+    const result = data as { request: number; error?: unknown };
+    const waiter = recoveryWaiters.get(result.request);
+    if (waiter === undefined) return;
+    recoveryWaiters.delete(result.request);
+    if (result.error === undefined) waiter.resolve();
+    else waiter.reject(new Error(String(result.error)));
+  } else if (t === "failed-device-erased") {
+    failedDeviceCanErase = false;
+    failedDeviceErased = true;
+    for (const waiter of recoveryWaiters.values()) waiter.resolve();
+    recoveryWaiters.clear();
+    paintFatal();
   } else if (t === "frame-port" || t === "frame-port-failed") {
     const session = (data as { session: number }).session;
     const waiter = framePortWaiters.get(session);
@@ -363,7 +472,11 @@ control.addEventListener("message", (ev: MessageEvent) => {
       waiter.resolve((data as { port: MessagePort }).port);
     } else waiter.reject(new Error((data as { message: string }).message));
   } else if (t === "kdf-request") {
-    const request = data as { id: number; passphrase: string; salt: Uint8Array };
+    const request = data as {
+      id: number;
+      passphrase: string;
+      salt: Uint8Array;
+    };
     if (!Number.isSafeInteger(request.id) || request.id <= 0) return;
     const abort = new AbortController();
     kdfRequests.set(request.id, abort);

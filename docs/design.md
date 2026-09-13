@@ -634,6 +634,13 @@ peers without authority for any local document are closed after the handshake.
 - **Switching devices is a reload** (`shell.switch-device`): the anchor
   changes and the page restarts against another worker. Erase destroys
   the namespace and the index row, then switches to a fresh device.
+- **A device that cannot boot remains recoverable in browser glue.** The
+  neutral fatal screen can retry, leave its files intact and use a new device,
+  or explicitly erase only the failed, hello-bound device after warning that
+  local changes and root keys will be lost. The failed worker holds that
+  device's Web Lock and recursively removes its OPFS namespace plus its own
+  `dev/<id>/` and `index/<id>` records; no migration or automatic deletion is
+  attempted.
 - **A tab with no anchor adopts the last kept device.** The glue keeps
   its id in `localStorage`, updated when `device.status` reports a durable
   device. Without this pointer, or after `switch-device(none)` clears it,

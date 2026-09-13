@@ -1874,7 +1874,258 @@ const scenarios: Scenario[] = [
       // The strip says "waking" until `device.status` answers over the
       // worker port; the placeholder is the first kernel-backed pixel, and
       // it is the right half — the one that speaks for this device.
-      await page.locator("#visor-self .bottom .user").waitFor({ timeout: 10_000 });
+      await page.locator("#visor-self .bottom .user").waitFor({
+        timeout: 10_000,
+      });
+    },
+  },
+
+  {
+    // PR209 changed dev/<id>/gen from a number to a structured pointer. A
+    // pre-change value makes the kernel fail before a device object exists;
+    // recovery therefore has to remain in the browser glue.
+    name: "boot-storage-recovery",
+    async run(ctx, origin) {
+      const corrupt = "11111111111111111111111111111111";
+      const other = "22222222222222222222222222222222";
+
+      // Same-origin setup without loading index.html, hence without starting
+      // either device's SharedWorker.
+      const setup = await ctx.newPage();
+      await setup.goto(origin + "/config.json");
+      await setup.evaluate(async ({ corrupt, other, anchor, last }) => {
+        sessionStorage.setItem(anchor, corrupt);
+        localStorage.setItem(last, corrupt);
+        const db = await new Promise<IDBDatabase>((resolve, reject) => {
+          const req = indexedDB.open("polyvisor", 1);
+          req.onupgradeneeded = () => req.result.createObjectStore("kv");
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+        await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction("kv", "readwrite");
+          const store = tx.objectStore("kv");
+          // The old numeric JSON pointer reported by users after PR209.
+          store.put(new TextEncoder().encode("1"), `dev/${corrupt}/gen`);
+          store.put(new Uint8Array(32), `dev/${corrupt}/dek`);
+          store.put(new Uint8Array([1]), `dev/${corrupt}/journal-marker`);
+          const index = (id: string) =>
+            new TextEncoder().encode(JSON.stringify({
+              id,
+              petname: "fixture",
+              tier: "durable",
+              rest: "rests-open",
+              created: 1,
+              last_used: Date.now(),
+            }));
+          store.put(index(corrupt), `index/${corrupt}`);
+          store.put(new Uint8Array([3]), `dev/${other}/marker`);
+          store.put(index(other), `index/${other}`);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+        });
+        const root = await navigator.storage.getDirectory();
+        for (const [id, name] of [[corrupt, "engine"], [other, "keep"]]) {
+          const dir = await root.getDirectoryHandle(id, { create: true });
+          const child = await dir.getDirectoryHandle(name, { create: true });
+          const file = await child.getFileHandle("marker", { create: true });
+          const writer = await file.createWritable();
+          await writer.write(id);
+          await writer.close();
+        }
+      }, { corrupt, other, anchor: ANCHOR, last: LAST });
+      await setup.close();
+
+      const first = await open(ctx, origin);
+      await first.locator("#boot-erase-device").waitFor({ timeout: 30_000 });
+      check(
+        (await first.locator("#visor").textContent() ?? "").includes(
+          "commit pointer is invalid",
+        ),
+        "the corrupt pointer did not reach the recovery screen",
+      );
+      await shot(first, "boot-storage-recovery");
+
+      // A tab arriving after ready rejected gets the retained failure too.
+      const late = await open(ctx, origin);
+      await late.locator("#boot-erase-device").waitFor({ timeout: 10_000 });
+
+      // The same non-WIT message cannot erase a successfully booted device,
+      // and carries no arbitrary id that could target `other`.
+      const healthyRefusal = await first.evaluate(async (device) => {
+        const worker = new SharedWorker("./worker.js", {
+          type: "module",
+          name: `polyvisor:healthy-recovery-probe-${device}`,
+        });
+        const config = await (await fetch("./config.json")).json();
+        return await new Promise<string>((resolve) => {
+          worker.port.onmessage = (event) => {
+            if (event.data?.t === "booted") {
+              worker.port.postMessage({ t: "erase-failed-device", request: 7 });
+            } else if (event.data?.t === "erase-failed-device-result") {
+              resolve(String(event.data.error ?? "erased"));
+              worker.port.postMessage({ t: "depart" });
+            }
+          };
+          worker.port.start();
+          worker.port.postMessage({
+            t: "hello",
+            device,
+            homeOrigin: new URL(".", location.href).href.replace(/\/$/, ""),
+            relay: config.relay,
+            pageUrl: location.origin + location.pathname,
+            driveApi: config.drive_api,
+            driveOauth: config.drive_oauth,
+          });
+        });
+      }, "33333333333333333333333333333333");
+      check(
+        healthyRefusal.includes("only after this worker's boot failed"),
+        `a healthy worker accepted recovery erase: ${healthyRefusal}`,
+      );
+
+      // Leaving for a fresh device is non-destructive and strips the stale
+      // app route before reload. LAST changes underneath this tab to prove
+      // that recovery mints an explicit anchor rather than adopting it.
+      await first.evaluate(({ other, last }) => {
+        localStorage.setItem(last, other);
+        history.replaceState(null, "", "#app/stale");
+      }, { other, last: LAST });
+      await Promise.all([
+        first.waitForNavigation(),
+        first.locator("#boot-new-device").click(),
+      ]);
+      await visorReady(first);
+      eq(
+        new URL(first.url()).hash,
+        "",
+        "new-device recovery retained app hash",
+      );
+      const freshAnchor = await first.evaluate(({ anchor, last }) => ({
+        anchor: sessionStorage.getItem(anchor),
+        last: localStorage.getItem(last),
+      }), { anchor: ANCHOR, last: LAST });
+      check(
+        freshAnchor.anchor !== corrupt && freshAnchor.anchor !== other,
+        `new-device recovery adopted an existing device: ${freshAnchor.anchor}`,
+      );
+      eq(freshAnchor.last, other, "recovery cleared another tab's LAST device");
+
+      const intact = await first.evaluate(async ({ corrupt, other }) => {
+        const root = await navigator.storage.getDirectory();
+        const opfs = async (id: string, child: string) => {
+          try {
+            await (await root.getDirectoryHandle(id)).getDirectoryHandle(child);
+            return true;
+          } catch {
+            return false;
+          }
+        };
+        const db = await new Promise<IDBDatabase>((resolve, reject) => {
+          const req = indexedDB.open("polyvisor", 1);
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+        const has = (key: string) =>
+          new Promise<boolean>((resolve, reject) => {
+            const req = db.transaction("kv").objectStore("kv").get(key);
+            req.onsuccess = () => resolve(req.result !== undefined);
+            req.onerror = () => reject(req.error);
+          });
+        return {
+          corruptOpfs: await opfs(corrupt, "engine"),
+          corruptPointer: await has(`dev/${corrupt}/gen`),
+          corruptIndex: await has(`index/${corrupt}`),
+          otherOpfs: await opfs(other, "keep"),
+          otherDev: await has(`dev/${other}/marker`),
+          otherIndex: await has(`index/${other}`),
+        };
+      }, { corrupt, other });
+      eq(intact, {
+        corruptOpfs: true,
+        corruptPointer: true,
+        corruptIndex: true,
+        otherOpfs: true,
+        otherDev: true,
+        otherIndex: true,
+      }, "using a new device changed stored devices");
+
+      // Return explicitly to the failed anchor and choose destructive
+      // recovery from two tabs at once. A third failed tab observes the
+      // terminal result without making another request.
+      await first.evaluate((id) => {
+        sessionStorage.setItem("polyvisor.device", id);
+        location.reload();
+      }, corrupt);
+      await first.locator("#boot-erase-device").waitFor({ timeout: 30_000 });
+      first.once("dialog", (dialog) => dialog.accept());
+      late.once("dialog", (dialog) => dialog.accept());
+      const terminal = await ctx.newPage();
+      await terminal.goto(origin + "/config.json");
+      await terminal.evaluate(({ anchor, corrupt }) => {
+        sessionStorage.setItem(anchor, corrupt);
+      }, { anchor: ANCHOR, corrupt });
+      await terminal.goto(origin + "/");
+      await terminal.locator("#boot-erase-device").waitFor({ timeout: 10_000 });
+      await Promise.all([
+        first.waitForNavigation(),
+        late.waitForNavigation(),
+        first.locator("#boot-erase-device").click(),
+        late.locator("#boot-erase-device").click(),
+      ]);
+      await visorReady(first);
+      await visorReady(late);
+      await terminal.getByRole("heading", { name: "This device has been erased" })
+        .waitFor({ timeout: 10_000 });
+      eq(
+        await terminal.locator("#boot-erase-device").count(),
+        0,
+        "a sibling tab still offered erase after completion",
+      );
+      await Promise.all([
+        terminal.waitForNavigation(),
+        terminal.locator("#boot-new-device").click(),
+      ]);
+      await visorReady(terminal);
+
+      const erased = await first.evaluate(async ({ corrupt, other }) => {
+        const root = await navigator.storage.getDirectory();
+        const exists = async (id: string) => {
+          try {
+            await root.getDirectoryHandle(id);
+            return true;
+          } catch {
+            return false;
+          }
+        };
+        const db = await new Promise<IDBDatabase>((resolve) => {
+          const req = indexedDB.open("polyvisor", 1);
+          req.onsuccess = () => resolve(req.result);
+        });
+        const has = (key: string) =>
+          new Promise<boolean>((resolve) => {
+            const req = db.transaction("kv").objectStore("kv").get(key);
+            req.onsuccess = () => resolve(req.result !== undefined);
+          });
+        return {
+          corruptOpfs: await exists(corrupt),
+          corruptPointer: await has(`dev/${corrupt}/gen`),
+          corruptJournal: await has(`dev/${corrupt}/journal-marker`),
+          corruptIndex: await has(`index/${corrupt}`),
+          otherOpfs: await exists(other),
+          otherDev: await has(`dev/${other}/marker`),
+          otherIndex: await has(`index/${other}`),
+        };
+      }, { corrupt, other });
+      eq(erased, {
+        corruptOpfs: false,
+        corruptPointer: false,
+        corruptJournal: false,
+        corruptIndex: false,
+        otherOpfs: true,
+        otherDev: true,
+        otherIndex: true,
+      }, "failed-device erase crossed its device boundary");
     },
   },
 

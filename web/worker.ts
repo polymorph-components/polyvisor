@@ -33,7 +33,7 @@ import { webrtcImports } from "@polymorph/webrtc-datachannels";
 import { socketsImports } from "./platform/sockets.ts";
 
 import { serveInterfaces } from "./rpc.ts";
-import { kv } from "./platform/kv.ts";
+import { deleteDeviceRecords, kv } from "./platform/kv.ts";
 import { createBackupKdf } from "./platform/backup-kdf.ts";
 
 // The `dom` lib does not describe a SharedWorker's global scope, and pulling
@@ -95,6 +95,12 @@ const QUEUE_LIMIT = 64;
 
 const tabs = new Set<Tab>();
 
+type BootState = "pending" | "live" | "failed" | "erased";
+let bootState: BootState = "pending";
+let bootFailure: string | undefined;
+let kernelBootStarted = false;
+let failedDeviceErase: Promise<void> | undefined;
+
 let nextKdfRequest = 0;
 let kdfOwner: Tab | undefined;
 const kdfWaiters = new Map<number, {
@@ -107,7 +113,9 @@ const kdfWaiters = new Map<number, {
 const backupKdf = createBackupKdf(({ passphrase, salt }) => {
   const tab = kdfOwner;
   if (tab === undefined || !tab.helloed) {
-    return Promise.reject(new Error("the requesting tab cannot run backup KDF"));
+    return Promise.reject(
+      new Error("the requesting tab cannot run backup KDF"),
+    );
   }
   const id = ++nextKdfRequest;
   return new Promise<Uint8Array>((resolve, reject) => {
@@ -121,7 +129,10 @@ const backupKdf = createBackupKdf(({ passphrase, salt }) => {
   });
 });
 
-async function withKdfOwner<T>(tab: Tab, operation: () => Promise<T>): Promise<T> {
+async function withKdfOwner<T>(
+  tab: Tab,
+  operation: () => Promise<T>,
+): Promise<T> {
   if (!tab.helloed) throw new Error("the requesting tab has departed");
   if (kdfOwner !== undefined) throw new Error("backup key derivation is busy");
   kdfOwner = tab;
@@ -320,14 +331,60 @@ const ready: Promise<Exports> = (async () => {
   // `option<string>` lowers as `T | undefined` (m1-context.md "Value
   // mapping"), so an absent base is passed as the absence itself rather
   // than as an empty string the kernel would have to re-interpret.
+  kernelBootStarted = true;
   await boot({ homeOrigin, device, relay, pageUrl, driveApi, driveOauth });
+  bootState = "live";
   return exports_;
 })();
 
 ready.catch((err: unknown) => {
   const message = String((err as Error)?.message ?? err);
-  for (const tab of tabs) tab.port.postMessage({ t: "fatal", message });
+  if (kernelBootStarted) bootState = "failed";
+  bootFailure = message;
+  for (const tab of tabs) {
+    tab.port.postMessage({
+      t: "fatal",
+      message,
+      canErase: bootState === "failed",
+    });
+  }
 });
+
+/** Browser-only recovery for a runtime that could not construct its device.
+ * The request carries no device id: it is scoped to the hello-bound worker,
+ * which already holds that device's Web Lock. OPFS recursive removal is used
+ * here because the WIT filesystem cannot list the namespace
+ * (docs/design.md "Devices", persistence bullet). */
+async function eraseFailedDevice(): Promise<void> {
+  if (bootState !== "failed" || hello === undefined) {
+    throw new Error(
+      "device erase is available only after this worker's boot failed",
+    );
+  }
+  const root = await navigator.storage.getDirectory();
+  try {
+    await root.removeEntry(hello.device, { recursive: true });
+  } catch (error) {
+    if ((error as DOMException)?.name !== "NotFoundError") throw error;
+  }
+  await deleteDeviceRecords(hello.device);
+}
+
+function eraseFailedDeviceOnce(): Promise<void> {
+  if (failedDeviceErase !== undefined) return failedDeviceErase;
+  failedDeviceErase = eraseFailedDevice().then(() => {
+    bootState = "erased";
+    for (const connected of tabs) {
+      if (connected.helloed) {
+        connected.port.postMessage({ t: "failed-device-erased" });
+      }
+    }
+  }).catch((error: unknown) => {
+    failedDeviceErase = undefined;
+    throw error;
+  });
+  return failedDeviceErase;
+}
 
 // ---------------------------------------------------------------------------
 // Events: one long-poll pump over the runtime's export
@@ -395,8 +452,7 @@ function mintSessionPort(
     [I.history]: {
       read: () => svc.historyRead(session),
       watch: (after: bigint) => svc.historyWatch(session, after),
-      publish: (changes: Uint8Array[]) =>
-        svc.historyPublish(session, changes),
+      publish: (changes: Uint8Array[]) => svc.historyPublish(session, changes),
     },
     // Only these three: a session port is not a way to enumerate or launch
     // apps.
@@ -430,8 +486,13 @@ const CONTACTS_METHODS = [
 ] as const;
 
 /// runtime/wit/internal.wit `interface meeting`'s methods, camelCase.
-const MEETING_METHODS = ["offer", "join", "confirm", "cancel", "status"] as
-  const;
+const MEETING_METHODS = [
+  "offer",
+  "join",
+  "confirm",
+  "cancel",
+  "status",
+] as const;
 const SHARING_METHODS = [
   "prompts",
   "confirm",
@@ -529,6 +590,17 @@ self.onconnect = (ev: MessageEvent) => {
         tabs.add(tab);
       }
       if (hello?.device === device && tabs.has(tab)) tab.helloed = true;
+      if (hello?.device === device && bootFailure !== undefined) {
+        if (bootState === "erased") {
+          port.postMessage({ t: "failed-device-erased" });
+        } else {
+          port.postMessage({
+            t: "fatal",
+            message: bootFailure,
+            canErase: bootState === "failed",
+          });
+        }
+      }
       return;
     }
 
@@ -547,6 +619,21 @@ self.onconnect = (ev: MessageEvent) => {
       const error = (data as { error?: unknown }).error;
       if (key instanceof Uint8Array) waiter.resolve(key);
       else waiter.reject(new Error(String(error ?? "backup KDF failed")));
+      return;
+    }
+
+    if (t === "erase-failed-device") {
+      const request = (data as { request?: unknown }).request;
+      if (!Number.isSafeInteger(request) || !tab.helloed) return;
+      void eraseFailedDeviceOnce().then(() => {
+        port.postMessage({ t: "erase-failed-device-result", request });
+      }).catch((error: unknown) => {
+        port.postMessage({
+          t: "erase-failed-device-result",
+          request,
+          error: String((error as Error)?.message ?? error),
+        });
+      });
       return;
     }
 
@@ -570,8 +657,10 @@ self.onconnect = (ev: MessageEvent) => {
       setName: async (name: string) => (await ready)[I.device].setName(name),
       setHue: async (hue: number) => (await ready)[I.device].setHue(hue),
       meta: async (scope: unknown) => (await ready)[I.device].meta(scope),
-      patchMeta: async (scope: unknown, fields: [string, string | undefined][]) =>
-        (await ready)[I.device].patchMeta(scope, fields),
+      patchMeta: async (
+        scope: unknown,
+        fields: [string, string | undefined][],
+      ) => (await ready)[I.device].patchMeta(scope, fields),
       keep: async (petname: string, passphrase: string | undefined) =>
         (await ready)[I.device].keep(petname, passphrase),
       unseal: async (passphrase: string) =>
@@ -681,7 +770,8 @@ self.onconnect = (ev: MessageEvent) => {
       backupImport: async (passphrase: string, envelope: Uint8Array) =>
         withKdfOwner(
           tab,
-          async () => (await ready)[I.identity].backupImport(passphrase, envelope),
+          async () =>
+            (await ready)[I.identity].backupImport(passphrase, envelope),
         ),
       backupSyncReplace: async (passphrase: string) =>
         withKdfOwner(
