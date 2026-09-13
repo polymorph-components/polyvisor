@@ -32,7 +32,7 @@ use std::cell::{Cell, RefCell};
 
 use polyvisor_kernel::{
     Accepted, Bound, Dialed, EngineTransport, LocalFuture, MEETING_ALPN, Net, NetHandle,
-    PAIRING_ALPN, SUBDUCTION_ALPN,
+    PAIRING_ALPN, ROOT_TRANSFER_ALPN, SUBDUCTION_ALPN,
 };
 
 // The generated bindings live where `wit_bindgen::generate!` was invoked.
@@ -51,7 +51,12 @@ use crate::z32;
 /// whose accept loop routes on it. The strings are the kernel's because the
 /// kernel is what decides which wire a dial belongs on; this file only
 /// spells them for `polymorph:iroh`, which takes ALPNs as bytes.
-const ALPNS: [&str; 3] = [SUBDUCTION_ALPN, PAIRING_ALPN, MEETING_ALPN];
+const ALPNS: [&str; 4] = [
+    SUBDUCTION_ALPN,
+    PAIRING_ALPN,
+    MEETING_ALPN,
+    ROOT_TRANSFER_ALPN,
+];
 
 /// Largest frame either direction, matching `subduction_iroh`'s
 /// `MAX_FRAME_SIZE` (50 MiB). A peer that announces more is not sending a

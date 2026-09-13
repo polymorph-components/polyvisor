@@ -686,7 +686,7 @@ pub(crate) fn Visor() -> Element {
         pending_submission.set(Some((request, card.clone())));
         let captured_epoch = meeting_epoch();
         spawn(async move {
-            match kernel::meeting_offer(card.clone()).await {
+            match kernel::meeting_offer(card.clone(), card.expected_profiles.clone()).await {
                 Ok(returned) => {
                     if crate::contacts::submission_is_current(request, meeting_request())
                         && let Some(generation) = returned.generation()
@@ -722,7 +722,8 @@ pub(crate) fn Visor() -> Element {
         pending_submission.set(Some((request, card.clone())));
         let captured_epoch = meeting_epoch();
         spawn(async move {
-            match kernel::meeting_join(fragment, card.clone()).await {
+            match kernel::meeting_join(fragment, card.clone(), card.expected_profiles.clone()).await
+            {
                 Ok(returned) => {
                     if crate::contacts::submission_is_current(request, meeting_request())
                         && let Some(generation) = returned.generation()
@@ -2322,6 +2323,11 @@ fn DevicesSection(
     let mut adding = use_signal(|| false);
     let mut typed = use_signal(String::new);
     let mut error = use_signal(|| None::<String>);
+    let mut identity = use_signal(|| None::<kernel::IdentityStatus>);
+    let mut transfer_target = use_signal(|| None::<String>);
+    use_future(move || async move {
+        identity.set(kernel::identity_status().await.ok());
+    });
 
     // Every act is the same shape: call the kernel, show its refusal if it
     // refused, and re-read — because what the ceremony is doing now is the
@@ -2385,6 +2391,30 @@ fn DevicesSection(
                                 async move { acted(kernel::connect(id).await) }
                             }},
                             "Connect"
+                        }
+                        if identity().is_some_and(|status| status.has_root) {
+                            button {
+                                class: "root-transfer-start",
+                                onclick: {
+                                    let endpoint = member.endpoint_id.clone();
+                                    move |_| transfer_target.set(Some(endpoint.clone()))
+                                },
+                                "Copy user root to this device"
+                            }
+                            if transfer_target().as_deref() == Some(member.endpoint_id.as_str()) {
+                                div { class: "root-transfer-confirm", "data-transfer-endpoint": "{member.endpoint_id}",
+                                    p { class: "framework", "Confirm endpoint " code { "{member.endpoint_id}" } ". This permanently gives that device a copy of the user root. This copy cannot be revoked in v0, and its holder can copy it again." }
+                                    button { onclick: {
+                                        let endpoint = member.endpoint_id.clone();
+                                        move |_| { let endpoint = endpoint.clone(); async move {
+                                            let result = kernel::root_transfer(endpoint).await;
+                                            transfer_target.set(None);
+                                            match result { Ok(()) => error.set(None), Err(message) => error.set(Some(message)) }
+                                        }}
+                                    }, "Approve permanent root copy" }
+                                    button { onclick: move |_| transfer_target.set(None), "Cancel" }
+                                }
+                            }
                         }
                     }
                 }

@@ -271,9 +271,7 @@ impl Document {
     /// whose deps are missing and applies it when they arrive, so the whole
     /// batch goes in as one call and order does not matter.
     pub fn apply(&mut self, items: Vec<(CommitId, Vec<u8>)>) -> Absorbed {
-        let mut ids = Vec::new();
         let mut changes = Vec::new();
-        let mut content = false;
         for (id, blob) in items {
             if self.applied.contains(&id) {
                 continue;
@@ -283,8 +281,6 @@ impl Document {
             };
             // A change with no operations is a merge anchor, somebody else's
             // or an older one of ours. It is not a reason to author another.
-            content |= !change.is_empty();
-            ids.push(id);
             changes.push(change);
         }
         if changes.is_empty() {
@@ -293,11 +289,14 @@ impl Document {
         if self.doc.apply_changes(changes).is_err() {
             return Absorbed::default();
         }
-        self.applied.extend(ids);
-        Absorbed {
-            landed: true,
-            content,
+        let mut absorbed = Absorbed::default();
+        for change in self.doc.get_changes(&[]) {
+            if self.applied.insert(CommitId::new(change.hash().0)) {
+                absorbed.landed = true;
+                absorbed.content |= !change.is_empty();
+            }
         }
+        absorbed
     }
 
     /// Run one transaction and, if it produced a change, record the commit
@@ -336,4 +335,59 @@ pub fn actor(domain: &[u8], seed: [u8; 32], scope: &[u8]) -> ActorId {
     hasher.update(seed);
     hasher.update(scope);
     ActorId::from(&hasher.finalize()[..16])
+}
+
+#[cfg(test)]
+mod tests {
+    use automerge::{ROOT, transaction::Transactable as _};
+
+    use super::*;
+
+    #[test]
+    fn queued_child_materializes_once_when_fragment_supplies_its_parent() {
+        let tree = SedimentreeId::new([7; 32]);
+        let mut source = Document::empty(ActorId::from(&[1][..]), tree);
+        source
+            .transact(|tx| tx.put(ROOT, "parent", "present").map_err(|e| e.to_string()))
+            .unwrap();
+        let parent = source.drain_local_commits().pop().unwrap();
+        source
+            .transact(|tx| tx.put(ROOT, "child", "present").map_err(|e| e.to_string()))
+            .unwrap();
+        let child = source.drain_local_commits().pop().unwrap();
+
+        let mut target = Document::empty(ActorId::from(&[2][..]), tree);
+        assert_eq!(
+            target.apply(vec![(child.head, child.blob.into_contents())]),
+            Absorbed::default(),
+            "an unknown dependency is queued, not materialized"
+        );
+        assert!(!target.contains(&child.head));
+
+        let parent_hash = automerge::ChangeHash(*parent.head.as_bytes());
+        let fragment = automerge::Fragment {
+            head: parent_hash,
+            level: 0,
+            boundary: Vec::new(),
+            checkpoints: Vec::new(),
+            members: vec![parent_hash],
+        };
+        let bundle = source.bundle(vec![fragment]).pop().unwrap();
+        assert_eq!(
+            target.apply_bundles(vec![(parent.head, bundle.clone())]),
+            Absorbed {
+                landed: true,
+                content: true,
+            }
+        );
+        assert!(target.contains(&parent.head));
+        assert!(target.contains(&child.head));
+        assert_eq!(target.revision(), 2);
+        assert_eq!(
+            target.apply_bundles(vec![(parent.head, bundle)]),
+            Absorbed::default(),
+            "replaying the adoption fragment is idempotent"
+        );
+        assert_eq!(target.revision(), 2);
+    }
 }

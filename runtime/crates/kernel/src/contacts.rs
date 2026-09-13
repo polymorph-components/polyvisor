@@ -1,19 +1,24 @@
-//! The user's private contacts document and signed introduction boundary.
-
-use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
+//! Root-authenticated identity and the private contacts document.
 
 use ed25519_dalek::SigningKey;
 use polyvisor_contacts_model as model;
+use std::rc::Rc;
 
 use crate::{Error, ErrorCode, Event, Kernel, engine_failed};
 
 pub const CONTACTS_APP: &str = "polyvisor:contacts";
 
 pub use model::{
-    Claim, ClaimedTime, Contact, ImportReview, Introduction, MeetingRecord, Observation, Party,
-    Provenance, SelfProfile,
+    AuthenticatedIdentity, Claim, ClaimedTime, Contact, ImportReview, Introduction, MeetingRecord,
+    Observation, Party, Profile, Provenance, SelfProfile, VerifiedIntroduction,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdentityStatus {
+    pub root: [u8; 32],
+    pub group: [u8; 32],
+    pub has_root: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
@@ -21,66 +26,96 @@ pub struct Selection {
     pub claims: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedIdentityReview {
+    pub root: [u8; 32],
+    pub group: [u8; 32],
+    /// Whole signed-profile variants, decoded only for accurate display.
+    pub profiles: Vec<Vec<Claim>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedIntroductionReview {
+    pub identities: Vec<AuthenticatedIdentityReview>,
+    pub parties: Vec<Party>,
+    pub issued_at: ClaimedTime,
+}
+
 impl Kernel {
-    /// Initialize the user identity only for the group's founder. A joining
-    /// device adopts the established identity in `pairing::run_claimed`.
+    /// Establish identity only when the contacts document has no root. The
+    /// root seed is freshly random and independent of the device seed.
     pub(crate) async fn initialize_contacts(&self) -> Result<bool, Error> {
         let engine = self.engine()?;
-        let members = engine.members().await.map_err(engine_failed)?;
-        let me = engine.verifying_key().to_bytes();
-        let am_founder = members.first().is_none_or(|member| member.key == me);
-        let (name, device_seed) = {
-            let state = self.state.borrow();
-            let device = state
-                .device
-                .as_ref()
-                .ok_or_else(|| Error::new(ErrorCode::Unavailable, "device is sealed"))?;
-            (
-                device.meta.user.get("name").cloned().unwrap_or_default(),
-                state.seed,
-            )
-        };
-        if !am_founder {
+        let group = engine.authority_group().await.map_err(engine_failed)?;
+        if let Some(profile) = engine
+            .document_read(CONTACTS_APP, model::self_profile)
+            .await
+            .map_err(engine_failed)?
+        {
+            self.validate_profile_context(&profile, group)?;
             return Ok(false);
         }
-        let entropy = engine.model_entropy();
-        let occurred = self.seams.clock.now_ms();
-        let (_, wrote) = engine
+        let mut root_seed = [0; 32];
+        self.seams.rng.fill(&mut root_seed);
+        let root = SigningKey::from_bytes(&root_seed);
+        let binding = model::sign_root_binding(&root, model::GroupId::from_bytes(group));
+        let name = self
+            .state
+            .borrow()
+            .device
+            .as_ref()
+            .and_then(|device| device.meta.user.get("name"))
+            .cloned()
+            .unwrap_or_default();
+        let profile = model::sign_profile(
+            &root,
+            (!name.is_empty())
+                .then_some(Claim {
+                    name: "name".into(),
+                    value: name,
+                })
+                .into_iter()
+                .collect(),
+        )
+        .map_err(refused)?;
+        engine
             .document_mutate(CONTACTS_APP, move |doc| {
-                let (seed, identity_wrote) = model::identity_or_create(doc, device_seed, entropy)?;
-                if !identity_wrote || name.is_empty() || name.len() > model::MAX_VALUE_BYTES {
-                    return Ok((seed, identity_wrote));
-                }
-                let meeting = model::create_meeting(
-                    doc,
-                    "entered by hand".into(),
-                    String::new(),
-                    None,
-                    occurred,
-                    false,
-                    entropy,
-                )?;
-                model::write_self_observation(
-                    doc,
-                    Observation {
-                        name: "name".into(),
-                        value: name,
-                        provenance: Provenance::Local,
-                        issuer: None,
-                        claimed: None,
-                        received: occurred,
-                        meeting,
-                    },
-                )?;
-                Ok((seed, true))
+                model::bind_root(doc, binding)?;
+                model::write_self_profile(doc, profile)
             })
             .await
             .map_err(engine_failed)?;
-        Ok(wrote)
+        self.with_device(|device| {
+            device.root_seed = Some(root_seed);
+            Ok(())
+        })?;
+        Ok(true)
+    }
+
+    pub async fn identity_status(&self) -> Result<IdentityStatus, Error> {
+        self.identity_open()?;
+        let context = self.identity_context();
+        let engine = self.engine()?;
+        let profile = engine
+            .document_read(CONTACTS_APP, model::self_profile)
+            .await
+            .map_err(engine_failed)?
+            .ok_or_else(|| Error::new(ErrorCode::Unavailable, "the user identity is not ready"))?;
+        let group = engine.authority_group().await.map_err(engine_failed)?;
+        if !self.identity_context_is(context) {
+            return Err(identity_changed());
+        }
+        self.validate_profile_context(&profile, group)?;
+        let binding = model::verify_root_binding(&profile.binding).map_err(refused)?;
+        Ok(IdentityStatus {
+            root: profile.root.to_bytes(),
+            group: binding.group.to_bytes(),
+            has_root: self.root_seed().is_some(),
+        })
     }
 
     pub async fn contacts_items(&self) -> Result<Vec<Contact>, Error> {
-        self.open()?;
+        self.identity_open()?;
         self.engine()?
             .document_read(CONTACTS_APP, model::contacts)
             .await
@@ -88,7 +123,7 @@ impl Kernel {
     }
 
     pub async fn contacts_get(&self, id: String) -> Result<Contact, Error> {
-        self.open()?;
+        self.identity_open()?;
         self.engine()?
             .document_read(CONTACTS_APP, move |doc| model::contact(doc, &id))
             .await
@@ -97,20 +132,56 @@ impl Kernel {
     }
 
     pub async fn contacts_profile(&self) -> Result<SelfProfile, Error> {
-        self.open()?;
-        self.engine()?
+        self.identity_open()?;
+        let context = self.identity_context();
+        let engine = self.engine()?;
+        let profile = engine
             .document_read(CONTACTS_APP, model::self_profile)
             .await
             .map_err(engine_failed)?
-            .ok_or_else(|| Error::new(ErrorCode::Unavailable, "the contacts identity is not ready"))
+            .ok_or_else(|| Error::new(ErrorCode::Unavailable, "the user identity is not ready"))?;
+        let group = engine.authority_group().await.map_err(engine_failed)?;
+        if !self.identity_context_is(context) {
+            return Err(identity_changed());
+        }
+        self.validate_profile_context(&profile, group)?;
+        Ok(profile)
     }
 
-    pub async fn contacts_meetings(&self) -> Result<Vec<MeetingRecord>, Error> {
-        self.open()?;
+    pub async fn contacts_resolve_profile(
+        &self,
+        mut observed_variants: Vec<Vec<u8>>,
+        claims: Vec<Claim>,
+    ) -> Result<SelfProfile, Error> {
+        self.identity_open()?;
+        let current_profile = self.contacts_profile().await?;
+        let mut current: Vec<_> = current_profile
+            .variants
+            .iter()
+            .map(|v| v.as_bytes().to_vec())
+            .collect();
+        current.sort();
+        observed_variants.sort();
+        if current != observed_variants {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "the self-profile changed; review every current variant again",
+            ));
+        }
+        let root = SigningKey::from_bytes(&self.require_root_seed()?);
+        let context = self.identity_context();
         self.engine()?
-            .document_read(CONTACTS_APP, model::meetings)
+            .document_mutate(CONTACTS_APP, move |doc| {
+                if !self.identity_context_is(context) {
+                    return Err("the user identity changed while saving the profile".into());
+                }
+                model::resolve_self_profile(doc, &root, &current_profile.variants, claims)
+                    .map(|_| ())
+            })
             .await
-            .map_err(engine_failed)
+            .map_err(refused)?;
+        self.contacts_changed().await?;
+        self.contacts_profile().await
     }
 
     pub async fn contacts_create(
@@ -119,7 +190,7 @@ impl Kernel {
         mut petname: String,
         glyph: String,
     ) -> Result<String, Error> {
-        self.open()?;
+        self.identity_open()?;
         if petname.is_empty() {
             petname = crate::device::generate_petname(self.seams.rng.as_ref(), "");
         }
@@ -136,24 +207,20 @@ impl Kernel {
         Ok(id)
     }
 
+    pub async fn contacts_meetings(&self) -> Result<Vec<MeetingRecord>, Error> {
+        self.identity_open()?;
+        self.engine()?
+            .document_read(CONTACTS_APP, model::meetings)
+            .await
+            .map_err(engine_failed)
+    }
+
     pub async fn contacts_set_label(
         &self,
         id: String,
-        mut petname: String,
+        petname: String,
         glyph: String,
     ) -> Result<(), Error> {
-        self.open()?;
-        if petname.is_empty() {
-            let id_for_read = id.clone();
-            let previous = self
-                .engine()?
-                .document_read(CONTACTS_APP, move |doc| model::contact(doc, &id_for_read))
-                .await
-                .map_err(engine_failed)?
-                .ok_or_else(|| Error::new(ErrorCode::NotFound, "no such contact"))?
-                .petname;
-            petname = crate::device::generate_petname(self.seams.rng.as_ref(), &previous);
-        }
         self.contacts_mutate(move |doc| model::set_label(doc, &id, petname, glyph))
             .await
     }
@@ -164,41 +231,33 @@ impl Kernel {
         name: String,
         value: String,
     ) -> Result<(), Error> {
-        self.open()?;
-        validate_claim(&name, &value)?;
-        self.require_contact(&id).await?;
-        let occurred = self.seams.clock.now_ms();
+        let received = self.seams.clock.now_ms();
         let entropy = self.fresh_contacts_entropy();
-        self.engine()?
-            .document_mutate(CONTACTS_APP, move |doc| {
-                let meeting = model::create_meeting(
-                    doc,
-                    "entered by hand".into(),
-                    String::new(),
-                    None,
-                    occurred,
-                    false,
-                    entropy,
-                )?;
-                model::write_extracted(
-                    doc,
-                    vec![model::ExtractedObservation {
-                        contact_id: id,
-                        observation: Observation {
-                            name,
-                            value,
-                            provenance: Provenance::Local,
-                            issuer: None,
-                            claimed: None,
-                            received: occurred,
-                            meeting,
-                        },
-                    }],
-                )
-            })
-            .await
-            .map_err(refused)?;
-        self.contacts_changed().await
+        self.contacts_mutate(move |doc| {
+            let meeting = model::create_meeting(
+                doc,
+                "entered by hand".into(),
+                String::new(),
+                None,
+                received,
+                false,
+                entropy,
+            )?;
+            model::write_observation(
+                doc,
+                &id,
+                Observation {
+                    name,
+                    value,
+                    provenance: Provenance::Local,
+                    issuer: None,
+                    claimed: None,
+                    received,
+                    meeting,
+                },
+            )
+        })
+        .await
     }
 
     pub async fn contacts_remove_observation(
@@ -231,87 +290,403 @@ impl Kernel {
             .await
     }
 
-    pub async fn contacts_set_self_observation(
+    pub async fn contacts_import_preview(&self, bytes: Vec<u8>) -> Result<ImportReview, Error> {
+        self.identity_open()?;
+        model::parse_unsigned_import(&bytes).map_err(refused)
+    }
+
+    pub async fn contacts_import_unsigned(
         &self,
-        name: String,
-        value: String,
-    ) -> Result<(), Error> {
-        self.open()?;
-        validate_claim(&name, &value)?;
-        let occurred = self.seams.clock.now_ms();
+        bytes: Vec<u8>,
+        source: String,
+        selections: Vec<Selection>,
+    ) -> Result<Vec<String>, Error> {
+        self.identity_open()?;
+        let review = model::parse_unsigned_import(&bytes).map_err(refused)?;
+        let received = self.seams.clock.now_ms();
         let entropy = self.fresh_contacts_entropy();
-        self.engine()?
+        let context = self.identity_context();
+        let ids = self
+            .engine()?
             .document_mutate(CONTACTS_APP, move |doc| {
-                if model::identity_seed(doc).is_none() {
-                    return Err("this device has not established a contacts identity yet".into());
+                if !self.identity_context_is(context) {
+                    return Err("the user identity changed while importing contacts".into());
                 }
                 let meeting = model::create_meeting(
                     doc,
-                    "entered by hand".into(),
-                    String::new(),
+                    "imported from a file".into(),
+                    source,
                     None,
-                    occurred,
+                    received,
                     false,
                     entropy,
                 )?;
-                model::write_self_observation(
+                let mut ids = Vec::new();
+                for selection in selections {
+                    let party = review
+                        .parties
+                        .iter()
+                        .find(|p| p.index == selection.index)
+                        .ok_or_else(|| "an import selection names no reviewed party".to_string())?;
+                    if !selection.claims.iter().all(|(name, value)| {
+                        party
+                            .claims
+                            .iter()
+                            .any(|c| c.name == *name && c.value == *value)
+                    }) {
+                        return Err("a selected claim was not in the preview".into());
+                    }
+                    let mut per_contact = entropy;
+                    per_contact[..4].copy_from_slice(&(selection.index + 1).to_le_bytes());
+                    let id = model::create_contact(
+                        doc,
+                        party.public_key,
+                        String::new(),
+                        String::new(),
+                        per_contact,
+                    )?;
+                    for (name, value) in selection.claims {
+                        model::write_observation(
+                            doc,
+                            &id,
+                            Observation {
+                                name,
+                                value,
+                                provenance: Provenance::Imported,
+                                issuer: None,
+                                claimed: None,
+                                received,
+                                meeting: meeting.clone(),
+                            },
+                        )?;
+                    }
+                    ids.push(id);
+                }
+                Ok(ids)
+            })
+            .await
+            .map_err(refused)?;
+        self.contacts_changed().await?;
+        Ok(ids)
+    }
+
+    /// Device-signed introduction containing the complete current official
+    /// profile variants and public Keyhive authority proof. Root custody is
+    /// deliberately unnecessary.
+    pub async fn contacts_share(
+        &self,
+        expected_root: [u8; 32],
+        expected_profiles: Vec<Vec<u8>>,
+        forwarded_contact_ids: Vec<String>,
+        expected_forwarded: Vec<AuthenticatedIdentity>,
+        parties: Vec<model::Party>,
+    ) -> Result<Vec<u8>, Error> {
+        self.identity_open()?;
+        let context = self.identity_context();
+        let profile = self.contacts_profile().await?;
+        let mut current_profiles = profile
+            .variants
+            .iter()
+            .map(|profile| profile.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let mut expected_profiles = expected_profiles;
+        current_profiles.sort();
+        expected_profiles.sort();
+        if profile.root.to_bytes() != expected_root || current_profiles != expected_profiles {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "the displayed self identity changed before sharing",
+            ));
+        }
+        let engine = self.engine()?;
+        let proof = engine.membership_proof().await.map_err(engine_failed)?;
+        let contacts = self.contacts_items().await?;
+        let mut authenticated_identities = Vec::with_capacity(forwarded_contact_ids.len());
+        for id in forwarded_contact_ids {
+            let retained = contacts
+                .iter()
+                .find(|contact| contact.id == id)
+                .and_then(|contact| contact.retained_identity.clone())
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::Refused,
+                        "a selected contact has no authenticated identity to forward",
+                    )
+                })?;
+            let authority = retained.authorities.first().ok_or_else(|| {
+                Error::new(
+                    ErrorCode::Refused,
+                    "a selected contact has no retained authority proof",
+                )
+            })?;
+            authenticated_identities.push(AuthenticatedIdentity {
+                binding: retained.binding,
+                profiles: retained.profiles,
+                authority_device: authority.device,
+                keyhive_authority_proof: authority.keyhive_authority_proof.clone(),
+            });
+        }
+        if authenticated_identities != expected_forwarded {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "a displayed forwarded identity changed before sharing",
+            ));
+        }
+        // Proof generation and contact reads both await. Re-read the complete
+        // displayed identity and capture the device seed only after those
+        // operations, immediately before signing.
+        let current_profile = self.contacts_profile().await?;
+        if current_profile != profile {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "the displayed self identity changed before sharing",
+            ));
+        }
+        let device_seed = self.state.borrow().seed;
+        if !self.identity_context_is(context) {
+            return Err(identity_changed());
+        }
+        let introduction = Introduction {
+            issuer: AuthenticatedIdentity {
+                binding: profile.binding,
+                profiles: profile.variants,
+                authority_device: model::DeviceSigningKey::from_bytes(
+                    engine.verifying_key().to_bytes(),
+                ),
+                keyhive_authority_proof: proof,
+            },
+            device: model::DeviceSigningKey::from_bytes(engine.verifying_key().to_bytes()),
+            authenticated_identities,
+            parties,
+            issued_at: claimed_time(self.seams.clock.now_ms())?,
+        };
+        model::sign_introduction(&introduction, &SigningKey::from_bytes(&device_seed))
+            .map_err(refused)
+    }
+
+    pub(crate) async fn contacts_sign_card(
+        self: &Rc<Self>,
+        card: Party,
+        expected_profiles: Vec<Vec<u8>>,
+    ) -> Result<Vec<u8>, Error> {
+        let profile = self.contacts_profile().await?;
+        if card.public_key != profile.root.to_bytes() {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "the meeting card is not this user's root identity",
+            ));
+        }
+        self.contacts_share(
+            profile.root.to_bytes(),
+            expected_profiles,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn contacts_validate_introduction(
+        &self,
+        bytes: &[u8],
+    ) -> Result<VerifiedIntroduction, Error> {
+        self.identity_open()?;
+        let pending = model::verify_introduction(bytes).map_err(refused)?;
+        let engine = self.engine()?;
+        model::validate_authority(pending, |request| {
+            let engine = engine.clone();
+            async move {
+                engine
+                    .verify_membership(
+                        request.keyhive_authority_proof.as_slice(),
+                        request.group.to_bytes(),
+                        request.device.to_bytes(),
+                    )
+                    .await
+            }
+        })
+        .await
+        .map_err(refused)
+    }
+
+    pub(crate) async fn contacts_validate_meeting_introduction(
+        &self,
+        bytes: &[u8],
+    ) -> Result<VerifiedIntroduction, Error> {
+        let verified = self.contacts_validate_introduction(bytes).await?;
+        let introduction = verified.introduction();
+        if !introduction.authenticated_identities.is_empty() || !introduction.parties.is_empty() {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "a meeting card must contain only its issuer identity",
+            ));
+        }
+        Ok(verified)
+    }
+
+    pub async fn contacts_signed_preview(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<SignedIntroductionReview, Error> {
+        self.identity_open()?;
+        let verified = self.contacts_validate_introduction(&bytes).await?;
+        let introduction = verified.introduction();
+        let identities = std::iter::once(&introduction.issuer)
+            .chain(&introduction.authenticated_identities)
+            .map(|identity| {
+                let binding = model::verify_root_binding(&identity.binding)?;
+                let profiles = identity
+                    .profiles
+                    .iter()
+                    .map(model::verify_profile)
+                    .map(|profile| profile.map(|profile| profile.claims))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(AuthenticatedIdentityReview {
+                    root: binding.root.to_bytes(),
+                    group: binding.group.to_bytes(),
+                    profiles,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(refused)?;
+        Ok(SignedIntroductionReview {
+            identities,
+            parties: introduction.parties.clone(),
+            issued_at: introduction.issued_at,
+        })
+    }
+
+    pub(crate) async fn contacts_accept_meeting(
+        self: &Rc<Self>,
+        generation: u32,
+        verified: VerifiedIntroduction,
+        keep: Vec<(String, String)>,
+    ) -> Result<String, Error> {
+        let introduction = verified.introduction();
+        self.identity_open()?;
+        let context = self.identity_context();
+        let binding = model::verify_root_binding(&introduction.issuer.binding).map_err(refused)?;
+        let offered = introduction
+            .issuer
+            .profiles
+            .iter()
+            .map(model::verify_profile)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(refused)?
+            .into_iter()
+            .flat_map(|profile| profile.claims)
+            .collect::<Vec<_>>();
+        if !introduction.authenticated_identities.is_empty() || !introduction.parties.is_empty() {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "a meeting card must contain only its issuer identity",
+            ));
+        }
+        let mut offered_pairs = offered
+            .iter()
+            .map(|claim| (claim.name.clone(), claim.value.clone()))
+            .collect::<Vec<_>>();
+        let mut keep_pairs = keep.clone();
+        offered_pairs.sort();
+        offered_pairs.dedup();
+        keep_pairs.sort();
+        keep_pairs.dedup();
+        if keep_pairs != offered_pairs {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "official profile disclosure must accept the whole reviewed identity",
+            ));
+        }
+        if !self.meeting_is_generation(generation) {
+            return Err(Error::new(ErrorCode::Refused, "that meeting was replaced"));
+        }
+        let received = self.seams.clock.now_ms();
+        let entropy = self.fresh_contacts_entropy();
+        let id = self
+            .engine()?
+            .document_mutate(CONTACTS_APP, move |doc| {
+                if !self.identity_context_is(context) {
+                    return Err("the user identity changed during meeting acceptance".into());
+                }
+                if !self.meeting_is_generation(generation) {
+                    return Err("that meeting was replaced".into());
+                }
+                // A meeting accepts its one displayed issuer identity whole.
+                let selected = verified.select(&[binding.root], &[])?;
+                model::persist_verified_introduction(
                     doc,
-                    Observation {
-                        name,
-                        value,
-                        provenance: Provenance::Local,
-                        issuer: None,
-                        claimed: None,
-                        received: occurred,
-                        meeting,
-                    },
+                    selected,
+                    String::new(),
+                    String::new(),
+                    entropy,
+                    received,
                 )
             })
             .await
             .map_err(refused)?;
-        self.contacts_changed().await
+        self.contacts_changed().await?;
+        Ok(id)
     }
 
-    pub async fn contacts_remove_self_observation(
+    /// Verify both signatures and each identity's supplied complete Keyhive
+    /// authority proof before retaining anything.
+    pub async fn contacts_import_accept(
         &self,
-        name: String,
-        value: String,
-    ) -> Result<(), Error> {
-        self.contacts_mutate(move |doc| model::remove_self_observation(doc, &name, &value))
-            .await
-    }
-
-    pub async fn contacts_share(&self, introduction: Introduction) -> Result<Vec<u8>, Error> {
-        self.open()?;
-        let now = claimed_time(self.seams.clock.now_ms())?;
-        let seed = self
+        bytes: Vec<u8>,
+        selected_roots: Vec<[u8; 32]>,
+        selected_parties: Vec<u32>,
+        petname: String,
+        glyph: String,
+    ) -> Result<String, Error> {
+        self.identity_open()?;
+        let context = self.identity_context();
+        let pending = model::verify_introduction(&bytes).map_err(refused)?;
+        let engine = self.engine()?;
+        let verified = model::validate_authority(pending, |request| {
+            let engine = engine.clone();
+            async move {
+                if !self.identity_context_is(context) {
+                    return Err("the user identity changed while verifying the introduction".into());
+                }
+                engine
+                    .verify_membership(
+                        request.keyhive_authority_proof.as_slice(),
+                        request.group.to_bytes(),
+                        request.device.to_bytes(),
+                    )
+                    .await
+            }
+        })
+        .await
+        .map_err(refused)?;
+        let selected_roots = selected_roots
+            .into_iter()
+            .map(model::RootIdentity::from_bytes)
+            .collect::<Vec<_>>();
+        let selected = verified
+            .select(&selected_roots, &selected_parties)
+            .map_err(refused)?;
+        let entropy = self.fresh_contacts_entropy();
+        let received = self.seams.clock.now_ms();
+        let id = self
             .engine()?
-            .document_read(CONTACTS_APP, model::identity_seed)
+            .document_mutate(CONTACTS_APP, move |doc| {
+                if !self.identity_context_is(context) {
+                    return Err("the user identity changed while accepting the introduction".into());
+                }
+                model::persist_verified_introduction(
+                    doc, selected, petname, glyph, entropy, received,
+                )
+            })
             .await
-            .map_err(engine_failed)?
-            .ok_or_else(|| {
-                Error::new(ErrorCode::Unavailable, "the contacts identity is not ready")
-            })?;
-        let own_key = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
-        if introduction.issuer.public_key != own_key {
-            return Err(Error::new(
-                ErrorCode::Refused,
-                "the introduction issuer is not this user's contact identity",
-            ));
-        }
-        model::sign(
-            &Introduction {
-                issued_at: now,
-                ..introduction
-            },
-            &SigningKey::from_bytes(&seed),
-        )
-        .map_err(refused)
+            .map_err(refused)?;
+        self.contacts_changed().await?;
+        Ok(id)
     }
 
     pub async fn contacts_decode_link(&self, body: String) -> Result<Vec<u8>, Error> {
-        self.open()?;
-        if body.len() > model::MAX_SIGNED_BYTES {
+        self.identity_open()?;
+        if body.len() > model::MAX_SIGNED_BYTES.saturating_mul(2) {
             return Err(Error::new(
                 ErrorCode::Refused,
                 "that contact link is too large",
@@ -327,205 +702,41 @@ impl Kernel {
             })
     }
 
-    pub async fn contacts_import_preview(&self, bytes: Vec<u8>) -> Result<ImportReview, Error> {
-        self.open()?;
-        model::parse_import(&bytes).map_err(refused)
-    }
-
-    pub async fn contacts_import_accept(
-        &self,
-        bytes: Vec<u8>,
-        source: String,
-        selections: Vec<Selection>,
-    ) -> Result<Vec<String>, Error> {
-        self.open()?;
-        let review = model::parse_import(&bytes).map_err(refused)?;
-        let parties: BTreeMap<_, _> = review.parties.into_iter().map(|p| (p.index, p)).collect();
-        let mut selected_indices = BTreeSet::new();
-        for selection in &selections {
-            if !selected_indices.insert(selection.index) {
-                return Err(Error::new(
-                    ErrorCode::Refused,
-                    "an import party was selected more than once",
-                ));
+    pub(crate) fn clear_root_custody(&self) -> Result<(), Error> {
+        self.with_device(|device| {
+            if let Some(mut seed) = device.root_seed.take() {
+                seed.fill(0);
             }
-            let party = parties.get(&selection.index).ok_or_else(|| {
-                Error::new(
-                    ErrorCode::Refused,
-                    "an import selection names no reviewed party",
-                )
-            })?;
-            ensure_claim_subset(&selection.claims, &party.claims)?;
-            for (name, value) in &selection.claims {
-                validate_claim(name, value)?;
-            }
-        }
-        if selections.is_empty() {
-            return Ok(Vec::new());
-        }
-        let received = self.seams.clock.now_ms();
-        let entropies = (0..selections.len())
-            .map(|_| self.fresh_contacts_entropy())
-            .collect::<Vec<_>>();
-        let ids = self
-            .engine()?
-            .document_mutate(CONTACTS_APP, move |doc| {
-                let mut ids = BTreeSet::new();
-                let signed = parties
-                    .values()
-                    .next()
-                    .is_some_and(|p| p.provenance == Provenance::Verified);
-                let source_key = if signed {
-                    parties.values().next().and_then(|p| p.issuer)
-                } else {
-                    None
-                };
-                let meeting = model::create_meeting(
-                    doc,
-                    "imported from a file".into(),
-                    source,
-                    source_key,
-                    received,
-                    signed,
-                    entropies.first().copied().unwrap_or([0; 32]),
-                )?;
-                for (selection, entropy) in selections.into_iter().zip(entropies) {
-                    let party = parties.get(&selection.index).expect("validated above");
-                    let id = model::create_contact(
-                        doc,
-                        party.public_key,
-                        String::new(),
-                        String::new(),
-                        entropy,
-                    )?;
-                    let observations = selection
-                        .claims
-                        .into_iter()
-                        .map(|(name, value)| model::ExtractedObservation {
-                            contact_id: id.clone(),
-                            observation: Observation {
-                                name,
-                                value,
-                                provenance: party.provenance,
-                                issuer: party.issuer,
-                                claimed: party.claimed,
-                                received,
-                                meeting: meeting.clone(),
-                            },
-                        })
-                        .collect();
-                    model::write_extracted(doc, observations)?;
-                    ids.insert(id);
-                }
-                Ok(ids.into_iter().collect::<Vec<_>>())
-            })
-            .await
-            .map_err(refused)?;
-        self.contacts_changed().await?;
-        Ok(ids)
-    }
-
-    pub(crate) async fn contacts_sign_card(self: &Rc<Self>, card: Party) -> Result<Vec<u8>, Error> {
-        if card.public_key != self.contacts_own_public_key().await? {
-            return Err(Error::new(
-                ErrorCode::Refused,
-                "the meeting card is not this user's contact identity",
-            ));
-        }
-        self.contacts_share(Introduction {
-            issuer: card,
-            parties: Vec::new(),
-            issued_at: ClaimedTime {
-                seconds: 0,
-                nanos: 0,
-            },
+            Ok(())
         })
-        .await
     }
 
-    pub(crate) async fn contacts_own_public_key(self: &Rc<Self>) -> Result<[u8; 32], Error> {
-        self.engine()?
-            .document_read(CONTACTS_APP, model::identity_public_key)
-            .await
-            .map_err(engine_failed)?
-            .ok_or_else(|| Error::new(ErrorCode::Unavailable, "the contacts identity is not ready"))
+    pub(crate) fn root_seed(&self) -> Option<[u8; 32]> {
+        self.state
+            .borrow()
+            .device
+            .as_ref()
+            .and_then(|device| device.root_seed)
     }
 
-    pub(crate) async fn contacts_accept_meeting(
-        self: &Rc<Self>,
-        generation: u32,
-        introduction: Introduction,
-        keep: Vec<(String, String)>,
-    ) -> Result<String, Error> {
-        self.open()?;
-        ensure_claim_subset(&keep, &introduction.issuer.claims)?;
-        for (name, value) in &keep {
-            validate_claim(name, value)?;
-        }
-        let received = self.seams.clock.now_ms();
-        let entropy = self.fresh_contacts_entropy();
-        let peer_key = introduction.issuer.public_key;
-        let claimed = introduction.issued_at;
-        let id = self
-            .engine()?
-            .document_mutate(CONTACTS_APP, |doc| {
-                if !self.meeting_is_generation(generation) {
-                    return Err("that meeting was replaced".into());
-                }
-                if self.meeting_identity(generation) != model::identity_public_key(doc) {
-                    return Err("the contacts identity changed during this meeting".into());
-                }
-                let id = model::create_contact(
-                    doc,
-                    Some(peer_key),
-                    String::new(),
-                    String::new(),
-                    entropy,
-                )?;
-                let meeting = model::create_meeting(
-                    doc,
-                    "met in real time".into(),
-                    String::new(),
-                    Some(peer_key),
-                    received,
-                    true,
-                    entropy,
-                )?;
-                let rows = keep
-                    .into_iter()
-                    .map(|(name, value)| model::ExtractedObservation {
-                        contact_id: id.clone(),
-                        observation: Observation {
-                            name,
-                            value,
-                            provenance: Provenance::Verified,
-                            issuer: Some(peer_key),
-                            claimed: Some(claimed),
-                            received,
-                            meeting: meeting.clone(),
-                        },
-                    })
-                    .collect();
-                model::write_extracted(doc, rows)?;
-                Ok(id)
-            })
-            .await
-            .map_err(refused)?;
-        self.checkpoint_durable().await?;
-        self.push_event(Event::ContactsChanged);
-        Ok(id)
+    pub(crate) fn install_root_seed(&self, seed: [u8; 32]) -> Result<(), Error> {
+        self.replace_root_seed(Some(seed))
     }
 
-    async fn contacts_mutate(
-        &self,
-        change: impl FnOnce(&mut polyvisor_document_history::Document) -> Result<(), String>,
-    ) -> Result<(), Error> {
-        self.open()?;
-        self.engine()?
-            .document_mutate(CONTACTS_APP, change)
-            .await
-            .map_err(refused)?;
-        self.contacts_changed().await
+    pub(crate) fn replace_root_seed(&self, seed: Option<[u8; 32]>) -> Result<(), Error> {
+        self.with_device(|device| {
+            device.root_seed = seed;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn require_root_seed(&self) -> Result<[u8; 32], Error> {
+        self.root_seed().ok_or_else(|| {
+            Error::new(
+                ErrorCode::Refused,
+                "this device does not hold the user root; transfer or unlock it first",
+            )
+        })
     }
 
     async fn contacts_changed(&self) -> Result<(), Error> {
@@ -534,24 +745,45 @@ impl Kernel {
         Ok(())
     }
 
+    async fn contacts_mutate(
+        &self,
+        change: impl FnOnce(&mut polyvisor_document_history::Document) -> Result<(), String>,
+    ) -> Result<(), Error> {
+        self.identity_open()?;
+        self.engine()?
+            .document_mutate(CONTACTS_APP, change)
+            .await
+            .map_err(refused)?;
+        self.contacts_changed().await
+    }
+
     fn fresh_contacts_entropy(&self) -> [u8; 32] {
         let mut entropy = [0; 32];
         self.seams.rng.fill(&mut entropy);
         entropy
     }
 
-    async fn require_contact(&self, id: &str) -> Result<(), Error> {
-        let id = id.to_string();
-        if self
-            .engine()?
-            .document_read(CONTACTS_APP, move |doc| model::contact(doc, &id).is_some())
-            .await
-            .map_err(engine_failed)?
-        {
-            Ok(())
-        } else {
-            Err(Error::new(ErrorCode::NotFound, "no such contact"))
+    fn validate_profile_context(
+        &self,
+        profile: &SelfProfile,
+        group: [u8; 32],
+    ) -> Result<(), Error> {
+        let binding = model::verify_root_binding(&profile.binding).map_err(refused)?;
+        if binding.root != profile.root || binding.group.to_bytes() != group {
+            return Err(Error::new(
+                ErrorCode::Unavailable,
+                "the public identity does not match this device's Keyhive group",
+            ));
         }
+        if let Some(seed) = self.root_seed()
+            && SigningKey::from_bytes(&seed).verifying_key().to_bytes() != profile.root.to_bytes()
+        {
+            return Err(Error::new(
+                ErrorCode::Unavailable,
+                "local root custody does not match the public identity",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -573,178 +805,13 @@ fn claimed_time(now_ms: u64) -> Result<ClaimedTime, Error> {
     })
 }
 
-fn ensure_claim_subset(selected: &[(String, String)], offered: &[Claim]) -> Result<(), Error> {
-    if selected.iter().all(|(name, value)| {
-        offered
-            .iter()
-            .any(|claim| claim.name == *name && claim.value == *value)
-    }) {
-        Ok(())
-    } else {
-        Err(Error::new(
-            ErrorCode::Refused,
-            "a selected claim was not in the reviewed introduction",
-        ))
-    }
-}
-
-fn validate_claim(name: &str, value: &str) -> Result<(), Error> {
-    if name.len() > model::MAX_NAME_BYTES || value.len() > model::MAX_VALUE_BYTES {
-        Err(Error::new(ErrorCode::Refused, "that claim is too large"))
-    } else {
-        Ok(())
-    }
-}
-
 fn refused(why: String) -> Error {
     Error::new(ErrorCode::Refused, why)
 }
 
-#[cfg(test)]
-mod tests {
-    use automerge::ActorId;
-    use ed25519_dalek::SigningKey;
-    use polyvisor_document_history::Document;
-    use sedimentree_core::id::SedimentreeId;
-
-    use super::*;
-
-    fn doc(actor: u8) -> Document {
-        Document::empty(ActorId::from(&[actor][..]), SedimentreeId::new([actor; 32]))
-    }
-
-    #[test]
-    fn identity_initialization_is_idempotent() {
-        let mut document = doc(1);
-        let first = model::identity_or_create(&mut document, [2; 32], [3; 32]).unwrap();
-        let second = model::identity_or_create(&mut document, [4; 32], [5; 32]).unwrap();
-        assert!(first.1);
-        assert_eq!(second, (first.0, false));
-    }
-
-    #[test]
-    fn selected_multi_party_import_uses_one_meeting_and_drops_raw_envelope() {
-        let signer = SigningKey::from_bytes(&[7; 32]);
-        let other = SigningKey::from_bytes(&[8; 32]);
-        let introduction = Introduction {
-            issuer: Party {
-                public_key: signer.verifying_key().to_bytes(),
-                claims: vec![Claim {
-                    name: "name".into(),
-                    value: "Ada".into(),
-                }],
-            },
-            parties: vec![Party {
-                public_key: other.verifying_key().to_bytes(),
-                claims: vec![
-                    Claim {
-                        name: "name".into(),
-                        value: "Grace".into(),
-                    },
-                    Claim {
-                        name: "email".into(),
-                        value: "g@example.test".into(),
-                    },
-                ],
-            }],
-            issued_at: ClaimedTime {
-                seconds: 4,
-                nanos: 5,
-            },
-        };
-        let raw = model::sign(&introduction, &signer).unwrap();
-        let review = model::parse_import(&raw).unwrap();
-        let mut document = doc(2);
-        let meeting = model::create_meeting(
-            &mut document,
-            "imported from a file".into(),
-            "contacts.card".into(),
-            Some(introduction.issuer.public_key),
-            6,
-            true,
-            [9; 32],
-        )
-        .unwrap();
-        let selected = [(0_u32, "name", "Ada"), (1, "email", "g@example.test")];
-        let mut ids = Vec::new();
-        for (index, name, value) in selected {
-            let party = &review.parties[index as usize];
-            let id = model::create_contact(
-                &mut document,
-                party.public_key,
-                String::new(),
-                String::new(),
-                [10 + index as u8; 32],
-            )
-            .unwrap();
-            model::write_extracted(
-                &mut document,
-                vec![model::ExtractedObservation {
-                    contact_id: id.clone(),
-                    observation: Observation {
-                        name: name.into(),
-                        value: value.into(),
-                        provenance: party.provenance,
-                        issuer: party.issuer,
-                        claimed: party.claimed,
-                        received: 7,
-                        meeting: meeting.clone(),
-                    },
-                }],
-            )
-            .unwrap();
-            ids.push(id);
-        }
-        assert_eq!(model::meetings(&document).len(), 1);
-        assert!(ids.iter().all(|id| {
-            let contact = model::contact(&document, id).unwrap();
-            contact.observations.len() == 1 && contact.observations[0].meeting == meeting
-        }));
-        let saved = document.save();
-        assert!(!saved.windows(raw.len()).any(|window| window == raw));
-    }
-
-    #[test]
-    fn preferred_value_survives_document_reload() {
-        let mut document = doc(3);
-        let id = model::create_contact(&mut document, None, "friend".into(), "🐈".into(), [1; 32])
-            .unwrap();
-        let meeting = model::create_meeting(
-            &mut document,
-            "entered by hand".into(),
-            String::new(),
-            None,
-            1,
-            false,
-            [2; 32],
-        )
-        .unwrap();
-        model::write_extracted(
-            &mut document,
-            vec![model::ExtractedObservation {
-                contact_id: id.clone(),
-                observation: Observation {
-                    name: "name".into(),
-                    value: "Ada".into(),
-                    provenance: Provenance::Local,
-                    issuer: None,
-                    claimed: None,
-                    received: 1,
-                    meeting,
-                },
-            }],
-        )
-        .unwrap();
-        model::set_preferred(&mut document, &id, "name", Some("Ada".into())).unwrap();
-        let restored = Document::load(
-            &document.save(),
-            ActorId::from(&[4][..]),
-            SedimentreeId::new([3; 32]),
-        );
-        assert_eq!(
-            model::contact(&restored, &id).unwrap().preferred,
-            vec![("name".into(), "Ada".into())]
-        );
-        assert_eq!(model::contact(&restored, &id).unwrap().glyph, "🐈");
-    }
+fn identity_changed() -> Error {
+    Error::new(
+        ErrorCode::Unavailable,
+        "the user identity changed during this operation",
+    )
 }

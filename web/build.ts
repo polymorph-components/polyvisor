@@ -188,6 +188,7 @@ await ensureDir(DIST);
 
 await bundle("boot.ts", "boot.js");
 await bundle("worker.ts", "worker.js");
+await bundle("kdf-worker.ts", "kdf-worker.js");
 await bundle("frame.ts", "frame.js");
 // The launcher-icon service worker (web/icon-sw.ts). It lands beside
 // `index.html` rather than inside `launcher-icons/` because a worker's
@@ -217,6 +218,9 @@ await component(
   "runtime.component",
   COMPOSED_RUNTIME,
 );
+// Unique worker-realm artifact names prevent accidentally instantiating the
+// shared runtime in the memory-heavy derivation worker.
+await component("polyvisor_kdf_component", "kdf.component");
 await component("polyvisor_visor", "visor.component");
 for (const id of apps) await app(id);
 await Deno.writeTextFile(

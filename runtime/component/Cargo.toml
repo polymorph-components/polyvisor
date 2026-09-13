@@ -12,5 +12,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 polyvisor-kernel = { path = "../crates/kernel" }
+polyvisor-contacts-model = { path = "../crates/contacts-model" }
 wit-bindgen.workspace = true
 futures.workspace = true
