@@ -3,9 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use dioxus::prelude::*;
 
 use crate::contacts::{
-    ClaimChoice, Qr, accept_signed, artifact_matches, complete_claims, default_name,
-    generation_changed, issuer_display, key_short, name_claim, qr_matrix, received_label, selected,
-    should_rebase, status_response_is_current,
+    ClaimChoice, Qr, accept_signed, artifact_matches, default_name, issuer_display, key_short,
+    name_claim, qr_matrix, received_label, selected, should_rebase, status_response_is_current,
 };
 use crate::draft::{RollState, RollTarget};
 use crate::glyph::normalize_glyph;
@@ -146,10 +145,10 @@ pub(crate) fn ContactsSheet(
     records: Signal<Vec<MeetingRecord>>,
     meeting: Signal<MeetingPhase>,
     meeting_epoch: Signal<u64>,
-    offered_card: Signal<Option<(u32, Party)>>,
-    on_meeting_offer: EventHandler<Party>,
-    on_meeting_join: EventHandler<(String, Party)>,
-    pending_submission: Signal<Option<(u64, Party)>>,
+    offered_card: Signal<Option<(u32, SelfProfile)>>,
+    on_meeting_offer: EventHandler<SelfProfile>,
+    on_meeting_join: EventHandler<(String, SelfProfile)>,
+    pending_submission: Signal<Option<(u64, SelfProfile)>>,
     mut incoming: Signal<Option<Incoming>>,
     rolls: CopyValue<RollState>,
     focus_glyph: Option<String>,
@@ -161,9 +160,6 @@ pub(crate) fn ContactsSheet(
     let mut error = use_signal(|| None::<String>);
     let mut incoming_contact = use_signal(|| None::<String>);
     let mut incoming_meet = use_signal(|| None::<String>);
-    let meet_choices = use_signal(Vec::<ClaimChoice>::new);
-    let meet_name = use_signal(String::new);
-    let meet_name_seed = use_signal(|| None::<String>);
 
     use_future(move || {
         let captured = meeting_epoch();
@@ -252,9 +248,6 @@ pub(crate) fn ContactsSheet(
                         profile,
                         meeting,
                         meeting_epoch,
-                        own_choices: meet_choices,
-                        shared_name: meet_name,
-                        shared_name_seed: meet_name_seed,
                         offered_card,
                         on_meeting_offer,
                         on_meeting_join,
@@ -936,7 +929,6 @@ fn ShareView(
         let issuer = Party {
             public_key: profile_value.public_key.clone(),
             claims: Vec::new(),
-            expected_profiles: Vec::new(),
         };
         let parties = contacts()
             .into_iter()
@@ -950,7 +942,6 @@ fn ShareView(
                         .map(|items| selected(items))
                         .unwrap_or_default(),
                 ),
-                expected_profiles: Vec::new(),
             })
             .collect();
         Introduction {
@@ -1440,106 +1431,66 @@ fn ImportView(
     }
 }
 
+/// The exact root-signed profile variants a party presents: shared by the
+/// share preview, the meeting card, and the meeting review — one rendering,
+/// no per-claim selection.
+#[component]
+fn ProfileVariants(variants: Vec<kernel::ProfileVariant>) -> Element {
+    rsx! {
+        for (index, variant) in variants.iter().enumerate() {
+            section { class: "meeting-share-profile", "data-meeting-profile": "{index}",
+                if variants.len() > 1 { h4 { "Concurrent variant {index + 1}" } }
+                for (name, value) in variant.claims.clone() {
+                    div { class: "observation-row", AppVoice { text: name } AppVoice { text: value } }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn MeetView(
     initial_fragment: Option<String>,
     profile: Signal<Option<SelfProfile>>,
     mut meeting: Signal<MeetingPhase>,
     mut meeting_epoch: Signal<u64>,
-    mut own_choices: Signal<Vec<ClaimChoice>>,
-    mut shared_name: Signal<String>,
-    mut shared_name_seed: Signal<Option<String>>,
-    mut offered_card: Signal<Option<(u32, Party)>>,
-    on_meeting_offer: EventHandler<Party>,
-    on_meeting_join: EventHandler<(String, Party)>,
-    pending_submission: Signal<Option<(u64, Party)>>,
+    offered_card: Signal<Option<(u32, SelfProfile)>>,
+    on_meeting_offer: EventHandler<SelfProfile>,
+    on_meeting_join: EventHandler<(String, SelfProfile)>,
+    pending_submission: Signal<Option<(u64, SelfProfile)>>,
     mut error: Signal<Option<String>>,
 ) -> Element {
-    let _ = (own_choices, shared_name, shared_name_seed);
     let fragment = use_signal(|| initial_fragment.unwrap_or_default());
-    let mut peer_generation = use_signal(|| None::<u32>);
-    let active = !matches!(
-        meeting(),
-        MeetingPhase::Idle | MeetingPhase::Done(_) | MeetingPhase::Failed(_)
-    );
-
-    use_effect(move || {
-        if profile().is_some() && !active {
-            if !own_choices().is_empty() {
-                own_choices.set(Vec::new());
-            }
-            if !shared_name().is_empty() {
-                shared_name.set(String::new());
-            }
-            if shared_name_seed().is_some() {
-                shared_name_seed.set(None);
-            }
-        }
-    });
 
     let Some(profile_value) = profile() else {
         return rsx! { div { class: "meet-now", "Profile unavailable." } };
     };
-    let meeting_profile = profile_value.clone();
-    let card = move || Party {
-        public_key: meeting_profile.public_key.clone(),
-        claims: Vec::new(),
-        expected_profiles: meeting_profile
-            .variants
-            .iter()
-            .map(|variant| variant.token.clone())
-            .collect(),
-    };
-    use_effect(move || {
-        if let MeetingPhase::AwaitingConfirm { generation, .. } = meeting()
-            && generation_changed(peer_generation(), generation)
-        {
-            peer_generation.set(Some(generation));
-        }
-        // Guard the reset writes: `Signal::set` marks the scope dirty
-        // unconditionally, so writing `None`/empty on every run when the
-        // meeting is already inactive re-triggers this effect forever (the
-        // Meet-now main-thread hang). Only write when the value actually
-        // changes.
-        if !active {
-            if peer_generation().is_some() {
-                peer_generation.set(None);
-            }
-        }
-    });
 
     rsx! {
         div { class: "meet-now",
             div { class: "meet-own-claims",
-                if let Some((_, card)) = pending_submission() {
+                if let Some((_, offered)) = pending_submission() {
                     p { class: "framework", "Submitting… you offered:" }
-                    PartyPreview { party: card }
+                    ProfileVariants { variants: offered.variants }
                 } else if let Some(generation) = active_generation(&meeting()) {
-                    if let Some((stored_generation, card)) = offered_card()
+                    if let Some((stored_generation, offered)) = offered_card()
                         && stored_generation == generation
                     {
                         p { class: "framework", "You offered:" }
-                        PartyPreview { party: card }
+                        ProfileVariants { variants: offered.variants }
                     } else {
                         p { class: "framework", "This meeting was started elsewhere; its offered card is not available in this tab." }
                     }
                 } else {
                     p { class: "framework", "Meeting shares every current root-signed profile variant whole. Individual claims cannot be omitted." }
-                    for (index, variant) in profile_value.variants.iter().enumerate() {
-                        section { class: "meeting-share-profile", "data-meeting-profile": "{index}",
-                            if profile_value.variants.len() > 1 { h4 { "Concurrent variant {index + 1}" } }
-                            for (name, value) in variant.claims.clone() {
-                                div { class: "observation-row", AppVoice { text: name } AppVoice { text: value } }
-                            }
-                        }
-                    }
+                    ProfileVariants { variants: profile_value.variants.clone() }
                 }
             }
             if fragment().is_empty() && active_generation(&meeting()).is_none() && pending_submission().is_none() {
                 button {
-                    onclick: move |_| {
-                        let exact = card();
-                        on_meeting_offer.call(exact);
+                    onclick: {
+                        let profile_value = profile_value.clone();
+                        move |_| on_meeting_offer.call(profile_value.clone())
                     },
                     "Offer meeting"
                 }
@@ -1548,9 +1499,9 @@ fn MeetView(
                     p { class: "framework", "Review what you will share before joining." }
                     button {
                         disabled: pending_submission().is_some(),
-                        onclick: move |_| {
-                            let exact = card();
-                            on_meeting_join.call((fragment(), exact));
+                        onclick: {
+                            let profile_value = profile_value.clone();
+                            move |_| on_meeting_join.call((fragment(), profile_value.clone()))
                         },
                         "Join meeting"
                     }
@@ -1618,16 +1569,12 @@ fn MeetView(
                             }
                         }
                         button {
-                            onclick: move |_| {
-                                let claims = claims.clone();
-                                async move {
-                                let keep = complete_claims(claims.iter().map(|(name, value)|
-                                    (name.expose().to_string(), value.expose().to_string())).collect());
-                                match kernel::meeting_confirm(generation, keep).await {
+                            onclick: move |_| async move {
+                                match kernel::meeting_confirm(generation).await {
                                     Ok(()) => { update_meeting(meeting, meeting_epoch, error).await; }
                                     Err(message) => error.set(Some(message)),
                                 }
-                            }},
+                            },
                             "Confirm"
                         }
                         button {

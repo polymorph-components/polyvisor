@@ -841,26 +841,27 @@ interface contacts {
 /// `confirm` on each side completes it.
 interface meeting {
     use types.{error, meeting-status};
-    use contacts.{party};
 
     /// Host: mint a token and return the bootstrap link (an absolute URL with
     /// the host endpoint and token in its fragment). Replaces any open offer.
-    /// `card` is the exact self-introduction party this user presents
-    /// (assembled from `profile`, not re-derived); its `public-key` must be
-    /// this user's own signing key. Returns this operation's own
+    /// `expected-root` must be this user's own signing key and
+    /// `expected-profiles` its exact current official profile tokens
+    /// (assembled from `profile`, not re-derived); the signed introduction
+    /// presented is exactly these, whole. Returns this operation's own
     /// `meeting-status` (generation + phase) so the caller binds to its own
     /// session, not a racy latest-status read another tab may have replaced.
     offer: async func(expected-root: list<u8>, expected-profiles: list<list<u8>>) -> result<meeting-status, error>;
     /// Guest: begin from a bootstrap link's fragment. Dials the host and runs
-    /// the exchange up to `awaiting-confirm`; never auto-accepts. `card` as
-    /// in `offer`. Returns this operation's own `meeting-status`.
+    /// the exchange up to `awaiting-confirm`; never auto-accepts.
+    /// `expected-root`/`expected-profiles` as in `offer`. Returns this
+    /// operation's own `meeting-status`.
     join: async func(fragment: string, expected-root: list<u8>, expected-profiles: list<list<u8>>) -> result<meeting-status, error>;
     /// After comparing the SAS and reviewing the peer's card. `generation`
     /// must match the current session (a stale one is `refused`, so a tab
-    /// confirming a replaced meeting cannot accept the new one). `keep` names
-    /// the exact `(name, value)` claims to record. Writes the contact once
-    /// the other side also confirms.
-    confirm: async func(generation: u32, keep: list<tuple<string, string>>) -> result<_, error>;
+    /// confirming a replaced meeting cannot accept the new one). Accepts the
+    /// peer's whole reviewed introduction; there is no per-claim choice.
+    /// Writes the contact once the other side also confirms.
+    confirm: async func(generation: u32) -> result<_, error>;
     /// Either side, any time; the other sees `failed`. A stale `generation`
     /// is ignored so it cannot tear down a replacement meeting.
     cancel: async func(generation: u32) -> result<_, error>;

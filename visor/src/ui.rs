@@ -673,26 +673,27 @@ pub(crate) fn Visor() -> Element {
     let contact_records = use_signal(Vec::<kernel::MeetingRecord>::new);
     let meeting_phase = use_signal(|| kernel::MeetingPhase::Idle);
     let mut meeting_epoch = use_signal(|| 0u64);
-    let offered_card = use_signal(|| None::<(u32, kernel::Party)>);
+    let offered_card = use_signal(|| None::<(u32, kernel::SelfProfile)>);
     let mut meeting_request = use_signal(|| 0u64);
-    let mut pending_submission = use_signal(|| None::<(u64, kernel::Party)>);
+    let mut pending_submission = use_signal(|| None::<(u64, kernel::SelfProfile)>);
     let incoming = use_signal(|| None::<Incoming>);
-    let on_meeting_offer = use_callback(move |card: kernel::Party| {
+    let on_meeting_offer = use_callback(move |profile: kernel::SelfProfile| {
         if pending_submission().is_some() {
             return;
         }
         meeting_request.set(meeting_request().wrapping_add(1));
         let request = meeting_request();
-        pending_submission.set(Some((request, card.clone())));
+        pending_submission.set(Some((request, profile.clone())));
         let captured_epoch = meeting_epoch();
         spawn(async move {
-            match kernel::meeting_offer(card.clone(), card.expected_profiles.clone()).await {
+            let expected_profiles = profile.variants.iter().map(|v| v.token.clone()).collect();
+            match kernel::meeting_offer(profile.public_key.clone(), expected_profiles).await {
                 Ok(returned) => {
                     if crate::contacts::submission_is_current(request, meeting_request())
                         && let Some(generation) = returned.generation()
                     {
                         let mut offered_card = offered_card;
-                        offered_card.set(Some((generation, card)));
+                        offered_card.set(Some((generation, profile)));
                     }
                     if crate::contacts::submission_is_current(request, meeting_request())
                         && meeting_epoch() == captured_epoch
@@ -713,43 +714,46 @@ pub(crate) fn Visor() -> Element {
             }
         });
     });
-    let on_meeting_join = use_callback(move |(fragment, card): (String, kernel::Party)| {
-        if pending_submission().is_some() {
-            return;
-        }
-        meeting_request.set(meeting_request().wrapping_add(1));
-        let request = meeting_request();
-        pending_submission.set(Some((request, card.clone())));
-        let captured_epoch = meeting_epoch();
-        spawn(async move {
-            match kernel::meeting_join(fragment, card.clone(), card.expected_profiles.clone()).await
-            {
-                Ok(returned) => {
-                    if crate::contacts::submission_is_current(request, meeting_request())
-                        && let Some(generation) = returned.generation()
-                    {
-                        let mut offered_card = offered_card;
-                        offered_card.set(Some((generation, card)));
-                    }
-                    if crate::contacts::submission_is_current(request, meeting_request())
-                        && meeting_epoch() == captured_epoch
-                    {
-                        let mut meeting_phase = meeting_phase;
-                        meeting_phase.set(returned);
-                    }
-                }
-                Err(message)
-                    if crate::contacts::submission_is_current(request, meeting_request()) =>
+    let on_meeting_join =
+        use_callback(move |(fragment, profile): (String, kernel::SelfProfile)| {
+            if pending_submission().is_some() {
+                return;
+            }
+            meeting_request.set(meeting_request().wrapping_add(1));
+            let request = meeting_request();
+            pending_submission.set(Some((request, profile.clone())));
+            let captured_epoch = meeting_epoch();
+            spawn(async move {
+                let expected_profiles = profile.variants.iter().map(|v| v.token.clone()).collect();
+                match kernel::meeting_join(fragment, profile.public_key.clone(), expected_profiles)
+                    .await
                 {
-                    notice.set(Some(Notice::Plain(message)));
+                    Ok(returned) => {
+                        if crate::contacts::submission_is_current(request, meeting_request())
+                            && let Some(generation) = returned.generation()
+                        {
+                            let mut offered_card = offered_card;
+                            offered_card.set(Some((generation, profile)));
+                        }
+                        if crate::contacts::submission_is_current(request, meeting_request())
+                            && meeting_epoch() == captured_epoch
+                        {
+                            let mut meeting_phase = meeting_phase;
+                            meeting_phase.set(returned);
+                        }
+                    }
+                    Err(message)
+                        if crate::contacts::submission_is_current(request, meeting_request()) =>
+                    {
+                        notice.set(Some(Notice::Plain(message)));
+                    }
+                    Err(_) => {}
                 }
-                Err(_) => {}
-            }
-            if crate::contacts::submission_is_current(request, meeting_request()) {
-                pending_submission.set(None);
-            }
+                if crate::contacts::submission_is_current(request, meeting_request()) {
+                    pending_submission.set(None);
+                }
+            });
         });
-    });
     // The user's own labels, and the running app's. Kernel state, like
     // everything else here — and written back only by a save, so the strip
     // never shows a label the kernel has not been told about.
