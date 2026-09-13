@@ -573,11 +573,13 @@ pub(crate) struct BackupStatus {
     pub(crate) synced: bool,
 }
 
+/// A party asserted in a signed introduction: the public key and its
+/// claims. Meeting no longer uses this — it shares the exact current
+/// `SelfProfile`, not a constructed party.
 #[derive(Clone, PartialEq)]
 pub(crate) struct Party {
     pub(crate) public_key: Vec<u8>,
     pub(crate) claims: Vec<(String, String)>,
-    pub(crate) expected_profiles: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -930,7 +932,6 @@ pub(crate) async fn contacts_signed_preview(bytes: &[u8]) -> Result<SignedReview
                 .map(|party| Party {
                     public_key: party.public_key,
                     claims: party.claims,
-                    expected_profiles: Vec::new(),
                 })
                 .collect(),
         })
@@ -1025,31 +1026,26 @@ pub(crate) async fn backup_sync_unlock(passphrase: String) -> Result<(), String>
         .map_err(message)
 }
 pub(crate) async fn meeting_offer(
-    card: Party,
+    expected_root: Vec<u8>,
     expected_profiles: Vec<Vec<u8>>,
 ) -> Result<MeetingPhase, String> {
-    api::meeting::offer(card.public_key, expected_profiles)
+    api::meeting::offer(expected_root, expected_profiles)
         .await
         .map_err(message)
         .map(meeting_phase)
 }
 pub(crate) async fn meeting_join(
     fragment: String,
-    card: Party,
+    expected_root: Vec<u8>,
     expected_profiles: Vec<Vec<u8>>,
 ) -> Result<MeetingPhase, String> {
-    api::meeting::join(fragment, card.public_key, expected_profiles)
+    api::meeting::join(fragment, expected_root, expected_profiles)
         .await
         .map_err(message)
         .map(meeting_phase)
 }
-pub(crate) async fn meeting_confirm(
-    generation: u32,
-    keep: Vec<(String, String)>,
-) -> Result<(), String> {
-    api::meeting::confirm(generation, keep)
-        .await
-        .map_err(message)
+pub(crate) async fn meeting_confirm(generation: u32) -> Result<(), String> {
+    api::meeting::confirm(generation).await.map_err(message)
 }
 pub(crate) async fn meeting_cancel(generation: u32) -> Result<(), String> {
     api::meeting::cancel(generation).await.map_err(message)

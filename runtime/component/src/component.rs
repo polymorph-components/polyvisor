@@ -1103,20 +1103,21 @@ fn meeting_status(
     }
 }
 
+fn expected_root(bytes: Vec<u8>) -> Result<[u8; 32], Error> {
+    bytes.try_into().map_err(|_| Error {
+        code: ErrorCode::Refused,
+        message: "the expected root must be 32 bytes".into(),
+    })
+}
+
 impl guest::meeting::Guest for Component {
     async fn offer(
         expected_root: Vec<u8>,
         expected_profiles: Vec<Vec<u8>>,
     ) -> Result<polyvisor::internal::types::MeetingStatus, Error> {
-        let card = polyvisor_kernel::Party {
-            public_key: expected_root.try_into().map_err(|_| Error {
-                code: ErrorCode::Refused,
-                message: "the expected root must be 32 bytes".into(),
-            })?,
-            observations: Vec::new(),
-        };
+        let expected_root = self::expected_root(expected_root)?;
         kernel()?
-            .meeting_offer(card, expected_profiles)
+            .meeting_offer(expected_root, expected_profiles)
             .await
             .map(meeting_status)
             .map_err(map_error)
@@ -1126,22 +1127,16 @@ impl guest::meeting::Guest for Component {
         expected_root: Vec<u8>,
         expected_profiles: Vec<Vec<u8>>,
     ) -> Result<polyvisor::internal::types::MeetingStatus, Error> {
-        let card = polyvisor_kernel::Party {
-            public_key: expected_root.try_into().map_err(|_| Error {
-                code: ErrorCode::Refused,
-                message: "the expected root must be 32 bytes".into(),
-            })?,
-            observations: Vec::new(),
-        };
+        let expected_root = self::expected_root(expected_root)?;
         kernel()?
-            .meeting_join(fragment, card, expected_profiles)
+            .meeting_join(fragment, expected_root, expected_profiles)
             .await
             .map(meeting_status)
             .map_err(map_error)
     }
-    async fn confirm(generation: u32, keep: Vec<(String, String)>) -> Result<(), Error> {
+    async fn confirm(generation: u32) -> Result<(), Error> {
         kernel()?
-            .meeting_confirm(generation, keep)
+            .meeting_confirm(generation)
             .await
             .map_err(map_error)
     }
