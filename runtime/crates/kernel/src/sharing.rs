@@ -296,7 +296,7 @@ impl Kernel {
             })
             .await
             .map_err(engine_failed)?;
-        self.checkpoint_durable().await?;
+        self.persist_engine_durable().await?;
         self.push_event(Event::SharingChanged);
         Ok(())
     }
@@ -310,7 +310,7 @@ impl Kernel {
             })
             .await
             .map_err(engine_failed)?;
-        self.checkpoint_durable().await?;
+        self.persist_engine_durable().await?;
         self.push_event(Event::SharingChanged);
         Ok(())
     }
@@ -333,7 +333,7 @@ impl Kernel {
             .map_err(engine_failed)?
             .is_some()
         {
-            self.checkpoint_durable().await?;
+            self.persist_engine_durable().await?;
             drop(write);
             return self.sharing_retry(prompt).await;
         }
@@ -465,7 +465,7 @@ impl Kernel {
             })
             .await
             .map_err(engine_failed)?;
-        self.checkpoint_durable().await?;
+        self.persist_engine_durable().await?;
         self.push_event(Event::SharingChanged);
         drop(write);
         if !deliverable {
@@ -541,7 +541,7 @@ impl Kernel {
                         })
                         .await
                         .map_err(engine_failed)?;
-                    self.checkpoint_durable().await?;
+                    self.persist_engine_durable().await?;
                 }
                 Err(error) => {
                     self.record_delivery_failure(id, &error.message).await?;
@@ -571,7 +571,7 @@ impl Kernel {
         // envelope to be durable before every send. This is intentionally
         // unconditional: a previous checkpoint may have reported failure
         // while leaving the outgoing row live in the in-memory document.
-        self.checkpoint_durable().await?;
+        self.persist_engine_durable().await?;
         let endpoint = self.endpoint.borrow().clone();
         let endpoint = match endpoint {
             Some(endpoint) => endpoint,
@@ -640,7 +640,7 @@ impl Kernel {
             })
             .await
             .map_err(engine_failed)?;
-        self.checkpoint_durable().await?;
+        self.persist_engine_durable().await?;
         self.push_event(Event::SharingChanged);
         if delivered {
             Ok(())
@@ -663,7 +663,7 @@ impl Kernel {
             })
             .await
             .map_err(engine_failed)?;
-        self.checkpoint_durable().await?;
+        self.persist_engine_durable().await?;
         self.push_event(Event::SharingChanged);
         Ok(())
     }
@@ -749,7 +749,7 @@ impl Kernel {
             })
             .await
             .map_err(engine_failed)?;
-        self.checkpoint_durable().await?;
+        self.persist_engine_durable().await?;
         self.push_event(Event::SharingChanged);
         let weak = self.me.borrow().clone();
         let sender = body.sender_device;
@@ -886,7 +886,7 @@ impl Kernel {
             })
             .await
             .map_err(engine_failed)?;
-        self.checkpoint_durable().await?;
+        self.persist_engine_durable().await?;
         self.push_event(Event::SharingChanged);
         Ok(())
     }

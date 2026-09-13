@@ -1619,11 +1619,60 @@ async function waitForMarkdownValue(
 }
 
 async function waitForMarkdownSaved(page: Page): Promise<void> {
-  // `Saved` is also the idle label before an edit reaches the publisher.
+  // `Saved locally` is also the idle label before an edit reaches the publisher.
   // Let the input event cross the frame boundary before accepting it.
   await page.waitForTimeout(250);
-  await markdownFrame(page).getByRole("status").getByText("Saved", { exact: true })
+  await markdownFrame(page).getByRole("status").getByText("Saved locally", { exact: true })
     .waitFor({ timeout: 30_000 });
+}
+
+async function measureMarkdownBurst(page: Page, text: string): Promise<{ typingMs: number; drainMs: number }> {
+  const source = markdownFrame(page).getByRole("textbox", { name: "Markdown source" });
+  const status = markdownFrame(page).getByRole("status");
+  await source.click();
+  await source.evaluate((element) => {
+    const textarea = element as HTMLTextAreaElement;
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+  });
+  let sawSaving = false;
+  const watch = (async () => {
+    while (!sawSaving) {
+      sawSaving = (await status.textContent())?.trim() === "Saving locally…";
+      if (!sawSaving) await page.waitForTimeout(5);
+    }
+  })();
+  const started = performance.now();
+  // Native key/input events make each character an Automerge edit; fill()
+  // would turn this into one synthetic input event and hide queue behavior.
+  await source.type(text, { delay: 2 });
+  const typed = performance.now();
+  await Promise.race([watch, page.waitForTimeout(30_000)]);
+  check(sawSaving, "the Markdown burst never reported Saving locally…");
+  await status.getByText("Saved locally", { exact: true }).waitFor({ timeout: 30_000 });
+  return { typingMs: typed - started, drainMs: performance.now() - typed };
+}
+
+async function deviceOpfsFiles(page: Page): Promise<Array<{ path: string; size: number; digest: string }>> {
+  const id = await page.evaluate((key) => sessionStorage.getItem(key), ANCHOR);
+  check(id !== null, "the Markdown persistence probe had no device anchor");
+  return await page.evaluate(async (device) => {
+    const root = await navigator.storage.getDirectory();
+    const deviceDir = await root.getDirectoryHandle(device);
+    const files: Array<{ path: string; size: number; digest: string }> = [];
+    async function walk(dir: FileSystemDirectoryHandle, prefix: string) {
+      for await (const [name, handle] of dir.entries()) {
+        const path = prefix === "" ? name : `${prefix}/${name}`;
+        if (handle.kind === "directory") await walk(handle as FileSystemDirectoryHandle, path);
+        else {
+          const file = await (handle as FileSystemFileHandle).getFile();
+          const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", await file.arrayBuffer()));
+          files.push({ path, size: file.size, digest: [...hash].map((b) => b.toString(16).padStart(2, "0")).join("") });
+        }
+      }
+    }
+    await walk(deviceDir, "");
+    return files.sort((a, b) => a.path.localeCompare(b.path));
+  }, id);
 }
 
 async function blurMarkdown(page: Page): Promise<void> {
@@ -2114,6 +2163,42 @@ const scenarios: Scenario[] = [
       );
       await appB.getByRole("region", { name: "Markdown preview" })
         .getByText("local 🌿", { exact: false }).waitFor({ timeout: 15_000 });
+    },
+  },
+
+  {
+    // Full browser path for docs/design.md "Devices": native edits append
+    // sealed engine records without replacing the device metadata generation.
+    // Byte-growth bounds belong in native Files tests; this checks real OPFS.
+    name: "markdown-incremental-local-persistence",
+    async run(ctx, origin) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+      await launchMarkdown(page);
+      await waitForMarkdownSaved(page);
+      const fixture = `# Incremental persistence fixture\n\n${"0123456789abcdef".repeat(1024)}`;
+      check(fixture.length >= 10_000 && fixture.length <= 50_000, `Markdown fixture was ${fixture.length} characters`);
+      await setMarkdown(page, fixture);
+      const before = await deviceOpfsFiles(page);
+      const generations = (files: Awaited<ReturnType<typeof deviceOpfsFiles>>) => files.filter((file) => /^gen-\d+\/(state|MANIFEST)$/.test(file.path));
+      const journal = (files: Awaited<ReturnType<typeof deviceOpfsFiles>>) => files.filter((file) => /^engine\/\d+$/.test(file.path));
+      const beforeGenerations = generations(before);
+      const beforeJournal = journal(before);
+      check(beforeGenerations.length > 0, "OPFS held no device metadata generation");
+      check(beforeJournal.length > 0, "OPFS held no sealed engine journal records");
+
+      const burstA = "a".repeat(200), first = await measureMarkdownBurst(page, burstA);
+      const burstB = "b".repeat(200), second = await measureMarkdownBurst(page, burstB);
+      console.log(`  markdown persistence: fixture=${fixture.length} chars; burst1 type=${first.typingMs.toFixed(0)}ms drain=${first.drainMs.toFixed(0)}ms; burst2 type=${second.typingMs.toFixed(0)}ms drain=${second.drainMs.toFixed(0)}ms`);
+
+      const after = await deviceOpfsFiles(page);
+      check(JSON.stringify(generations(after)) === JSON.stringify(beforeGenerations), "ordinary Markdown edits rewrote the device metadata checkpoint");
+      check(journal(after).length > beforeJournal.length, "ordinary Markdown edits did not append a sealed engine journal record");
+      await page.reload();
+      await visorReady(page);
+      const source = markdownFrame(page).getByRole("textbox", { name: "Markdown source" });
+      await source.waitFor({ timeout: 30_000 });
+      eq(await source.inputValue(), fixture + burstA + burstB, "reload lost the large fixture or either native typing burst");
     },
   },
 

@@ -29,7 +29,9 @@ pub use clock::EngineClock;
 pub use ed25519_dalek::VerifyingKey;
 pub use opaque::{OpaqueItem, OpaqueMode, is_opaque_tree};
 pub use polyvisor_document_history::Document;
-pub use storage::{AppState, Item, ItemKind, OpaqueState, Snapshot, StoreItem, TreeState};
+pub use storage::{
+    AppState, Item, ItemKind, OpaqueState, Snapshot, StoreItem, TreeState, UnboundState,
+};
 pub use subduction_protocol::peer_id::PeerId;
 pub use transport::{DynTransport, EngineTransport};
 pub use us::{Member, us_tree};
@@ -274,10 +276,188 @@ pub struct Engine<T: Transport<Local> + 'static> {
     >,
     catalog_sent: RefCell<BTreeSet<subduction_protocol::id::ConnId>>,
     control_write: futures::lock::Mutex<()>,
+    persistence_boundary: futures::lock::Mutex<()>,
+    persistence_revision: Cell<u64>,
+    persisted_revision: Cell<u64>,
     control_revision: Cell<u64>,
     pending_opaque_retire: RefCell<BTreeSet<[u8; 32]>>,
     pending_opaque_subscribe: RefCell<BTreeSet<[u8; 12]>>,
     group_generation: Cell<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineControl {
+    pub partitions: Vec<String>,
+    pub vault: Option<VaultState>,
+    pub name_key: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StorageMutation {
+    Put(StoreItem),
+    Remove {
+        tree: [u8; 32],
+        commit: [u8; 32],
+        kind: ItemKind,
+    },
+    ForgetTree([u8; 32]),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineDelta {
+    pub control: EngineControl,
+    pub mutations: Vec<StorageMutation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedDelta {
+    pub delta: EngineDelta,
+    pending: usize,
+    revision: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct JournalState {
+    control: Option<EngineControl>,
+    items: BTreeMap<([u8; 32], [u8; 32], ItemKind), StoreItem>,
+}
+
+impl JournalState {
+    pub fn apply(&mut self, delta: EngineDelta) {
+        for mutation in delta.mutations {
+            match mutation {
+                StorageMutation::Put(item) => {
+                    self.items.insert(item.key(), item);
+                }
+                StorageMutation::Remove { tree, commit, kind } => {
+                    self.items.remove(&(tree, commit, kind));
+                }
+                StorageMutation::ForgetTree(tree) => {
+                    self.items.retain(|(item_tree, _, _), _| *item_tree != tree)
+                }
+            }
+        }
+        self.control = Some(delta.control);
+    }
+
+    pub fn snapshot(self) -> Option<Snapshot> {
+        let control = self.control?;
+        let mut by_tree: BTreeMap<[u8; 32], Vec<StoreItem>> = BTreeMap::new();
+        for item in self.items.into_values() {
+            by_tree.entry(item.tree).or_default().push(item);
+        }
+        let tree_state = |tree: [u8; 32], by_tree: &BTreeMap<[u8; 32], Vec<StoreItem>>| {
+            let mut state = TreeState::default();
+            for item in by_tree.get(&tree).into_iter().flatten() {
+                let stored = Item {
+                    signed: item.signed.clone(),
+                    blob: item.blob.clone(),
+                };
+                match item.kind {
+                    ItemKind::Commit => state.commits.push(stored),
+                    ItemKind::Fragment => state.fragments.push(stored),
+                }
+            }
+            state
+        };
+        let apps: Vec<AppState> = control
+            .partitions
+            .into_iter()
+            .map(|app| {
+                let tree = document_tree(&app);
+                let mut state = tree_state(*tree.as_bytes(), &by_tree);
+                state.doc.clear();
+                let authority = shared_document(&app)
+                    .ok()
+                    .flatten()
+                    .map(|_| tree_state(*shared_authority_tree(&app).as_bytes(), &by_tree).commits)
+                    .unwrap_or_default();
+                AppState {
+                    app,
+                    state,
+                    authority,
+                }
+            })
+            .collect();
+        let us_state = tree_state(*us_tree().as_bytes(), &by_tree);
+        let keyhive_state = tree_state(*keyhive_tree().as_bytes(), &by_tree);
+        let known: BTreeSet<[u8; 32]> = apps_trees(&apps)
+            .chain([*us_tree().as_bytes(), *keyhive_tree().as_bytes()])
+            .collect();
+        let opaque = by_tree
+            .iter()
+            .filter(|(tree, _)| is_opaque_tree(tree) && !known.contains(*tree))
+            .map(|(tree, _)| OpaqueState {
+                tree: *tree,
+                commits: tree_state(*tree, &by_tree).commits,
+            })
+            .collect();
+        let unbound = by_tree
+            .iter()
+            .filter(|(tree, _)| !is_opaque_tree(tree) && !known.contains(*tree))
+            .map(|(tree, _)| UnboundState {
+                tree: *tree,
+                commits: tree_state(*tree, &by_tree).commits,
+                fragments: tree_state(*tree, &by_tree).fragments,
+            })
+            .collect();
+        Some(Snapshot {
+            apps,
+            us: (!us_state.commits.is_empty() || !us_state.fragments.is_empty())
+                .then_some(us_state),
+            keyhive: (!keyhive_state.commits.is_empty() || !keyhive_state.fragments.is_empty())
+                .then_some(keyhive_state),
+            vault: control.vault,
+            name_key: control.name_key,
+            opaque,
+            unbound,
+        })
+    }
+}
+
+fn apps_trees(apps: &[AppState]) -> impl Iterator<Item = [u8; 32]> + '_ {
+    apps.iter().flat_map(|app| {
+        let mut trees = vec![*document_tree(&app.app).as_bytes()];
+        if shared_document(&app.app).ok().flatten().is_some() {
+            trees.push(*shared_authority_tree(&app.app).as_bytes());
+        }
+        trees
+    })
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    #[test]
+    fn unopened_tree_keeps_fragments_for_later_hydration() {
+        let tree = [42; 32];
+        let fragment = StoreItem {
+            tree,
+            commit: [7; 32],
+            signed: vec![1],
+            blob: vec![2],
+            kind: ItemKind::Fragment,
+        };
+        let mut journal = JournalState::default();
+        journal.apply(EngineDelta {
+            control: EngineControl {
+                partitions: Vec::new(),
+                vault: None,
+                name_key: None,
+            },
+            mutations: vec![StorageMutation::Put(fragment.clone())],
+        });
+        let snapshot = journal.snapshot().unwrap();
+        assert_eq!(snapshot.unbound.len(), 1);
+        assert_eq!(
+            snapshot.unbound[0].fragments,
+            vec![Item {
+                signed: fragment.signed,
+                blob: fragment.blob
+            }]
+        );
+    }
 }
 
 impl<T: Transport<Local> + 'static> Engine<T> {
@@ -422,6 +602,11 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                     hydrate.push(tree);
                 }
             }
+            for state in state.unbound {
+                let tree = SedimentreeId::new(state.tree);
+                storage.restore(tree, state.commits, state.fragments);
+                hydrate.push(tree);
+            }
             if let Some(state) = state.keyhive {
                 let tree = keyhive_tree();
                 storage.restore(tree, state.commits, state.fragments);
@@ -486,11 +671,15 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             foreign_sync: RefCell::new(BTreeMap::new()),
             catalog_sent: RefCell::new(BTreeSet::new()),
             control_write: futures::lock::Mutex::new(()),
+            persistence_boundary: futures::lock::Mutex::new(()),
+            persistence_revision: Cell::new(0),
+            persisted_revision: Cell::new(0),
             control_revision: Cell::new(0),
             pending_opaque_retire: RefCell::new(BTreeSet::new()),
             pending_opaque_subscribe: RefCell::new(BTreeSet::new()),
             group_generation: Cell::new(0),
         };
+        engine.storage.mark_restored();
         (engine, driver.run())
     }
 
@@ -559,13 +748,15 @@ impl<T: Transport<Local> + 'static> Engine<T> {
 
     pub async fn create_shared_document(&self) -> Result<SharedDocument, String> {
         self.open_us().await?;
+        let _boundary = self.persistence_boundary.lock().await;
         let vault = self.require_vault()?;
         let document = vault.create_document().await?;
         let partition = shared_partition(document);
-        self.open_document(&partition).await?;
+        self.open_document_inner(&partition).await?;
         self.refresh_shared_authority(&partition).await?;
         self.publish_shared_authority(&partition).await?;
         self.sync_shared_partition(&partition).await?;
+        self.settle_persistence();
         Ok(SharedDocument {
             partition,
             document,
@@ -581,6 +772,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         access: DocumentAccess,
     ) -> Result<DocumentGrant, String> {
         self.open_document(partition).await?;
+        let _boundary = self.persistence_boundary.lock().await;
         let document = shared_document(partition)?
             .ok_or_else(|| "private partitions cannot be granted".to_string())?;
         let vault = self.require_vault()?;
@@ -600,6 +792,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         self.refresh_shared_authority(partition).await?;
         self.publish_shared_authority(partition).await?;
         self.sync_shared_partition(partition).await?;
+        self.settle_persistence();
         Ok(DocumentGrant {
             document: SharedDocument {
                 partition: partition.to_string(),
@@ -626,15 +819,19 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             return Err("document grant partition does not match its keyhive document".into());
         }
         self.open_us().await?;
+        let _boundary = self.persistence_boundary.lock().await;
         let vault = self.require_vault()?;
         vault
             .adopt_document_authority(&grant.authority, document)
             .await?;
         vault.import_shared_frontier(document, &grant.frontier)?;
-        self.open_document(&grant.document.partition).await?;
+        self.open_document_inner(&grant.document.partition).await?;
         self.refresh_shared_authority(&grant.document.partition)
             .await?;
-        self.sync_shared_partition(&grant.document.partition).await
+        self.sync_shared_partition(&grant.document.partition)
+            .await?;
+        self.settle_persistence();
+        Ok(())
     }
 
     /// Validate an invitation in isolated Keyhive state. This has no effect on
@@ -674,6 +871,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     pub async fn adopt_shared_documents(&self, grants: &[DocumentGrant]) -> Result<(), String> {
         self.open_us().await?;
         let local_group = self.authority_group().await?;
+        let _boundary = self.persistence_boundary.lock().await;
         let vault = self.require_vault()?;
         for grant in grants {
             let document = shared_document(&grant.document.partition)?
@@ -690,11 +888,15 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 .flatten()
                 .is_some()
             {
-                self.open_document(&grant.document.partition).await?;
+                // The persistence boundary is already held for the whole
+                // descriptor/frontier adoption. Calling `open_document`
+                // would recursively acquire it through `absorb`.
+                self.open_document_inner(&grant.document.partition).await?;
                 self.sync_shared_partition(&grant.document.partition)
                     .await?;
             }
         }
+        self.settle_persistence();
         Ok(())
     }
 
@@ -921,6 +1123,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         bytes: Vec<u8>,
     ) -> Result<[u8; 32], String> {
         self.open_us().await?;
+        let _boundary = self.persistence_boundary.lock().await;
         let mode = self.require_current_opaque(&tree)?;
         let mut parents = parents;
         parents.sort_unstable();
@@ -1006,11 +1209,15 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 let _retired = self.retire_tree(tree).await;
             }
         }
+        if result.is_ok() {
+            self.settle_persistence();
+        }
         result
     }
 
     pub async fn opaque_read(&self, tree: [u8; 32]) -> Result<Vec<OpaqueItem>, String> {
         self.open_us().await?;
+        let _boundary = self.persistence_boundary.lock().await;
         let mode = self.require_current_opaque(&tree)?;
         let sedimentree = SedimentreeId::new(tree);
         let metadata: BTreeMap<_, _> = self
@@ -1091,6 +1298,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             })
             .collect();
         answer.sort_by_key(|item| item.id);
+        self.settle_persistence();
         Ok(answer)
     }
 
@@ -1258,6 +1466,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         // Also onto the wire: a third device that pairs later learns of the
         // second one from the tree, not from a frame it never saw.
         self.publish_keyhive().await?;
+        self.settle_persistence();
         Ok((events, keys))
     }
 
@@ -1294,6 +1503,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 let _landed = self.absorb_app(&app).await;
             }
         }
+        self.settle_persistence();
         Ok(())
     }
 
@@ -1646,16 +1856,23 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 // (subduction_protocol/src/effect.rs:93).
                 AppEvent::TreeUpdated { tree, .. } => {
                     let changed = if is_opaque_tree(tree.as_bytes()) {
-                        self.opaque_status(tree.as_bytes()) == Some(true)
+                        let _boundary = self.persistence_boundary.lock().await;
+                        let accepted = self.opaque_status(tree.as_bytes()) == Some(true);
+                        if accepted {
+                            self.settle_persistence();
+                        }
+                        accepted
                     } else {
                         self.absorb(tree).await
                     };
                     if tree == us_tree() {
                         let _reconciled = self.reconcile_opaque().await;
                     }
-                    if changed {
-                        notify(EngineEvent::Changed).await;
-                    }
+                    // Persist storage even when the tree is unopened or its
+                    // envelope cannot be decrypted yet. Consumers compare
+                    // revisions, so the broader notification is harmless.
+                    let _materialized = changed;
+                    notify(EngineEvent::Changed).await;
                 }
                 AppEvent::SyncFinished { conn, tree, status }
                     if tree.as_bytes()[0] == SHARED_AUTHORITY_TREE_TAG
@@ -2014,6 +2231,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 self.retire_tree(*tree.as_bytes()).await?;
             }
         }
+        self.settle_persistence();
         Ok(fresh)
     }
 
@@ -2119,6 +2337,63 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             vault,
             name_key,
         ))
+    }
+
+    /// Prepare the semantic storage changes not covered by the last
+    /// acknowledged local journal record. The complete vault rides each
+    /// record: Keyhive exposes no supported archive delta, and its private
+    /// state must not be reconstructed from public operations.
+    ///
+    pub async fn prepare_persistence(&self) -> Result<Option<PreparedDelta>, String> {
+        self.control_barrier().await?;
+        let _boundary = self.persistence_boundary.lock().await;
+        let pending = self.storage.settled_len();
+        let revision = self.persistence_revision.get();
+        if pending == 0 && revision == self.persisted_revision.get() {
+            return Ok(None);
+        }
+        let mut vault = match self.vault() {
+            Some(vault) => Some(vault.state().await?),
+            None => self.pending_vault.borrow().clone(),
+        };
+        if let Some(vault) = &mut vault {
+            vault.heads.sort_unstable_by_key(|(cref, _)| *cref);
+            for (_, heads) in &mut vault.shared_heads {
+                heads.sort_unstable_by_key(|(cref, _)| *cref);
+            }
+            vault
+                .shared_heads
+                .sort_unstable_by_key(|(document, _)| *document);
+        }
+        let control = EngineControl {
+            partitions: self.documents.borrow().keys().cloned().collect(),
+            vault,
+            name_key: *self.name_key.borrow(),
+        };
+        Ok(Some(PreparedDelta {
+            delta: EngineDelta {
+                control,
+                mutations: self.storage.pending_prefix(pending),
+            },
+            pending,
+            revision,
+        }))
+    }
+
+    /// Mark exactly the prepared cut durable. Work that completed after the
+    /// cut remains visible when the next view is diffed against this one.
+    pub fn acknowledge_persistence(&self, prepared: PreparedDelta) {
+        self.storage.acknowledge(prepared.pending);
+        self.persisted_revision.set(prepared.revision);
+    }
+
+    fn settle_persistence(&self) {
+        let control_only = !self.storage.has_unsettled();
+        self.storage.settle();
+        if control_only {
+            self.persistence_revision
+                .set(self.persistence_revision.get().wrapping_add(1));
+        }
     }
 
     // -- internals -----------------------------------------------------------
@@ -2395,6 +2670,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     ) -> Result<R, String> {
         self.open_us().await?;
         let _serial = self.control_write.lock().await;
+        let _boundary = self.persistence_boundary.lock().await;
         let (answer, commits) = {
             let mut cell = self.us.borrow_mut();
             let doc = cell
@@ -2418,6 +2694,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         // is not a case anyone expects, and the cost of saying so is one
         // walk of a very short change graph.
         let _compacted = self.compact(us_tree()).await;
+        self.settle_persistence();
         answer
     }
 
@@ -2657,6 +2934,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         {
             return Err("this device has read-only access to the shared document".into());
         }
+        let _boundary = self.persistence_boundary.lock().await;
         let (answer, tree, commits) = self.with_document(app, |doc| {
             let answer = change(doc);
             Ok((answer, doc.tree(), doc.drain_local_commits()))
@@ -2701,6 +2979,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             // saw to that — so a compaction that failed must not report the
             // user's write as failed. The roll-up waits for the next one.
             let _compacted = self.compact(tree).await;
+            self.settle_persistence();
         }
         answer
     }
@@ -2951,6 +3230,11 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         // sealed to, so it is opened first even for a device whose caller only
         // ever asked about tasks.
         self.open_us().await?;
+        let _boundary = self.persistence_boundary.lock().await;
+        self.open_document_inner(app).await
+    }
+
+    async fn open_document_inner(&self, app: &str) -> Result<(), String> {
         if let Some(document) = shared_document(app)? {
             if shared_partition(document) != app {
                 return Err("shared document partition is not canonical".into());
@@ -2978,7 +3262,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         // The tree may already hold envelopes: a peer pushed them before this
         // device ever opened the app, and the event pump had no document to
         // put them in.
-        let _absorbed = self.absorb(tree).await;
+        let _absorbed = self.absorb_inner(tree).await;
         // Cloned out of the cell first: `sync_tree` awaits into the driver,
         // and a borrow held across that await would collide with anything the
         // driver's own progress lets run.
@@ -3009,6 +3293,11 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     /// is an async call into the vault. The `RefCell` borrows are taken and
     /// dropped around each await rather than across one.
     async fn absorb(&self, tree: SedimentreeId) -> bool {
+        let _boundary = self.persistence_boundary.lock().await;
+        self.absorb_inner(tree).await
+    }
+
+    async fn absorb_inner(&self, tree: SedimentreeId) -> bool {
         let landed = self.absorb_items(tree).await;
         if landed {
             // The second compaction trigger. Absorbing is how a device that
@@ -3018,6 +3307,9 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             // forever. Failure is not the caller's business — nothing here
             // is lost if the roll-up waits for the next batch.
             let _compacted = self.compact(tree).await;
+        }
+        if landed || self.storage.has_unsettled() {
+            self.settle_persistence();
         }
         landed
     }

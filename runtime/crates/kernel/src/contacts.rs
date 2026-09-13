@@ -623,7 +623,7 @@ impl Kernel {
     }
 
     async fn contacts_changed(&self) -> Result<(), Error> {
-        self.checkpoint_durable().await?;
+        self.persist_engine_durable().await?;
         self.push_event(Event::ContactsChanged);
         Ok(())
     }
