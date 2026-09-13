@@ -3688,6 +3688,11 @@ const scenarios: Scenario[] = [
           exact: true,
         }).click();
         await waitForRootCustody(b, true);
+        // Custody can be visible while its checkpoint is still in flight.
+        // The sender finishes only after the recipient's durable receipt.
+        await confirm.waitFor({ state: "detached", timeout: 60_000 });
+        eq(await devicesSheet(a).locator(".sheet-error").count(), 0,
+          "root transfer reported an error before reload");
         await shot(b, "identity-after-root-transfer");
 
         await b.reload();

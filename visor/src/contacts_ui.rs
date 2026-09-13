@@ -13,6 +13,7 @@ use crate::kernel::{
     self, Contact, ImportReview, Introduction, MeetingPhase, MeetingRecord, Party, Provenance,
     Selection, SelfProfile,
 };
+use crate::state::Gate;
 use crate::ui::LabelControl;
 use crate::voice::{AppText, AppVoice, Voice};
 
@@ -630,13 +631,23 @@ fn ProfileView(
     let mut identity = use_signal(|| None::<kernel::IdentityStatus>);
     let mut backup = use_signal(|| None::<kernel::BackupStatus>);
     let mut passphrase = use_signal(String::new);
+    let mut status_gate = use_hook(|| CopyValue::new(Gate::default()));
     use_effect(move || {
         // ContactsChanged also announces custody and backup changes. Subscribe
         // to the refreshed profile even when its signed claims are unchanged.
         let _ = profile();
+        status_gate.write().bump();
+        let token = status_gate.peek().begin();
         spawn(async move {
-            identity.set(kernel::identity_status().await.ok());
-            backup.set(kernel::backup_status().await.ok());
+            let next_identity = kernel::identity_status().await.ok();
+            if !status_gate.peek().apply(token) {
+                return;
+            }
+            identity.set(next_identity);
+            let next_backup = kernel::backup_status().await.ok();
+            if status_gate.peek().apply(token) {
+                backup.set(next_backup);
+            }
         });
     });
     use_effect(move || {
@@ -754,19 +765,23 @@ fn ProfileView(
                 }
                 label { span { "Backup passphrase" } input { r#type: "password", value: "{passphrase}", oninput: move |event| passphrase.set(event.value()) } }
                 button { disabled: !has_root || passphrase().is_empty(), onclick: move |_| async move {
-                    match kernel::backup_sync_replace(passphrase()).await { Ok(()) => backup.set(kernel::backup_status().await.ok()), Err(message) => error.set(Some(message)) }
+                    status_gate.write().bump();
+                    match kernel::backup_sync_replace(passphrase()).await { Ok(()) => { backup.set(kernel::backup_status().await.ok()); error.set(None); }, Err(message) => error.set(Some(message)) }
                 }, "Create or replace synced backup" }
                 button { onclick: move |_| async move {
-                    match kernel::backup_sync_disable().await { Ok(()) => backup.set(kernel::backup_status().await.ok()), Err(message) => error.set(Some(message)) }
+                    status_gate.write().bump();
+                    match kernel::backup_sync_disable().await { Ok(()) => { backup.set(kernel::backup_status().await.ok()); error.set(None); }, Err(message) => error.set(Some(message)) }
                 }, "Disable synced backup" }
                 button { disabled: passphrase().is_empty(), onclick: move |_| async move {
-                    match kernel::backup_sync_unlock(passphrase()).await { Ok(()) => { identity.set(kernel::identity_status().await.ok()); }, Err(message) => error.set(Some(message)) }
+                    status_gate.write().bump();
+                    match kernel::backup_sync_unlock(passphrase()).await { Ok(()) => { identity.set(kernel::identity_status().await.ok()); backup.set(kernel::backup_status().await.ok()); error.set(None); }, Err(message) => error.set(Some(message)) }
                 }, "Unlock synced backup" }
                 button { disabled: !has_root || passphrase().is_empty(), onclick: move |_| async move {
                     match kernel::backup_export(passphrase()).await { Ok(bytes) => if let Err(message) = kernel::save_contact_file("polyvisor-root-backup.pvbackup".into(), &bytes).await { error.set(Some(message)); }, Err(message) => error.set(Some(message)) }
                 }, "Export backup file" }
                 button { disabled: passphrase().is_empty(), onclick: move |_| async move {
-                    match kernel::read_contact_file().await { Ok(Some((_name, bytes))) => match kernel::backup_import(passphrase(), bytes).await { Ok(()) => identity.set(kernel::identity_status().await.ok()), Err(message) => error.set(Some(message)) }, Ok(None) => {}, Err(message) => error.set(Some(message)) }
+                    status_gate.write().bump();
+                    match kernel::read_contact_file().await { Ok(Some((_name, bytes))) => match kernel::backup_import(passphrase(), bytes).await { Ok(()) => { identity.set(kernel::identity_status().await.ok()); backup.set(kernel::backup_status().await.ok()); error.set(None); }, Err(message) => error.set(Some(message)) }, Ok(None) => {}, Err(message) => error.set(Some(message)) }
                 }, "Import backup file" }
             }
         }
