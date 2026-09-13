@@ -38,3 +38,4 @@ subduction_runtime.workspace = true
 futures = { workspace = true, features = ["executor"] }
 polyvisor-todo-model = { path = "../todo-model" }
 polyvisor-visor-model = { path = "../visor-model" }
+serde_json = "1"

@@ -103,6 +103,13 @@ mod service {
     pub async fn remove(id: String) -> Result<(), String> {
         tasks::remove(id).await
     }
+
+    /// Queue a trusted share prompt (`polyvisor:app/tasks.share`). The
+    /// visor owns recipient choice, consent, grant and delivery from here;
+    /// this call only returns once the prompt is durably queued.
+    pub async fn share() -> Result<(), String> {
+        tasks::share().await
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -154,6 +161,10 @@ mod service {
     pub async fn remove(_id: String) -> Result<(), String> {
         Ok(())
     }
+
+    pub async fn share() -> Result<(), String> {
+        Ok(())
+    }
 }
 
 async fn refresh(mut snapshot: Signal<(u64, Vec<TodoItem>)>) {
@@ -170,12 +181,39 @@ fn accepts_snapshot(current: u64, incoming: u64) -> bool {
 
 /// Run one mutation, then re-read the list. Every write path goes through
 /// here, which is what keeps "mutate then re-fetch" from being restated six
-/// times.
-fn mutate(snapshot: Signal<(u64, Vec<TodoItem>)>, work: impl Future<Output = ()> + 'static) {
+/// times. A failed mutation (including a read-only session's refusal) sets
+/// `error` to the kernel's own framework-voice message rather than being
+/// discarded; a later success clears it.
+fn mutate(
+    snapshot: Signal<(u64, Vec<TodoItem>)>,
+    mut error: Signal<Option<String>>,
+    work: impl Future<Output = Result<(), String>> + 'static,
+) {
     spawn(async move {
-        work.await;
+        match work.await {
+            Ok(()) => error.set(None),
+            Err(message) => error.set(Some(message)),
+        }
         refresh(snapshot).await;
     });
+}
+
+/// Run every mutation in `work`, keeping the first failure — used by the
+/// bulk actions (toggle all, clear completed), which are several calls the
+/// service has no batch form for.
+async fn first_error<I, F>(work: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = F>,
+    F: Future<Output = Result<(), String>>,
+{
+    let mut first = None;
+    for one in work {
+        let result = one.await;
+        if first.is_none() {
+            first = result.err();
+        }
+    }
+    first.map_or(Ok(()), Err)
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -189,12 +227,16 @@ enum FilterState {
 /// `handle` for `todomvc-app.css` — the spelling upstream's writer gives an
 /// asset-valued attribute (polymorph-stream-dom#19, `writer.rs` `asset_handle`). The
 /// `tests` module below asserts these stay in agreement.
-const STYLESHEET: &str = "asset:0f827d119b7bec30534b1767e8ab8ee0f2890c98f93baa1159dcf1a46f10bc17";
+const STYLESHEET: &str = "asset:3d2e4819b48027f57bed841b57d3e69d2f32722a50532b9915116b40ac1c8680";
 
 pub fn app() -> Element {
     // The snapshot. Owned by the `tasks` service; this is a cached view of it.
     let mut snapshot = use_signal(|| (0, Vec::<TodoItem>::new()));
     let items = use_memo(move || snapshot.read().1.clone());
+    // Any mutation's refusal, including a read-only session's (this
+    // instance was granted `Read`, not `Edit`) — shown rather than
+    // discarded, since a silently-ignored keystroke looks like a bug.
+    let mut error = use_signal(|| None::<String>);
     // The route is this app's own prior output, relayed back by the visor —
     // not user-typed input (`wit/app.wit` `route`: "a route this app is
     // handed is one it wrote itself on one of the user's own devices"). An
@@ -248,18 +290,21 @@ pub fn app() -> Element {
             .filter(|i| i.completed != completed)
             .map(|i| i.id.clone())
             .collect::<Vec<_>>();
-        mutate(snapshot, async move {
-            for id in ids {
-                let _ = service::set_completed(id, completed).await;
-            }
-        });
+        mutate(
+            snapshot,
+            error,
+            first_error(
+                ids.into_iter()
+                    .map(move |id| service::set_completed(id, completed)),
+            ),
+        );
     };
 
     rsx! {
         link { rel: "stylesheet", href: STYLESHEET }
 
         section { class: "todoapp",
-            TodoHeader { items: snapshot }
+            TodoHeader { items: snapshot, error }
             section { class: "main",
                 if !items.read().is_empty() {
                     input {
@@ -274,12 +319,33 @@ pub fn app() -> Element {
 
                 ul { class: "todo-list",
                     for item in filtered_todos() {
-                        TodoEntry { key: "{item.id}", item, items: snapshot }
+                        TodoEntry { key: "{item.id}", item, items: snapshot, error }
                     }
                 }
 
                 if !items.read().is_empty() {
-                    ListFooter { active_todo_count, items: snapshot, filter }
+                    ListFooter { active_todo_count, items: snapshot, filter, error }
+                }
+            }
+            // Below `.main`, not between the header and it: TodoMVC's own
+            // stylesheet positions `.toggle-all + label` at `top: -65px`
+            // relative to `.main` (a decorative chevron overlapping the
+            // header band), so anything placed in that band is covered and
+            // unclickable once the list is non-empty.
+            div { class: "sharing-controls",
+                button {
+                    r#type: "button",
+                    onclick: move |_| {
+                        spawn(async move {
+                            if let Err(message) = service::share().await {
+                                error.set(Some(message));
+                            }
+                        });
+                    },
+                    "Share this list"
+                }
+                if let Some(message) = error() {
+                    p { class: "error", role: "alert", "{message}" }
                 }
             }
         }
@@ -296,7 +362,7 @@ pub fn app() -> Element {
 }
 
 #[component]
-fn TodoHeader(items: Signal<(u64, Vec<TodoItem>)>) -> Element {
+fn TodoHeader(items: Signal<(u64, Vec<TodoItem>)>, error: Signal<Option<String>>) -> Element {
     let mut draft = use_signal(String::new);
 
     // A `<form onsubmit>` rather than the example's `onkeydown == Enter`:
@@ -309,8 +375,8 @@ fn TodoHeader(items: Signal<(u64, Vec<TodoItem>)>) -> Element {
             return;
         }
         draft.set(String::new());
-        mutate(items, async move {
-            let _ = service::add(title).await;
+        mutate(items, error, async move {
+            service::add(title).await.map(|_| ())
         });
     };
 
@@ -333,7 +399,11 @@ fn TodoHeader(items: Signal<(u64, Vec<TodoItem>)>) -> Element {
 /// A single todo entry. Takes the item by value: the snapshot is immutable
 /// here, so there is nothing to memoize a read out of.
 #[component]
-fn TodoEntry(item: TodoItem, items: Signal<(u64, Vec<TodoItem>)>) -> Element {
+fn TodoEntry(
+    item: TodoItem,
+    items: Signal<(u64, Vec<TodoItem>)>,
+    error: Signal<Option<String>>,
+) -> Element {
     let mut is_editing = use_signal(|| false);
     // The edit box is local until it is committed. The example wrote every
     // keystroke into the shared map; doing that here would be one
@@ -355,9 +425,11 @@ fn TodoEntry(item: TodoItem, items: Signal<(u64, Vec<TodoItem>)>) -> Element {
         is_editing.set(false);
         let title = draft();
         let id = commit_id.clone();
-        mutate(items, async move {
-            let _ = service::set_title(id, title).await;
-        });
+        mutate(
+            items,
+            error,
+            async move { service::set_title(id, title).await },
+        );
     });
 
     rsx! {
@@ -374,7 +446,7 @@ fn TodoEntry(item: TodoItem, items: Signal<(u64, Vec<TodoItem>)>) -> Element {
                     oninput: move |evt: FormEvent| {
                         let id = toggle_id.clone();
                         let completed = evt.checked();
-                        mutate(items, async move { let _ = service::set_completed(id, completed).await; });
+                        mutate(items, error, async move { service::set_completed(id, completed).await });
                     },
                 }
                 label {
@@ -391,7 +463,7 @@ fn TodoEntry(item: TodoItem, items: Signal<(u64, Vec<TodoItem>)>) -> Element {
                     onclick: move |evt: MouseEvent| {
                         evt.prevent_default();
                         let id = destroy_id.clone();
-                        mutate(items, async move { let _ = service::remove(id).await; });
+                        mutate(items, error, async move { service::remove(id).await });
                     },
                 }
             }
@@ -420,6 +492,7 @@ fn ListFooter(
     items: Signal<(u64, Vec<TodoItem>)>,
     active_todo_count: ReadSignal<usize>,
     mut filter: Signal<FilterState>,
+    error: Signal<Option<String>>,
 ) -> Element {
     let show_clear_completed = use_memo(move || items.read().1.iter().any(|i| i.completed));
 
@@ -432,11 +505,11 @@ fn ListFooter(
             .filter(|i| i.completed)
             .map(|i| i.id.clone())
             .collect::<Vec<_>>();
-        mutate(items, async move {
-            for id in ids {
-                let _ = service::remove(id).await;
-            }
-        });
+        mutate(
+            items,
+            error,
+            first_error(ids.into_iter().map(service::remove)),
+        );
     };
 
     rsx! {

@@ -33,6 +33,7 @@ pub enum Event {
     PersonalizationChanged,
     ContactsChanged,
     MeetingChanged(crate::meeting::Status),
+    SharingChanged,
 }
 
 #[derive(Default)]

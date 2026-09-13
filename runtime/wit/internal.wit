@@ -461,6 +461,8 @@ interface apps {
     record route-target {
         app: app-info,
         route: string,
+        /// Adopted document instance, or `none` for the personal instance.
+        instance: option<string>,
     }
 
     installed: async func() -> result<list<app-info>, error>;
@@ -491,6 +493,9 @@ interface apps {
     /// frame fetches `component`/`assets`/`asset` over that port, which
     /// the glue answers with the session already filled in.
     launch: async func(app: app-id) -> result<session-id, error>;
+    /// Start an installed app against one adopted document instance. The
+    /// instance remains distinct from that app's personal document.
+    launch-instance: async func(app: app-id, instance: string) -> result<session-id, error>;
     component: async func(session: session-id) -> result<component-artifacts, error>;
     assets: async func(session: session-id) -> result<list<asset-info>, error>;
     asset: async func(session: session-id, handle: list<u8>) -> result<list<u8>, error>;
@@ -544,6 +549,8 @@ interface events {
         /// The meeting ceremony moved (like `pairing-changed`): the kernel
         /// emits this on every transition, including ones the peer caused.
         meeting-changed(meeting-status),
+        /// A share prompt, delivery status, or received invitation changed.
+        sharing-changed,
     }
 
     /// Resolves with the next event; parks while there is none.
@@ -564,9 +571,66 @@ interface app-services {
     tasks-set-completed: async func(session: session-id, id: string, completed: bool) -> result<_, string>;
     tasks-set-title: async func(session: session-id, id: string, title: string) -> result<_, string>;
     tasks-remove: async func(session: session-id, id: string) -> result<_, string>;
+    tasks-share: async func(session: session-id) -> result<_, string>;
     history-read: async func(session: session-id) -> result<history-snapshot, string>;
     history-watch: async func(session: session-id, after: u64) -> result<history-snapshot, string>;
     history-publish: async func(session: session-id, changes: list<list<u8>>) -> result<_, string>;
+}
+
+/// Trusted document-sharing controls. Applications can only enqueue a share
+/// request through `tasks-share`; recipient choice, consent, adoption and
+/// opening remain trusted visor acts.
+interface sharing {
+    use types.{session-id, error};
+
+    enum access { read, edit }
+    enum delivery-state { queued, delivering, delivered, failed }
+
+    record prompt {
+        id: string,
+        label: string,
+        app: string,
+    }
+    record outgoing-item {
+        id: string,
+        label: string,
+        recipient: string,
+        access: access,
+        state: delivery-state,
+        detail: string,
+    }
+    record invitation {
+        id: string,
+        label: string,
+        sender: string,
+        app: string,
+        access: access,
+        /// Sharing includes the readable document history and permits the
+        /// recipient to reshare with no owner-only promise.
+        history-and-resharing: bool,
+        adopted-instance: option<string>,
+    }
+    record document-instance {
+        /// Kernel-minted opaque instance id. Empty identifies personal.
+        id: string,
+        label: string,
+        personal: bool,
+        access: access,
+    }
+
+    prompts: async func() -> result<list<prompt>, error>;
+    /// Confirm against the exact queued prompt and an authenticated contact.
+    /// Grant and checkpoint precede delivery; a failed delivery stays retryable.
+    confirm: async func(prompt: string, contact: string, access: access) -> result<_, error>;
+    cancel: async func(prompt: string) -> result<_, error>;
+    outgoing: async func() -> result<list<outgoing-item>, error>;
+    retry: async func(id: string) -> result<_, error>;
+    inbox: async func() -> result<list<invitation>, error>;
+    instances: async func(app: string) -> result<list<document-instance>, error>;
+    /// Local acceptance only: verify/adopt the already-granted document and
+    /// create a durable instance binding. No receiver handshake occurs.
+    adopt: async func(id: string) -> result<string, error>;
+    dismiss: async func(id: string) -> result<_, error>;
 }
 
 /// The user's private contacts: identity bindings, signed disclosures, and
@@ -1041,6 +1105,7 @@ world runtime {
     export app-services;
     export contacts;
     export meeting;
+    export sharing;
 }
 
 /// The visor component: the trusted pixels, on the main thread.
@@ -1059,4 +1124,5 @@ world visor {
     import shell;
     import contacts;
     import meeting;
+    import sharing;
 }

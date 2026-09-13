@@ -22,7 +22,7 @@ use subduction_protocol::event::Direction;
 
 use crate::{
     Clock, EngineTransport, Error, ErrorCode, Kernel, MEETING_ALPN, NetHandle, PAIRING_ALPN,
-    ROOT_TRANSFER_ALPN, SUBDUCTION_ALPN, State, SyncEngine,
+    ROOT_TRANSFER_ALPN, SHARING_ALPN, SUBDUCTION_ALPN, State, SyncEngine,
 };
 
 /// `polyvisor:internal/sync.member`.
@@ -89,6 +89,49 @@ impl EngineClock for ClockSeam {
 }
 
 impl Kernel {
+    pub(crate) async fn sync_connect_hint(&self, key: [u8; 32]) -> Result<(), Error> {
+        let endpoint_id = self.seams.net.endpoint_id(key);
+        let endpoint = self
+            .endpoint
+            .borrow()
+            .clone()
+            .ok_or_else(|| Error::new(ErrorCode::Unavailable, "this device has no endpoint"))?;
+        if !self
+            .engine()?
+            .can_sync_peer(key)
+            .await
+            .map_err(|why| Error::new(ErrorCode::Failed, why))?
+        {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "that device has no shared document authority",
+            ));
+        }
+        let (actual, transport) = endpoint
+            .connect(endpoint_id.clone(), SUBDUCTION_ALPN.into())
+            .await
+            .map_err(|why| Error::new(ErrorCode::Unavailable, why))?;
+        if actual != key {
+            transport.close().await;
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "that endpoint authenticated as another device",
+            ));
+        }
+        self.note_peer(&endpoint_id, key, PeerState::Connecting);
+        let expected = VerifyingKey::from_bytes(&key)
+            .map_err(|_| Error::new(ErrorCode::Refused, "invalid peer key"))?;
+        self.engine()?
+            .connect(
+                DynTransport::new(transport),
+                Direction::Outbound,
+                Some(expected),
+            )
+            .await
+            .map_err(|why| Error::new(ErrorCode::Failed, why))?;
+        self.note_peer(&endpoint_id, key, PeerState::Connected);
+        Ok(())
+    }
     /// Build the engine from the checkpointed state and spawn its driver, its
     /// event pump, and the task that binds the endpoint.
     ///
@@ -154,8 +197,19 @@ impl Kernel {
                             // arrived earlier, so the reporting tree alone is
                             // insufficient. Re-read snapshots; task watches
                             // compare revisions and the visor compares fields.
-                            let apps: Vec<String> =
-                                kernel.sessions.borrow().values().cloned().collect();
+                            let apps: Vec<String> = kernel
+                                .sessions
+                                .borrow()
+                                .iter()
+                                .map(|(session, app)| {
+                                    kernel
+                                        .session_documents
+                                        .borrow()
+                                        .get(session)
+                                        .cloned()
+                                        .unwrap_or_else(|| app.clone())
+                                })
+                                .collect();
                             for app in apps {
                                 kernel.wake_documents(&app);
                             }
@@ -322,17 +376,6 @@ impl Kernel {
     /// Whether `key` is in the group. The post-handshake check's half: the
     /// handshake proves a key, so this is the comparison that decides whether
     /// a connection may live.
-    pub(crate) async fn is_member_key(&self, key: [u8; 32]) -> bool {
-        let Ok(engine) = self.engine() else {
-            return false;
-        };
-        engine
-            .members()
-            .await
-            .map(|members| members.iter().any(|member| member.key == key))
-            .unwrap_or(false)
-    }
-
     /// This device's endpoint id, or `""` while sealed or unbound.
     pub(crate) fn endpoint_id(&self) -> String {
         if self.state() == State::Sealed {
@@ -484,6 +527,12 @@ async fn accept_loop(kernel: Weak<Kernel>, endpoint: Rc<dyn NetHandle>) {
                     kernel.root_transfer_accept(key, transport).await;
                 }));
             }
+            SHARING_ALPN => {
+                let spawn = Rc::clone(&kernel.seams.spawn);
+                spawn.spawn(Box::pin(async move {
+                    kernel.sharing_accept(key, transport).await;
+                }));
+            }
             // An ALPN this device never advertised. The endpoint should not
             // deliver one; if something does, it is not a wire we speak.
             _ => kernel
@@ -519,7 +568,7 @@ async fn admit(
             // handshake because the handshake is what *proves* the key. A
             // device that is not one of this user's syncs nothing: it is
             // disconnected with the reason the visor shows.
-            if kernel.is_member_key(key).await {
+            if engine.can_sync_peer(key).await.unwrap_or(false) {
                 PeerState::Connected
             } else {
                 engine.disconnect(peer).await;
@@ -547,5 +596,29 @@ async fn reconnect(kernel: Rc<Kernel>) {
         // The failure is already recorded as that peer's row state, and a
         // device that is not on right now is the ordinary case.
         let _dialed = kernel.sync_connect(member.endpoint_id).await;
+    }
+    let hints = match kernel.engine() {
+        Ok(engine) => engine
+            .document_read(
+                polyvisor_visor_model::VISOR_APP,
+                polyvisor_visor_model::share_peer_hints,
+            )
+            .await
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    for (key, _endpoint) in hints {
+        // A reloaded worker can race the old SharedWorker connection closing.
+        // Retry the authenticated stored hint rather than requiring another
+        // user action; each attempt still pins the endpoint key and runs the
+        // engine's document-authority admission.
+        for attempt in 0..3 {
+            if kernel.sync_connect_hint(key).await.is_ok() {
+                break;
+            }
+            if attempt < 2 {
+                kernel.seams.clock.sleep(1_000).await;
+            }
+        }
     }
 }

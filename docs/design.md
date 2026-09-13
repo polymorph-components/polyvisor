@@ -264,6 +264,71 @@ responsive. This is not a phone estimate. Phone validation should time
 three sequential backup creations on the built site with these unchanged
 costs and check that the visor remains responsive during each derivation.
 
+### Document sharing v0
+
+A document is the platform's atomic sharing unit: one data instance and
+authorization scope, independent of Automerge or opaque payload encoding.
+Services may compose documents for finer sharing boundaries. TodoMVC creates
+an explicit document for the user's personal list. Each shareable instance
+has its own Keyhive document, Sedimentree content tree and decryption frontier;
+its identity is independent of package/install identity. Existing private
+runtime partitions and Markdown still use the private group encryption scope
+and are not selectable for sharing in v0.
+
+The task service binds each session to one list. `tasks.share()` takes no
+document or contact arguments: the trusted visor selects an authenticated
+contact and confirms the bound list, read/edit access, readable history and
+resharing. The grant targets the contact's root-bound device group. Existing
+Keyhive delegation semantics apply: recipients may delegate at their access
+level or lower. The creator's direct Admin edge and its group's Admin edge
+are retained. Sharing requires member authority, not root-secret custody.
+There is no removal, rotation, revocation or owner-only resharing guarantee.
+
+Confirmation grants immediately. The grant and outgoing invitation state are
+checkpointed before delivery; every retry crosses a durable barrier too.
+Delivery failure does not revoke access. The recipient checkpoints a pending
+invitation before acknowledging delivery. Acceptance later adopts the document
+and records a local service-instance binding; it neither grants access nor
+launches an app. A separate Open action uses installed TodoMVC. Dismissal
+preserves grants and adopted instances. Personal and received lists remain
+distinct, including in encrypted bookmarks and after reload.
+
+Invitations use a dedicated iroh ALPN with bounded waits. A domain-separated
+device signature covers the exact encoded body: an existing authenticated
+introduction (root/group binding and member-device proof), recipient root/group,
+document identity, service/type, label, access, history policy and scoped grant
+bootstrap. Identity and grant authority are validated in isolated state before
+trusted inbox display and revalidated on adoption. Pairing's identity change
+is serialized against sharing mutations. No peer-supplied executable URL runs.
+
+The full bincode invitation, including its four-byte transport frame prefix,
+has a fixed 512 KiB limit. Signed metadata and payload sizes are counted from
+borrowed items in the selected tree before copying payloads. Items are included
+only when the complete invitation fits; otherwise content comes through normal
+Subduction after adoption. Inline items use the same signed-item and ciphertext
+scope checks as network and Drive items; the whole inline batch is validated
+before insertion. Input frame sizes are bounded before allocation. Inline is
+not a completeness claim: newer or missing history still uses normal sync.
+A delivered small list can be adopted with its sender offline; a larger list
+needs an available replica. There is no mailbox, archive-fetch or blob protocol.
+
+Each shareable document has a companion Sedimentree containing only its relevant
+Keyhive membership/prekey/CGKA authority. Sync ingests authority before content.
+Foreign peers cannot read private `us`, the global Keyhive tree, contacts,
+visor, unrelated lists or opaque backups. Readers may courier signed items;
+content authors must have Edit or Admin access. Signed tree/parent metadata
+and scoped ciphertext references are checked independently of courier identity.
+Missing authority fails closed; read-only replicas do not author merge anchors.
+Shared compaction is deferred: shared histories retain signed loose commits
+and reject fragments rather than using the private fragment path.
+
+Same-user enrollment transfers scoped descriptors/frontiers and existing signed
+items, allowing the new device to serve or reshare history with the original
+offline. Cross-user sharing never enrolls the recipient into the sender's
+group. Each user keeps their own sealed checkpoint and Drive replica, with
+their own name key and OAuth credentials. Authenticated peer hints from both
+received and outgoing shares support reload reconnect; hints grant no authority.
+
 ### Domain providers
 
 Task semantics will move out of the engine into an ordinary service component.
@@ -308,7 +373,7 @@ form. Polyvisor owns five implementations:
 |---|---|
 | `Transport` | one per connection over `polymorph:iroh` streams, relay-only: WebRTC is off in the worker because a SharedWorker has no `RTCPeerConnection` (the host backend never resolves there). Framing per `subduction_iroh` (u32 BE length prefix) so native subduction peers interoperate |
 | `Storage` | an in-memory item store serialized into the sealed checkpoint with the automerge docs |
-| `Policy` | group membership, read off the user-system document (`polyvisor:us`): a remote peer may read/write exactly while its key is a member. App-tree envelopes are keyhive's (M3c, `engine/src/vault.rs`) |
+| `Policy` | own-group membership for private trees; per-document Keyhive authority for shared trees, with independent signed-author validation on ingestion. Envelopes are Keyhive's (`engine/src/vault.rs`) |
 | `Signer` / `NodeEffect::Sign` | `ed25519-dalek` over the sealed device seed, also used by the iroh identity |
 | `Clock` | `wasi:clocks@0.3` |
 
@@ -525,8 +590,8 @@ sessionStorage anchor, or a fresh id it mints), because the worker is
 named after it. Everything else — the index, tiers, sealing, the sweep —
 is kernel logic over `kv`, `locks` and the OPFS state root. A device
 starts as a group of one; pairing replaces the joiner's group with the
-adder's, members reconnect at boot, and non-members are closed after
-the handshake.
+adder's. Members and authenticated shared-document peers reconnect at boot;
+peers without authority for any local document are closed after the handshake.
 
 - **The index** (`store`) is the one unsealed record: id, local picker
   petname, tier, how the device rests, timestamps. Never the member label,
@@ -613,7 +678,7 @@ unknown kinds are refused by `route-decode`), and the app owns the
 text inside `route`, which the visor carries byte-for-byte and never
 interprets.
 
-- **The token is ciphertext, and deterministic.** `install-id ‖ route`,
+- **The token is ciphertext, and deterministic.** `install-id ‖ instance ‖ route`,
   zero-padded to 256 bytes, sealed under a *user* route key with
   AES-256-GCM and a synthetic nonce (`HMAC(k_siv, plaintext)`), so equal
   state is equal text: bookmarks dedupe, `replaceState` does not churn
@@ -670,7 +735,7 @@ interprets.
   `route.set` is relayed by the frame to the glue, debounced, encoded by
   the kernel, and written with `history.replaceState` — never
   `pushState`. The back button is the visor's; an app gets no history
-  entry. Routes over the cap (238 bytes) are refused and the bar does not
+  entry. Routes over the cap (205 bytes) are refused and the bar does not
   move.
 - **Consumed once, after unseal.** The visor reads `shell.fragment`
   exactly once per page load, at the first identity read that finds the
@@ -771,4 +836,5 @@ Versions live in the manifests, lockfiles, `rust-toolchain.toml`, and
 Passkey unseal (#166), recovery kits (#167), app worker (#45), native
 shell, JS producers, and additional stores. Drive is the only provider;
 a provider-component abstraction waits for a second one. Shared-document
-history policy is undecided; shared documents do not exist yet.
+compaction, history-limiting grants, revocation and offline invitation delivery
+remain deferred.

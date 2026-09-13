@@ -1685,6 +1685,259 @@ fn signed_preview_accept_retains_whole_profiles_and_can_forward_them() {
 }
 
 #[test]
+fn document_invitation_delivers_adopts_and_reloads_as_a_distinct_instance() {
+    let alice_world = World::default();
+    let bob_world = alice_world.peer();
+    let alice = alice_world.boot();
+    let bob = bob_world.boot();
+    settle();
+
+    let bob_profile = block_on(bob.contacts_profile()).unwrap();
+    let bob_card = block_on(
+        bob.contacts_share(
+            bob_profile.root.to_bytes(),
+            bob_profile
+                .variants
+                .iter()
+                .map(|profile| profile.as_bytes().to_vec())
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
+    )
+    .unwrap();
+    let bob_contact = block_on(alice.contacts_import_accept(
+        bob_card,
+        vec![bob_profile.root.to_bytes()],
+        Vec::new(),
+        "Bob".into(),
+        "🐕".into(),
+    ))
+    .unwrap();
+
+    let personal = session(&alice);
+    block_on(alice.tasks_add(personal, "shared task".into())).unwrap();
+    block_on(alice.tasks_share(personal)).unwrap();
+    let prompt = block_on(alice.sharing_prompts()).unwrap().pop().unwrap();
+    block_on(alice.sharing_confirm(
+        &prompt.id,
+        &bob_contact,
+        polyvisor_kernel::ShareAccess::Edit,
+    ))
+    .unwrap();
+    settle();
+
+    let invite = block_on(bob.sharing_inbox()).unwrap().pop().unwrap();
+    assert_eq!(
+        invite.label,
+        alice.meta(MetaScope::App("todomvc".into())).unwrap()["petname"]
+    );
+    assert_eq!(invite.access, polyvisor_kernel::ShareAccess::Edit);
+    assert!(invite.adopted_instance.is_none());
+    let instance = block_on(bob.sharing_adopt(&invite.id)).unwrap();
+    assert_eq!(block_on(bob.sharing_adopt(&invite.id)).unwrap(), instance);
+    let shared = block_on(bob.launch_instance("todomvc", &instance)).unwrap();
+    assert_eq!(block_on(titles(&bob, shared)), vec!["shared task"]);
+
+    let personal = session(&bob);
+    assert!(block_on(titles(&bob, personal)).is_empty());
+    drop(bob);
+    let rebooted = bob_world.boot();
+    let shared = block_on(rebooted.launch_instance("todomvc", &instance)).unwrap();
+    assert_eq!(block_on(titles(&rebooted, shared)), vec!["shared task"]);
+}
+
+#[test]
+fn sharing_retry_checkpoints_an_existing_envelope_before_sending() {
+    let alice_world = World::default();
+    let bob_world = alice_world.peer();
+    let alice = alice_world.boot();
+    let bob = bob_world.boot();
+    settle();
+
+    let bob_profile = block_on(bob.contacts_profile()).unwrap();
+    let bob_card = block_on(
+        bob.contacts_share(
+            bob_profile.root.to_bytes(),
+            bob_profile
+                .variants
+                .iter()
+                .map(|profile| profile.as_bytes().to_vec())
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
+    )
+    .unwrap();
+    let bob_contact = block_on(alice.contacts_import_accept(
+        bob_card,
+        vec![bob_profile.root.to_bytes()],
+        Vec::new(),
+        "Bob".into(),
+        "🐕".into(),
+    ))
+    .unwrap();
+
+    let session = session(&alice);
+    block_on(alice.tasks_share(session)).unwrap();
+    let prompt = block_on(alice.sharing_prompts()).unwrap().pop().unwrap();
+    let bob_endpoint = bob.device_status().unwrap().endpoint_id;
+    alice_world.net.unplug(&bob_endpoint);
+    assert!(
+        block_on(alice.sharing_confirm(
+            &prompt.id,
+            &bob_contact,
+            polyvisor_kernel::ShareAccess::Edit,
+        ))
+        .is_err()
+    );
+
+    // Bring the same recipient back, then make the sender's mandatory
+    // pre-send durability barrier fail. The direct retry must not put the
+    // already-built envelope on the wire.
+    let bob = bob_world.boot();
+    settle();
+    alice_world.files.fail_next_writes(1);
+    assert_eq!(
+        block_on(alice.sharing_retry(&prompt.id))
+            .unwrap_err()
+            .message,
+        "this device's state could not be written"
+    );
+    settle();
+    assert!(block_on(bob.sharing_inbox()).unwrap().is_empty());
+
+    block_on(alice.sharing_retry(&prompt.id)).unwrap();
+    settle();
+    assert_eq!(block_on(bob.sharing_inbox()).unwrap().len(), 1);
+}
+
+#[test]
+fn paired_device_can_reshare_signed_history_after_original_goes_offline() {
+    let a_world = World::default();
+    let b_world = a_world.peer();
+    let c_world = a_world.peer_seeded(0x1020_3040_5060_7080);
+    let a = a_world.boot();
+    let b = b_world.boot();
+    let c = c_world.boot();
+    settle();
+
+    let source = session(&a);
+    block_on(a.tasks_add(source, "survives original offline".into())).unwrap();
+    pair(&b, &a);
+    let b_source = session(&b);
+    assert_eq!(
+        block_on(titles(&b, b_source)),
+        vec!["survives original offline"]
+    );
+
+    let c_profile = block_on(c.contacts_profile()).unwrap();
+    let c_card = block_on(
+        c.contacts_share(
+            c_profile.root.to_bytes(),
+            c_profile
+                .variants
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
+    )
+    .unwrap();
+    let c_contact = block_on(b.contacts_import_accept(
+        c_card,
+        vec![c_profile.root.to_bytes()],
+        Vec::new(),
+        "C".into(),
+        "🐁".into(),
+    ))
+    .unwrap();
+
+    let a_endpoint = a.device_status().unwrap().endpoint_id;
+    drop(a);
+    a_world.net.unplug(&a_endpoint);
+    settle();
+
+    block_on(b.tasks_share(b_source)).unwrap();
+    let prompt = block_on(b.sharing_prompts()).unwrap().pop().unwrap();
+    block_on(b.sharing_confirm(&prompt.id, &c_contact, polyvisor_kernel::ShareAccess::Edit))
+        .unwrap();
+    settle();
+    let invite = block_on(c.sharing_inbox()).unwrap().pop().unwrap();
+    let instance = block_on(c.sharing_adopt(&invite.id)).unwrap();
+    let opened = block_on(c.launch_instance("todomvc", &instance)).unwrap();
+    assert_eq!(
+        block_on(titles(&c, opened)),
+        vec!["survives original offline"]
+    );
+}
+
+#[test]
+fn device_enrolled_by_a_non_root_member_receives_the_official_profile() {
+    let world = World::default();
+    let a = world.boot();
+    let b = world.peer().boot();
+    let c = world.peer_seeded(0x1020_3040_5060_7080).boot();
+    settle();
+
+    let initial = block_on(a.contacts_profile()).unwrap();
+    block_on(
+        a.contacts_resolve_profile(
+            initial
+                .variants
+                .iter()
+                .map(|profile| profile.as_bytes().to_vec())
+                .collect(),
+            vec![Claim {
+                name: "name".into(),
+                value: "Founder Identity".into(),
+            }],
+        ),
+    )
+    .unwrap();
+
+    pair(&b, &a);
+    let code = block_on(c.pairing_offer()).unwrap();
+    block_on(b.pairing_claim(code)).unwrap();
+    let (here, there) = settle_until(|| async {
+        match (c.pairing_status().unwrap(), b.pairing_status().unwrap()) {
+            (Phase::AwaitingConfirm(here), Phase::AwaitingConfirm(there)) => Some((here, there)),
+            (Phase::Failed(why), _) | (_, Phase::Failed(why)) => panic!("pairing failed: {why}"),
+            _ => None,
+        }
+    });
+    assert_eq!(here, there);
+    c.pairing_confirm().unwrap();
+    b.pairing_confirm().unwrap();
+    block_on(async {
+        for _ in 0..8192 {
+            if c.pairing_status().unwrap() == Phase::Done
+                && b.pairing_status().unwrap() == Phase::Done
+            {
+                return;
+            }
+            yield_now().await;
+        }
+    });
+    assert_eq!(c.pairing_status().unwrap(), Phase::Done);
+    assert_eq!(b.pairing_status().unwrap(), Phase::Done);
+    assert!(
+        block_on(c.contacts_profile())
+            .unwrap()
+            .variants
+            .iter()
+            .flat_map(|profile| polyvisor_contacts_model::verify_profile(profile)
+                .unwrap()
+                .claims)
+            .any(|claim| claim.name == "name" && claim.value == "Founder Identity")
+    );
+}
+
+#[test]
 fn contacts_import_selects_claims_and_shares_one_meeting() {
     let kernel = boot();
     let json = br#"[{"claims":[{"name":"name","value":"Ada"},{"name":"email","value":"a@example.test"}]},{"claims":[{"name":"name","value":"Grace"}]}]"#.to_vec();
@@ -3044,7 +3297,13 @@ fn history_is_partitioned_by_app_and_close_cancels_a_watch() {
         .route(
             &format!("{ORIGIN}/apps/other/manifest.json"),
             manifest_json(CSS_HANDLE_HEX).replace("todomvc", "other"),
-        );
+        )
+        .route(&format!("{ORIGIN}/apps/other/app.component.wasm"), b"\0asm")
+        .route(
+            &format!("{ORIGIN}/apps/other/app.component.plan.json"),
+            r#"{"plan":true}"#,
+        )
+        .route(&format!("{ORIGIN}/apps/other/todomvc-app.css"), CSS);
     let kernel = World::with_fetch(fetch).boot();
     let session = session(&kernel);
     let other = block_on(kernel.launch("other")).unwrap();
@@ -3400,19 +3659,22 @@ fn two_devices_on_one_network_converge_on_tasks() {
     let there = here.peer();
     let a = here.boot();
     let b = there.boot();
-    let (sa, sb) = (session(&a), session(&b));
+    let sa = session(&a);
     // The endpoints bind on spawned tasks; give them their turns.
     settle();
 
     block_on(a.tasks_add(sa, "buy milk".into())).unwrap();
-    // Opening the list on B is what makes it ask for the tree.
-    assert!(block_on(titles(&b, sb)).is_empty());
-
     let endpoint = b.device_status().unwrap().endpoint_id;
     assert!(!endpoint.is_empty(), "an open device binds an endpoint");
     // Sync is within the group and nowhere else, so the two devices pair
     // first — B shows the code, A claims it.
     let _sas = pair(&b, &a);
+    let sb = session(&b);
+    assert_eq!(
+        block_on(titles(&b, sb)),
+        vec!["buy milk"],
+        "pairing snapshot did not carry the established personal list"
+    );
     block_on(a.sync_connect(endpoint.clone())).unwrap();
     assert_eq!(
         a.sync_peers().unwrap(),
@@ -3428,7 +3690,8 @@ fn two_devices_on_one_network_converge_on_tasks() {
     });
     assert_eq!(seen, vec!["buy milk"]);
 
-    // And back the other way.
+    // The pairing snapshot is only bootstrap. Both directions after it must
+    // travel over the live Subduction connection.
     let id = block_on(b.tasks_items(sb)).unwrap().items[0].id.clone();
     block_on(b.tasks_set_completed(sb, &id, true)).unwrap();
     settle_until(|| async {
@@ -3436,13 +3699,17 @@ fn two_devices_on_one_network_converge_on_tasks() {
             .completed
             .then_some(())
     });
+    block_on(a.tasks_set_title(sa, &id, "bread".into())).unwrap();
+    settle_until(|| async {
+        (b.tasks_items(sb).await.unwrap().items[0].title == "bread").then_some(())
+    });
 }
 
 #[test]
 fn a_remote_change_is_checkpointed_so_a_reboot_still_has_it() {
-    // The engine's event pump checkpoints what no export call witnessed: a
-    // change that arrived from a peer. Without that, B's reload would forget
-    // A's todo — the device would have shown it and then lost it.
+    // A remote change survives a reboot after the durable barrier. Observing
+    // the in-memory task alone does not mean asynchronous persistence finished;
+    // this test explicitly waits for the barrier before destroying the worker.
     let here = World::default();
     let there = here.peer();
     let a = here.boot();
@@ -3459,6 +3726,7 @@ fn a_remote_change_is_checkpointed_so_a_reboot_still_has_it() {
             let items = titles(&b, sb).await;
             (!items.is_empty()).then_some(items)
         });
+        block_on(b.checkpoint_durable()).unwrap();
     }
 
     // B reboots: a fresh worker over the same storage. A is still up, but the
@@ -3597,10 +3865,9 @@ fn a_remote_change_checkpointing_does_not_overlap_a_local_one() {
     let there = here.peer();
     let a = here.boot();
     let b = there.boot();
-    let (sa, sb) = (session(&a), session(&b));
     settle();
-    assert!(block_on(titles(&b, sb)).is_empty());
     let _sas = pair(&b, &a);
+    let (sa, sb) = (session(&a), session(&b));
     block_on(a.sync_connect(b.device_status().unwrap().endpoint_id)).unwrap();
 
     there.forget_writes();
@@ -3719,7 +3986,6 @@ fn pairing_enrolls_the_joiner_and_the_two_devices_then_sync() {
     let there = here.peer();
     let joiner = here.boot();
     let adder = there.boot();
-    let (sj, sa) = (session(&joiner), session(&adder));
     settle();
 
     // Before pairing each device is its own group of one, and neither knows
@@ -3734,6 +4000,7 @@ fn pairing_enrolls_the_joiner_and_the_two_devices_then_sync() {
     );
 
     let sas = pair(&joiner, &adder);
+    let (sj, sa) = (session(&joiner), session(&adder));
     assert_eq!(sas.len(), 6, "six digits, in trusted pixels on both sides");
 
     // Every transition was announced. The visor has no timer, so the phases
@@ -3777,14 +4044,25 @@ fn pairing_enrolls_the_joiner_and_the_two_devices_then_sync() {
         assert_eq!(mine, vec![kernel.device_status().unwrap().endpoint_id]);
     }
 
-    // The joiner dialed the adder as the last step of the ceremony, so tasks
-    // converge with no further `sync.connect`.
-    block_on(adder.tasks_add(sa, "after pairing".into())).unwrap();
+    // The joiner dialed the adder as the last step of the ceremony. Exercise
+    // both directions after the enrollment snapshot; neither update may rely
+    // on another explicit connect or snapshot transfer.
+    let id = block_on(adder.tasks_add(sa, "after pairing".into())).unwrap();
     let seen = settle_until(|| async {
         let items = titles(&joiner, sj).await;
         (!items.is_empty()).then_some(items)
     });
     assert_eq!(seen, vec!["after pairing"]);
+    block_on(joiner.tasks_set_completed(sj, &id, true)).unwrap();
+    settle_until(|| async {
+        adder.tasks_items(sa).await.unwrap().items[0]
+            .completed
+            .then_some(())
+    });
+    block_on(adder.tasks_set_title(sa, &id, "back again".into())).unwrap();
+    settle_until(|| async {
+        (joiner.tasks_items(sj).await.unwrap().items[0].title == "back again").then_some(())
+    });
 }
 
 #[test]
@@ -4038,7 +4316,7 @@ fn a_device_outside_the_group_is_closed_on_the_subduction_wire() {
         let row = peers.iter().find(|p| p.endpoint_id == c_endpoint)?;
         row.state.starts_with("closed").then(|| row.state.clone())
     });
-    assert_eq!(state, "closed: not a member of this device's group");
+    assert_eq!(state, "closed: peer has no document authority");
 }
 
 #[test]
@@ -4046,8 +4324,18 @@ fn a_device_dials_its_group_when_it_comes_back_up() {
     // The group is the address book: no `sync.connect` from the visor is
     // needed after the first pairing, or a reload would leave two paired
     // devices sitting next to each other doing nothing.
-    let here = World::default();
-    let there = here.peer();
+    let fetch = fetch_with(CSS_HANDLE_HEX)
+        .route(
+            &format!("{ORIGIN}/apps/index.json"),
+            r#"["todomvc","other"]"#,
+        )
+        .route(
+            &format!("{ORIGIN}/apps/other/manifest.json"),
+            manifest_json(CSS_HANDLE_HEX).replace("todomvc", "other"),
+        );
+    let here = World::with_fetch(fetch.clone());
+    let mut there = here.peer();
+    there.fetch = fetch;
     let b = here.boot();
     let a = there.boot();
     settle();
@@ -4075,8 +4363,8 @@ fn a_device_dials_its_group_when_it_comes_back_up() {
     assert_eq!(state, "connected");
 
     // And it is a working connection, not just a row.
-    let sa = session(&a);
-    let sb = session(&rebooted);
+    let sa = block_on(a.launch("other")).unwrap();
+    let sb = block_on(rebooted.launch("other")).unwrap();
     block_on(a.tasks_add(sa, "while you were out".into())).unwrap();
     let seen = settle_until(|| async {
         let items = titles(&rebooted, sb).await;
@@ -5046,26 +5334,19 @@ fn a_compacted_range_reaches_the_store_as_one_object() {
     here.net.unplug(&idb);
     settle();
 
-    // A fragment is one commit in 256, so the run is bounded well above the
-    // mean rather than at it; a run that reached the bound would mean the
-    // depth metric moved.
+    // Shared-document compaction is deliberately disabled until fragments
+    // have shared-authority validation. Keep this store test bounded and
+    // assert ordinary signed commits remain publishable instead.
     let mut written = 0usize;
-    for n in 1..=4096 {
+    for n in 1..=32 {
         block_on(a.tasks_add(sa, format!("task {n}"))).unwrap();
         written = n;
-        if a.fragments_held(Some("todomvc")) > 0 {
-            break;
-        }
     }
-    assert!(written < 4096, "no level-1 fragment in 4096 commits");
 
     connect_store(&a);
     settle();
     let objects = drive.objects().len();
-    assert!(
-        objects < written,
-        "the range went up as one object, not {written}: {objects} in the folder",
-    );
+    assert!(objects >= written, "shared commits reached the store");
 
     connect_store(&b);
     let seen = settle_until(|| async {

@@ -429,6 +429,42 @@ pub(crate) const CSS: &str = r#"
 #visor-root .sheet-error { margin-top: 2px; }
 #visor-root .choice { display: flex; flex-wrap: wrap; gap: 8px; }
 
+/* Trusted document sharing (visor/src/sharing_ui.rs): the consent prompt
+   is a labeled form, not a one-line list row, so it gets its own block
+   layout rather than reusing `.app-row`'s flex-wrap row (that squeezed an
+   unstyled `<select>` and `<fieldset>` onto one line, the tiny-dropdown/
+   huge-radio-box complaint). `.sharing-status-row` keeps the outgoing/
+   inbox rows on `.app-row`'s compact one-row-per-item layout, just with
+   `<p>`s instead of bare `<span>`s so a heading and an empty-state
+   sentence never run together on one line. */
+#visor-root .sharing-section-title { font-weight: 600; margin: 12px 0 4px; }
+#visor-root .sharing-consent {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 10px;
+  padding: 8px 0;
+}
+#visor-root .sharing-consent-title { font-weight: 600; }
+#visor-root .sharing-consent-note { margin: 0; }
+#visor-root .sharing-field {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
+  width: 100%;
+}
+#visor-root .sharing-field-label { font-weight: 600; }
+#visor-root .sharing-field select {
+  font: inherit; color: inherit; background: var(--field);
+  border: 1px solid var(--edge); border-radius: 6px;
+  min-height: 44px; padding: 8px; box-sizing: border-box;
+  width: min(24rem, 100%); min-width: 12rem;
+}
+#visor-root .sharing-access { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+#visor-root .sharing-access label {
+  display: inline-flex; align-items: center; gap: 6px; width: auto; margin: 0;
+}
+#visor-root .sharing-access input[type="radio"] { flex: none; width: auto; min-width: 0; margin: 0; }
+#visor-root .sharing-actions { display: flex; gap: 8px; }
+#visor-root .sharing-status-row { align-items: flex-start; flex-direction: column; }
+#visor-root .sharing-status-row .app-row-title { flex: none; width: 100%; }
+#visor-root .sharing-status-row p { margin: 0; }
+
 #visor-root .contacts-nav { display:flex; flex-wrap:wrap; gap:6px; }
 #visor-root .contacts-sheet { align-items: stretch; width: min(100%, 720px); margin-inline: auto; }
 #visor-root .contacts-list, #visor-root .contact-history,

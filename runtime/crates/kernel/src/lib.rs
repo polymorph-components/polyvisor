@@ -26,6 +26,7 @@ mod root_backup;
 mod root_transfer;
 mod route;
 mod seal;
+mod sharing;
 mod store;
 mod sync;
 
@@ -47,6 +48,10 @@ pub use polyvisor_engine::{EngineTransport, OpaqueItem, OpaqueMode};
 pub use polyvisor_todo_model::{Snapshot, TodoItem};
 pub use root_backup::{
     DerivedKey, SALT_LEN as ROOT_BACKUP_SALT_LEN, derive_key as derive_backup_key,
+};
+pub use sharing::{
+    DeliveryState, DocumentInstance, SHARING_ALPN, ShareAccess, ShareInvitation, ShareOutgoing,
+    SharePrompt, sharing_wire_budget,
 };
 pub use store::LEASE_TTL_MS;
 pub use sync::{Member, Peer};
@@ -416,6 +421,9 @@ pub struct Kernel {
     registry: Registry,
     /// Live sessions, session id -> app id.
     sessions: RefCell<BTreeMap<SessionId, String>>,
+    /// Session document bindings. Absent means the package's personal
+    /// partition; adopted instances are explicit and never merge into it.
+    session_documents: RefCell<BTreeMap<SessionId, String>>,
     /// Monotonic; ids are never reused within a runtime instance
     /// (internal.wit `types.session-id`).
     next_session: RefCell<SessionId>,
@@ -453,6 +461,7 @@ pub struct Kernel {
     syncing: RefCell<Checkpointing>,
     next_watch: Cell<u64>,
     document_waiters: RefCell<BTreeMap<u64, (String, Waker)>>,
+    sharing_write: futures::lock::Mutex<()>,
 }
 
 /// The checkpoint gate: at most one writer, and one bit of "someone asked
@@ -514,6 +523,7 @@ impl Kernel {
             }),
             registry,
             sessions: RefCell::new(BTreeMap::new()),
+            session_documents: RefCell::new(BTreeMap::new()),
             next_session: RefCell::new(1),
             events: Events::default(),
             engine: RefCell::new(None),
@@ -529,6 +539,7 @@ impl Kernel {
             syncing: RefCell::new(Checkpointing::default()),
             next_watch: Cell::new(1),
             document_waiters: RefCell::new(BTreeMap::new()),
+            sharing_write: futures::lock::Mutex::new(()),
         });
         *kernel.me.borrow_mut() = Rc::downgrade(&kernel);
         // A sealed device has no seed in memory, so it has no engine and no
@@ -537,7 +548,8 @@ impl Kernel {
             kernel.start_sync();
             let personalization_wrote = kernel.initialize_personalization().await?;
             let contacts_wrote = kernel.initialize_contacts().await?;
-            if personalization_wrote || contacts_wrote {
+            let instances_wrote = kernel.initialize_document_instances().await?;
+            if personalization_wrote || contacts_wrote || instances_wrote {
                 kernel.checkpoint().await?;
             }
             // At boot, after `open`: a device that was off while its group
@@ -1277,7 +1289,8 @@ impl Kernel {
     /// Checkpoint and do not return until this caller's in-memory mutation is
     /// covered by a completed write. A caller arriving during another writer
     /// joins its dirty follow-up pass and receives that pass's real result.
-    async fn checkpoint_durable(&self) -> Result<(), Error> {
+    #[doc(hidden)]
+    pub async fn checkpoint_durable(&self) -> Result<(), Error> {
         let wait = {
             let mut gate = self.checkpointing.borrow_mut();
             if gate.running {
@@ -1390,6 +1403,15 @@ impl Kernel {
     }
 
     pub async fn launch(&self, app: &str) -> Result<SessionId, Error> {
+        self.launch_bound(app, None).await
+    }
+
+    pub async fn launch_instance(&self, app: &str, instance: &str) -> Result<SessionId, Error> {
+        let partition = self.sharing_instance_partition(instance, app).await?;
+        self.launch_bound(app, Some(partition)).await
+    }
+
+    async fn launch_bound(&self, app: &str, partition: Option<String>) -> Result<SessionId, Error> {
         self.open()?;
         if !self.registry.contains(app) {
             return Err(Error::new(
@@ -1397,6 +1419,36 @@ impl Kernel {
                 format!("no app named {app} is installed"),
             ));
         }
+        let _instance_write = self.sharing_write.lock().await;
+        let partition = if app == "todomvc" && partition.is_none() {
+            let engine = self.engine()?;
+            match engine
+                .document_read(visor_model::VISOR_APP, move |doc| {
+                    visor_model::personal_partition(doc, "todomvc")
+                })
+                .await
+                .map_err(engine_failed)?
+            {
+                Some(existing) => Some(existing),
+                None => {
+                    let shared = engine
+                        .create_shared_document()
+                        .await
+                        .map_err(engine_failed)?;
+                    let value = shared.partition.clone();
+                    engine
+                        .document_mutate(visor_model::VISOR_APP, move |doc| {
+                            visor_model::set_personal_partition(doc, "todomvc", value)
+                        })
+                        .await
+                        .map_err(engine_failed)?;
+                    self.checkpoint_durable().await?;
+                    Some(shared.partition)
+                }
+            }
+        } else {
+            partition
+        };
         self.initialize_personalization().await?;
         let existing = self.meta(MetaScope::App(app.to_string()))?;
         if existing.get("petname").is_none_or(String::is_empty) {
@@ -1414,7 +1466,46 @@ impl Kernel {
         let session = *next;
         *next += 1;
         self.sessions.borrow_mut().insert(session, app.to_string());
+        if let Some(partition) = partition {
+            self.session_documents
+                .borrow_mut()
+                .insert(session, partition);
+        }
         Ok(session)
+    }
+
+    /// Seed the one built-in shareable service document before a device can
+    /// pair or launch. This makes the established group's descriptor part of
+    /// enrollment and avoids two paired devices racing to mint incompatible
+    /// "personal" lists on their first launches.
+    async fn initialize_document_instances(&self) -> Result<bool, Error> {
+        if !self.registry.contains("todomvc") {
+            return Ok(false);
+        }
+        let _write = self.sharing_write.lock().await;
+        let engine = self.engine()?;
+        if engine
+            .document_read(visor_model::VISOR_APP, |doc| {
+                visor_model::personal_partition(doc, "todomvc")
+            })
+            .await
+            .map_err(engine_failed)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let shared = engine
+            .create_shared_document()
+            .await
+            .map_err(engine_failed)?;
+        let partition = shared.partition;
+        engine
+            .document_mutate(visor_model::VISOR_APP, move |doc| {
+                visor_model::set_personal_partition(doc, "todomvc", partition)
+            })
+            .await
+            .map_err(engine_failed)?;
+        Ok(true)
     }
 
     pub async fn component(&self, session: SessionId) -> Result<ComponentArtifacts, Error> {
@@ -1444,8 +1535,9 @@ impl Kernel {
     /// visor did not ask for, and this one it did.
     pub fn close(&self, session: SessionId) {
         let app = self.sessions.borrow_mut().remove(&session);
+        let partition = self.session_documents.borrow_mut().remove(&session);
         if let Some(app) = app {
-            self.wake_documents(&app);
+            self.wake_documents(partition.as_deref().unwrap_or(&app));
         }
     }
 
@@ -1459,7 +1551,8 @@ impl Kernel {
         let Some(app) = self.sessions.borrow_mut().remove(&session) else {
             return;
         };
-        self.wake_documents(&app);
+        let partition = self.session_documents.borrow_mut().remove(&session);
+        self.wake_documents(partition.as_deref().unwrap_or(&app));
         self.push_event(Event::SessionEnded(session, reason));
     }
 
@@ -1532,7 +1625,18 @@ impl Kernel {
         if install_wrote || key_wrote {
             self.checkpoint().await?;
         }
-        route::encode(&key, install, &route).map_err(|why| match why {
+        let partition = self.session_documents.borrow().get(&session).cloned();
+        let instance = match partition {
+            Some(partition) => self
+                .engine()?
+                .document_read(visor_model::VISOR_APP, move |doc| {
+                    visor_model::instance_for_partition(doc, &partition)
+                })
+                .await
+                .map_err(engine_failed)?,
+            None => None,
+        };
+        route::encode_instance(&key, install, instance.as_deref(), &route).map_err(|why| match why {
             route::RouteError::TooLong => Error::new(
                 ErrorCode::Refused,
                 format!(
@@ -1551,7 +1655,10 @@ impl Kernel {
     /// internal.wit `apps.route-decode`. Every way a fragment can fail to
     /// open is one answer, because the honest thing to say about a link from
     /// another user, another key or a flipped bit is the same (`crate::route`).
-    pub async fn route_decode(&self, fragment: String) -> Result<(AppInfo, String), Error> {
+    pub async fn route_decode(
+        &self,
+        fragment: String,
+    ) -> Result<(AppInfo, String, Option<String>), Error> {
         self.open()?;
         // The second kind first (`crate::route` module docs): plaintext,
         // keyless, resolved by a registry lookup rather than the sealed
@@ -1570,14 +1677,15 @@ impl Kernel {
             if wrote {
                 self.checkpoint().await?;
             }
-            return Ok((info, String::new()));
+            return Ok((info, String::new(), None));
         }
         let engine = self.engine()?;
         let (key, wrote) = self.visor_route_key().await.map_err(engine_failed)?;
         if wrote {
             self.checkpoint().await?;
         }
-        let (install, route) = route::decode(&key, &fragment).map_err(|_| unopenable_link())?;
+        let (install, instance, route) =
+            route::decode_instance(&key, &fragment).map_err(|_| unopenable_link())?;
         let installs = engine
             .document_read(visor_model::VISOR_APP, visor_model::installs)
             .await
@@ -1596,7 +1704,10 @@ impl Kernel {
                 "that link names an app that is no longer installed",
             )
         })?;
-        Ok((info, route))
+        if let Some(ref id) = instance {
+            self.sharing_instance_partition(id, &app).await?;
+        }
+        Ok((info, route, instance))
     }
 
     /// The fragment an installed app's window opens at (internal.wit
@@ -1921,20 +2032,27 @@ impl Kernel {
         // The session id comes from the port the call arrived on, never from
         // the app (internal.wit header), so an unknown one is a glue bug or a
         // race with `close`, not an app error worth naming further.
-        let app = self
+        let app_id = self
             .session_app_id(session)
             .map_err(|_| "unknown session".to_string())?;
+        let app = self
+            .session_documents
+            .borrow()
+            .get(&session)
+            .cloned()
+            .unwrap_or(app_id);
         let engine = self.engine().map_err(|e| e.message)?;
         Ok((app, engine))
     }
 
     fn validate_session(&self, session: SessionId, app: &str) -> Result<(), String> {
-        if self
-            .sessions
+        let expected = self
+            .session_documents
             .borrow()
             .get(&session)
-            .is_some_and(|id| id == app)
-        {
+            .cloned()
+            .or_else(|| self.sessions.borrow().get(&session).cloned());
+        if expected.as_deref() == Some(app) {
             Ok(())
         } else {
             Err("unknown session".to_string())

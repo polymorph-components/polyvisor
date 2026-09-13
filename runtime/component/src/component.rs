@@ -1220,6 +1220,12 @@ impl guest::apps::Guest for Component {
     async fn launch(app: String) -> Result<u32, Error> {
         kernel()?.launch(&app).await.map_err(map_error)
     }
+    async fn launch_instance(app: String, instance: String) -> Result<u32, Error> {
+        kernel()?
+            .launch_instance(&app, &instance)
+            .await
+            .map_err(map_error)
+    }
     async fn component(session: u32) -> Result<guest::apps::ComponentArtifacts, Error> {
         let artifacts = kernel()?.component(session).await.map_err(map_error)?;
         Ok(guest::apps::ComponentArtifacts {
@@ -1247,10 +1253,11 @@ impl guest::apps::Guest for Component {
             .map_err(map_error)
     }
     async fn route_decode(fragment: String) -> Result<guest::apps::RouteTarget, Error> {
-        let (app, route) = kernel()?.route_decode(fragment).await.map_err(map_error)?;
+        let (app, route, instance) = kernel()?.route_decode(fragment).await.map_err(map_error)?;
         Ok(guest::apps::RouteTarget {
             app: app_info(app),
             route,
+            instance,
         })
     }
     async fn install_fragment(app: String) -> Result<String, Error> {
@@ -1293,6 +1300,7 @@ impl guest::events::Guest for Component {
             polyvisor_kernel::Event::MeetingChanged(status) => {
                 guest::events::Event::MeetingChanged(meeting_status(status))
             }
+            polyvisor_kernel::Event::SharingChanged => guest::events::Event::SharingChanged,
         }
     }
 }
@@ -1365,6 +1373,12 @@ impl guest::app_services::Guest for Component {
             .tasks_remove(session, &id)
             .await
     }
+    async fn tasks_share(session: u32) -> Result<(), String> {
+        kernel()
+            .map_err(|_| unavailable_service())?
+            .tasks_share(session)
+            .await
+    }
     async fn history_read(session: u32) -> Result<polyvisor::app::history::Snapshot, String> {
         let snapshot = kernel()
             .map_err(|_| unavailable_service())?
@@ -1393,6 +1407,120 @@ impl guest::app_services::Guest for Component {
             .map_err(|_| unavailable_service())?
             .history_publish(session, changes)
             .await
+    }
+}
+
+fn sharing_access(access: guest::sharing::Access) -> polyvisor_kernel::ShareAccess {
+    match access {
+        guest::sharing::Access::Read => polyvisor_kernel::ShareAccess::Read,
+        guest::sharing::Access::Edit => polyvisor_kernel::ShareAccess::Edit,
+    }
+}
+
+impl guest::sharing::Guest for Component {
+    async fn prompts() -> Result<Vec<guest::sharing::Prompt>, Error> {
+        Ok(kernel()?
+            .sharing_prompts()
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .map(|p| guest::sharing::Prompt {
+                id: p.id,
+                label: p.label,
+                app: p.app,
+            })
+            .collect())
+    }
+    async fn confirm(
+        prompt: String,
+        contact: String,
+        access: guest::sharing::Access,
+    ) -> Result<(), Error> {
+        kernel()?
+            .sharing_confirm(&prompt, &contact, sharing_access(access))
+            .await
+            .map_err(map_error)
+    }
+    async fn cancel(prompt: String) -> Result<(), Error> {
+        kernel()?.sharing_cancel(&prompt).await.map_err(map_error)
+    }
+    async fn outgoing() -> Result<Vec<guest::sharing::OutgoingItem>, Error> {
+        Ok(kernel()?
+            .sharing_outgoing()
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .map(|o| guest::sharing::OutgoingItem {
+                id: o.id,
+                label: o.label,
+                recipient: o.recipient,
+                access: match o.access {
+                    polyvisor_kernel::ShareAccess::Read => guest::sharing::Access::Read,
+                    polyvisor_kernel::ShareAccess::Edit => guest::sharing::Access::Edit,
+                },
+                state: match o.state {
+                    polyvisor_kernel::DeliveryState::Queued => {
+                        guest::sharing::DeliveryState::Queued
+                    }
+                    polyvisor_kernel::DeliveryState::Delivering => {
+                        guest::sharing::DeliveryState::Delivering
+                    }
+                    polyvisor_kernel::DeliveryState::Delivered => {
+                        guest::sharing::DeliveryState::Delivered
+                    }
+                    polyvisor_kernel::DeliveryState::Failed => {
+                        guest::sharing::DeliveryState::Failed
+                    }
+                },
+                detail: o.detail,
+            })
+            .collect())
+    }
+    async fn retry(id: String) -> Result<(), Error> {
+        kernel()?.sharing_retry(&id).await.map_err(map_error)
+    }
+    async fn inbox() -> Result<Vec<guest::sharing::Invitation>, Error> {
+        Ok(kernel()?
+            .sharing_inbox()
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .map(|i| guest::sharing::Invitation {
+                id: i.id,
+                label: i.label,
+                sender: i.sender,
+                app: i.app,
+                access: match i.access {
+                    polyvisor_kernel::ShareAccess::Read => guest::sharing::Access::Read,
+                    polyvisor_kernel::ShareAccess::Edit => guest::sharing::Access::Edit,
+                },
+                history_and_resharing: true,
+                adopted_instance: i.adopted_instance,
+            })
+            .collect())
+    }
+    async fn instances(app: String) -> Result<Vec<guest::sharing::DocumentInstance>, Error> {
+        Ok(kernel()?
+            .sharing_instances(&app)
+            .await
+            .map_err(map_error)?
+            .into_iter()
+            .map(|i| guest::sharing::DocumentInstance {
+                id: i.id,
+                label: i.label,
+                personal: i.personal,
+                access: match i.access {
+                    polyvisor_kernel::ShareAccess::Read => guest::sharing::Access::Read,
+                    polyvisor_kernel::ShareAccess::Edit => guest::sharing::Access::Edit,
+                },
+            })
+            .collect())
+    }
+    async fn adopt(id: String) -> Result<String, Error> {
+        kernel()?.sharing_adopt(&id).await.map_err(map_error)
+    }
+    async fn dismiss(id: String) -> Result<(), Error> {
+        kernel()?.sharing_dismiss(&id).await.map_err(map_error)
     }
 }
 

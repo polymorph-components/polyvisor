@@ -13,6 +13,7 @@ pub(crate) enum Tenant {
     AppInfo,
     Settings,
     Contacts,
+    Sharing,
     Unseal,
     Devices,
 }

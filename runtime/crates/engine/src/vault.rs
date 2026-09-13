@@ -12,14 +12,12 @@
 //! The content — the user's actual documents — is what the relay must not see,
 //! and that is exactly what is sealed here.
 //!
-//! ## One keyhive document per group, not per app
+//! ## Private partitions and shareable documents
 //!
-//! Every app tree of one device group has the *same* membership (the group),
-//! so per-app keyhive documents would buy no confidentiality — and they would
-//! buy a race: two paired devices that open an app neither has seen would each
-//! generate a document for it, and the loser's commits would be sealed to a
-//! document nobody else holds. The group's single document has no such moment:
-//! it is generated once, with the group, and its id travels in `us`.
+//! Private partitions use one group-wide Keyhive document, generated with the
+//! group and named in `us`. Shareable instances each have their own Keyhive
+//! document and scoped frontier. The kernel persists instance bindings so
+//! package identity never merges independently created lists across users.
 //!
 //! ## Identity
 //!
@@ -44,11 +42,10 @@
 //! (keyhive_core store/ciphertext.rs:189), so a look-alike struct with a
 //! different `ancestors` encoding would fail on every non-genesis commit.
 //!
-//! Worth stating plainly rather than discovering later: this makes possession
-//! of one commit key transitively grant the whole ancestry behind it. Within
-//! one person's own devices — which is the entire membership model here — that
-//! is the intent. It would be a policy decision to revisit for shared
-//! documents, which do not exist yet.
+//! Possession of one commit key grants its readable ancestry. Same-user
+//! enrollment and document sharing v0 both deliberately disclose that history;
+//! the trusted sharing confirmation says so. Shared frontiers and validated
+//! ancestor edges are confined to the selected document.
 //!
 //! Because the ancestry rides in the envelopes, the state a device keeps is a
 //! *set of heads* — one `⟨pointer, key⟩` pair per readable branch — and not a
@@ -97,6 +94,7 @@ type Plaintext = Vec<u8>;
 
 type Store = MemoryCiphertextStore<Cref, Plaintext>;
 type Kh = Keyhive<Local, SigningKey, Cref, Plaintext, Store, NoListener, ChaCha20Rng>;
+type SerializedHeads = Vec<(Cref, [u8; 32])>;
 
 #[derive(Serialize, Deserialize)]
 struct MembershipProof {
@@ -125,6 +123,10 @@ pub struct VaultState {
     ///
     #[serde(default)]
     pub heads: Vec<(Cref, [u8; 32])>,
+    /// Readable frontiers for explicitly shareable platform documents. Kept
+    /// separate so granting one document can never export keys for another.
+    #[serde(default)]
+    pub shared_heads: Vec<([u8; 32], SerializedHeads)>,
 }
 
 /// A sealed commit, and what the frontier owes it once it has landed.
@@ -139,6 +141,7 @@ pub struct Sealed {
     cref: Cref,
     key: SymmetricKey,
     embedded: Vec<Cref>,
+    shared_document: Option<[u8; 32]>,
 }
 
 /// This device's keyhive: its own identity, the device group, and the one
@@ -154,6 +157,7 @@ pub struct Vault {
     /// The readable frontier: a content key per head commit, and nothing
     /// below them. See [`VaultState::heads`] and [`Vault::advance`].
     heads: RefCell<HashMap<Cref, SymmetricKey>>,
+    shared_heads: RefCell<BTreeMap<[u8; 32], HashMap<Cref, SymmetricKey>>>,
     /// Digests of the static events already carried into the keyhive-events
     /// tree, so republishing is a no-op rather than a re-commit of the whole
     /// op graph on every turn.
@@ -194,6 +198,7 @@ impl Vault {
             group: Cell::new(group_id),
             doc: Cell::new(doc_id),
             heads: RefCell::new(HashMap::new()),
+            shared_heads: RefCell::new(BTreeMap::new()),
             published: RefCell::new(HashSet::new()),
         })
     }
@@ -228,6 +233,21 @@ impl Vault {
                     .map(|(cref, key)| (*cref, SymmetricKey::from(*key)))
                     .collect(),
             ),
+            shared_heads: RefCell::new(
+                state
+                    .shared_heads
+                    .iter()
+                    .map(|(doc, heads)| {
+                        (
+                            *doc,
+                            heads
+                                .iter()
+                                .map(|(cref, key)| (*cref, SymmetricKey::from(*key)))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            ),
             published: RefCell::new(HashSet::new()),
         })
     }
@@ -248,6 +268,24 @@ impl Vault {
                     bytes.copy_from_slice(key.as_slice());
                     (*cref, bytes)
                 })
+                .collect::<Vec<_>>(),
+            shared_heads: self
+                .shared_heads
+                .borrow()
+                .iter()
+                .map(|(doc, heads)| {
+                    (
+                        *doc,
+                        heads
+                            .iter()
+                            .map(|(cref, key)| {
+                                let mut bytes = [0; 32];
+                                bytes.copy_from_slice(key.as_slice());
+                                (*cref, bytes)
+                            })
+                            .collect(),
+                    )
+                })
                 .collect(),
         })
     }
@@ -260,6 +298,272 @@ impl Vault {
     #[must_use]
     pub fn doc_id(&self) -> [u8; 32] {
         self.doc.get().to_bytes()
+    }
+
+    pub async fn create_document(&self) -> Result<[u8; 32], String> {
+        let group = self
+            .kh
+            .get_group(self.group.get())
+            .await
+            .ok_or_else(|| "this device has no keyhive group".to_string())?;
+        let document = self
+            .kh
+            .generate_doc(
+                vec![Peer::Group(self.group.get(), group)],
+                NonEmpty::new(self.group.get().to_bytes()),
+            )
+            .await
+            .map_err(|e| format!("keyhive document: {e}"))?;
+        let id = document.lock().await.doc_id().to_bytes();
+        self.shared_heads.borrow_mut().entry(id).or_default();
+        Ok(id)
+    }
+
+    pub async fn import_group_proof(
+        &self,
+        proof: &[u8],
+        group: [u8; 32],
+        member: [u8; 32],
+    ) -> Result<(), String> {
+        Self::verify_membership(proof, group, member).await?;
+        let proof = decode_membership_proof(proof)?;
+        for card in proof.identities {
+            self.kh
+                .receive_contact_card(&card)
+                .await
+                .map_err(|e| format!("membership proof identity: {e:?}"))?;
+        }
+        let events = proof.membership;
+        if !self
+            .kh
+            .ingest_unsorted_static_events(events)
+            .await
+            .is_empty()
+        {
+            return Err("membership proof has unresolved authority dependencies".into());
+        }
+        if self
+            .kh
+            .get_group(GroupId::new(identifier(group)?))
+            .await
+            .is_none()
+        {
+            return Err("membership proof did not materialize the recipient group".into());
+        }
+        Ok(())
+    }
+
+    pub async fn grant_document(
+        &self,
+        doc: [u8; 32],
+        recipient_group: [u8; 32],
+        access: Access,
+    ) -> Result<(), String> {
+        let doc_id = DocumentId::from(identifier(doc)?);
+        let document = self
+            .kh
+            .get_document(doc_id)
+            .await
+            .ok_or_else(|| "unknown keyhive document".to_string())?;
+        let group_id = GroupId::new(identifier(recipient_group)?);
+        let group = self
+            .kh
+            .get_group(group_id)
+            .await
+            .ok_or_else(|| "unknown recipient group".to_string())?;
+        let existing = document
+            .lock()
+            .await
+            .transitive_members()
+            .await
+            .get(&Identifier::from(group_id))
+            .map(|(_, access)| *access);
+        if existing.is_some_and(|have| have >= access) {
+            return Ok(());
+        }
+        self.kh
+            .add_member(
+                Agent::Group(group_id, group),
+                &Membered::Document(doc_id, document),
+                access,
+                &[],
+            )
+            .await
+            .map_err(|e| format!("keyhive grant: {e:?}"))?;
+        Ok(())
+    }
+
+    pub async fn document_access(
+        &self,
+        doc: [u8; 32],
+        agent: [u8; 32],
+    ) -> Result<Option<Access>, String> {
+        let document = self
+            .kh
+            .get_document(DocumentId::from(identifier(doc)?))
+            .await
+            .ok_or_else(|| "unknown keyhive document".to_string())?;
+        Ok(document
+            .lock()
+            .await
+            .transitive_members()
+            .await
+            .get(&identifier(agent)?)
+            .map(|(_, access)| *access))
+    }
+
+    pub async fn document_members(&self, doc: [u8; 32]) -> Result<Vec<([u8; 32], Access)>, String> {
+        let document = self
+            .kh
+            .get_document(DocumentId::from(identifier(doc)?))
+            .await
+            .ok_or_else(|| "unknown keyhive document".to_string())?;
+        Ok(document
+            .lock()
+            .await
+            .transitive_members()
+            .await
+            .into_iter()
+            .filter_map(|(id, (agent, access))| {
+                matches!(agent, Agent::Individual(..) | Agent::Active(..))
+                    .then_some((id.to_bytes(), access))
+            })
+            .collect())
+    }
+
+    pub async fn document_authority(&self, document: [u8; 32]) -> Result<Vec<u8>, String> {
+        let document_id = DocumentId::from(identifier(document)?);
+        let doc = self
+            .kh
+            .get_document(document_id)
+            .await
+            .ok_or_else(|| "unknown keyhive document".to_string())?;
+        let members: HashSet<_> = doc
+            .lock()
+            .await
+            .transitive_members()
+            .await
+            .into_iter()
+            .filter_map(|(id, (agent, _))| {
+                matches!(agent, Agent::Individual(..) | Agent::Active(..)).then_some(id)
+            })
+            .collect();
+        let membership = self.kh.membership_ops_for_all_agents().await;
+        let prekeys = self.kh.reachable_prekey_ops_for_all_agents().await;
+        let cgka = self.kh.cgka_ops_for_all_agents().await;
+        let source = Identifier::from(document_id);
+        let mut events = Vec::new();
+        if let Some(ops) = membership.ops.get(&source) {
+            events.extend(ops.values().cloned().map(|op| {
+                StaticEvent::from(Event::<Local, SigningKey, Cref, NoListener>::from(op))
+            }));
+        }
+        for member in members {
+            if let Some(ops) = prekeys.ops.get(&member) {
+                events.extend(ops.iter().map(|op| match op.as_ref() {
+                    keyhive_core::principal::individual::op::KeyOp::Add(op) => {
+                        StaticEvent::PrekeysExpanded(Box::new(op.as_ref().clone()))
+                    }
+                    keyhive_core::principal::individual::op::KeyOp::Rotate(op) => {
+                        StaticEvent::PrekeyRotated(Box::new(op.as_ref().clone()))
+                    }
+                }));
+            }
+        }
+        if let Some(ops) = cgka.ops.get(&source) {
+            events.extend(
+                ops.iter()
+                    .map(|op| StaticEvent::CgkaOperation(Box::new(op.as_ref().clone()))),
+            );
+        }
+        let mut seen = HashSet::new();
+        events.retain(|event| seen.insert(digest(event)));
+        bincode::serialize(&events).map_err(|e| format!("document authority: {e}"))
+    }
+
+    pub async fn adopt_document_authority(
+        &self,
+        events: &[u8],
+        document: [u8; 32],
+    ) -> Result<(), String> {
+        let events = decode_document_authority(events, document)?;
+        if !self
+            .kh
+            .ingest_unsorted_static_events(events)
+            .await
+            .is_empty()
+        {
+            return Err("document authority has unresolved dependencies".into());
+        }
+        if self
+            .kh
+            .get_document(DocumentId::from(identifier(document)?))
+            .await
+            .is_none()
+        {
+            return Err("document authority does not define the document".into());
+        }
+        Ok(())
+    }
+
+    pub async fn validate_document_authority(
+        events: &[u8],
+        document: [u8; 32],
+        recipient_group: [u8; 32],
+        sender_group: [u8; 32],
+        sender_device: [u8; 32],
+        required: Access,
+    ) -> Result<(), String> {
+        let events = decode_document_authority(events, document)?;
+        let verifier = Kh::generate(
+            SigningKey::from_bytes(&[0x5a; 32]),
+            Store::new(),
+            NoListener,
+            ChaCha20Rng::from_seed([0xa5; 32]),
+        )
+        .await
+        .map_err(|e| format!("document authority verifier: {e}"))?;
+        if !verifier
+            .ingest_unsorted_static_events(events)
+            .await
+            .is_empty()
+        {
+            return Err("document authority has unresolved dependencies".into());
+        }
+        let doc = verifier
+            .get_document(DocumentId::from(identifier(document)?))
+            .await
+            .ok_or_else(|| "document authority does not define the document".to_string())?;
+        let members = doc.lock().await.transitive_members().await;
+        for (who, label) in [
+            (recipient_group, "recipient group"),
+            (sender_group, "sender group"),
+            (sender_device, "sender device"),
+        ] {
+            if !members
+                .get(&identifier(who)?)
+                .is_some_and(|(_, access)| *access >= required)
+            {
+                return Err(format!("{label} lacks the delegated document authority"));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn ingest_document_authority(&self, events: &[u8]) -> Result<(), String> {
+        let events: Vec<StaticEvent<Cref>> = decode_events(events)?;
+        let _pending = self.kh.ingest_unsorted_static_events(events).await;
+        Ok(())
+    }
+
+    pub async fn ingest_scoped_document_authority(
+        &self,
+        events: &[u8],
+        document: [u8; 32],
+    ) -> Result<(), String> {
+        let events = decode_document_authority(events, document)?;
+        let _pending = self.kh.ingest_unsorted_static_events(events).await;
+        Ok(())
     }
 
     /// The device signing keys in Keyhive's materialized membership view.
@@ -678,6 +982,7 @@ impl Vault {
             cref,
             key,
             embedded,
+            shared_document: None,
         })
     }
 
@@ -686,6 +991,15 @@ impl Vault {
     /// ones. They are not lost — they are one hop below a head, which is where
     /// `design/causal_encryption.md` says a key belongs.
     pub fn confirm(&self, sealed: &Sealed) {
+        if let Some(document) = sealed.shared_document {
+            let mut all = self.shared_heads.borrow_mut();
+            advance_heads(
+                all.entry(document).or_default(),
+                &[(sealed.cref, sealed.key)],
+                sealed.embedded.iter().copied(),
+            );
+            return;
+        }
         self.advance(
             &[(sealed.cref, sealed.key)],
             sealed.embedded.iter().copied(),
@@ -704,6 +1018,83 @@ impl Vault {
     /// outside the fragment is not carried by it and must keep its key.
     pub fn cover(&self, members: impl Iterator<Item = Cref>) {
         self.advance(&[], members);
+    }
+
+    pub async fn seal_shared(
+        &self,
+        document: [u8; 32],
+        cref: Cref,
+        preds: &[Cref],
+        change: Vec<u8>,
+    ) -> Result<Sealed, String> {
+        let doc = self
+            .kh
+            .get_document(DocumentId::from(identifier(document)?))
+            .await
+            .ok_or_else(|| "unknown keyhive document".to_string())?;
+        let ancestors: HashMap<Cref, SymmetricKey> = {
+            let all = self.shared_heads.borrow();
+            let keys = all.get(&document);
+            preds
+                .iter()
+                .filter_map(|parent| {
+                    keys.and_then(|keys| keys.get(parent))
+                        .map(|key| (*parent, *key))
+                })
+                .collect()
+        };
+        let embedded = ancestors.keys().copied().collect();
+        let plaintext = bincode::serialize(&Envelope {
+            plaintext: change,
+            ancestors,
+        })
+        .map_err(|e| format!("envelope: {e}"))?;
+        let (sealed, key) = self
+            .kh
+            .try_encrypt_content_keyed(doc, &cref, &preds.to_vec(), &plaintext)
+            .await
+            .map_err(|e| format!("encrypt: {e:?}"))?;
+        self.store
+            .insert(Arc::new(sealed.encrypted_content().clone()))
+            .await;
+        Ok(Sealed {
+            blob: bincode::serialize(sealed.encrypted_content())
+                .map_err(|e| format!("envelope: {e}"))?,
+            cref,
+            key,
+            embedded,
+            shared_document: Some(document),
+        })
+    }
+
+    pub fn export_shared_frontier(&self, document: [u8; 32]) -> Result<Vec<u8>, String> {
+        let keys: Vec<_> = self
+            .shared_heads
+            .borrow()
+            .get(&document)
+            .into_iter()
+            .flat_map(|heads| heads.iter())
+            .map(|(cref, key)| {
+                let mut bytes = [0; 32];
+                bytes.copy_from_slice(key.as_slice());
+                (*cref, bytes)
+            })
+            .collect();
+        bincode::serialize(&keys).map_err(|e| format!("document frontier: {e}"))
+    }
+
+    pub fn import_shared_frontier(&self, document: [u8; 32], bytes: &[u8]) -> Result<(), String> {
+        let keys: Vec<(Cref, [u8; 32])> =
+            bincode::deserialize(bytes).map_err(|e| format!("bad document frontier: {e}"))?;
+        self.shared_heads
+            .borrow_mut()
+            .entry(document)
+            .or_default()
+            .extend(
+                keys.into_iter()
+                    .map(|(cref, key)| (cref, SymmetricKey::from(key))),
+            );
+        Ok(())
     }
 
     /// Remove cached ciphertext and frontier keys belonging to a retired raw
@@ -894,6 +1285,94 @@ impl Vault {
         Ok(opened)
     }
 
+    pub async fn open_shared(
+        &self,
+        document: [u8; 32],
+        blobs: Vec<(Cref, Vec<u8>)>,
+        known: &HashSet<Cref>,
+        parents: &BTreeMap<Cref, BTreeSet<Cref>>,
+    ) -> Result<Vec<(Cref, Vec<u8>)>, String> {
+        let Some(doc) = self
+            .kh
+            .get_document(DocumentId::from(identifier(document)?))
+            .await
+        else {
+            return Ok(Vec::new());
+        };
+        let encrypted: HashMap<_, _> = decode(blobs).into_iter().collect();
+        let mut opened = HashMap::new();
+        let mut reached = Vec::new();
+        let mut queue = VecDeque::new();
+        for (cref, ciphertext) in &encrypted {
+            if ciphertext.content_ref != *cref {
+                return Err(
+                    "shared ciphertext content reference does not match signed item".into(),
+                );
+            }
+            if let Ok((plain, key)) = self
+                .kh
+                .try_decrypt_content_keyed(doc.clone(), ciphertext)
+                .await
+            {
+                let envelope: Envelope<Cref, Vec<u8>> = bincode::deserialize(&plain)
+                    .map_err(|e| format!("shared chunk envelope: {e}"))?;
+                if !envelope
+                    .ancestors
+                    .keys()
+                    .all(|ancestor| parents.get(cref).is_some_and(|set| set.contains(ancestor)))
+                {
+                    return Err("shared envelope contains an unsigned ancestor".into());
+                }
+                reached.push((*cref, key));
+                queue.extend(envelope.ancestors.iter().map(|(cref, key)| (*cref, *key)));
+                opened.insert(*cref, envelope.plaintext);
+            }
+        }
+        {
+            let all = self.shared_heads.borrow();
+            if let Some(heads) = all.get(&document) {
+                for (cref, key) in heads {
+                    if encrypted.contains_key(cref) {
+                        queue.push_back((*cref, *key));
+                    }
+                }
+            }
+        }
+        let mut covered = HashSet::new();
+        while let Some((cref, key)) = queue.pop_front() {
+            if opened.contains_key(&cref) {
+                covered.insert(cref);
+                continue;
+            }
+            let Some(ciphertext) = encrypted.get(&cref) else {
+                reached.push((cref, key));
+                continue;
+            };
+            let Ok(plain) = ciphertext.try_decrypt(key) else {
+                continue;
+            };
+            let envelope: Envelope<Cref, Vec<u8>> =
+                bincode::deserialize(&plain).map_err(|e| format!("shared chunk envelope: {e}"))?;
+            if !envelope
+                .ancestors
+                .keys()
+                .all(|ancestor| parents.get(&cref).is_some_and(|set| set.contains(ancestor)))
+            {
+                return Err("shared envelope contains an unsigned ancestor".into());
+            }
+            queue.extend(envelope.ancestors.iter().map(|(cref, key)| (*cref, *key)));
+            opened.insert(cref, envelope.plaintext);
+        }
+        covered.extend(known.iter().copied());
+        let mut all = self.shared_heads.borrow_mut();
+        advance_heads(
+            all.entry(document).or_default(),
+            &reached,
+            covered.into_iter(),
+        );
+        Ok(opened.into_iter().collect())
+    }
+
     /// Open caller-authenticated raw commits without letting their envelopes
     /// name content outside that raw tree.
     ///
@@ -1045,15 +1524,7 @@ impl Vault {
     /// legitimate entry point.
     fn advance(&self, arrived: &[(Cref, SymmetricKey)], covered: impl Iterator<Item = Cref>) {
         let mut heads = self.heads.borrow_mut();
-        for (cref, key) in arrived {
-            let _replaced = heads.insert(*cref, *key);
-        }
-        let fresh: HashSet<Cref> = arrived.iter().map(|(cref, _)| *cref).collect();
-        for cref in covered {
-            if !fresh.contains(&cref) {
-                let _dropped = heads.remove(&cref);
-            }
-        }
+        advance_heads(&mut heads, arrived, covered);
     }
 
     async fn all_events(&self) -> Vec<StaticEvent<Cref>> {
@@ -1115,6 +1586,22 @@ fn decode(blobs: Vec<(Cref, Vec<u8>)>) -> Vec<(Cref, Ciphertext)> {
         .collect()
 }
 
+fn advance_heads(
+    heads: &mut HashMap<Cref, SymmetricKey>,
+    arrived: &[(Cref, SymmetricKey)],
+    covered: impl Iterator<Item = Cref>,
+) {
+    for (cref, key) in arrived {
+        let _replaced = heads.insert(*cref, *key);
+    }
+    let fresh: HashSet<Cref> = arrived.iter().map(|(cref, _)| *cref).collect();
+    for cref in covered {
+        if !fresh.contains(&cref) {
+            let _dropped = heads.remove(&cref);
+        }
+    }
+}
+
 fn identifier(bytes: [u8; 32]) -> Result<Identifier, String> {
     ed25519_dalek::VerifyingKey::from_bytes(&bytes)
         .map(Identifier::from)
@@ -1144,6 +1631,44 @@ fn decode_membership_proof(bytes: &[u8]) -> Result<MembershipProof, String> {
         return Err("membership proof contains a private epoch operation".into());
     }
     Ok(proof)
+}
+
+fn decode_events(bytes: &[u8]) -> Result<Vec<StaticEvent<Cref>>, String> {
+    bincode::options()
+        .with_fixint_encoding()
+        .with_limit(MAX_MEMBERSHIP_PROOF_BYTES as u64)
+        .reject_trailing_bytes()
+        .deserialize(bytes)
+        .map_err(|e| format!("bad document authority: {e}"))
+}
+
+fn decode_document_authority(
+    bytes: &[u8],
+    document: [u8; 32],
+) -> Result<Vec<StaticEvent<Cref>>, String> {
+    let events = decode_events(bytes)?;
+    let document_id = DocumentId::from(identifier(document)?);
+    if events.iter().any(|event| match event {
+        StaticEvent::CgkaOperation(op) => *op.payload().doc_id().as_bytes() != document,
+        StaticEvent::Delegated(op) => op
+            .payload()
+            .after_content
+            .keys()
+            .any(|id| *id != document_id),
+        StaticEvent::Revoked(op) => op
+            .payload()
+            .after_content
+            .keys()
+            .any(|id| id.to_bytes() != document),
+        StaticEvent::PrekeysExpanded(_) | StaticEvent::PrekeyRotated(_) => false,
+    }) {
+        return Err("document authority contains another document's operations".into());
+    }
+    Ok(events)
+}
+
+pub(crate) fn valid_document_authority_scope(bytes: &[u8], document: [u8; 32]) -> bool {
+    decode_document_authority(bytes, document).is_ok()
 }
 
 fn digest<T: Serialize>(value: &T) -> [u8; 32] {

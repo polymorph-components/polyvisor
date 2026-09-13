@@ -301,6 +301,16 @@ pub(crate) async fn launch(app: &str) -> Result<SessionId, String> {
     api::apps::launch(app.to_string()).await.map_err(message)
 }
 
+/// Start an installed app against one adopted document instance
+/// (internal.wit `apps.launch-instance`): the instance stays distinct from
+/// that app's personal document, and only ever comes from an inbox
+/// invitation this device already adopted — never a route the app chose.
+pub(crate) async fn launch_instance(app: &str, instance: &str) -> Result<SessionId, String> {
+    api::apps::launch_instance(app.to_string(), instance.to_string())
+        .await
+        .map_err(message)
+}
+
 pub(crate) async fn close(session: SessionId) -> Result<(), String> {
     api::apps::close(session).await.map_err(message)
 }
@@ -322,26 +332,33 @@ pub(crate) fn fragment() -> Option<String> {
     api::shell::fragment()
 }
 
-/// What a bookmark resolves to: the app to launch, and the route to hand
-/// its frame.
-///
+/// What a bookmark resolves to (internal.wit `apps.route-target`): the app
+/// to launch, the route to hand its frame, and — when the bookmark named an
+/// adopted document — which instance to open it against.
+#[derive(Clone, PartialEq)]
+pub(crate) struct RouteTarget {
+    pub(crate) app: App,
+    pub(crate) route: String,
+    pub(crate) instance: Option<String>,
+}
+
 /// The visor never looks inside `fragment`. The kernel owns the grammar
-/// and the token is opaque — install id and route sealed under the user's
-/// route key (internal.wit `apps.route-decode`) — so a fragment this
-/// device cannot open is a kernel `not-found`, with the kernel's own
-/// framework-voice message, and not a shape this file could recognise.
-pub(crate) async fn route_decode(fragment: &str) -> Result<(App, String), String> {
+/// and the token is opaque — install id, route and instance sealed under
+/// the user's route key (internal.wit `apps.route-decode`) — so a
+/// fragment this device cannot open is a kernel `not-found`, with the
+/// kernel's own framework-voice message, and not a shape this file could
+/// recognise.
+pub(crate) async fn route_decode(fragment: &str) -> Result<RouteTarget, String> {
     api::apps::route_decode(fragment.to_string())
         .await
         .map_err(message)
-        .map(|t| {
-            (
-                App {
-                    id: t.app.id,
-                    title: AppText::from_kernel(t.app.title),
-                },
-                t.route,
-            )
+        .map(|t| RouteTarget {
+            app: App {
+                id: t.app.id,
+                title: AppText::from_kernel(t.app.title),
+            },
+            route: t.route,
+            instance: t.instance,
         })
 }
 
@@ -1071,6 +1088,206 @@ pub(crate) async fn save_contact_file(name: String, bytes: &[u8]) -> Result<(), 
         .map_err(message)
 }
 
+/// internal.wit `sharing.access`: the two access levels a trusted grant may
+/// carry. Sharing always includes the whole readable history and permits
+/// the recipient to reshare (internal.wit `sharing.invitation`
+/// `history-and-resharing`; there is no owner-only-resharing promise in
+/// this contract), so the visor has no "history" or "resharing" choice to
+/// offer — only which of these two access levels to grant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Access {
+    Read,
+    Edit,
+}
+
+fn access(value: api::sharing::Access) -> Access {
+    match value {
+        api::sharing::Access::Read => Access::Read,
+        api::sharing::Access::Edit => Access::Edit,
+    }
+}
+
+fn raw_access(value: Access) -> api::sharing::Access {
+    match value {
+        Access::Read => api::sharing::Access::Read,
+        Access::Edit => api::sharing::Access::Edit,
+    }
+}
+
+/// internal.wit `sharing.delivery-state`. The visor's own framework voice
+/// is composed off this, never off `outgoing-item.detail` alone — `detail`
+/// is shown as extra context, but the state is what decides whether Retry
+/// is offered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DeliveryState {
+    Queued,
+    Delivering,
+    Delivered,
+    Failed,
+}
+
+fn delivery_state(value: api::sharing::DeliveryState) -> DeliveryState {
+    match value {
+        api::sharing::DeliveryState::Queued => DeliveryState::Queued,
+        api::sharing::DeliveryState::Delivering => DeliveryState::Delivering,
+        api::sharing::DeliveryState::Delivered => DeliveryState::Delivered,
+        api::sharing::DeliveryState::Failed => DeliveryState::Failed,
+    }
+}
+
+/// A trusted share prompt (internal.wit `sharing.prompt`): `tasks-share`
+/// queued this and is waiting on a contact/access choice in trusted
+/// pixels. The app supplied neither a contact nor a document id — those
+/// never cross into app-facing types at all.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct Prompt {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) app: String,
+}
+
+/// One outgoing grant (internal.wit `sharing.outgoing-item`). `state` is
+/// the kernel's authority on delivery; `detail` is framework voice shown
+/// alongside it verbatim.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct OutgoingItem {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) recipient: String,
+    pub(crate) access: Access,
+    pub(crate) state: DeliveryState,
+    pub(crate) detail: String,
+}
+
+/// A received invitation (internal.wit `sharing.invitation`).
+/// `adopted_instance` is `None` until `sharing.adopt` has run locally; a
+/// dismissal never sets it and never removes the invitation from view —
+/// dismissal is not revocation.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct Invitation {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) sender: String,
+    pub(crate) app: String,
+    pub(crate) access: Access,
+    pub(crate) history_and_resharing: bool,
+    pub(crate) adopted_instance: Option<String>,
+}
+
+/// One document instance an app may be opened against (internal.wit
+/// `sharing.document-instance`): the personal instance (`personal` true,
+/// `id` empty) or one adopted invitation's instance.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct DocumentInstance {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) personal: bool,
+    pub(crate) access: Access,
+}
+
+pub(crate) async fn sharing_prompts() -> Result<Vec<Prompt>, String> {
+    Ok(api::sharing::prompts()
+        .await
+        .map_err(message)?
+        .into_iter()
+        .map(|p| Prompt {
+            id: p.id,
+            label: p.label,
+            app: p.app,
+        })
+        .collect())
+}
+
+/// Confirm the exact queued prompt against an authenticated contact.
+/// Grant and checkpoint precede delivery (internal.wit `sharing.confirm`);
+/// a failed delivery stays retryable through `sharing_retry`.
+pub(crate) async fn sharing_confirm(
+    prompt: &str,
+    contact: &str,
+    grant_access: Access,
+) -> Result<(), String> {
+    api::sharing::confirm(
+        prompt.to_string(),
+        contact.to_string(),
+        raw_access(grant_access),
+    )
+    .await
+    .map_err(message)
+}
+
+pub(crate) async fn sharing_cancel(prompt: &str) -> Result<(), String> {
+    api::sharing::cancel(prompt.to_string())
+        .await
+        .map_err(message)
+}
+
+pub(crate) async fn sharing_outgoing() -> Result<Vec<OutgoingItem>, String> {
+    Ok(api::sharing::outgoing()
+        .await
+        .map_err(message)?
+        .into_iter()
+        .map(|o| OutgoingItem {
+            id: o.id,
+            label: o.label,
+            recipient: o.recipient,
+            access: access(o.access),
+            state: delivery_state(o.state),
+            detail: o.detail,
+        })
+        .collect())
+}
+
+pub(crate) async fn sharing_retry(id: &str) -> Result<(), String> {
+    api::sharing::retry(id.to_string()).await.map_err(message)
+}
+
+pub(crate) async fn sharing_inbox() -> Result<Vec<Invitation>, String> {
+    Ok(api::sharing::inbox()
+        .await
+        .map_err(message)?
+        .into_iter()
+        .map(|i| Invitation {
+            id: i.id,
+            label: i.label,
+            sender: i.sender,
+            app: i.app,
+            access: access(i.access),
+            history_and_resharing: i.history_and_resharing,
+            adopted_instance: i.adopted_instance,
+        })
+        .collect())
+}
+
+/// Local acceptance only (internal.wit `sharing.adopt`): verify/adopt the
+/// already-granted document and bind a durable instance. No receiver
+/// handshake occurs, and no app is launched here — opening is a separate,
+/// explicit act.
+pub(crate) async fn sharing_adopt(id: &str) -> Result<String, String> {
+    api::sharing::adopt(id.to_string()).await.map_err(message)
+}
+
+/// Dismiss the inbox row. Display only: never revokes an adopted instance
+/// (internal.wit `sharing.dismiss`).
+pub(crate) async fn sharing_dismiss(id: &str) -> Result<(), String> {
+    api::sharing::dismiss(id.to_string()).await.map_err(message)
+}
+
+/// The personal and adopted document instances an app may be opened
+/// against (internal.wit `sharing.instances`).
+pub(crate) async fn sharing_instances(app: &str) -> Result<Vec<DocumentInstance>, String> {
+    Ok(api::sharing::instances(app.to_string())
+        .await
+        .map_err(message)?
+        .into_iter()
+        .map(|i| DocumentInstance {
+            id: i.id,
+            label: i.label,
+            personal: i.personal,
+            access: access(i.access),
+        })
+        .collect())
+}
+
 /// The next kernel event.
 pub(crate) enum Event {
     /// The pairing ceremony moved (internal.wit `events.pairing-changed`).
@@ -1087,6 +1304,11 @@ pub(crate) enum Event {
     PersonalizationChanged,
     ContactsChanged,
     MeetingChanged(MeetingPhase),
+    /// internal.wit `events.sharing-changed`: a share prompt, delivery
+    /// status, or received invitation changed. Carries nothing — the visor
+    /// re-reads `sharing.prompts`/`outgoing`/`inbox`, the same pattern
+    /// `ContactsChanged` uses for `contacts.items`.
+    SharingChanged,
 }
 
 pub(crate) async fn next_event() -> Event {
@@ -1096,5 +1318,6 @@ pub(crate) async fn next_event() -> Event {
         api::events::Event::PersonalizationChanged => Event::PersonalizationChanged,
         api::events::Event::ContactsChanged => Event::ContactsChanged,
         api::events::Event::MeetingChanged(p) => Event::MeetingChanged(meeting_phase(p)),
+        api::events::Event::SharingChanged => Event::SharingChanged,
     }
 }

@@ -5,7 +5,7 @@
   "plan": "app.component.plan.json",
   "assets": [
     {
-      "handle": "0f827d119b7bec30534b1767e8ab8ee0f2890c98f93baa1159dcf1a46f10bc17",
+      "handle": "3d2e4819b48027f57bed841b57d3e69d2f32722a50532b9915116b40ac1c8680",
       "path": "todomvc-app.css",
       "media_type": "text/css"
     }

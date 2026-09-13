@@ -32,7 +32,7 @@ use std::cell::{Cell, RefCell};
 
 use polyvisor_kernel::{
     Accepted, Bound, Dialed, EngineTransport, LocalFuture, MEETING_ALPN, Net, NetHandle,
-    PAIRING_ALPN, ROOT_TRANSFER_ALPN, SUBDUCTION_ALPN,
+    PAIRING_ALPN, ROOT_TRANSFER_ALPN, SHARING_ALPN, SUBDUCTION_ALPN,
 };
 
 // The generated bindings live where `wit_bindgen::generate!` was invoked.
@@ -51,11 +51,12 @@ use crate::z32;
 /// whose accept loop routes on it. The strings are the kernel's because the
 /// kernel is what decides which wire a dial belongs on; this file only
 /// spells them for `polymorph:iroh`, which takes ALPNs as bytes.
-const ALPNS: [&str; 4] = [
+const ALPNS: [&str; 5] = [
     SUBDUCTION_ALPN,
     PAIRING_ALPN,
     MEETING_ALPN,
     ROOT_TRANSFER_ALPN,
+    SHARING_ALPN,
 ];
 
 /// Largest frame either direction, matching `subduction_iroh`'s
@@ -214,7 +215,15 @@ impl IrohEndpoint {
             .open_bi()
             .await
             .map_err(|e| format!("that device answered but opened no stream: {e:?}"))?;
-        Ok((key, Box::new(IrohTransport::new(connection, send, recv))))
+        let cap = if alpn == polyvisor_kernel::SHARING_ALPN {
+            polyvisor_kernel::sharing_wire_budget()
+        } else {
+            MAX_FRAME
+        };
+        Ok((
+            key,
+            Box::new(IrohTransport::new(connection, send, recv, cap)),
+        ))
     }
 
     /// The next connection dialed to this device, and which wire it is on.
@@ -249,11 +258,16 @@ impl IrohEndpoint {
         let peer = z32::encode(&raw);
         let alpn = String::from_utf8(connection.alpn())
             .map_err(|_| "a peer connected on a wire this device does not serve".to_string())?;
+        let cap = if alpn == polyvisor_kernel::SHARING_ALPN {
+            polyvisor_kernel::sharing_wire_budget()
+        } else {
+            MAX_FRAME
+        };
         Ok((
             peer,
             key,
             alpn,
-            Box::new(IrohTransport::new(connection, send, recv)),
+            Box::new(IrohTransport::new(connection, send, recv, cap)),
         ))
     }
 }
@@ -280,6 +294,7 @@ pub struct IrohTransport {
     /// closed stream to rediscover that is noise on the host.
     ended: Cell<bool>,
     closed: Cell<bool>,
+    max_frame: usize,
 }
 
 impl EngineTransport for IrohTransport {
@@ -297,7 +312,7 @@ impl EngineTransport for IrohTransport {
 }
 
 impl IrohTransport {
-    fn new(connection: Connection, send: SendStream, recv: RecvStream) -> Self {
+    fn new(connection: Connection, send: SendStream, recv: RecvStream, max_frame: usize) -> Self {
         Self {
             connection,
             send,
@@ -305,6 +320,7 @@ impl IrohTransport {
             pending: RefCell::new(Vec::new()),
             ended: Cell::new(false),
             closed: Cell::new(false),
+            max_frame,
         }
     }
 
@@ -319,7 +335,7 @@ impl IrohTransport {
     /// — and if one ever did, the host refuses it loudly rather than
     /// corrupting the stream.
     async fn send_frame(&self, bytes: Vec<u8>) -> Result<(), String> {
-        if bytes.len() > MAX_FRAME {
+        if bytes.len() > self.max_frame {
             return Err(format!(
                 "a {} byte message is past this wire's {MAX_FRAME} byte limit",
                 bytes.len()
@@ -369,7 +385,7 @@ impl IrohTransport {
             return Some(None);
         }
         let len = u32::from_be_bytes([pending[0], pending[1], pending[2], pending[3]]) as usize;
-        if len > MAX_FRAME {
+        if len > self.max_frame {
             self.ended.set(true);
             pending.clear();
             return None;

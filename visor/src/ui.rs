@@ -29,19 +29,33 @@
 use dioxus::html::Key;
 use dioxus::prelude::*;
 
+use std::collections::BTreeMap;
+
 use crate::contacts::{FragmentRoute, classify_fragment};
 use crate::contacts_ui::{ContactsSheet, Incoming};
 use crate::draft::{RollState, RollTarget, rebase_map};
 use crate::glyph::{normalize_glyph, roll_animal};
 use crate::kernel::{
-    self, App, Binding, Entry, Event, InstallOutcome, Member, Meta, MetaScope, Peer, SessionId,
-    Status,
+    self, App, Binding, DocumentInstance, Entry, Event, InstallOutcome, Invitation, Member, Meta,
+    MetaScope, Peer, SessionId, Status,
 };
+use crate::sharing_ui::{SharingSheet, refresh_sharing};
 use crate::state::{
     Action, Drawer, Gate, Phase, Rest, Tenant, Tier, boot_drawer, claim_code, grouped,
 };
 use crate::style::CSS;
 use crate::voice::{AppText, AppVoice, Voice, coarse_age};
+
+/// The running session's app and, when it is an adopted document rather
+/// than the personal instance, the received list's own label — what the
+/// strip and `AppInfo` show beside the app's title (internal.wit
+/// `sharing.document-instance.label`).
+#[derive(Clone, PartialEq)]
+pub(crate) struct RunningApp {
+    id: SessionId,
+    app: App,
+    label: Option<String>,
+}
 
 /// Visor-owned keys, with the same meaning in user and app metadata.
 const PETNAME: &str = "petname";
@@ -111,7 +125,7 @@ fn roll_petname(
     previous: String,
     mut rolls: CopyValue<RollState>,
     mut draft: Signal<Draft>,
-    session: Signal<Option<(SessionId, App)>>,
+    session: Signal<Option<RunningApp>>,
 ) {
     let value = polyvisor_petname::generate(
         || {
@@ -121,7 +135,7 @@ fn roll_petname(
         &previous,
     );
     if let RollTarget::App(expected) = &target
-        && session.read().as_ref().map(|(_, app)| &app.id) != Some(expected)
+        && session.read().as_ref().map(|r| &r.app.id) != Some(expected)
     {
         return;
     }
@@ -332,6 +346,7 @@ fn pane_label(t: Tenant) -> &'static str {
         Tenant::AppInfo => "the running app",
         Tenant::Settings => "settings",
         Tenant::Contacts => "contacts",
+        Tenant::Sharing => "sharing",
         Tenant::Unseal => "unseal this device",
         Tenant::Devices => "other devices",
     }
@@ -346,28 +361,41 @@ fn flag(yes: bool) -> Option<&'static str> {
     yes.then_some("")
 }
 
-/// Launch `app` and give its frame the screen, with `route` as what the
-/// frame answers `polyvisor:app/route.get` with (internal.wit
-/// `shell.open-frame`): "" for a press on the app list, and the route a
-/// bookmark carried for [`restore_bookmark`]. One function because the two
-/// paths differ in that string and in nothing else — including the failure
-/// handling, where a frame that will not open has to take its session with
-/// it or every failure leaks a session id.
+/// Launch `app` and give its frame the screen.
+///
+/// `route` is what the frame answers `polyvisor:app/route.get` with
+/// (internal.wit `shell.open-frame`): "" for a plain launch, and the route
+/// a bookmark carried for [`restore_bookmark`]. `instance` is `None` for
+/// the app's personal document (`apps.launch`) or `Some(id)` for one
+/// adopted instance (`apps.launch-instance`, internal.wit); `label` is that
+/// instance's own label, shown beside the app's title, and is meaningless
+/// when `instance` is `None`.
+///
+/// One function for every launch path because they differ only in these
+/// three values — including the failure handling, where a frame that will
+/// not open has to take its session with it or every failure leaks a
+/// session id.
 async fn open_app(
     app: App,
     route: String,
-    mut session: Signal<Option<(SessionId, App)>>,
+    instance: Option<String>,
+    label: Option<String>,
+    mut session: Signal<Option<RunningApp>>,
     app_meta: Signal<Meta>,
     mut notice: Signal<Option<Notice>>,
     apply: Callback<Action>,
 ) {
-    match kernel::launch(&app.id).await {
+    let launched = match &instance {
+        Some(instance) => kernel::launch_instance(&app.id, instance).await,
+        None => kernel::launch(&app.id).await,
+    };
+    match launched {
         Err(e) => notice.set(Some(Notice::Plain(e))),
         Ok(id) => match kernel::open_frame(id, &route).await {
             Ok(()) => {
                 notice.set(None);
                 let app_id = app.id.clone();
-                session.set(Some((id, app)));
+                session.set(Some(RunningApp { id, app, label }));
                 // The strip's left half now speaks for this app.
                 read_app_meta(app_id, app_meta, notice).await;
                 // The frame gets the screen; the drawer never covers it.
@@ -384,6 +412,24 @@ async fn open_app(
             }
         },
     }
+}
+
+/// Every installed app's document instances (internal.wit
+/// `sharing.instances`): the personal instance plus any adopted ones,
+/// which is what lets the app list offer a choice of list to open instead
+/// of only the personal one. Re-read whenever the app list or the sharing
+/// state changes — an adopt happening elsewhere adds an entry here.
+async fn refresh_app_instances(
+    apps: Vec<App>,
+    mut app_instances: Signal<BTreeMap<String, Vec<DocumentInstance>>>,
+) {
+    let mut map = BTreeMap::new();
+    for app in apps {
+        if let Ok(list) = kernel::sharing_instances(&app.id).await {
+            map.insert(app.id, list);
+        }
+    }
+    app_instances.set(map);
 }
 
 thread_local! {
@@ -419,7 +465,7 @@ thread_local! {
 /// restores its bookmark when the unseal ceremony succeeds, because
 /// `on_unsealed` reads the identity again and the flag is still unspent.
 async fn restore_bookmark(
-    session: Signal<Option<(SessionId, App)>>,
+    session: Signal<Option<RunningApp>>,
     app_meta: Signal<Meta>,
     mut notice: Signal<Option<Notice>>,
     apply: Callback<Action>,
@@ -446,7 +492,32 @@ async fn restore_bookmark(
     }
     match kernel::route_decode(&f).await {
         Err(e) => notice.set(Some(Notice::Plain(e))),
-        Ok((app, route)) => open_app(app, route, session, app_meta, notice, apply).await,
+        Ok(target) => {
+            // The instance a bookmark named is looked up against
+            // `sharing.instances` for its current label — an adopted
+            // list's label can change (a resharing, a rename) since the
+            // fragment was minted, and the strip should say the current one.
+            let label = match &target.instance {
+                Some(instance) => kernel::sharing_instances(&target.app.id)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|i| &i.id == instance)
+                    .map(|i| i.label),
+                None => None,
+            };
+            open_app(
+                target.app,
+                target.route,
+                target.instance,
+                label,
+                session,
+                app_meta,
+                notice,
+                apply,
+            )
+            .await
+        }
     }
 }
 
@@ -471,10 +542,11 @@ async fn read_identity(
     mut notice: Signal<Option<Notice>>,
     mut user_meta: Signal<Meta>,
     gate: CopyValue<Gate>,
-    session: Signal<Option<(SessionId, App)>>,
+    session: Signal<Option<RunningApp>>,
     app_meta: Signal<Meta>,
     apply: Callback<Action>,
     incoming: Signal<Option<Incoming>>,
+    app_instances: Signal<BTreeMap<String, Vec<DocumentInstance>>>,
 ) {
     let token = gate.peek().begin();
     match kernel::status().await {
@@ -498,7 +570,8 @@ async fn read_identity(
     match kernel::installed().await {
         Ok(list) => {
             if gate.peek().apply(token) {
-                apps.set(list);
+                apps.set(list.clone());
+                refresh_app_instances(list, app_instances).await;
             }
         }
         Err(e) => notice.set(Some(Notice::Plain(e))),
@@ -662,15 +735,19 @@ pub(crate) fn Visor() -> Element {
     let mut status = use_signal(|| None::<Status>);
     let apps = use_signal(Vec::<App>::new);
     let mut entries = use_signal(Vec::<Entry>::new);
-    let mut session = use_signal(|| None::<(SessionId, App)>);
+    let mut session = use_signal(|| None::<RunningApp>);
     let mut notice = use_signal(|| None::<Notice>);
     let peers = use_signal(Vec::<Peer>::new);
     let mut members = use_signal(Vec::<Member>::new);
     let pairing_phase = use_signal(Phase::default);
     let binding = use_signal(|| None::<Binding>);
-    let contacts = use_signal(Vec::<kernel::Contact>::new);
+    let mut contacts = use_signal(Vec::<kernel::Contact>::new);
     let contacts_profile = use_signal(|| None::<kernel::SelfProfile>);
     let contact_records = use_signal(Vec::<kernel::MeetingRecord>::new);
+    let mut sharing_prompts = use_signal(Vec::<kernel::Prompt>::new);
+    let mut sharing_outgoing = use_signal(Vec::<kernel::OutgoingItem>::new);
+    let mut sharing_inbox = use_signal(Vec::<Invitation>::new);
+    let app_instances = use_signal(BTreeMap::<String, Vec<DocumentInstance>>::new);
     let meeting_phase = use_signal(|| kernel::MeetingPhase::Idle);
     let mut meeting_epoch = use_signal(|| 0u64);
     let offered_card = use_signal(|| None::<(u32, kernel::SelfProfile)>);
@@ -942,10 +1019,7 @@ pub(crate) fn Visor() -> Element {
             return;
         }
         saving.set(true);
-        let app_id = session
-            .read()
-            .as_ref()
-            .map(|(_, a): &(SessionId, App)| a.id.clone());
+        let app_id = session.read().as_ref().map(|r| r.app.id.clone());
         spawn(async move {
             let saved = save_draft(
                 draft,
@@ -1014,6 +1088,7 @@ pub(crate) fn Visor() -> Element {
             app_meta,
             apply,
             incoming,
+            app_instances,
         )
         .await;
         let index = kernel::devices().await.unwrap_or_default();
@@ -1048,15 +1123,15 @@ pub(crate) fn Visor() -> Element {
         loop {
             match kernel::next_event().await {
                 Event::SessionEnded(ended, reason) => {
-                    let current = session.read().as_ref().map(|(id, app)| (*id, app.clone()));
-                    if let Some((id, app)) = current
-                        && id == ended
+                    let current = session.read().clone();
+                    if let Some(running) = current
+                        && running.id == ended
                     {
-                        let _ = kernel::close_frame(id).await;
+                        let _ = kernel::close_frame(running.id).await;
                         session.set(None);
                         app_meta.set(Meta::new());
                         notice.set(Some(Notice::Ended {
-                            app: app.title,
+                            app: running.app.title,
                             reason,
                         }));
                         // Nothing is running now, so this rests the drawer
@@ -1075,10 +1150,8 @@ pub(crate) fn Visor() -> Element {
                 Event::PersonalizationChanged => loop {
                     let status_token = status_gate.peek().begin();
                     let drawer_token = drawer_gate.peek().begin();
-                    let expected_session = session
-                        .read()
-                        .as_ref()
-                        .map(|(id, app)| (*id, app.id.clone()));
+                    let expected_session =
+                        session.read().as_ref().map(|r| (r.id, r.app.id.clone()));
                     let fresh_status = kernel::status().await;
                     let fresh_user = kernel::meta(MetaScope::User).await;
                     let fresh_members = kernel::members().await;
@@ -1086,10 +1159,7 @@ pub(crate) fn Visor() -> Element {
                         Some((_, app)) => kernel::meta(MetaScope::App(app.clone())).await,
                         None => Ok(Meta::new()),
                     };
-                    let session_now = session
-                        .read()
-                        .as_ref()
-                        .map(|(id, app)| (*id, app.id.clone()));
+                    let session_now = session.read().as_ref().map(|r| (r.id, r.app.id.clone()));
                     if !status_gate.peek().apply(status_token)
                         || !drawer_gate.peek().apply(drawer_token)
                         || session_now != expected_session
@@ -1143,15 +1213,73 @@ pub(crate) fn Visor() -> Element {
                         contact_records,
                     );
                 }
+                // A share prompt, delivery status, or received invitation
+                // changed (internal.wit `events.sharing-changed`). A fresh
+                // prompt raises the Sharing pane on its own; an inbox or
+                // outgoing change only refreshes the signals it reads.
+                Event::SharingChanged => {
+                    let prompts = kernel::sharing_prompts().await.unwrap_or_default();
+                    let has_prompt = !prompts.is_empty();
+                    sharing_prompts.set(prompts);
+                    if let Ok(items) = kernel::sharing_outgoing().await {
+                        sharing_outgoing.set(items);
+                    }
+                    if let Ok(items) = kernel::sharing_inbox().await {
+                        sharing_inbox.set(items);
+                    }
+                    // The recipient selector needs a contact list even if
+                    // the visor never opened Contacts this session.
+                    if contacts.read().is_empty()
+                        && let Ok(items) = kernel::contacts_items().await
+                    {
+                        contacts.set(items);
+                    }
+                    refresh_app_instances(apps(), app_instances).await;
+                    if has_prompt && pending().is_none() {
+                        apply.call(Action::Show(Tenant::Sharing));
+                    }
+                }
             }
         }
     });
 
-    // A press on the app list is a plain launch: no route, so the frame
-    // answers `route.get` with "" (internal.wit `shell.open-frame`).
+    // A press on the app list's plain "Open" is the personal instance: no
+    // route, no instance (internal.wit `shell.open-frame`, `apps.launch`).
     let open = move |app: App| async move {
-        open_app(app, String::new(), session, app_meta, notice, apply).await
+        open_app(
+            app,
+            String::new(),
+            None,
+            None,
+            session,
+            app_meta,
+            notice,
+            apply,
+        )
+        .await
     };
+
+    // The Sharing sheet's explicit "Open in <app>" press, distinct from
+    // "Adopt" and never called by it.
+    let on_open_instance =
+        use_callback(move |(app_id, instance, label): (String, String, String)| {
+            let Some(app) = apps.read().iter().find(|a| a.id == app_id).cloned() else {
+                notice.set(Some(Notice::Plain(
+                    "that app is no longer installed".into(),
+                )));
+                return;
+            };
+            spawn(open_app(
+                app,
+                String::new(),
+                Some(instance),
+                Some(label),
+                session,
+                app_meta,
+                notice,
+                apply,
+            ));
+        });
 
     let close_session = move |id: SessionId| async move {
         let _ = kernel::close_frame(id).await;
@@ -1234,6 +1362,7 @@ pub(crate) fn Visor() -> Element {
                 app_meta,
                 apply,
                 incoming,
+                app_instances,
             )
             .await;
             // Unseal normally rests the drawer on the app list. But
@@ -1271,6 +1400,7 @@ pub(crate) fn Visor() -> Element {
                 app_meta,
                 apply,
                 incoming,
+                app_instances,
             )
             .await;
         });
@@ -1342,6 +1472,7 @@ pub(crate) fn Visor() -> Element {
     // and deliberately has no active top-level navigation item.
     let on_self = matches!(tenant, Some(Tenant::Settings | Tenant::Devices));
     let on_contacts = tenant == Some(Tenant::Contacts);
+    let on_sharing = tenant == Some(Tenant::Sharing);
     let sidebar_class = if sidebar_open() { "open" } else { "" };
 
     // At most one element carries `data-visor-focus`, so the glue never has
@@ -1387,8 +1518,8 @@ pub(crate) fn Visor() -> Element {
                 0,
             ),
         };
-        let live = session.read().as_ref().map(|(id, app)| (*id, app.clone()));
-        let live_id = live.as_ref().map(|(id, _)| *id);
+        let live = session.read().clone();
+        let live_id = live.as_ref().map(|r| r.id);
         let (info_petname, info_glyph) = {
             let d = draft.read();
             (
@@ -1419,9 +1550,59 @@ pub(crate) fn Visor() -> Element {
                     for app in apps.read().iter().cloned() {
                         div { key: "{app.id}", class: "app-row",
                             div { class: "app-row-title", AppVoice { text: app.title.clone() } }
-                            button {
-                                onclick: move |_| { let app = app.clone(); async move { open(app).await } },
-                                "Open"
+                            {
+                                let list = app_instances.read().get(&app.id).cloned().unwrap_or_default();
+                                if list.is_empty() {
+                                    rsx! {
+                                        button {
+                                            onclick: {
+                                                let app = app.clone();
+                                                move |_| { let app = app.clone(); async move { open(app).await } }
+                                            },
+                                            "Open"
+                                        }
+                                    }
+                                } else {
+                                    // Personal plus every adopted instance
+                                    // (internal.wit `sharing.instances`):
+                                    // the personal/shared selector. The
+                                    // personal instance's button stays
+                                    // exactly "Open" — plain launches
+                                    // elsewhere (bookmarks, install)
+                                    // depend on that exact label.
+                                    rsx! {
+                                        for instance in list {
+                                            {
+                                                let open_label = if instance.personal {
+                                                    "Open".to_string()
+                                                } else {
+                                                    format!("Open {}", instance.label)
+                                                };
+                                                rsx! {
+                                                    button {
+                                                        key: "{instance.id}",
+                                                        onclick: {
+                                                            let app = app.clone();
+                                                            let instance = instance.clone();
+                                                            move |_| {
+                                                                let app = app.clone();
+                                                                let (target, label) = if instance.personal {
+                                                                    (None, None)
+                                                                } else {
+                                                                    (Some(instance.id.clone()), Some(instance.label.clone()))
+                                                                };
+                                                                async move {
+                                                                    open_app(app, String::new(), target, label, session, app_meta, notice, apply).await
+                                                                }
+                                                            }
+                                                        },
+                                                        "{open_label}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1437,23 +1618,28 @@ pub(crate) fn Visor() -> Element {
                 Tenant::AppInfo => rsx! {
                     div { class: "sheet",
                         match &live {
-                            Some((_, app)) => rsx! {
-                                div { class: "sheet-head", AppVoice { text: app.title.clone() } }
+                            Some(running) => rsx! {
+                                div { class: "sheet-head",
+                                    AppVoice { text: running.app.title.clone() }
+                                    if let Some(label) = &running.label {
+                                        span { class: "{Voice::Framework.class()}", " — {label}" }
+                                    }
+                                }
                             },
                             None => rsx! {
                                 span { class: "{Voice::Framework.class()}", "nothing running" }
                             },
                         }
-                        if let Some((_, app)) = live.clone() {
+                        if let Some(running) = live.clone() {
                             LabelControl {
                                 petname_label: "petname",
                                 glyph_label: "glyph",
                                 petname: info_petname.clone(),
                                 glyph: info_glyph,
                                 roll_label: "Re-roll app petname",
-                                roll_enabled: info_petname.is_empty() || rolls.read().is_active(&RollTarget::App(app.id.clone()), &info_petname),
+                                roll_enabled: info_petname.is_empty() || rolls.read().is_active(&RollTarget::App(running.app.id.clone()), &info_petname),
                                 onpetname: {
-                                    let target = RollTarget::App(app.id.clone());
+                                    let target = RollTarget::App(running.app.id.clone());
                                     move |value| {
                                         rolls.write().invalidate(&target);
                                         let mut d = draft.write();
@@ -1465,7 +1651,7 @@ pub(crate) fn Visor() -> Element {
                                     set_field(&mut d.app, GLYPH, value);
                                 },
                                 onroll: {
-                                        let target = RollTarget::App(app.id.clone());
+                                        let target = RollTarget::App(running.app.id.clone());
                                         let previous = info_petname.clone();
                                         move |_| {
                                             let target = target.clone();
@@ -1496,7 +1682,7 @@ pub(crate) fn Visor() -> Element {
                                 onclick: {
                                     let live = live.clone();
                                     move |_| {
-                                        let app = live.clone().unwrap().1;
+                                        let app = live.clone().unwrap().app;
                                         let glyph = glyph_of(&app_meta.read());
                                         async move { install_as_app(app, hue, glyph).await }
                                     }
@@ -1536,6 +1722,17 @@ pub(crate) fn Visor() -> Element {
                         focus_glyph_search: focus_glyph_search.clone(),
                         on_glyph_return: move |_| ask_focus.call(FocusWant::Glyph),
                         on_glyph_search: move |_| ask_focus.call(FocusWant::GlyphSearch),
+                    }
+                },
+
+                Tenant::Sharing => rsx! {
+                    SharingSheet {
+                        prompts: sharing_prompts,
+                        outgoing: sharing_outgoing,
+                        inbox: sharing_inbox,
+                        contacts,
+                        apps,
+                        on_open_instance,
                     }
                 },
 
@@ -1695,6 +1892,26 @@ pub(crate) fn Visor() -> Element {
                                     span { aria_hidden: "true", "◆" }
                                     span { class: "nav-label", "Contacts" }
                                 }
+                                button {
+                                    id: "visor-nav-sharing",
+                                    aria_label: "Sharing",
+                                    disabled: "{locked}",
+                                    aria_current: on_sharing.then_some("page"),
+                                    onclick: move |_| {
+                                        sidebar_open.set(false);
+                                        if on_sharing {
+                                            ask_focus.call(FocusWant::Pane);
+                                        } else {
+                                            refresh_sharing(sharing_prompts, sharing_outgoing, sharing_inbox);
+                                            request.call(Action::Show(Tenant::Sharing));
+                                            if pending().is_some() {
+                                                pending_from_sidebar.set(true);
+                                            }
+                                        }
+                                    },
+                                    span { aria_hidden: "true", "⇄" }
+                                    span { class: "nav-label", "Sharing" }
+                                }
                             }
                             div {
                                 id: "visor-content",
@@ -1756,7 +1973,12 @@ pub(crate) fn Visor() -> Element {
                     div { class: "stack",
                         div { class: "top",
                             match session.read().as_ref() {
-                                Some((_, app)) => rsx! { AppVoice { text: app.title.clone() } },
+                                Some(running) => rsx! {
+                                    AppVoice { text: running.app.title.clone() }
+                                    if let Some(label) = &running.label {
+                                        span { class: "{Voice::Framework.class()}", " — {label}" }
+                                    }
+                                },
                                 None => rsx! {
                                     span { class: "{Voice::Framework.class()}", "nothing running" }
                                 },
@@ -2856,7 +3078,7 @@ fn SettingsSheet(
     peers: Vec<Peer>,
     phase: Phase,
     rolls: CopyValue<RollState>,
-    session: Signal<Option<(SessionId, App)>>,
+    session: Signal<Option<RunningApp>>,
     on_refresh_storage: EventHandler<()>,
     on_refresh_devices: EventHandler<()>,
     on_kept: EventHandler<bool>,

@@ -12,7 +12,7 @@
 //! (subduction_runtime/src/policy.rs:15).
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use future_form::{FutureForm as _, Local};
@@ -25,18 +25,35 @@ use subduction_runtime::policy::{Policy, StorageAction, Verdict};
 /// storage operation).
 pub type Members = Rc<RefCell<BTreeSet<[u8; 32]>>>;
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TreeAuthority {
+    pub readers: BTreeSet<[u8; 32]>,
+    pub editors: BTreeSet<[u8; 32]>,
+}
+
+pub(crate) type SharedAuthorities = Rc<RefCell<BTreeMap<SedimentreeId, TreeAuthority>>>;
+
 /// Allows this device's own operations, and a remote peer's exactly while it
 /// is in the group.
 #[derive(Debug, Clone)]
 pub struct GroupPolicy {
     members: Members,
     lifecycle: crate::opaque::Lifecycle,
+    shared: SharedAuthorities,
 }
 
 impl GroupPolicy {
     #[must_use]
-    pub fn new(members: Members, lifecycle: crate::opaque::Lifecycle) -> GroupPolicy {
-        GroupPolicy { members, lifecycle }
+    pub fn new(
+        members: Members,
+        lifecycle: crate::opaque::Lifecycle,
+        shared: SharedAuthorities,
+    ) -> GroupPolicy {
+        GroupPolicy {
+            members,
+            lifecycle,
+            shared,
+        }
     }
 }
 
@@ -52,13 +69,31 @@ impl Policy<Local> for GroupPolicy {
         let peer_not_ready = matches!(provenance, Provenance::Remote(peer)
             if crate::opaque::is_opaque_tree(tree.as_bytes())
                 && !self.lifecycle.borrow().ready_peers.contains_key(peer.as_bytes()));
+        let shared = self.shared.borrow().get(&tree).cloned();
         let verdict = if (retired || peer_not_ready) && action != StorageAction::Delete {
             Verdict::Deny
         } else {
             match provenance {
                 Provenance::Local => Verdict::Allow,
                 Provenance::Remote(peer) => {
-                    if self.members.borrow().contains(peer.as_bytes()) {
+                    // A known shared tree is governed only by its Keyhive
+                    // document. Own-group membership must not bypass a
+                    // document grant while a newly enrolled device races
+                    // scoped authority delivery. Remote deletion is never
+                    // part of document sharing v0.
+                    let reserved = matches!(
+                        tree.as_bytes()[0],
+                        crate::SHARED_TREE_TAG | crate::SHARED_AUTHORITY_TREE_TAG
+                    );
+                    let allowed = if let Some(authority) = &shared {
+                        action != StorageAction::Delete
+                            && authority.readers.contains(peer.as_bytes())
+                    } else if reserved {
+                        false
+                    } else {
+                        self.members.borrow().contains(peer.as_bytes())
+                    };
+                    if allowed {
                         Verdict::Allow
                     } else {
                         Verdict::Deny
@@ -90,6 +125,7 @@ mod tests {
         ));
         let policy = GroupPolicy::new(
             Rc::clone(&members),
+            Rc::new(RefCell::new(Default::default())),
             Rc::new(RefCell::new(Default::default())),
         );
         let tree = SedimentreeId::new([9u8; 32]);
@@ -146,7 +182,11 @@ mod tests {
             .borrow_mut()
             .ready_peers
             .insert(*member.as_bytes(), 1);
-        let policy = GroupPolicy::new(members, lifecycle);
+        let policy = GroupPolicy::new(
+            members,
+            lifecycle,
+            Rc::new(RefCell::new(Default::default())),
+        );
         assert_eq!(
             block_on(policy.authorize(
                 &Provenance::Remote(member),
@@ -154,6 +194,35 @@ mod tests {
                 StorageAction::Write,
             )),
             Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn shared_tree_never_allows_remote_delete_or_group_fallback() {
+        let member = peer(4);
+        let reader = peer(5);
+        let tree = SedimentreeId::new([crate::SHARED_TREE_TAG; 32]);
+        let members: Members = Rc::new(RefCell::new([*member.as_bytes()].into_iter().collect()));
+        let shared = Rc::new(RefCell::new(BTreeMap::from([(
+            tree,
+            TreeAuthority {
+                readers: [*reader.as_bytes()].into_iter().collect(),
+                editors: BTreeSet::new(),
+            },
+        )])));
+        let policy = GroupPolicy::new(members, Rc::new(RefCell::new(Default::default())), shared);
+        assert_eq!(
+            block_on(policy.authorize(&Provenance::Remote(reader), tree, StorageAction::Read)),
+            Verdict::Allow
+        );
+        assert_eq!(
+            block_on(policy.authorize(&Provenance::Remote(reader), tree, StorageAction::Delete)),
+            Verdict::Deny
+        );
+        assert_eq!(
+            block_on(policy.authorize(&Provenance::Remote(member), tree, StorageAction::Read)),
+            Verdict::Deny,
+            "own-group membership cannot bypass the shared document grant"
         );
     }
 }

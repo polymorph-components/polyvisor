@@ -550,6 +550,104 @@ async function addProfileClaim(
     .waitFor({ timeout: 10_000 });
 }
 
+// ---------------------------------------------------------------------------
+// Sharing (visor/src/sharing_ui.rs). Same conventions as the contacts
+// helpers above: the visor auto-raises this section when `tasks-share`
+// queues a prompt (`events.sharing-changed`), so most callers only need to
+// wait for the sheet rather than navigate to it.
+// ---------------------------------------------------------------------------
+
+const sharingSheet = (page: Page) => content(page).locator(".sharing-sheet");
+const sharingNav = (page: Page) => page.locator("#visor-nav-sharing");
+
+async function openSharingSection(page: Page): Promise<void> {
+  await paneSettled(page);
+  const mobile = await page.evaluate(() => matchMedia("(max-width: 560px)").matches);
+  if (mobile && await sidebarToggle(page).isVisible() &&
+    await sidebarToggle(page).getAttribute("aria-expanded") !== "true") {
+    await sidebarToggle(page).click();
+    await waitForSidebarState(page, true);
+  }
+  await sharingNav(page).click();
+  await page.waitForFunction(
+    () => document.querySelector("#visor-content")?.getAttribute("aria-label") === "sharing",
+    undefined,
+    { timeout: 10_000 },
+  );
+  await sharingSheet(page).waitFor({ timeout: 10_000 });
+}
+
+/**
+ * Confirm the (only) queued share prompt against the (only) authenticated
+ * contact. Selecting by index rather than by petname text: a met contact's
+ * petname is whatever the visor defaulted it to, which this scenario has no
+ * reason to pin down.
+ */
+async function confirmSharePrompt(page: Page, accessLabel: "Read" | "Edit"): Promise<void> {
+  const row = sharingSheet(page).locator(".sharing-consent").first();
+  await row.waitFor({ timeout: 15_000 });
+  await row.locator("select").selectOption({ index: 0 });
+  await row.getByRole("radio", { name: accessLabel, exact: true }).check();
+  await row.getByRole("button", { name: "Confirm", exact: true }).click();
+}
+
+async function waitForOutgoingState(
+  page: Page,
+  state: "delivered" | "failed",
+  ms = 30_000,
+): Promise<void> {
+  await page.waitForFunction(
+    (want) => {
+      const rows = document.querySelectorAll("#visor-content .sharing-sheet .app-row");
+      return [...rows].some((r) => (r.textContent ?? "").includes(want));
+    },
+    state,
+    { timeout: ms },
+  );
+}
+
+/**
+ * Establish one mutual authenticated contact between two independent users'
+ * devices, exactly the real-time meeting path `contacts-meet-now` exercises
+ * — the sharing scenarios below need one of these before there is anyone
+ * eligible to grant a document to (visor/src/sharing_ui.rs `eligible`:
+ * `contact.authenticated.is_some()`, which only a meeting or a verified
+ * import produces).
+ */
+async function meetAsContacts(
+  a: Page,
+  b: Page,
+  nameA: string,
+  nameB: string,
+): Promise<void> {
+  await addProfileClaim(a, "name", nameA);
+  await addProfileClaim(b, "name", nameB);
+  await openContactsView(a, "Meet now", ".meet-now");
+  const meetA = contactsSheet(a).locator(".meet-now");
+  await meetA.getByRole("button", { name: "Offer meeting", exact: true }).click();
+  const offer = contactsSheet(a).locator(".meet-offer");
+  await offer.waitFor({ timeout: 30_000 });
+  const link = (await offer.locator("code").textContent() ?? "").trim();
+  check(link.startsWith("http"), `meeting offer did not expose a meet link: ${link}`);
+
+  await b.goto("about:blank");
+  await b.goto(link);
+  await visorReady(b);
+  const meetB = contactsSheet(b).locator(".meet-now");
+  await meetB.waitFor({ timeout: 10_000 });
+  await meetB.locator(".meet-join-review").waitFor({ timeout: 10_000 });
+  await meetB.getByRole("button", { name: "Join meeting", exact: true }).click();
+
+  const confirmA = contactsSheet(a).locator(".meet-confirm");
+  const confirmB = contactsSheet(b).locator(".meet-confirm");
+  await confirmA.waitFor({ timeout: 30_000 });
+  await confirmB.waitFor({ timeout: 30_000 });
+  await confirmA.getByRole("button", { name: "Confirm", exact: true }).click();
+  await confirmB.getByRole("button", { name: "Confirm", exact: true }).click();
+  await contactsSheet(a).getByText(/^Meeting complete\. Contact /).waitFor({ timeout: 30_000 });
+  await contactsSheet(b).getByText(/^Meeting complete\. Contact /).waitFor({ timeout: 30_000 });
+}
+
 async function expectRootCustody(page: Page, hasRoot: boolean): Promise<void> {
   await openContactsView(page, "My profile", ".contacts-profile");
   const status = contactsSheet(page).locator("#root-custody-status");
@@ -4079,7 +4177,11 @@ const scenarios: Scenario[] = [
         check(over.length === 0, `mobile sidebar layout overflowed while open: ${over.join("; ")}`);
         await shot(narrow, "sidebar-mobile-open");
 
-        await contactsNav(narrow).focus();
+        // The last item in the sidebar's own tab order, not necessarily
+        // "Contacts": `visor/src/ui.rs` may add sections after it (Sharing
+        // did), and this check is specifically about Tab leaving the LAST
+        // one.
+        await sharingNav(narrow).focus();
         check(await activeElementVisible(narrow), "mobile current nav item was not visibly focusable while open");
         await narrow.keyboard.press("Tab");
         const afterTab = await focused(narrow);
@@ -4562,6 +4664,304 @@ const scenarios: Scenario[] = [
   },
 
   {
+    // Document sharing v0's whole user-visible path: two independent
+    // users, each with their own personal TodoMVC list, a trusted grant
+    // over an authenticated contact, local adoption, an explicit open, and
+    // the same document syncing normally afterwards. Tamper/oversize/proof
+    // substitution are covered by the kernel's own native integration
+    // tests, not here.
+    name: "document-sharing-grant-adopt-open",
+    async run(ctx, origin, browser) {
+      const ctxB = await browser.newContext();
+      let a: Page | undefined;
+      let b: Page | undefined;
+      try {
+        a = await open(ctx, origin);
+        b = await open(ctxB, origin);
+        await visorReady(a);
+        await visorReady(b);
+
+        await meetAsContacts(a, b, "Ada Sharer", "Bob Sharer");
+
+        // A's own personal list, shared with Bob at Edit access.
+        await launchTodoMvc(a);
+        const appA = a.frameLocator("#app-zone iframe");
+        const inputA = appA.locator("input.new-todo, input").first();
+        await inputA.waitFor({ timeout: 30_000 });
+        await inputA.fill("shared task");
+        await inputA.press("Enter");
+        await appA.getByText("shared task").first().waitFor({ timeout: 15_000 });
+
+        await appA.getByRole("button", { name: "Share this list", exact: true })
+          .click();
+
+        // `events.sharing-changed` raises the Sharing pane on its own once
+        // `tasks-share` queued a prompt (visor/src/ui.rs) — nothing pressed
+        // here to get there.
+        await sharingSheet(a).waitFor({ timeout: 15_000 });
+        await shot(a, "sharing-consent-prompt");
+        await confirmSharePrompt(a, "Edit");
+        await waitForOutgoingState(a, "delivered");
+        await shot(a, "sharing-outgoing-delivered");
+
+        // Bob's inbox: preview, then Adopt as its own explicit act.
+        await openSharingSection(b);
+        const received = sharingSheet(b).locator(".sheet-section").filter({
+          hasText: "Received",
+        });
+        const inboxRow = received.locator(".app-row").first();
+        await inboxRow.waitFor({ timeout: 30_000 });
+        await shot(b, "sharing-inbox-preview");
+        await inboxRow.getByRole("button", { name: "Adopt", exact: true }).click();
+        const openButton = inboxRow.getByRole("button", { name: /^Open in /, exact: false });
+        await openButton.waitFor({ timeout: 15_000 });
+        await shot(b, "sharing-adopted-before-open");
+
+        // Adopting alone must not have opened anything.
+        eq(
+          await b.locator("#app-zone iframe").count(),
+          0,
+          "adopting an invitation launched the app on its own",
+        );
+
+        await openButton.click();
+        await b.waitForSelector("#app-zone iframe[sandbox]", { timeout: 30_000 });
+        const appB = b.frameLocator("#app-zone iframe");
+        await appB.getByText("shared task").first().waitFor({ timeout: 15_000 });
+        await shot(b, "sharing-opened-instance");
+
+        // Concurrent edit from the recipient (granted Edit access): proven
+        // live, on both sides' already-open frames, before either reloads —
+        // isolating "do concurrent edits sync" from "does a reload survive
+        // them", which is a checkpoint-persistence question and a separate
+        // claim (matches the engine's own
+        // `a_remote_change_is_checkpointed_so_a_reboot_still_has_it`).
+        const inputB = appB.locator("input.new-todo, input").first();
+        await inputB.fill("added by bob");
+        await inputB.press("Enter");
+        await appB.getByText("added by bob").first().waitFor({ timeout: 15_000 });
+        await appA.getByText("added by bob").first().waitFor({ timeout: 30_000 });
+
+        // Reload A: the concurrent edit it already received must still be
+        // there from checkpoint — not a fresh re-sync, which a reload's
+        // from-scratch endpoint would have to schedule on its own timeline.
+        await a.reload();
+        await visorReady(a);
+        // A's page bookmark already names its personal instance (the one
+        // it launched before ever sharing) — reload restores it on its
+        // own; pressing the strip's app half now would show `AppInfo`
+        // (something is already running), not the app list `launchTodoMvc`
+        // expects.
+        await a.waitForSelector("#app-zone iframe[sandbox]", { timeout: 30_000 });
+        const appAAgain = a.frameLocator("#app-zone iframe");
+        await appAAgain.getByText("shared task").first().waitFor({ timeout: 30_000 });
+        await appAAgain.getByText("added by bob").first().waitFor({ timeout: 30_000 });
+
+        // The persistence check above proves nothing about whether A's
+        // reloaded (from-scratch) worker can still reach Bob at all — a
+        // genuinely NEW edit, made after A's reload, has to actually
+        // traverse a reconnect Bob's side never dropped. Bob stays online
+        // throughout (his page never reloaded); the assertion is on A's
+        // post-reload frame, which is the side whose connection had to be
+        // re-established from nothing.
+        await inputB.fill("added after a's reload");
+        await inputB.press("Enter");
+        await appB.getByText("added after a's reload").first().waitFor({ timeout: 15_000 });
+        await appAAgain.getByText("added after a's reload").first().waitFor({
+          timeout: 30_000,
+        });
+
+        // Bob's own personal list stays a distinct document: a fresh,
+        // plain launch (never `launch-instance`) must not carry either
+        // item across. Bob's bookmark currently names the SHARED instance
+        // (the one `openButton` launched) — reload restores that first,
+        // so the running session has to be closed explicitly before the
+        // app list (and its personal "Open") is reachable again.
+        await b.reload();
+        await visorReady(b);
+        await b.waitForSelector("#app-zone iframe[sandbox]", { timeout: 30_000 });
+        await openApps(b);
+        await drawer(b).getByRole("button", { name: "Close app", exact: true }).click();
+        await launchTodoMvc(b);
+        const appBPersonal = b.frameLocator("#app-zone iframe");
+        await appBPersonal.locator("input.new-todo, input").first().waitFor({
+          timeout: 30_000,
+        });
+        eq(
+          await appBPersonal.getByText("shared task").count(),
+          0,
+          "Bob's personal TodoMVC list carried the shared document's item",
+        );
+        eq(
+          await appBPersonal.getByText("added by bob").count(),
+          0,
+          "Bob's personal TodoMVC list carried Bob's own edit to the shared document",
+        );
+        eq(
+          await appBPersonal.getByText("added after a's reload").count(),
+          0,
+          "Bob's personal TodoMVC list carried the post-reload shared edit",
+        );
+      } catch (err) {
+        if (a !== undefined) await shot(a, "sharing-fail-a").catch(() => {});
+        if (b !== undefined) await shot(b, "sharing-fail-b").catch(() => {});
+        throw err;
+      } finally {
+        await closeContext(ctxB, "document-sharing-grant-adopt-open-recipient");
+      }
+    },
+  },
+
+  {
+    // A small shared list fits inside the invitation itself
+    // (runtime-api.md: the kernel inlines signed items under its wire
+    // budget). The recipient's adopt/open must work from that inline copy
+    // alone: the sender's device closes right after delivery and stays
+    // closed for the rest of the scenario, so nothing here can be reaching
+    // it over the network.
+    name: "document-sharing-inline-after-sender-disconnect",
+    async run(ctx, origin, browser) {
+      const ctxB = await browser.newContext();
+      let a: Page | undefined;
+      let b: Page | undefined;
+      try {
+        a = await open(ctx, origin);
+        b = await open(ctxB, origin);
+        await visorReady(a);
+        await visorReady(b);
+
+        await meetAsContacts(a, b, "Ada Inline", "Bob Inline");
+
+        await launchTodoMvc(a);
+        const appA = a.frameLocator("#app-zone iframe");
+        const inputA = appA.locator("input.new-todo, input").first();
+        await inputA.waitFor({ timeout: 30_000 });
+        await inputA.fill("small inline task");
+        await inputA.press("Enter");
+        await appA.getByText("small inline task").first().waitFor({ timeout: 15_000 });
+
+        await appA.getByRole("button", { name: "Share this list", exact: true }).click();
+        await sharingSheet(a).waitFor({ timeout: 15_000 });
+        await confirmSharePrompt(a, "Read");
+        await waitForOutgoingState(a, "delivered");
+
+        // The sender goes away for good: closing its context tears down
+        // its SharedWorker and iroh endpoint, so anything Bob still needs
+        // has to already be sitting in his own device.
+        await closeContext(ctx, "document-sharing-inline-after-sender-disconnect-sender");
+        a = undefined;
+
+        await openSharingSection(b);
+        const received = sharingSheet(b).locator(".sheet-section").filter({
+          hasText: "Received",
+        });
+        const inboxRow = received.locator(".app-row").first();
+        await inboxRow.waitFor({ timeout: 30_000 });
+        await inboxRow.getByRole("button", { name: "Adopt", exact: true }).click();
+        const openButton = inboxRow.getByRole("button", { name: /^Open in /, exact: false });
+        await openButton.waitFor({ timeout: 15_000 });
+        await openButton.click();
+        await b.waitForSelector("#app-zone iframe[sandbox]", { timeout: 30_000 });
+        const appB = b.frameLocator("#app-zone iframe");
+        await appB.getByText("small inline task").first().waitFor({ timeout: 15_000 });
+        await shot(b, "sharing-inline-after-disconnect");
+      } catch (err) {
+        if (a !== undefined) await shot(a, "sharing-inline-fail-a").catch(() => {});
+        if (b !== undefined) await shot(b, "sharing-inline-fail-b").catch(() => {});
+        throw err;
+      } finally {
+        await closeContext(
+          ctxB,
+          "document-sharing-inline-after-sender-disconnect-recipient",
+        );
+      }
+    },
+  },
+
+  {
+    // A list too large to be a passing inline courtesy: adopting it
+    // depends on normal Subduction sync actually running (not merely a
+    // small embedded copy), and both users stay online throughout so a
+    // later edit's live propagation — without either side reloading —
+    // is itself part of the claim.
+    name: "document-sharing-large-list-normal-sync",
+    async run(ctx, origin, browser) {
+      const ctxB = await browser.newContext();
+      let a: Page | undefined;
+      let b: Page | undefined;
+      const ITEMS = 40;
+      try {
+        a = await open(ctx, origin);
+        b = await open(ctxB, origin);
+        await visorReady(a);
+        await visorReady(b);
+
+        await meetAsContacts(a, b, "Ada Bulk", "Bob Bulk");
+
+        await launchTodoMvc(a);
+        const appA = a.frameLocator("#app-zone iframe");
+        const inputA = appA.locator("input.new-todo, input").first();
+        await inputA.waitFor({ timeout: 30_000 });
+        for (let i = 0; i < ITEMS; i++) {
+          await inputA.fill(`bulk item ${i}`);
+          await inputA.press("Enter");
+          // Wait for each add's round trip before typing the next: an
+          // unconfirmed input still holds the previous title, and typing
+          // over it races the app's own state, not this harness.
+          await appA.getByText(`bulk item ${i}`, { exact: true }).first().waitFor({
+            timeout: 15_000,
+          });
+        }
+        eq(
+          await appA.locator(".todo-list li").count(),
+          ITEMS,
+          "the sender did not end up with every bulk item",
+        );
+
+        await appA.getByRole("button", { name: "Share this list", exact: true }).click();
+        await sharingSheet(a).waitFor({ timeout: 15_000 });
+        await confirmSharePrompt(a, "Edit");
+        await waitForOutgoingState(a, "delivered");
+
+        await openSharingSection(b);
+        const received = sharingSheet(b).locator(".sheet-section").filter({
+          hasText: "Received",
+        });
+        const inboxRow = received.locator(".app-row").first();
+        await inboxRow.waitFor({ timeout: 30_000 });
+        await inboxRow.getByRole("button", { name: "Adopt", exact: true }).click();
+        const openButton = inboxRow.getByRole("button", { name: /^Open in /, exact: false });
+        await openButton.waitFor({ timeout: 15_000 });
+        await openButton.click();
+        await b.waitForSelector("#app-zone iframe[sandbox]", { timeout: 30_000 });
+        const appB = b.frameLocator("#app-zone iframe");
+        await appB.getByText(`bulk item ${ITEMS - 1}`).first().waitFor({ timeout: 30_000 });
+        await appB.getByText("bulk item 0").first().waitFor({ timeout: 30_000 });
+        eq(
+          await appB.locator(".todo-list li").count(),
+          ITEMS,
+          "the recipient did not receive every bulk item via normal sync",
+        );
+
+        // Both stay online and neither page reloads: a live edit now has to
+        // reach the other side through the same ongoing sync, not a
+        // checkpoint-and-reload round trip.
+        const inputB = appB.locator("input.new-todo, input").first();
+        await inputB.fill("bob's live addition");
+        await inputB.press("Enter");
+        await appA.getByText("bob's live addition").first().waitFor({ timeout: 30_000 });
+      } catch (err) {
+        if (a !== undefined) await shot(a, "sharing-bulk-fail-a").catch(() => {});
+        if (b !== undefined) await shot(b, "sharing-bulk-fail-b").catch(() => {});
+        throw err;
+      } finally {
+        await closeContext(ctxB, "document-sharing-large-list-normal-sync-recipient");
+      }
+    },
+  },
+
+  {
+
     // Both realms on this side, named: the visor on the main thread and the
     // runtime in the SharedWorker. The worker is worth spelling out — a
     // page can see its own realm fail, but a worker that throws while

@@ -12,8 +12,8 @@ use future_form::Local;
 use futures::future::LocalBoxFuture;
 use futures::{executor::LocalPool, task::LocalSpawnExt as _};
 use polyvisor_engine::{
-    AppState, Engine, EngineClock, EngineEvent, EngineNotify, ItemKind, LocalFuture, OpaqueMode,
-    Snapshot, Spawner, StoreItem, TreeState, document_tree,
+    AppState, DocumentAccess, Engine, EngineClock, EngineEvent, EngineNotify, ItemKind,
+    LocalFuture, OpaqueMode, Snapshot, Spawner, StoreItem, TreeState, document_tree,
 };
 use polyvisor_todo_model::Snapshot as TaskSnapshot;
 use polyvisor_visor_model as visor;
@@ -29,6 +29,559 @@ use subduction_runtime::memory::transport::MemoryTransport;
 use subduction_runtime::transport::Transport;
 
 const APP: &str = "todomvc";
+
+#[test]
+fn shared_document_is_its_own_tree_and_inline_budget_is_exact() {
+    let mut pool = LocalPool::new();
+    let device = device(&pool, 91, None);
+    let engine = Rc::clone(&device.engine);
+    pool.run_until(async move {
+        let shared = engine.create_shared_document().await.unwrap();
+        assert!(shared.partition.starts_with("document:"));
+        assert_eq!(shared.partition.len(), "document:".len() + 64);
+        engine
+            .document_mutate(&shared.partition, |doc| {
+                polyvisor_todo_model::add(doc, "shared".into()).map(|_| ())
+            })
+            .await
+            .unwrap();
+        let items = engine
+            .document_inline_items(&shared.partition, usize::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        let size = 8 + bincode::serialized_size(&items[0]).unwrap() as usize;
+        assert!(
+            engine
+                .document_inline_items(&shared.partition, size)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            engine
+                .document_inline_items(&shared.partition, size - 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine
+                .document_inline_items(APP, usize::MAX)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn grant_rejects_a_device_not_in_the_claimed_group() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 92, None);
+    let b = device(&pool, 93, None);
+    let outsider = device(&pool, 94, None);
+    let (ea, eb, eo) = (
+        Rc::clone(&a.engine),
+        Rc::clone(&b.engine),
+        Rc::clone(&outsider.engine),
+    );
+    pool.run_until(async move {
+        let shared = ea.create_shared_document().await.unwrap();
+        let proof = eb.membership_proof().await.unwrap();
+        let group = eb.authority_group().await.unwrap();
+        let error = ea
+            .grant_document(
+                &shared.partition,
+                group,
+                eo.verifying_key().to_bytes(),
+                &proof,
+                DocumentAccess::Read,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("does not authorize"), "{error}");
+    });
+}
+
+#[test]
+fn document_authority_export_excludes_another_shared_document() {
+    use keyhive_core::event::static_event::StaticEvent;
+
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 104, None);
+    let b = device(&pool, 105, None);
+    let c = device(&pool, 106, None);
+    let (ea, eb, ec) = (
+        Rc::clone(&a.engine),
+        Rc::clone(&b.engine),
+        Rc::clone(&c.engine),
+    );
+    pool.run_until(async move {
+        let first = ea.create_shared_document().await.unwrap();
+        let second = ea.create_shared_document().await.unwrap();
+        let first_grant = ea
+            .grant_document(
+                &first.partition,
+                eb.authority_group().await.unwrap(),
+                eb.verifying_key().to_bytes(),
+                &eb.membership_proof().await.unwrap(),
+                DocumentAccess::Edit,
+            )
+            .await
+            .unwrap();
+        let _second_grant = ea
+            .grant_document(
+                &second.partition,
+                ec.authority_group().await.unwrap(),
+                ec.verifying_key().to_bytes(),
+                &ec.membership_proof().await.unwrap(),
+                DocumentAccess::Edit,
+            )
+            .await
+            .unwrap();
+        let events: Vec<StaticEvent<[u8; 32]>> =
+            bincode::deserialize(&first_grant.authority).unwrap();
+        assert!(events.iter().all(|event| {
+            match event {
+                StaticEvent::CgkaOperation(op) => {
+                    *op.payload().doc_id().as_bytes() != second.document
+                }
+                StaticEvent::Delegated(op) => !op
+                    .payload()
+                    .after_content
+                    .keys()
+                    .any(|id| id.to_bytes() == second.document),
+                StaticEvent::Revoked(op) => !op
+                    .payload()
+                    .after_content
+                    .keys()
+                    .any(|id| id.to_bytes() == second.document),
+                StaticEvent::PrekeysExpanded(_) | StaticEvent::PrekeyRotated(_) => true,
+            }
+        }));
+    });
+}
+
+#[test]
+fn selected_document_grant_adopts_inline_without_private_history() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 95, None);
+    let b = device(&pool, 96, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        ea.tasks_add(APP, "private".into()).await.unwrap();
+        eb.tasks_add(APP, "recipient private".into()).await.unwrap();
+        let shared = ea.create_shared_document().await.unwrap();
+        ea.document_mutate(&shared.partition, |doc| {
+            polyvisor_todo_model::add(doc, "shared".into()).map(|_| ())
+        })
+        .await
+        .unwrap();
+        let grant = ea
+            .grant_document(
+                &shared.partition,
+                eb.authority_group().await.unwrap(),
+                eb.verifying_key().to_bytes(),
+                &eb.membership_proof().await.unwrap(),
+                DocumentAccess::Edit,
+            )
+            .await
+            .unwrap();
+        eb.adopt_document(
+            &grant,
+            ea.authority_group().await.unwrap(),
+            ea.verifying_key().to_bytes(),
+        )
+        .await
+        .unwrap();
+        let inline = ea
+            .document_inline_items(&shared.partition, usize::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            eb.document_import_inline(&shared.partition, inline)
+                .await
+                .unwrap()
+        );
+        let shared_items = eb
+            .document_read(&shared.partition, polyvisor_todo_model::snapshot)
+            .await
+            .unwrap();
+        assert_eq!(titles(&shared_items), vec!["shared"]);
+        assert_eq!(
+            titles(&eb.tasks_items(APP).await.unwrap()),
+            vec!["recipient private"]
+        );
+    });
+}
+
+#[test]
+fn invalid_grant_validation_and_mixed_inline_batch_are_atomic() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 107, None);
+    let b = device(&pool, 108, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        let shared = ea.create_shared_document().await.unwrap();
+        ea.document_mutate(&shared.partition, |doc| {
+            polyvisor_todo_model::add(doc, "one".into()).map(|_| ())
+        })
+        .await
+        .unwrap();
+        let grant = ea
+            .grant_document(
+                &shared.partition,
+                eb.authority_group().await.unwrap(),
+                eb.verifying_key().to_bytes(),
+                &eb.membership_proof().await.unwrap(),
+                DocumentAccess::Edit,
+            )
+            .await
+            .unwrap();
+        let mut invalid = grant.clone();
+        invalid.document.document[0] ^= 1;
+        assert!(
+            eb.validate_document_grant(
+                &invalid,
+                ea.authority_group().await.unwrap(),
+                ea.verifying_key().to_bytes(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(eb.document_revision_open(&grant.document.partition), None);
+        assert_eq!(eb.document_revision_open(&invalid.document.partition), None);
+
+        eb.adopt_document(
+            &grant,
+            ea.authority_group().await.unwrap(),
+            ea.verifying_key().to_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut items = ea
+            .document_inline_items(&shared.partition, usize::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bad = items[0].clone();
+        bad.blob.push(0);
+        items.push(bad);
+        assert!(
+            eb.document_import_inline(&shared.partition, items)
+                .await
+                .is_err()
+        );
+        assert!(
+            eb.document_read(&shared.partition, polyvisor_todo_model::snapshot)
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn read_only_recipient_can_import_but_cannot_author() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 97, None);
+    let b = device(&pool, 98, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        let shared = ea.create_shared_document().await.unwrap();
+        ea.document_mutate(&shared.partition, |doc| {
+            polyvisor_todo_model::add(doc, "readable".into()).map(|_| ())
+        })
+        .await
+        .unwrap();
+        let grant = ea
+            .grant_document(
+                &shared.partition,
+                eb.authority_group().await.unwrap(),
+                eb.verifying_key().to_bytes(),
+                &eb.membership_proof().await.unwrap(),
+                DocumentAccess::Read,
+            )
+            .await
+            .unwrap();
+        eb.adopt_document(
+            &grant,
+            ea.authority_group().await.unwrap(),
+            ea.verifying_key().to_bytes(),
+        )
+        .await
+        .unwrap();
+        let items = ea
+            .document_inline_items(&shared.partition, usize::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        eb.document_import_inline(&shared.partition, items)
+            .await
+            .unwrap();
+        assert_eq!(
+            titles(
+                &eb.document_read(&shared.partition, polyvisor_todo_model::snapshot)
+                    .await
+                    .unwrap()
+            ),
+            vec!["readable"]
+        );
+        let error = eb
+            .document_mutate(&shared.partition, |doc| {
+                polyvisor_todo_model::add(doc, "forbidden".into()).map(|_| ())
+            })
+            .await
+            .unwrap_err();
+        assert!(error.contains("read-only"), "{error}");
+    });
+}
+
+#[test]
+fn shared_document_survives_json_checkpoint_round_trip() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 99, None);
+    let engine = Rc::clone(&a.engine);
+    let (partition, snapshot) = pool.run_until(async move {
+        let shared = engine.create_shared_document().await.unwrap();
+        engine
+            .document_mutate(&shared.partition, |doc| {
+                polyvisor_todo_model::add(doc, "persisted".into()).map(|_| ())
+            })
+            .await
+            .unwrap();
+        (shared.partition, engine.snapshot().await.unwrap())
+    });
+    let json = serde_json::to_vec(&snapshot).expect("snapshot encodes as kernel JSON");
+    let restored: Snapshot = serde_json::from_slice(&json).expect("snapshot decodes from JSON");
+    let mut pool = LocalPool::new();
+    let restored = device(&pool, 99, Some(restored));
+    pool.run_until(async move {
+        assert_eq!(
+            titles(
+                &restored
+                    .engine
+                    .document_read(&partition, polyvisor_todo_model::snapshot)
+                    .await
+                    .unwrap()
+            ),
+            vec!["persisted"]
+        );
+    });
+}
+
+#[test]
+fn independent_groups_sync_shared_document_and_concurrent_edits() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 100, None);
+    let b = device(&pool, 101, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    let (snapshot, partition) = pool.run_until(async move {
+        ea.tasks_add(APP, "a private".into()).await.unwrap();
+        eb.tasks_add(APP, "b private".into()).await.unwrap();
+        let shared = ea.create_shared_document().await.unwrap();
+        ea.document_mutate(&shared.partition, |doc| {
+            polyvisor_todo_model::add(doc, "seed".into()).map(|_| ())
+        })
+        .await
+        .unwrap();
+        let grant = ea
+            .grant_document(
+                &shared.partition,
+                eb.authority_group().await.unwrap(),
+                eb.verifying_key().to_bytes(),
+                &eb.membership_proof().await.unwrap(),
+                DocumentAccess::Edit,
+            )
+            .await
+            .unwrap();
+        eb.adopt_document(
+            &grant,
+            ea.authority_group().await.unwrap(),
+            ea.verifying_key().to_bytes(),
+        )
+        .await
+        .unwrap();
+        wire_only(&ea, &eb).await;
+        until(|| async {
+            eb.document_read(&shared.partition, |doc| doc.revision() >= 1)
+                .await
+                .ok()
+                .filter(|ready| *ready)
+        })
+        .await;
+        let (left, right) = futures::future::join(
+            ea.document_mutate(&shared.partition, |doc| {
+                polyvisor_todo_model::add(doc, "from a".into()).map(|_| ())
+            }),
+            eb.document_mutate(&shared.partition, |doc| {
+                polyvisor_todo_model::add(doc, "from b".into()).map(|_| ())
+            }),
+        )
+        .await;
+        left.unwrap();
+        right.unwrap();
+        for engine in [&ea, &eb] {
+            let seen = until(|| async {
+                let snapshot = engine
+                    .document_read(&shared.partition, polyvisor_todo_model::snapshot)
+                    .await
+                    .ok()?;
+                (snapshot.items.len() == 3).then_some(snapshot)
+            })
+            .await;
+            let mut titles = titles(&seen);
+            titles.sort();
+            assert_eq!(titles, vec!["from a", "from b", "seed"]);
+        }
+        ea.document_mutate(&shared.partition, |doc| {
+            polyvisor_todo_model::add(doc, "after merge".into()).map(|_| ())
+        })
+        .await
+        .unwrap();
+        until(|| async {
+            eb.document_read(&shared.partition, |doc| doc.revision() >= 4)
+                .await
+                .ok()
+                .filter(|ready| *ready)
+        })
+        .await;
+        let snapshot = eb.snapshot().await.unwrap();
+        assert_eq!(
+            titles(&ea.tasks_items(APP).await.unwrap()),
+            vec!["a private"]
+        );
+        assert_eq!(
+            titles(&eb.tasks_items(APP).await.unwrap()),
+            vec!["b private"]
+        );
+        (snapshot, shared.partition)
+    });
+    let snapshot: Snapshot = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap())
+        .expect("shared snapshot JSON round trip");
+    let mut pool = LocalPool::new();
+    let restored = device(&pool, 101, Some(snapshot));
+    pool.run_until(async move {
+        restored
+            .engine
+            .document_mutate(&partition, |doc| {
+                polyvisor_todo_model::add(doc, "after reload".into()).map(|_| ())
+            })
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn later_same_user_device_adopts_shared_descriptor_and_frontier() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 102, None);
+    let b = device(&pool, 103, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        let shared = ea.create_shared_document().await.unwrap();
+        ea.document_mutate(&shared.partition, |doc| {
+            polyvisor_todo_model::add(doc, "before enrollment".into()).map(|_| ())
+        })
+        .await
+        .unwrap();
+        enroll(&ea, &eb).await;
+        let descriptors = ea.shared_documents().await.unwrap();
+        eb.adopt_shared_documents(&descriptors).await.unwrap();
+        let items = ea
+            .document_inline_items(&shared.partition, usize::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        eb.document_import_inline(&shared.partition, items)
+            .await
+            .unwrap();
+        assert_eq!(
+            titles(
+                &eb.document_read(&shared.partition, polyvisor_todo_model::snapshot)
+                    .await
+                    .unwrap()
+            ),
+            vec!["before enrollment"]
+        );
+    });
+}
+
+#[test]
+fn later_same_user_device_syncs_both_directions_after_snapshot_adoption() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 109, None);
+    let b = device(&pool, 110, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        let shared = ea.create_shared_document().await.unwrap();
+        ea.document_mutate(&shared.partition, |doc| {
+            polyvisor_todo_model::add(doc, "snapshot".into()).map(|_| ())
+        })
+        .await
+        .unwrap();
+        enroll(&ea, &eb).await;
+        let descriptors = ea.shared_documents().await.unwrap();
+        eb.adopt_shared_documents(&descriptors).await.unwrap();
+        let snapshot = ea.document_save(&shared.partition).await.unwrap();
+        eb.document_adopt(&shared.partition, &snapshot, |current, source| {
+            current.merge_snapshot(&source.save())
+        })
+        .await
+        .unwrap();
+        wire_only(&ea, &eb).await;
+        eb.document_mutate(&shared.partition, |doc| {
+            polyvisor_todo_model::add(doc, "from b".into()).map(|_| ())
+        })
+        .await
+        .unwrap();
+        assert!(
+            ea.can_sync_peer(eb.verifying_key().to_bytes())
+                .await
+                .unwrap()
+        );
+        assert!(
+            eb.can_sync_peer(ea.verifying_key().to_bytes())
+                .await
+                .unwrap()
+        );
+        for _ in 0..5000 {
+            if ea
+                .document_read(&shared.partition, |doc| doc.revision() >= 2)
+                .await
+                .unwrap()
+            {
+                break;
+            }
+            yield_now().await;
+        }
+        assert!(
+            ea.document_read(&shared.partition, |doc| doc.revision() >= 2)
+                .await
+                .unwrap(),
+            "B's post-pairing edit did not reach A; A={} B={}",
+            ea.document_revision_open(&shared.partition).unwrap(),
+            eb.document_revision_open(&shared.partition).unwrap(),
+        );
+        ea.document_mutate(&shared.partition, |doc| {
+            polyvisor_todo_model::add(doc, "from a".into()).map(|_| ())
+        })
+        .await
+        .unwrap();
+        until(|| async {
+            eb.document_read(&shared.partition, |doc| doc.revision() >= 3)
+                .await
+                .ok()
+                .filter(|ready| *ready)
+        })
+        .await;
+    });
+}
 
 #[derive(Clone, Debug)]
 struct TestTransport {
@@ -1206,10 +1759,16 @@ async fn wire_only(a: &TestEngine, b: &TestEngine) {
     let (ta, tb) = TestTransport::pair();
     let b_key = b.verifying_key();
     let inbound = RefCell::new(None);
-    let _ = futures::future::join(a.connect(ta, Direction::Outbound, Some(b_key)), async {
-        *inbound.borrow_mut() = Some(b.connect(tb, Direction::Inbound, None).await);
-    })
-    .await;
+    let (outbound, ()) =
+        futures::future::join(a.connect(ta, Direction::Outbound, Some(b_key)), async {
+            *inbound.borrow_mut() = Some(b.connect(tb, Direction::Inbound, None).await);
+        })
+        .await;
+    outbound.expect("outbound connection succeeds");
+    inbound
+        .into_inner()
+        .expect("inbound resolved")
+        .expect("inbound connection succeeds");
 }
 
 fn titles(snapshot: &TaskSnapshot) -> Vec<String> {
@@ -1746,6 +2305,7 @@ fn commits_at_rest_are_envelopes_a_stranger_cannot_open() {
             .iter()
             .map(|app| AppState {
                 app: app.app.clone(),
+                authority: app.authority.clone(),
                 state: TreeState {
                     doc: Vec::new(),
                     ..app.state.clone()
@@ -2373,7 +2933,6 @@ fn a_closed_range_becomes_one_fragment_and_the_commits_it_carries_go() {
         );
 
         let after = ea.entry_points().await.unwrap();
-        eprintln!("PROBE2 written={written} before={before} after={after}");
         assert!(
             after <= before + 1,
             "compaction adds at most the fragment's own entry point: {before} -> {after}",

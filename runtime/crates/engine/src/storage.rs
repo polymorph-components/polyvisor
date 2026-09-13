@@ -75,6 +75,9 @@ pub struct AppState {
     pub app: String,
     #[serde(flatten)]
     pub state: TreeState,
+    /// Signed Keyhive operations scoped to this shareable document.
+    #[serde(default)]
+    pub authority: Vec<Item>,
 }
 
 /// One document and the sedimentree items backing it.
@@ -130,6 +133,7 @@ pub struct StoreItem {
 pub struct SnapshotStorage {
     trees: RefCell<BTreeMap<SedimentreeId, Tree>>,
     lifecycle: crate::opaque::Lifecycle,
+    shared: RefCell<Option<crate::policy::SharedAuthorities>>,
 }
 
 #[derive(Debug, Default)]
@@ -143,6 +147,37 @@ impl SnapshotStorage {
         Self {
             trees: RefCell::new(BTreeMap::new()),
             lifecycle,
+            shared: RefCell::new(None),
+        }
+    }
+
+    pub(crate) fn set_shared_authorities(&self, shared: crate::policy::SharedAuthorities) {
+        *self.shared.borrow_mut() = Some(shared);
+    }
+
+    fn shared_authorized<T>(&self, tree: SedimentreeId, signed: &Signed<T>) -> bool
+    where
+        T: sedimentree_core::codec::schema::Schema
+            + sedimentree_core::codec::encode::EncodeFields
+            + sedimentree_core::codec::decode::DecodeFields,
+    {
+        let shared = self.shared.borrow();
+        let Some(authority) = shared
+            .as_ref()
+            .and_then(|shared| shared.borrow().get(&tree).cloned())
+        else {
+            // The reserved namespace must fail closed even before a descriptor
+            // arrives; otherwise own-group authority treats an unknown shared
+            // tree as an ordinary private partition.
+            return !matches!(
+                tree.as_bytes()[0],
+                crate::SHARED_TREE_TAG | crate::SHARED_AUTHORITY_TREE_TAG
+            );
+        };
+        if tree.as_bytes()[0] == crate::SHARED_AUTHORITY_TREE_TAG {
+            authority.readers.contains(&signed.issuer().to_bytes())
+        } else {
+            authority.editors.contains(&signed.issuer().to_bytes())
         }
     }
     /// Every stored commit of `tree` as `(id, blob)`, for the automerge
@@ -218,6 +253,69 @@ impl SnapshotStorage {
                 commits.chain(fragments).collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// Compute the bincode size of `Vec<StoreItem>` for one tree without
+    /// cloning any payload, then clone only if it fits.
+    pub fn inline_items(
+        &self,
+        tree: SedimentreeId,
+        budget: usize,
+    ) -> Result<Option<Vec<StoreItem>>, String> {
+        let trees = self.trees.borrow();
+        let Some(stored) = trees.get(&tree) else {
+            return Ok(Some(Vec::new()));
+        };
+        let count = stored.commits.len() + stored.fragments.len();
+        let mut size = bincode::serialized_size(&vec![(); count]).map_err(|e| e.to_string())?;
+        for (id, (signed, blob)) in &stored.commits {
+            let item = StoreItemRef {
+                tree: tree.as_bytes(),
+                commit: id.as_bytes(),
+                signed: signed.as_bytes(),
+                blob,
+                kind: ItemKind::Commit,
+            };
+            size = size
+                .checked_add(bincode::serialized_size(&item).map_err(|e| e.to_string())?)
+                .ok_or_else(|| "inline item size overflow".to_string())?;
+            if size > budget as u64 {
+                return Ok(None);
+            }
+        }
+        for (id, (signed, blob)) in &stored.fragments {
+            let item = StoreItemRef {
+                tree: tree.as_bytes(),
+                commit: id.as_bytes(),
+                signed: signed.as_bytes(),
+                blob,
+                kind: ItemKind::Fragment,
+            };
+            size = size
+                .checked_add(bincode::serialized_size(&item).map_err(|e| e.to_string())?)
+                .ok_or_else(|| "inline item size overflow".to_string())?;
+            if size > budget as u64 {
+                return Ok(None);
+            }
+        }
+        let commits = stored.commits.iter().map(|(id, (signed, blob))| StoreItem {
+            tree: *tree.as_bytes(),
+            commit: *id.as_bytes(),
+            signed: signed.as_bytes().to_vec(),
+            blob: blob.clone(),
+            kind: ItemKind::Commit,
+        });
+        let fragments = stored
+            .fragments
+            .iter()
+            .map(|(id, (signed, blob))| StoreItem {
+                tree: *tree.as_bytes(),
+                commit: *id.as_bytes(),
+                signed: signed.as_bytes().to_vec(),
+                blob: blob.clone(),
+                kind: ItemKind::Fragment,
+            });
+        Ok(Some(commits.chain(fragments).collect()))
     }
 
     /// Whether `tree` holds `commit`.
@@ -372,6 +470,14 @@ impl SnapshotStorage {
         Snapshot {
             apps: apps
                 .map(|(app, tree, doc)| AppState {
+                    authority: crate::shared_document(&app)
+                        .ok()
+                        .flatten()
+                        .map(|_| {
+                            self.tree_state(crate::shared_authority_tree(&app), Vec::new())
+                                .commits
+                        })
+                        .unwrap_or_default(),
                     app,
                     state: self.tree_state(tree, doc),
                 })
@@ -410,6 +516,15 @@ impl SnapshotStorage {
     }
 }
 
+#[derive(Serialize)]
+struct StoreItemRef<'a> {
+    tree: &'a [u8; 32],
+    commit: &'a [u8; 32],
+    signed: &'a [u8],
+    blob: &'a [u8],
+    kind: ItemKind,
+}
+
 fn items<'a, T>(stored: impl Iterator<Item = &'a (Signed<T>, Vec<u8>)>) -> Vec<Item>
 where
     T: 'a
@@ -445,9 +560,37 @@ impl Storage<Local> for SnapshotStorage {
             let entry = trees.entry(tree).or_default();
             let mut stored = 0u32;
             for (signed, blob) in commits {
+                if !self.shared_authorized(tree, &signed) {
+                    return Err(StorageFailure::Permanent);
+                }
                 let Ok(payload) = signed.try_decode_trusted_payload() else {
                     return Err(StorageFailure::Permanent);
                 };
+                if payload.sedimentree_id() != tree
+                    || *payload.blob_meta()
+                        != sedimentree_core::blob::BlobMeta::new(
+                            &sedimentree_core::blob::Blob::new(blob.clone()),
+                        )
+                {
+                    return Err(StorageFailure::Permanent);
+                }
+                if tree.as_bytes()[0] == crate::SHARED_TREE_TAG {
+                    let Ok(ciphertext) = bincode::deserialize::<crate::vault::Ciphertext>(&blob)
+                    else {
+                        return Err(StorageFailure::Permanent);
+                    };
+                    let cref = crate::shared_cref(tree, *payload.head().as_bytes());
+                    let preds: Vec<_> = payload
+                        .parents()
+                        .iter()
+                        .map(|parent| crate::shared_cref(tree, *parent.as_bytes()))
+                        .collect();
+                    if ciphertext.content_ref != cref
+                        || ciphertext.pred_refs != keyhive_crypto::digest::Digest::hash(&preds)
+                    {
+                        return Err(StorageFailure::Permanent);
+                    }
+                }
                 if crate::opaque::is_opaque_tree(tree.as_bytes())
                     && crate::opaque::mode(&self.lifecycle, tree.as_bytes())
                         == Some(crate::opaque::OpaqueMode::CallerEncrypted)
@@ -459,6 +602,13 @@ impl Storage<Local> for SnapshotStorage {
                 stored += 1;
             }
             for (signed, blob) in fragments {
+                if matches!(
+                    tree.as_bytes()[0],
+                    crate::SHARED_TREE_TAG | crate::SHARED_AUTHORITY_TREE_TAG
+                ) || !self.shared_authorized(tree, &signed)
+                {
+                    return Err(StorageFailure::Permanent);
+                }
                 let Ok(payload) = signed.try_decode_trusted_payload() else {
                     return Err(StorageFailure::Permanent);
                 };

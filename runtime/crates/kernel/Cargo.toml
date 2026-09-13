@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 aes-gcm.workspace = true
 blake3.workspace = true
+bincode.workspace = true
 data-encoding.workspace = true
 hmac.workspace = true
 polyvisor-engine = { path = "../engine" }
