@@ -46,6 +46,28 @@ interface tasks {
     remove: async func(id: string) -> result<_, string>;
 }
 
+/// Raw Automerge history for one application-private document partition.
+/// The application owns the document schema and authors every change; the
+/// runtime only validates, persists, and synchronizes its history. Snapshot
+/// bytes are an Automerge save, and `revision` is monotonic on this replica.
+interface history {
+    record snapshot {
+        revision: u64,
+        bytes: list<u8>,
+    }
+
+    /// Read the latest complete saved history.
+    read: async func() -> result<snapshot, string>;
+    /// Park until this replica advances beyond `after`. Session shutdown
+    /// settles a parked watch with an error.
+    watch: async func(after: u64) -> result<snapshot, string>;
+    /// Publish raw Automerge changes. Every dependency must already exist or
+    /// be present in this batch. Duplicate changes are idempotent, invalid or
+    /// incomplete batches are rejected atomically, and success means the
+    /// accepted history is durably checkpointed on this device.
+    publish: async func(changes: list<list<u8>>) -> result<_, string>;
+}
+
 /// The app's place in the visor's bookmarkable URL.
 ///
 /// The visor's page fragment names the running app and carries one opaque
@@ -73,4 +95,10 @@ world app {
     include polymorph:stream-dom/producer@0.1.0;
     import tasks;
     import route;
+}
+
+/// An application that owns its Automerge schema directly.
+world markdown-app {
+    include polymorph:stream-dom/producer@0.1.0;
+    import history;
 }

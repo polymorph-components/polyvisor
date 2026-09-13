@@ -3033,6 +3033,130 @@ fn task_watch_returns_immediately_or_wakes_all_and_close_settles() {
 }
 
 #[test]
+fn history_is_partitioned_by_app_and_close_cancels_a_watch() {
+    use automerge::{Automerge, ROOT, transaction::Transactable as _};
+
+    let fetch = fetch_with(CSS_HANDLE_HEX)
+        .route(
+            &format!("{ORIGIN}/apps/index.json"),
+            r#"["todomvc","other"]"#,
+        )
+        .route(
+            &format!("{ORIGIN}/apps/other/manifest.json"),
+            manifest_json(CSS_HANDLE_HEX).replace("todomvc", "other"),
+        );
+    let kernel = World::with_fetch(fetch).boot();
+    let session = session(&kernel);
+    let other = block_on(kernel.launch("other")).unwrap();
+    let initial = block_on(kernel.history_read(other)).unwrap();
+    let mut author = Automerge::new().with_actor(automerge::ActorId::from(&[43][..]));
+    author.transact(|tx| tx.put(ROOT, "owned", true)).unwrap();
+    let change = author.get_last_local_change().unwrap().raw_bytes().to_vec();
+    block_on(kernel.history_publish(session, vec![change])).unwrap();
+    assert_eq!(block_on(kernel.history_read(session)).unwrap().revision, 1);
+    assert_eq!(block_on(kernel.history_read(other)).unwrap().revision, 0);
+
+    let watched = Rc::new(RefCell::new(None));
+    let slot = Rc::clone(&watched);
+    let watching = Rc::clone(&kernel);
+    POOL.with(|pool| {
+        pool.spawner
+            .spawn_local(async move {
+                *slot.borrow_mut() = Some(watching.history_watch(other, initial.revision).await);
+            })
+            .unwrap()
+    });
+    settle();
+    kernel.close(other);
+    settle_until(|| async { watched.borrow().is_some().then_some(()) });
+    assert_eq!(
+        watched.borrow().as_ref().unwrap(),
+        &Err("unknown session".into())
+    );
+
+    assert_eq!(
+        block_on(kernel.history_read(other)),
+        Err("unknown session".into())
+    );
+}
+
+#[test]
+fn history_publish_is_visible_to_every_session_and_retries_are_idempotent() {
+    use automerge::{Automerge, ROOT, transaction::Transactable as _};
+
+    let kernel = boot();
+    let first = session(&kernel);
+    let second = session(&kernel);
+    let mut author = Automerge::new().with_actor(automerge::ActorId::from(&[42][..]));
+    author.transact(|tx| tx.put(ROOT, "body", "hello")).unwrap();
+    let change = author.get_last_local_change().unwrap().raw_bytes().to_vec();
+
+    block_on(kernel.history_publish(first, vec![change.clone()])).unwrap();
+    let published = block_on(kernel.history_read(second)).unwrap();
+    assert_eq!(published.revision, 1);
+
+    block_on(kernel.history_publish(first, vec![change])).unwrap();
+    assert_eq!(block_on(kernel.history_read(second)).unwrap(), published);
+}
+
+#[test]
+fn history_publish_retry_after_checkpoint_failure_is_durable_and_wakes_watch() {
+    use automerge::{Automerge, ROOT, transaction::Transactable as _};
+
+    let world = World::default();
+    let kernel = world.boot();
+    let active = session(&kernel);
+    let initial = block_on(kernel.history_read(active)).unwrap();
+    let watched = Rc::new(RefCell::new(None));
+    let slot = Rc::clone(&watched);
+    let watching = Rc::clone(&kernel);
+    POOL.with(|pool| {
+        pool.spawner
+            .spawn_local(async move {
+                *slot.borrow_mut() = Some(watching.history_watch(active, initial.revision).await);
+            })
+            .unwrap()
+    });
+    settle();
+
+    let mut author = Automerge::new().with_actor(automerge::ActorId::from(&[45][..]));
+    author
+        .transact(|tx| tx.put(ROOT, "persisted", true))
+        .unwrap();
+    let change = author.get_last_local_change().unwrap().raw_bytes().to_vec();
+    world.files.fail_next_writes(1);
+    assert!(block_on(kernel.history_publish(active, vec![change.clone()])).is_err());
+    assert!(
+        watched.borrow().is_none(),
+        "failed durability did not wake watch"
+    );
+
+    block_on(kernel.history_publish(active, vec![change])).unwrap();
+    settle_until(|| async { watched.borrow().is_some().then_some(()) });
+    assert_eq!(
+        watched
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .revision,
+        1
+    );
+
+    drop(kernel);
+    settle();
+    let restored = world.boot();
+    let restored_session = session(&restored);
+    assert_eq!(
+        block_on(restored.history_read(restored_session))
+            .unwrap()
+            .revision,
+        1
+    );
+}
+
+#[test]
 fn a_manifest_handle_that_is_not_hex_is_a_boot_failure() {
     let Err(err) = World::with_fetch(fetch_with("not hex")).try_boot() else {
         panic!("a manifest with an unreadable handle must not boot");

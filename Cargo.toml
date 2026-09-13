@@ -12,6 +12,7 @@ members = [
     "runtime/crates/visor-model",
     "visor",
     "apps/todomvc",
+    "apps/markdown",
     # Not shipped by the production site build: `web/build.ts --fixtures`
     # only.
     "apps/hostile",
@@ -85,8 +86,8 @@ dioxus = { version = "=0.7.10", default-features = false, features = ["macro", "
 # docs/design.md "Pins, with reasons": unpublished, moving; policy object
 # and asset handles landed in #15. Full 40-char sha of origin/main at the
 # time this skeleton was cut.
-stream-dom-dioxus = { git = "https://github.com/polymorph-components/polymorph-stream-dom", rev = "e35dc357137a3563aa891662a626b3310a7078c4" }
-stream-dom-guest = { git = "https://github.com/polymorph-components/polymorph-stream-dom", rev = "e35dc357137a3563aa891662a626b3310a7078c4" }
+stream-dom-dioxus = { git = "https://github.com/polymorph-components/polymorph-stream-dom", rev = "5942eae23be9dffcfdab737a54f2687e63645216" }
+stream-dom-guest = { git = "https://github.com/polymorph-components/polymorph-stream-dom", rev = "5942eae23be9dffcfdab737a54f2687e63645216" }
 # The store's name derivation (docs/design.md "Storage", internal.wit
 # `storage`): every object in the user's Drive is named
 # `hex(HMAC-SHA256(name-key, tree || commit))`, so two devices of a group

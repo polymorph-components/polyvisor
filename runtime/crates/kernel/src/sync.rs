@@ -157,7 +157,7 @@ impl Kernel {
                             let apps: Vec<String> =
                                 kernel.sessions.borrow().values().cloned().collect();
                             for app in apps {
-                                kernel.wake_tasks(&app);
+                                kernel.wake_documents(&app);
                             }
                             let _ = kernel.refresh_personalization().await;
                             kernel.push_event(crate::Event::PersonalizationChanged);

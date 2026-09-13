@@ -47,6 +47,7 @@ const TAGS = new Set([
   "q",
   "code",
   "pre",
+  "textarea",
   "br",
   "hr",
   "img",
@@ -68,6 +69,7 @@ const ATTRS = new Set([
   "src",
   "rel",
   "role",
+  "readonly",
 ]);
 
 const ATTR_PREFIXES = ["aria-", "data-"];
@@ -95,6 +97,10 @@ const LISTENERS = new Set([
   "focus",
   "focusout",
   "dblclick",
+  "select",
+  "selectionchange",
+  "compositionstart",
+  "compositionend",
 ]);
 
 function attrAllowed(name: string): boolean {
@@ -148,6 +154,12 @@ export function checkOp(op: PolicyOp): string | undefined {
     }
     case "setProperty": {
       if (!PROPERTIES.has(op.name)) return `property '${op.name}'`;
+      return undefined;
+    }
+    case "setTextControlState": {
+      if (op.tag !== "textarea") {
+        return `text-control state on <${op.tag ?? "unknown"}>`;
+      }
       return undefined;
     }
     case "addListener": {

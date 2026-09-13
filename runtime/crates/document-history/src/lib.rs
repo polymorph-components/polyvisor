@@ -299,6 +299,74 @@ impl Document {
         absorbed
     }
 
+    /// Validate and accept an application-authored batch as one atomic unit.
+    /// Every dependency must already be present or occur in this batch;
+    /// retries containing changes already accepted are harmless.
+    pub fn publish(&mut self, blobs: Vec<Vec<u8>>) -> Result<bool, String> {
+        let mut batch = BTreeSet::new();
+        let mut changes = Vec::new();
+        for blob in blobs {
+            let change = automerge::Change::from_bytes(blob)
+                .map_err(|error| format!("invalid Automerge change: {error}"))?;
+            let id = CommitId::new(change.hash().0);
+            if self.applied.contains(&id) || !batch.insert(id) {
+                continue;
+            }
+            changes.push(change);
+        }
+        for change in &changes {
+            for dependency in change.deps() {
+                let dependency = CommitId::new(dependency.0);
+                if !self.applied.contains(&dependency) && !batch.contains(&dependency) {
+                    return Err("an Automerge change dependency is missing".to_string());
+                }
+            }
+        }
+        if changes.is_empty() {
+            return Ok(false);
+        }
+
+        // Validate against a clone first: even if Automerge rejects an actor
+        // sequence or another graph invariant, the live document is untouched.
+        let mut candidate = self.doc.clone();
+        candidate
+            .apply_changes(changes.clone())
+            .map_err(|error| format!("invalid Automerge change batch: {error}"))?;
+
+        let mut remaining = changes;
+        let mut ordered = Vec::with_capacity(remaining.len());
+        let mut available = self.applied.clone();
+        while !remaining.is_empty() {
+            let Some(index) = remaining.iter().position(|change| {
+                change
+                    .deps()
+                    .iter()
+                    .all(|hash| available.contains(&CommitId::new(hash.0)))
+            }) else {
+                return Err("the Automerge change batch is not causally ordered".to_string());
+            };
+            let change = remaining.remove(index);
+            available.insert(CommitId::new(change.hash().0));
+            ordered.push(change);
+        }
+
+        for change in ordered {
+            let head = CommitId::new(change.hash().0);
+            self.pending.push(NewCommit {
+                head,
+                parents: change
+                    .deps()
+                    .iter()
+                    .map(|hash| CommitId::new(hash.0))
+                    .collect(),
+                blob: Blob::new(change.raw_bytes().to_vec()),
+            });
+            self.applied.insert(head);
+        }
+        self.doc = candidate;
+        Ok(true)
+    }
+
     /// Run one transaction and, if it produced a change, record the commit
     /// that carries it. `Success::hash` is `None` exactly when the
     /// transaction created no operations, which is how a no-op mutation
@@ -339,9 +407,50 @@ pub fn actor(domain: &[u8], seed: [u8; 32], scope: &[u8]) -> ActorId {
 
 #[cfg(test)]
 mod tests {
-    use automerge::{ROOT, transaction::Transactable as _};
+    use automerge::{Automerge, ROOT, transaction::Transactable as _};
 
     use super::*;
+
+    fn document() -> Document {
+        Document::empty(
+            automerge::ActorId::from(&[1][..]),
+            SedimentreeId::new([7; 32]),
+        )
+    }
+
+    fn change(doc: &mut Automerge, key: &str, value: &str) -> Vec<u8> {
+        doc.transact(|tx| tx.put(ROOT, key, value)).unwrap();
+        doc.get_last_local_change().unwrap().raw_bytes().to_vec()
+    }
+
+    #[test]
+    fn publish_accepts_concurrent_histories_and_duplicate_retries() {
+        let mut left = Automerge::new().with_actor(automerge::ActorId::from(&[2][..]));
+        let mut right = Automerge::new().with_actor(automerge::ActorId::from(&[3][..]));
+        let left = change(&mut left, "left", "one");
+        let right = change(&mut right, "right", "two");
+        let mut history = document();
+
+        assert!(history.publish(vec![left.clone(), right]).unwrap());
+        assert_eq!(history.revision(), 2);
+        assert!(!history.publish(vec![left]).unwrap());
+        assert_eq!(history.revision(), 2);
+    }
+
+    #[test]
+    fn invalid_batch_and_missing_dependency_leave_history_unchanged() {
+        let mut author = Automerge::new().with_actor(automerge::ActorId::from(&[4][..]));
+        let first = change(&mut author, "first", "one");
+        let second = change(&mut author, "second", "two");
+        let mut history = document();
+        let before = history.save();
+
+        assert!(history.publish(vec![first, vec![0, 1, 2]]).is_err());
+        assert_eq!(history.save(), before);
+        assert!(history.publish(vec![second]).is_err());
+        assert_eq!(history.save(), before);
+        assert_eq!(history.revision(), 0);
+    }
 
     #[test]
     fn queued_child_materializes_once_when_fragment_supplies_its_parent() {

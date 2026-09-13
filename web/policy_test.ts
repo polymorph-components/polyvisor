@@ -62,6 +62,74 @@ Deno.test("the TodoMVC vocabulary is allowed", () => {
   });
 });
 
+Deno.test("Markdown editor vocabulary is allowed without navigation", () => {
+  allowed({ op: "createElement", tag: "textarea", ns: undefined });
+  allowed({
+    op: "setAttribute",
+    tag: "textarea",
+    name: "readonly",
+    ns: undefined,
+    value: text("true"),
+  });
+  // Dioxus removes boolean attributes when their props become false.
+  allowed({
+    op: "setAttribute",
+    tag: "textarea",
+    name: "readonly",
+    ns: undefined,
+    value: undefined,
+  });
+  allowed({
+    op: "setProperty",
+    tag: "textarea",
+    name: "value",
+    value: text("remote"),
+  });
+  allowed({
+    op: "setTextControlState",
+    tag: "textarea",
+    state: {
+      value: "A💡B",
+      selectionStart: 1,
+      selectionEnd: 3,
+      direction: "backward",
+    },
+  });
+  rejected({
+    op: "setTextControlState",
+    tag: "input",
+    state: {
+      value: "nope",
+      selectionStart: 0,
+      selectionEnd: 0,
+      direction: "none",
+    },
+  });
+  for (const name of [
+    "select",
+    "selectionchange",
+    "compositionstart",
+    "compositionend",
+  ]) {
+    allowed({
+      op: "addListener",
+      target: "node",
+      name,
+      capture: false,
+      passive: false,
+      preventDefault: false,
+      stopPropagation: false,
+    });
+  }
+  rejected({
+    op: "setAttribute",
+    tag: "textarea",
+    name: "formaction",
+    ns: undefined,
+    value: text("https://example.invalid"),
+  });
+});
+
 Deno.test("tags outside the table are rejected", () => {
   for (const tag of ["script", "iframe", "object", "embed", "style", "base"]) {
     rejected({ op: "createElement", tag, ns: undefined });

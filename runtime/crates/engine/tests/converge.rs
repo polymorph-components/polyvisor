@@ -1309,6 +1309,171 @@ fn generic_mutation_publishes_every_transaction_even_before_a_domain_error() {
 }
 
 #[test]
+fn linear_raw_change_batch_keeps_one_frontier_and_reaches_a_later_joiner() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 43, None);
+    let b = device(&pool, 44, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+
+    pool.run_until(async move {
+        let mut author =
+            automerge::Automerge::new().with_actor(automerge::ActorId::from(&[43][..]));
+        let heads = author.get_heads();
+        author.transact(|tx| tx.put(ROOT, "one", 1)).unwrap();
+        author.transact(|tx| tx.put(ROOT, "two", 2)).unwrap();
+        let changes = author
+            .get_changes(&heads)
+            .into_iter()
+            .map(|change| change.raw_bytes().to_vec())
+            .collect();
+
+        assert!(ea.document_publish("generic", changes).await.unwrap());
+        assert_eq!(
+            ea.entry_points().await.unwrap(),
+            1,
+            "a linear application-authored batch has one readable frontier"
+        );
+
+        enroll(&ea, &eb).await;
+        eb.document_read("generic", |_| ()).await.unwrap();
+        wire_only(&ea, &eb).await;
+        until(|| async {
+            eb.document_read("generic", |doc| {
+                ["one", "two"]
+                    .into_iter()
+                    .all(|key| doc.read().get(ROOT, key).ok().flatten().is_some())
+            })
+            .await
+            .ok()
+            .filter(|seen| *seen)
+        })
+        .await;
+    });
+}
+
+#[test]
+fn overlapping_dependent_publications_share_one_partition_gate() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 45, None);
+    let b = device(&pool, 46, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+
+    pool.run_until(async move {
+        let mut author =
+            automerge::Automerge::new().with_actor(automerge::ActorId::from(&[45][..]));
+        author.transact(|tx| tx.put(ROOT, "one", 1)).unwrap();
+        let first = author.get_last_local_change().unwrap().raw_bytes().to_vec();
+        author.transact(|tx| tx.put(ROOT, "two", 2)).unwrap();
+        let second = author.get_last_local_change().unwrap().raw_bytes().to_vec();
+
+        let (first_result, second_result) = futures::future::join(
+            ea.document_publish("generic", vec![first]),
+            ea.document_publish("generic", vec![second]),
+        )
+        .await;
+        assert!(first_result.unwrap());
+        assert!(second_result.unwrap());
+        assert_eq!(
+            ea.entry_points().await.unwrap(),
+            1,
+            "overlapping dependent publications confirm in causal order"
+        );
+
+        enroll(&ea, &eb).await;
+        eb.document_read("generic", |_| ()).await.unwrap();
+        wire_only(&ea, &eb).await;
+        until(|| async {
+            eb.document_read("generic", |doc| {
+                ["one", "two"]
+                    .into_iter()
+                    .all(|key| doc.read().get(ROOT, key).ok().flatten().is_some())
+            })
+            .await
+            .ok()
+            .filter(|seen| *seen)
+        })
+        .await;
+    });
+}
+
+#[test]
+fn connected_peers_exchange_concurrent_raw_history_updates() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 47, None);
+    let b = device(&pool, 48, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+
+    pool.run_until(async move {
+        eb.document_read("generic", |_| ()).await.unwrap();
+        wire(&ea, &eb).await;
+
+        let mut genesis =
+            automerge::Automerge::new().with_actor(automerge::ActorId::from(&[47][..]));
+        genesis.transact(|tx| tx.put(ROOT, "note", 0)).unwrap();
+        ea.document_publish(
+            "generic",
+            vec![
+                genesis
+                    .get_last_local_change()
+                    .unwrap()
+                    .raw_bytes()
+                    .to_vec(),
+            ],
+        )
+        .await
+        .unwrap();
+        until(|| async {
+            eb.document_read("generic", |doc| doc.revision() == 1)
+                .await
+                .ok()
+                .filter(|seen| *seen)
+        })
+        .await;
+
+        let snapshot = ea.document_save("generic").await.unwrap();
+        let mut author_a = automerge::Automerge::load(&snapshot).unwrap();
+        let mut author_b = automerge::Automerge::load(&snapshot).unwrap();
+        let _ = author_a.set_actor(automerge::ActorId::from(&[49][..]));
+        let _ = author_b.set_actor(automerge::ActorId::from(&[50][..]));
+        author_a.transact(|tx| tx.put(ROOT, "from-a", 1)).unwrap();
+        author_b.transact(|tx| tx.put(ROOT, "from-b", 2)).unwrap();
+        let change_a = author_a
+            .get_last_local_change()
+            .unwrap()
+            .raw_bytes()
+            .to_vec();
+        let change_b = author_b
+            .get_last_local_change()
+            .unwrap()
+            .raw_bytes()
+            .to_vec();
+
+        let (published_a, published_b) = futures::future::join(
+            ea.document_publish("generic", vec![change_a]),
+            eb.document_publish("generic", vec![change_b]),
+        )
+        .await;
+        assert!(published_a.unwrap());
+        assert!(published_b.unwrap());
+
+        for engine in [&ea, &eb] {
+            until(|| async {
+                engine
+                    .document_read("generic", |doc| {
+                        ["from-a", "from-b"]
+                            .into_iter()
+                            .all(|key| doc.read().get(ROOT, key).ok().flatten().is_some())
+                    })
+                    .await
+                    .ok()
+                    .filter(|seen| *seen)
+            })
+            .await;
+        }
+    });
+}
+
+#[test]
 fn a_snapshot_restores_the_same_items() {
     let mut pool = LocalPool::new();
     let a = device(&pool, 3, None);

@@ -515,7 +515,7 @@ impl Kernel {
                     // perform the same UI notifications here after apply.
                     let apps: Vec<String> = self.sessions.borrow().values().cloned().collect();
                     for app in apps {
-                        self.wake_tasks(&app);
+                        self.wake_documents(&app);
                     }
                     let _ = self.refresh_personalization().await;
                     self.push_event(crate::Event::PersonalizationChanged);

@@ -556,6 +556,7 @@ interface events {
 interface app-services {
     use types.{session-id};
     use polyvisor:app/tasks@0.1.0.{snapshot};
+    use polyvisor:app/history@0.1.0.{snapshot as history-snapshot};
 
     tasks-items: async func(session: session-id) -> result<snapshot, string>;
     tasks-watch: async func(session: session-id, after: u64) -> result<snapshot, string>;
@@ -563,6 +564,9 @@ interface app-services {
     tasks-set-completed: async func(session: session-id, id: string, completed: bool) -> result<_, string>;
     tasks-set-title: async func(session: session-id, id: string, title: string) -> result<_, string>;
     tasks-remove: async func(session: session-id, id: string) -> result<_, string>;
+    history-read: async func(session: session-id) -> result<history-snapshot, string>;
+    history-watch: async func(session: session-id, after: u64) -> result<history-snapshot, string>;
+    history-publish: async func(session: session-id, changes: list<list<u8>>) -> result<_, string>;
 }
 
 /// The user's private contacts: identity bindings, signed disclosures, and
