@@ -11,11 +11,12 @@ use futures::channel::mpsc;
 use futures::future::LocalBoxFuture;
 use futures::stream::StreamExt as _;
 use futures::{executor::LocalPool, task::LocalSpawnExt as _};
+use polyvisor_contacts_model::{Claim, Party};
 use polyvisor_kernel::{
-    Accepted, BootConfig, Bound, Claim, Clock, Dialed, EngineTransport, Error, ErrorCode, Event,
-    Fetch, Files, HttpResponse, IndexRow, Introduction, Kernel, LEASE_TTL_MS, LocalFuture, Locks,
-    MetaScope, Net, NetHandle, OpaqueMode, Party, Phase, Platform, Rest, Rng, Seams, Selection,
-    Spawn, State, Tier,
+    Accepted, BootConfig, Bound, Clock, Dialed, EngineTransport, Error, ErrorCode, Event, Fetch,
+    Files, HttpResponse, IndexRow, Kernel, LEASE_TTL_MS, LocalFuture, Locks, MetaScope,
+    NativeRootBackupKdf, Net, NetHandle, OpaqueMode, Phase, Platform, Rest, Rng, RootBackupKdf,
+    Seams, Selection, Spawn, State, Tier,
 };
 
 // -- harness -----------------------------------------------------------------
@@ -393,7 +394,7 @@ impl NetHandle for FakeEndpoint {
         alpn: String,
     ) -> LocalFuture<'_, Result<Dialed, String>> {
         Box::pin(async move {
-            let key = key_of(&endpoint_id)
+            let requested_key = key_of(&endpoint_id)
                 .ok_or_else(|| format!("{endpoint_id} is not an endpoint id"))?;
             let peer = self
                 .switchboard
@@ -429,7 +430,13 @@ impl NetHandle for FakeEndpoint {
                 }) as Box<dyn EngineTransport>,
                 None => here.transport,
             };
-            Ok((key, mine))
+            let answered_key = self
+                .liars
+                .borrow()
+                .get(&endpoint_id)
+                .copied()
+                .unwrap_or(requested_key);
+            Ok((answered_key, mine))
         })
     }
 
@@ -510,6 +517,8 @@ struct FakeFiles {
     peak_in_flight: Rc<Cell<u32>>,
     /// Paths written, in order, for counting checkpoints.
     written: Rc<RefCell<Vec<String>>>,
+    hold_writes: Rc<Cell<bool>>,
+    write_waker: Rc<RefCell<Option<std::task::Waker>>>,
 }
 
 impl FakeFiles {
@@ -530,6 +539,15 @@ impl FakeFiles {
     fn fail_next_writes(&self, n: u32) {
         self.failures.set(n);
     }
+    fn hold_writes(&self) {
+        self.hold_writes.set(true);
+    }
+    fn release_writes(&self) {
+        self.hold_writes.set(false);
+        if let Some(waker) = self.write_waker.borrow_mut().take() {
+            waker.wake();
+        }
+    }
 }
 
 impl Files for FakeFiles {
@@ -547,6 +565,15 @@ impl Files for FakeFiles {
             self.in_flight.set(depth);
             self.peak_in_flight
                 .set(self.peak_in_flight.get().max(depth));
+            futures::future::poll_fn(|cx| {
+                if self.hold_writes.get() {
+                    *self.write_waker.borrow_mut() = Some(cx.waker().clone());
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+            .await;
             // Several turns, not one: the window a second writer would have
             // to slip into has to be wide enough for the engine's driver and
             // event pump to get their turns inside it.
@@ -582,32 +609,57 @@ impl Locks for FakeLocks {
 }
 
 #[derive(Clone)]
-struct FakeClock(Rc<Cell<u64>>);
+struct FakeClock {
+    now: Rc<Cell<u64>>,
+    sleepers: Rc<RefCell<Vec<(u64, std::task::Waker)>>>,
+}
 
 impl Default for FakeClock {
     fn default() -> Self {
         // Far enough from zero that a stale lease can be expressed by
         // subtracting the TTL without underflowing.
-        FakeClock(Rc::new(Cell::new(1_700_000_000_000)))
+        FakeClock {
+            now: Rc::new(Cell::new(1_700_000_000_000)),
+            sleepers: Rc::default(),
+        }
     }
 }
 
 impl FakeClock {
     fn advance(&self, ms: u64) {
-        self.0.set(self.0.get() + ms);
+        self.now.set(self.now.get() + ms);
+        let now = self.now.get();
+        let mut sleepers = self.sleepers.borrow_mut();
+        let mut pending = Vec::new();
+        for (deadline, waker) in sleepers.drain(..) {
+            if now >= deadline {
+                waker.wake();
+            } else {
+                pending.push((deadline, waker));
+            }
+        }
+        *sleepers = pending;
     }
 }
 
 impl Clock for FakeClock {
     fn now_ms(&self) -> u64 {
-        self.0.get()
+        self.now.get()
     }
 
-    /// Never resolves: no protocol deadline should fire on a happy path, and
-    /// one that did would make a test hang rather than fail
-    /// (subduction_runtime/tests/common/mod.rs:36).
-    fn sleep(&self, _ms: u64) -> LocalFuture<'_, ()> {
-        Box::pin(futures::future::pending())
+    fn sleep(&self, ms: u64) -> LocalFuture<'_, ()> {
+        let deadline = self.now.get().saturating_add(ms);
+        Box::pin(futures::future::poll_fn(move |cx| {
+            if self.now.get() >= deadline {
+                Poll::Ready(())
+            } else {
+                let mut sleepers = self.sleepers.borrow_mut();
+                if !sleepers.iter().any(|(at, _)| *at == deadline) {
+                    sleepers.push((deadline, cx.waker().clone()));
+                }
+                Poll::Pending
+            }
+        }))
     }
 }
 
@@ -1461,33 +1513,174 @@ fn boot() -> Rc<Kernel> {
 }
 
 #[test]
-fn contacts_boot_reuses_identity_and_share_signs_the_exact_card() {
+fn contacts_boot_reuses_identity_and_member_shares_without_root_signing() {
     let world = World::default();
     let kernel = world.boot();
-    let first = block_on(kernel.contacts_profile()).unwrap().public_key;
-    let card = Party {
-        public_key: first,
-        claims: vec![Claim {
-            name: "name".into(),
-            value: "Ada".into(),
-        }],
-    };
-    let signed = block_on(kernel.contacts_share(Introduction {
-        issuer: card.clone(),
-        parties: Vec::new(),
-        issued_at: polyvisor_kernel::ClaimedTime {
-            seconds: 0,
-            nanos: 0,
-        },
-    }))
+    let first = block_on(kernel.contacts_profile()).unwrap().root;
+    let profile = block_on(kernel.contacts_profile()).unwrap();
+    let signed = block_on(
+        kernel.contacts_share(
+            profile.root.to_bytes(),
+            profile
+                .variants
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
+    )
     .unwrap();
-    let verified = polyvisor_contacts_model::verify(&signed).unwrap();
-    assert_eq!(verified.issuer, card);
+    assert!(polyvisor_contacts_model::verify_introduction(&signed).is_ok());
     drop(kernel);
     let second = world.boot();
+    assert_eq!(block_on(second.contacts_profile()).unwrap().root, first);
+}
+
+#[test]
+fn signed_preview_accept_retains_whole_profiles_and_can_forward_them() {
+    let alice_world = World::default();
+    let bob_world = alice_world.peer();
+    let carol_world = alice_world.peer_seeded(0x1020_3040_5060_7080);
+    let alice = alice_world.boot();
+    let bob = bob_world.boot();
+    let carol = carol_world.boot();
+    settle();
+
+    let alice_profile = block_on(alice.contacts_profile()).unwrap();
+    let alice_root = alice_profile.root.to_bytes();
+    let bob_root = block_on(bob.contacts_profile()).unwrap().root.to_bytes();
+    let signed = block_on(
+        alice.contacts_share(
+            alice_root,
+            alice_profile
+                .variants
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+            vec![Party {
+                public_key: bob_root,
+                observations: vec![Claim {
+                    name: "note".into(),
+                    value: "not selected".into(),
+                }],
+            }],
+        ),
+    )
+    .unwrap();
+    let preview = block_on(bob.contacts_signed_preview(signed.clone())).unwrap();
+    assert_eq!(preview.identities.len(), 1);
+    assert_eq!(preview.identities[0].root, alice_root);
     assert_eq!(
-        block_on(second.contacts_profile()).unwrap().public_key,
-        first
+        preview.parties.len(),
+        1,
+        "ordinary observations are previewed"
+    );
+    assert_eq!(
+        preview.identities[0].profiles.len(),
+        alice_profile.variants.len()
+    );
+
+    let alice_id = block_on(bob.contacts_import_accept(
+        signed,
+        vec![alice_root],
+        Vec::new(),
+        "Alice".into(),
+        "🐈".into(),
+    ))
+    .unwrap();
+    let retained = block_on(bob.contacts_get(alice_id.clone()))
+        .unwrap()
+        .retained_identity
+        .unwrap();
+    assert_eq!(retained.root.to_bytes(), alice_root);
+    assert_eq!(retained.profiles, alice_profile.variants);
+    assert!(
+        block_on(bob.contacts_items())
+            .unwrap()
+            .iter()
+            .filter(|contact| contact.public_key == Some(bob_root))
+            .all(|contact| contact.observations.is_empty()),
+        "an unselected observation party is not persisted",
+    );
+
+    let stale_profiles = alice_profile
+        .variants
+        .iter()
+        .map(|profile| profile.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    block_on(alice.contacts_resolve_profile(
+        stale_profiles.clone(),
+        vec![Claim {
+            name: "name".into(),
+            value: "changed".into(),
+        }],
+    ))
+    .unwrap();
+    assert_eq!(
+        block_on(alice.contacts_share(
+            alice_root,
+            stale_profiles,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ))
+        .unwrap_err()
+        .code,
+        ErrorCode::Refused,
+        "sharing refuses when the displayed official profile became stale",
+    );
+
+    let bob_profile = block_on(bob.contacts_profile()).unwrap();
+    let authority = retained.authorities.first().unwrap();
+    let forwarded_identity = polyvisor_kernel::AuthenticatedIdentity {
+        binding: retained.binding.clone(),
+        profiles: retained.profiles.clone(),
+        authority_device: authority.device,
+        keyhive_authority_proof: authority.keyhive_authority_proof.clone(),
+    };
+    let forwarded = block_on(
+        bob.contacts_share(
+            bob_profile.root.to_bytes(),
+            bob_profile
+                .variants
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect(),
+            vec![alice_id],
+            vec![forwarded_identity],
+            Vec::new(),
+        ),
+    )
+    .unwrap();
+    let forwarded_preview = block_on(carol.contacts_signed_preview(forwarded.clone())).unwrap();
+    let selected = forwarded_preview
+        .identities
+        .iter()
+        .map(|identity| identity.root)
+        .collect::<Vec<_>>();
+    assert_eq!(selected.len(), 2);
+    block_on(carol.contacts_import_accept(
+        forwarded,
+        selected,
+        Vec::new(),
+        "Bob".into(),
+        "🐕".into(),
+    ))
+    .unwrap();
+    assert!(
+        block_on(carol.contacts_items())
+            .unwrap()
+            .iter()
+            .any(|contact| {
+                contact
+                    .retained_identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.root.to_bytes() == alice_root)
+            })
     );
 }
 
@@ -1495,7 +1688,7 @@ fn contacts_boot_reuses_identity_and_share_signs_the_exact_card() {
 fn contacts_import_selects_claims_and_shares_one_meeting() {
     let kernel = boot();
     let json = br#"[{"claims":[{"name":"name","value":"Ada"},{"name":"email","value":"a@example.test"}]},{"claims":[{"name":"name","value":"Grace"}]}]"#.to_vec();
-    let ids = block_on(kernel.contacts_import_accept(
+    let ids = block_on(kernel.contacts_import_unsigned(
         json,
         "contacts.json".into(),
         vec![
@@ -1600,21 +1793,338 @@ fn pairing_adopts_the_founders_contacts_identity_and_document() {
     let adder = there.boot();
     settle();
 
-    let founder_key = block_on(adder.contacts_profile()).unwrap().public_key;
+    let founder_key = block_on(adder.contacts_profile()).unwrap().root;
     let contact_id =
         block_on(adder.contacts_create(Vec::new(), "friend".into(), "🐈".into())).unwrap();
-    let joiner_before = block_on(joiner.contacts_profile()).unwrap().public_key;
+    let joiner_before = block_on(joiner.contacts_profile()).unwrap().root;
     assert_ne!(joiner_before, founder_key);
 
     pair(&joiner, &adder);
 
     assert_eq!(
-        block_on(joiner.contacts_profile()).unwrap().public_key,
+        block_on(joiner.contacts_profile()).unwrap().root,
         founder_key
     );
     let adopted = block_on(joiner.contacts_get(contact_id)).unwrap();
     assert_eq!(adopted.petname, "friend");
     assert_eq!(adopted.glyph, "🐈");
+    assert!(!block_on(joiner.identity_status()).unwrap().has_root);
+    assert!(block_on(adder.identity_status()).unwrap().has_root);
+    let profile = block_on(joiner.contacts_profile()).unwrap();
+    assert!(
+        block_on(
+            joiner.contacts_share(
+                profile.root.to_bytes(),
+                profile
+                    .variants
+                    .iter()
+                    .map(|p| p.as_bytes().to_vec())
+                    .collect(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        )
+        .is_ok()
+    );
+    let observed = profile
+        .variants
+        .iter()
+        .map(|variant| variant.as_bytes().to_vec())
+        .collect();
+    assert_eq!(
+        block_on(joiner.contacts_resolve_profile(observed, Vec::new()))
+            .unwrap_err()
+            .code,
+        ErrorCode::Refused,
+    );
+}
+
+#[test]
+fn failed_pairing_after_group_mutation_leaves_identity_fail_closed() {
+    let here = World::default();
+    let there = here.peer();
+    let joiner = here.boot();
+    let adder = there.boot();
+    settle();
+    there.net.tamper(
+        &adder.device_status().unwrap().endpoint_id,
+        Rc::new(|bytes| {
+            let Ok(mut frame) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                return bytes;
+            };
+            let Some(enroll) = frame
+                .get_mut("Enroll")
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                return bytes;
+            };
+            enroll.insert("visor".into(), serde_json::json!([0]));
+            serde_json::to_vec(&frame).unwrap()
+        }),
+    );
+    let code = block_on(joiner.pairing_offer()).unwrap();
+    block_on(adder.pairing_claim(code)).unwrap();
+    settle_until(|| async {
+        matches!(joiner.pairing_status().unwrap(), Phase::AwaitingConfirm(_)).then_some(())
+    });
+    joiner.pairing_confirm().unwrap();
+    adder.pairing_confirm().unwrap();
+    settle_until(|| async {
+        matches!(joiner.pairing_status().unwrap(), Phase::Failed(_)).then_some(())
+    });
+    assert_eq!(
+        block_on(joiner.identity_status()).unwrap_err().code,
+        ErrorCode::Unavailable,
+    );
+    assert_eq!(
+        block_on(joiner.contacts_create(Vec::new(), "blocked".into(), String::new()))
+            .unwrap_err()
+            .code,
+        ErrorCode::Unavailable,
+    );
+}
+
+#[test]
+fn explicit_transfer_copies_root_and_persists_before_ack() {
+    let joiner_world = World::default();
+    let founder_world = joiner_world.peer();
+    let joiner = joiner_world.boot();
+    let founder = founder_world.boot();
+    settle();
+    pair(&joiner, &founder);
+    block_on(founder.root_transfer(joiner.device_status().unwrap().endpoint_id)).unwrap();
+    assert!(block_on(joiner.identity_status()).unwrap().has_root);
+    drop(joiner);
+    settle();
+    let restored = joiner_world.boot();
+    assert!(block_on(restored.identity_status()).unwrap().has_root);
+}
+
+#[test]
+fn transfer_refuses_when_selected_endpoint_answers_as_another_member() {
+    let b_world = World::default();
+    let a_world = b_world.peer();
+    let c_world = b_world.peer_seeded(0x8877_6655_4433_2211);
+    let b = b_world.boot();
+    let a = a_world.boot();
+    let c = c_world.boot();
+    settle();
+    pair(&b, &a);
+    pair(&c, &a);
+    let b_endpoint = b.device_status().unwrap().endpoint_id;
+    let c_key = key_of(&c.device_status().unwrap().endpoint_id).unwrap();
+    b_world.net.impersonate(&b_endpoint, c_key);
+    assert_eq!(
+        block_on(a.root_transfer(b_endpoint)).unwrap_err().code,
+        ErrorCode::Refused,
+    );
+    assert!(!block_on(b.identity_status()).unwrap().has_root);
+}
+
+#[test]
+fn transfer_checkpoint_failure_is_refused_and_not_installed() {
+    let joiner_world = World::default();
+    let founder_world = joiner_world.peer();
+    let joiner = joiner_world.boot();
+    let founder = founder_world.boot();
+    settle();
+    pair(&joiner, &founder);
+    joiner_world.files.fail_next_writes(1);
+    assert!(block_on(founder.root_transfer(joiner.device_status().unwrap().endpoint_id)).is_err());
+    assert!(!block_on(joiner.identity_status()).unwrap().has_root);
+    block_on(joiner.contacts_create(Vec::new(), "after failure".into(), String::new())).unwrap();
+    drop(joiner);
+    settle();
+    let restored = joiner_world.boot();
+    assert!(!block_on(restored.identity_status()).unwrap().has_root);
+}
+
+#[test]
+fn transfer_network_deadline_does_not_cancel_a_suspended_receiver_checkpoint() {
+    let joiner_world = World::default();
+    let founder_world = joiner_world.peer();
+    let joiner = joiner_world.boot();
+    let founder = founder_world.boot();
+    settle();
+    pair(&joiner, &founder);
+    joiner_world.files.hold_writes();
+    let target = joiner.device_status().unwrap().endpoint_id;
+
+    let transfer = founder.root_transfer(target);
+    futures::pin_mut!(transfer);
+    block_on(futures::future::poll_fn(|cx| {
+        if transfer.as_mut().poll(cx).is_ready() {
+            panic!("transfer completed before the receiver checkpoint was released");
+        }
+        if joiner_world.files.in_flight.get() > 0 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }));
+    founder_world.clock.advance(120_001);
+    joiner_world.clock.advance(120_001);
+    assert_eq!(
+        block_on(transfer).unwrap_err().message,
+        "root transfer timed out"
+    );
+    assert!(
+        joiner_world.files.in_flight.get() > 0,
+        "network deadline did not cancel the receiver checkpoint",
+    );
+    joiner_world.files.release_writes();
+    settle_until(|| async { (joiner_world.files.in_flight.get() == 0).then_some(()) });
+    block_on(joiner.contacts_create(Vec::new(), "after transfer".into(), String::new())).unwrap();
+    assert!(block_on(joiner.identity_status()).unwrap().has_root);
+}
+
+struct FastBackupKdf;
+
+impl RootBackupKdf for FastBackupKdf {
+    fn derive(&self, _passphrase: String, salt: [u8; 16]) -> LocalFuture<'_, Result<[u8; 32], ()>> {
+        Box::pin(async move {
+            let mut key = [0; 32];
+            key[..16].copy_from_slice(&salt);
+            key[16..].copy_from_slice(&salt);
+            Ok(key)
+        })
+    }
+}
+
+#[derive(Default)]
+struct HeldBackupKdf {
+    waiting: Cell<bool>,
+    released: Cell<bool>,
+    waker: RefCell<Option<std::task::Waker>>,
+}
+
+impl HeldBackupKdf {
+    fn release(&self) {
+        self.released.set(true);
+        if let Some(waker) = self.waker.borrow_mut().take() {
+            waker.wake();
+        }
+    }
+}
+
+impl RootBackupKdf for HeldBackupKdf {
+    fn derive(&self, _passphrase: String, salt: [u8; 16]) -> LocalFuture<'_, Result<[u8; 32], ()>> {
+        Box::pin(futures::future::poll_fn(move |cx| {
+            self.waiting.set(true);
+            if self.released.get() {
+                let mut key = [0; 32];
+                key[..16].copy_from_slice(&salt);
+                key[16..].copy_from_slice(&salt);
+                Poll::Ready(Ok(key))
+            } else {
+                *self.waker.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }))
+    }
+}
+
+#[test]
+fn backup_export_suspended_in_kdf_refuses_after_identity_adoption() {
+    let joiner_world = World::default();
+    let founder_world = joiner_world.peer();
+    let joiner = joiner_world.boot();
+    let founder = founder_world.boot();
+    let held = HeldBackupKdf::default();
+    let export = joiner.root_backup_export(&held, "test".into());
+    futures::pin_mut!(export);
+    block_on(futures::future::poll_fn(|cx| {
+        assert!(export.as_mut().poll(cx).is_pending());
+        if held.waiting.get() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }));
+    settle();
+    pair(&joiner, &founder);
+    held.release();
+    assert!(matches!(
+        block_on(export).unwrap_err().code,
+        ErrorCode::Unavailable | ErrorCode::Refused
+    ));
+}
+
+#[test]
+fn synced_backup_replaces_unlocks_and_disables_one_current_slot() {
+    let joiner_world = World::default();
+    let founder_world = joiner_world.peer();
+    let joiner = joiner_world.boot();
+    let founder = founder_world.boot();
+    settle();
+    pair(&joiner, &founder);
+    block_on(founder.root_backup_sync_replace(&FastBackupKdf, "test".into())).unwrap();
+    block_on(founder.sync_connect(joiner.device_status().unwrap().endpoint_id)).unwrap();
+    settle();
+    assert!(block_on(joiner.root_backup_status()).unwrap().synced);
+    block_on(joiner.root_backup_sync_unlock(&FastBackupKdf, "test".into())).unwrap();
+    assert!(block_on(joiner.identity_status()).unwrap().has_root);
+    drop(joiner);
+    settle();
+    let joiner = joiner_world.boot();
+    assert!(block_on(joiner.identity_status()).unwrap().has_root);
+    block_on(joiner.root_backup_sync_disable()).unwrap();
+    assert!(!block_on(joiner.root_backup_status()).unwrap().synced);
+}
+
+#[test]
+fn backup_import_checkpoint_failure_does_not_leave_root_installed() {
+    let joiner_world = World::default();
+    let founder_world = joiner_world.peer();
+    let joiner = joiner_world.boot();
+    let founder = founder_world.boot();
+    settle();
+    pair(&joiner, &founder);
+    let envelope = block_on(founder.root_backup_export(&FastBackupKdf, "test".into())).unwrap();
+    joiner_world.files.fail_next_writes(1);
+    assert!(block_on(joiner.root_backup_import(&FastBackupKdf, "test".into(), envelope)).is_err());
+    assert!(!block_on(joiner.identity_status()).unwrap().has_root);
+    block_on(joiner.contacts_create(Vec::new(), "after failure".into(), String::new())).unwrap();
+    drop(joiner);
+    settle();
+    assert!(
+        !block_on(joiner_world.boot().identity_status())
+            .unwrap()
+            .has_root
+    );
+}
+
+#[test]
+fn file_backup_installs_root_only_after_matching_identity_and_group() {
+    let here = World::default();
+    let there = here.peer();
+    let joiner = here.boot();
+    let founder = there.boot();
+    settle();
+    pair(&joiner, &founder);
+
+    let envelope = block_on(
+        founder.root_backup_export(&NativeRootBackupKdf, "synthetic test passphrase".into()),
+    )
+    .unwrap();
+    let public_root = block_on(founder.identity_status()).unwrap().root;
+    assert_eq!(
+        envelope
+            .windows(32)
+            .filter(|window| **window == public_root)
+            .count(),
+        1,
+        "the public root occurs only in the authenticated envelope header",
+    );
+    assert!(!block_on(joiner.identity_status()).unwrap().has_root);
+    block_on(joiner.root_backup_import(
+        &NativeRootBackupKdf,
+        "synthetic test passphrase".into(),
+        envelope,
+    ))
+    .unwrap();
+    assert!(block_on(joiner.identity_status()).unwrap().has_root);
 }
 
 fn session(kernel: &Kernel) -> u32 {
@@ -1822,7 +2332,7 @@ fn every_mutation_refreshes_the_lease() {
     let world = World::default();
     let kernel = world.boot();
     let booted = world.row(ID).unwrap().last_used;
-    world.clock.0.set(booted + 5_000);
+    world.clock.now.set(booted + 5_000);
     block_on(kernel.set_name("study".into())).unwrap();
     assert_eq!(world.row(ID).unwrap().last_used, booted + 5_000);
 }
@@ -2003,7 +2513,7 @@ fn plant(world: &World, id: &str, tier: Tier, last_used: u64) {
 #[test]
 fn the_sweep_takes_only_stale_unlocked_ephemeral_devices() {
     let world = World::default();
-    let now = world.clock.0.get();
+    let now = world.clock.now.get();
     let stale = now - LEASE_TTL_MS - 1;
 
     plant(&world, "abandoned", Tier::Ephemeral, stale);
@@ -2028,7 +2538,7 @@ fn the_sweep_takes_only_stale_unlocked_ephemeral_devices() {
 #[test]
 fn the_sweep_never_takes_the_device_it_is_booting() {
     let world = World::default();
-    let stale = world.clock.0.get() - LEASE_TTL_MS - 1;
+    let stale = world.clock.now.get() - LEASE_TTL_MS - 1;
     let mut row = IndexRow::fresh(ID, stale);
     row.petname = "mine".into();
     world.put_row(&row);
@@ -2259,7 +2769,7 @@ fn a_wrapped_key_copied_under_another_id_does_not_unwrap() {
     }
     let wrapped = world.kv.store.borrow()[&format!("dev/{ID}/dek-wrapped")].clone();
 
-    let mut row = IndexRow::fresh("other", world.clock.0.get());
+    let mut row = IndexRow::fresh("other", world.clock.now.get());
     row.tier = Tier::Durable;
     row.rest = Rest::Passphrase;
     world.put_row(&row);
@@ -2294,7 +2804,7 @@ fn a_checkpoint_moved_into_another_namespace_does_not_open() {
     let dek = world.kv.store.borrow()[&format!("dev/{ID}/dek")].clone();
     world.kv_put("dev/other/dek", dek);
     world.kv_put("dev/other/gen", world.pointer(ID).to_string().into_bytes());
-    world.put_row(&IndexRow::fresh("other", world.clock.0.get()));
+    world.put_row(&IndexRow::fresh("other", world.clock.now.get()));
 
     // It does not boot: the pointer names a generation, so an unreadable one
     // is loss, not absence. Silently blanking it is what rule 5 forbids.
@@ -2307,7 +2817,7 @@ fn a_checkpoint_moved_into_another_namespace_does_not_open() {
 #[test]
 fn a_rests_open_device_whose_key_is_gone_does_not_boot() {
     let world = World::default();
-    world.put_row(&IndexRow::fresh(ID, world.clock.0.get()));
+    world.put_row(&IndexRow::fresh(ID, world.clock.now.get()));
     let Err(err) = world.try_boot() else {
         panic!("a device whose data key is missing must not boot");
     };
@@ -2319,7 +2829,7 @@ fn a_rests_open_device_whose_key_is_gone_does_not_boot() {
 #[test]
 fn devices_lists_every_row_on_the_origin() {
     let world = World::default();
-    plant(&world, "aaa", Tier::Durable, world.clock.0.get());
+    plant(&world, "aaa", Tier::Durable, world.clock.now.get());
     let kernel = world.boot();
     let ids: Vec<String> = block_on(kernel.devices())
         .unwrap()

@@ -18,6 +18,7 @@ import {
 import { mountProducer } from "./mount.ts";
 import { popupReturn } from "./oauth.ts";
 import { proxyInterfaces } from "./rpc.ts";
+import { runBackupKdf } from "./platform/backup-kdf.ts";
 
 // ---------------------------------------------------------------------------
 // The returning half of the storage ceremony (internal.wit
@@ -149,6 +150,7 @@ const I = {
   store: "polyvisor:internal/store@0.1.0",
   apps: "polyvisor:internal/apps@0.1.0",
   sync: "polyvisor:internal/sync@0.1.0",
+  identity: "polyvisor:internal/identity@0.1.0",
   pairing: "polyvisor:internal/pairing@0.1.0",
   storage: "polyvisor:internal/storage@0.1.0",
   events: "polyvisor:internal/events@0.1.0",
@@ -333,6 +335,16 @@ const framePortWaiters = new Map<
   { resolve(p: MessagePort): void; reject(e: unknown): void }
 >();
 
+const kdfRequests = new Map<number, AbortController>();
+
+function departWorker(): void {
+  control.postMessage({ t: "depart" });
+  for (const request of kdfRequests.values()) request.abort();
+  kdfRequests.clear();
+}
+
+addEventListener("pagehide", departWorker, { once: true });
+
 control.addEventListener("message", (ev: MessageEvent) => {
   const data = ev.data;
   if (typeof data !== "object" || data === null) return;
@@ -349,6 +361,23 @@ control.addEventListener("message", (ev: MessageEvent) => {
     if (t === "frame-port") {
       waiter.resolve((data as { port: MessagePort }).port);
     } else waiter.reject(new Error((data as { message: string }).message));
+  } else if (t === "kdf-request") {
+    const request = data as { id: number; passphrase: string; salt: Uint8Array };
+    if (!Number.isSafeInteger(request.id) || request.id <= 0) return;
+    const abort = new AbortController();
+    kdfRequests.set(request.id, abort);
+    void runBackupKdf(request, abort.signal).then(
+      (key) => control.postMessage({ t: "kdf-response", id: request.id, key }),
+      (error: unknown) =>
+        control.postMessage({
+          t: "kdf-response",
+          id: request.id,
+          error: String((error as Error)?.message ?? error),
+        }),
+    ).finally(() => kdfRequests.delete(request.id));
+  } else if (t === "kdf-cancel") {
+    const id = (data as { id: number }).id;
+    kdfRequests.get(id)?.abort();
   }
 });
 
@@ -357,6 +386,7 @@ const kernel = proxyInterfaces(control, [
   I.store,
   I.apps,
   I.sync,
+  I.identity,
   I.pairing,
   I.storage,
   I.events,
@@ -1010,6 +1040,7 @@ async function main(): Promise<void> {
     // durable, and if it isn't, LAST still names whatever this profile's
     // last durable device was.
     switchDevice: (target: string | undefined) => {
+      departWorker();
       if (target === undefined) {
         sessionStorage.removeItem(ANCHOR);
         localStorage.removeItem(LAST);

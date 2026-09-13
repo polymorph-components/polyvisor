@@ -22,7 +22,7 @@ use subduction_protocol::event::Direction;
 
 use crate::{
     Clock, EngineTransport, Error, ErrorCode, Kernel, MEETING_ALPN, NetHandle, PAIRING_ALPN,
-    SUBDUCTION_ALPN, State, SyncEngine,
+    ROOT_TRANSFER_ALPN, SUBDUCTION_ALPN, State, SyncEngine,
 };
 
 /// `polyvisor:internal/sync.member`.
@@ -473,13 +473,15 @@ async fn accept_loop(kernel: Weak<Kernel>, endpoint: Rc<dyn NetHandle>) {
                 }
             }
             MEETING_ALPN => {
-                // Admission remains inside the meeting state machine; this
-                // read also keeps the offer predicate available to routing
-                // diagnostics without changing that unconditional handoff.
-                let _offering = kernel.meeting_offering();
                 let spawn = Rc::clone(&kernel.seams.spawn);
                 spawn.spawn(Box::pin(async move {
                     kernel.meeting_accept(endpoint_id, key, transport).await;
+                }));
+            }
+            ROOT_TRANSFER_ALPN => {
+                let spawn = Rc::clone(&kernel.seams.spawn);
+                spawn.spawn(Box::pin(async move {
+                    kernel.root_transfer_accept(key, transport).await;
                 }));
             }
             // An ALPN this device never advertised. The endpoint should not

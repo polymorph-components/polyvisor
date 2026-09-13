@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use dioxus::prelude::*;
 
 use crate::contacts::{
-    ClaimChoice, Qr, accept_signed, artifact_matches, default_name, generation_changed,
-    issuer_display, key_short, name_claim, qr_matrix, received_label, selected, should_rebase,
-    status_response_is_current,
+    ClaimChoice, Qr, accept_signed, artifact_matches, complete_claims, default_name,
+    generation_changed, issuer_display, key_short, name_claim, qr_matrix, received_label, selected,
+    should_rebase, status_response_is_current,
 };
 use crate::draft::{RollState, RollTarget};
 use crate::glyph::normalize_glyph;
@@ -13,6 +13,7 @@ use crate::kernel::{
     self, Contact, ImportReview, Introduction, MeetingPhase, MeetingRecord, Party, Provenance,
     Selection, SelfProfile,
 };
+use crate::state::Gate;
 use crate::ui::LabelControl;
 use crate::voice::{AppText, AppVoice, Voice};
 
@@ -437,6 +438,21 @@ fn ContactDetail(
                 },
                 "Revert label"
             }
+            div { class: "official-profiles",
+                h3 { "Official root-signed profile" }
+                if contact.official_profiles.is_empty() {
+                    p { class: "framework", "No verified official profile retained." }
+                }
+                for (index, variant) in contact.official_profiles.iter().enumerate() {
+                    section { class: "contact-official-profile", "data-official-profile": "{index}",
+                        if contact.official_profiles.len() > 1 { h4 { "Concurrent variant {index + 1}" } }
+                        for (name, value) in variant.claims.clone() {
+                            div { class: "observation-row", AppVoice { text: name } AppVoice { text: value } }
+                        }
+                    }
+                }
+                p { class: "framework", "These complete claims were signed by the contact's root identity. Local petname and issuer observations below are separate." }
+            }
             div { class: "contact-history",
                 if contact.observations.is_empty() {
                     p { class: "framework", "No observations." }
@@ -609,46 +625,164 @@ fn ProfileView(
 ) -> Element {
     let mut name = use_signal(String::new);
     let mut value = use_signal(String::new);
+    let mut chosen = use_signal(|| None::<usize>);
+    let mut draft = use_signal(Vec::<(String, String)>::new);
+    let mut draft_source = use_signal(|| None::<Vec<Vec<u8>>>);
+    let mut identity = use_signal(|| None::<kernel::IdentityStatus>);
+    let mut backup = use_signal(|| None::<kernel::BackupStatus>);
+    let mut passphrase = use_signal(String::new);
+    let mut status_gate = use_hook(|| CopyValue::new(Gate::default()));
+    use_effect(move || {
+        // ContactsChanged also announces custody and backup changes. Subscribe
+        // to the refreshed profile even when its signed claims are unchanged.
+        let _ = profile();
+        status_gate.write().bump();
+        let token = status_gate.peek().begin();
+        spawn(async move {
+            let next_identity = kernel::identity_status().await.ok();
+            if !status_gate.peek().apply(token) {
+                return;
+            }
+            identity.set(next_identity);
+            let next_backup = kernel::backup_status().await.ok();
+            if status_gate.peek().apply(token) {
+                backup.set(next_backup);
+            }
+        });
+    });
+    use_effect(move || {
+        let Some(current) = profile() else { return };
+        let tokens: Vec<_> = current
+            .variants
+            .iter()
+            .map(|variant| variant.token.clone())
+            .collect();
+        if draft_source().as_ref() != Some(&tokens) {
+            chosen.set((current.variants.len() == 1).then_some(0));
+            draft.set(
+                current
+                    .variants
+                    .first()
+                    .map(|variant| {
+                        variant
+                            .claims
+                            .iter()
+                            .map(|(name, value)| {
+                                (name.expose().to_string(), value.expose().to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            );
+            draft_source.set(Some(tokens));
+        }
+    });
+    let has_root = identity().is_some_and(|status| status.has_root);
     rsx! {
         div { class: "contacts-profile",
+            if let Some(status) = identity() {
+                div { class: "identity-status", "Root identity ", code { "{key_short(&status.root)}" } }
+                div { class: "framework", "Group ", code { "{key_short(&status.group)}" } }
+                strong { id: "root-custody-status", if status.has_root { "This device holds the user root." } else { "This device does not hold the user root." } }
+            }
             if let Some(profile_value) = profile() {
                 div { class: "key-full", code { "{full_key(&profile_value.public_key)}" } }
-                if profile_value.observations.is_empty() {
+                p { class: "framework", "Official profiles are disclosed whole. Individual claims cannot be omitted." }
+                if profile_value.variants.len() > 1 {
+                    p { id: "profile-conflict", class: "sheet-error framework", "Concurrent official profile variants need explicit resolution. Saving will replace every variant currently shown." }
+                }
+                if profile_value.variants.is_empty() {
                     p { class: "framework", "No profile claims." }
                 }
-                for item in profile_value.observations {
-                    div { class: "observation-row",
-                        AppVoice { text: item.name.clone() }
-                        AppVoice { text: item.value.clone() }
-                        button {
-                            onclick: {
-                                let claim_name = item.name.expose().to_string();
-                                let claim_value = item.value.expose().to_string();
+                for (index, variant) in profile_value.variants.iter().enumerate() {
+                    section { class: "profile-variant", "data-profile-variant": "{index}",
+                        h3 { "Official variant {index + 1}" }
+                        if variant.claims.is_empty() { p { class: "framework", "No claims." } }
+                        for (claim_name, claim_value) in variant.claims.clone() {
+                            div { class: "observation-row",
+                                AppVoice { text: claim_name }
+                                AppVoice { text: claim_value }
+                            }
+                        }
+                        if profile_value.variants.len() > 1 {
+                            button { class: "choose-profile-variant", onclick: {
+                                let claims = variant.claims.clone();
                                 move |_| {
-                                    let claim_name = claim_name.clone();
-                                    let claim_value = claim_value.clone();
-                                    async move { match kernel::contacts_remove_self_observation(claim_name, claim_value).await {
-                                        Ok(()) => refresh_contacts(contacts, profile, records),
-                                        Err(message) => error.set(Some(message)),
-                                    }}
+                                    chosen.set(Some(index));
+                                    draft.set(claims.iter().map(|(name, value)| (name.expose().to_string(), value.expose().to_string())).collect());
                                 }
-                            },
-                            "Remove"
+                            }, "Use this whole variant as the draft" }
                         }
                     }
+                }
+            }
+            if !has_root { p { id: "profile-root-required", class: "framework", "Editing the official profile requires the user root. Transfer it to this device or unlock a backup first." } }
+            h3 { "Profile draft" }
+            if profile().is_some_and(|current| current.variants.len() > 1) && chosen().is_none() {
+                p { class: "framework", "Choose one complete variant above before editing or resolving this conflict." }
+            }
+            for (index, (claim_name, claim_value)) in draft().into_iter().enumerate() {
+                div { class: "profile-draft-claim",
+                    span { class: "user", "{claim_name}" }
+                    span { class: "user", "{claim_value}" }
+                    button { disabled: !has_root, onclick: move |_| {
+                        let mut claims = draft();
+                        claims.remove(index);
+                        draft.set(claims);
+                    }, "Remove from draft" }
                 }
             }
             label { span { "Claim name" } input { value: "{name}", oninput: move |event| name.set(event.value()) } }
             label { span { "Claim value" } input { value: "{value}", oninput: move |event| value.set(event.value()) } }
             button {
-                disabled: name().is_empty() || value().is_empty(),
+                disabled: !has_root || name().is_empty() || value().is_empty(),
+                onclick: move |_| {
+                    let mut claims = draft();
+                    claims.push((name(), value()));
+                    draft.set(claims);
+                    name.set(String::new());
+                    value.set(String::new());
+                },
+                "Add to draft"
+            }
+            button {
+                id: "save-profile-draft",
+                disabled: !has_root || chosen().is_none() || draft_source().is_none(),
                 onclick: move |_| async move {
-                    match kernel::contacts_set_self_observation(name(), value()).await {
-                        Ok(()) => refresh_contacts(contacts, profile, records),
+                    let expected = draft_source().unwrap_or_default();
+                    match kernel::resolve_profile(expected, draft()).await {
+                        Ok(updated) => { profile.set(Some(updated)); error.set(None); }
                         Err(message) => error.set(Some(message)),
                     }
                 },
-                "Add to my profile"
+                "Save complete profile"
+            }
+            section { class: "root-backup",
+                h3 { "Root backup" }
+                p { class: "framework", "This optional backup recovers only the root signing secret. It does not recover group or app documents." }
+                if let Some(status) = backup() {
+                    p { id: "root-backup-status", if status.synced { "Synced backup enabled." } else { "Synced backup disabled." } }
+                }
+                label { span { "Backup passphrase" } input { r#type: "password", value: "{passphrase}", oninput: move |event| passphrase.set(event.value()) } }
+                button { disabled: !has_root || passphrase().is_empty(), onclick: move |_| async move {
+                    status_gate.write().bump();
+                    match kernel::backup_sync_replace(passphrase()).await { Ok(()) => { backup.set(kernel::backup_status().await.ok()); error.set(None); }, Err(message) => error.set(Some(message)) }
+                }, "Create or replace synced backup" }
+                button { onclick: move |_| async move {
+                    status_gate.write().bump();
+                    match kernel::backup_sync_disable().await { Ok(()) => { backup.set(kernel::backup_status().await.ok()); error.set(None); }, Err(message) => error.set(Some(message)) }
+                }, "Disable synced backup" }
+                button { disabled: passphrase().is_empty(), onclick: move |_| async move {
+                    status_gate.write().bump();
+                    match kernel::backup_sync_unlock(passphrase()).await { Ok(()) => { identity.set(kernel::identity_status().await.ok()); backup.set(kernel::backup_status().await.ok()); error.set(None); }, Err(message) => error.set(Some(message)) }
+                }, "Unlock synced backup" }
+                button { disabled: !has_root || passphrase().is_empty(), onclick: move |_| async move {
+                    match kernel::backup_export(passphrase()).await { Ok(bytes) => if let Err(message) = kernel::save_contact_file("polyvisor-root-backup.pvbackup".into(), &bytes).await { error.set(Some(message)); }, Err(message) => error.set(Some(message)) }
+                }, "Export backup file" }
+                button { disabled: passphrase().is_empty(), onclick: move |_| async move {
+                    status_gate.write().bump();
+                    match kernel::read_contact_file().await { Ok(Some((_name, bytes))) => match kernel::backup_import(passphrase(), bytes).await { Ok(()) => { identity.set(kernel::identity_status().await.ok()); backup.set(kernel::backup_status().await.ok()); error.set(None); }, Err(message) => error.set(Some(message)) }, Ok(None) => {}, Err(message) => error.set(Some(message)) }
+                }, "Import backup file" }
             }
         }
     }
@@ -740,13 +874,6 @@ fn ShareView(
             let source_changed = source_snapshot().as_ref() != Some(&snapshot);
             let old_rows = choices_by_id();
             let mut rows = BTreeMap::new();
-            rows.insert(
-                "self".into(),
-                rebase_choices(
-                    old_rows.get("self").map(Vec::as_slice).unwrap_or_default(),
-                    &profile.observations,
-                ),
-            );
             let live_ids: BTreeSet<_> = live.iter().map(|contact| contact.id.clone()).collect();
             let mut selected_ids = included();
             selected_ids.retain(|id| live_ids.contains(id));
@@ -767,12 +894,6 @@ fn ShareView(
             }
             let mut next_names = names();
             let mut next_baselines = name_baselines();
-            rebase_name(
-                "self",
-                observed_name(None, &profile.observations),
-                &mut next_names,
-                &mut next_baselines,
-            );
             for contact in &live {
                 let preferred = contact
                     .preferred
@@ -786,8 +907,8 @@ fn ShareView(
                     &mut next_baselines,
                 );
             }
-            next_names.retain(|id, _| id == "self" || live_ids.contains(id));
-            next_baselines.retain(|id, _| id == "self" || live_ids.contains(id));
+            next_names.retain(|id, _| live_ids.contains(id));
+            next_baselines.retain(|id, _| live_ids.contains(id));
             if rows != old_rows
                 || selected_ids != included()
                 || next_names != names()
@@ -809,17 +930,13 @@ fn ShareView(
     let Some(profile_value) = profile() else {
         return rsx! { div { class: "contacts-share", p { class: "framework", "Profile unavailable." } } };
     };
+    let displayed_profile = profile_value.clone();
     let assemble = move || {
         let choices = choices_by_id();
         let issuer = Party {
             public_key: profile_value.public_key.clone(),
-            claims: with_draft_name(
-                names().get("self"),
-                choices
-                    .get("self")
-                    .map(|items| selected(items))
-                    .unwrap_or_default(),
-            ),
+            claims: Vec::new(),
+            expected_profiles: Vec::new(),
         };
         let parties = contacts()
             .into_iter()
@@ -833,18 +950,41 @@ fn ShareView(
                         .map(|items| selected(items))
                         .unwrap_or_default(),
                 ),
+                expected_profiles: Vec::new(),
             })
             .collect();
-        Introduction { issuer, parties }
+        Introduction {
+            issuer,
+            expected_profiles: displayed_profile
+                .variants
+                .iter()
+                .map(|variant| variant.token.clone())
+                .collect(),
+            forwarded_contact_ids: included().into_iter().collect(),
+            expected_forwarded: contacts()
+                .into_iter()
+                .filter(|contact| included().contains(&contact.id))
+                .filter_map(|contact| contact.authenticated)
+                .collect(),
+            parties,
+        }
     };
     let preview = assemble();
 
     rsx! {
         div { class: "contacts-share",
-            h3 { "My claims" }
-            ShareName { id: "self", names, signed, share_gen, signing }
-            ClaimChecks { id: "self", choices_by_id, signed, share_gen, signing }
+            h3 { "My complete official profile" }
+            p { class: "framework", "Sharing includes every current root-signed profile variant whole. Individual claims cannot be omitted." }
+            for (index, variant) in profile_value.variants.iter().enumerate() {
+                section { class: "share-official-profile", "data-share-profile": "{index}",
+                    if profile_value.variants.len() > 1 { h4 { "Concurrent variant {index + 1}" } }
+                    for (name, value) in variant.claims.clone() {
+                        div { class: "observation-row", AppVoice { text: name } AppVoice { text: value } }
+                    }
+                }
+            }
             h3 { "Other contacts" }
+            p { class: "framework", "Selected contacts are forwarded with their intact signed profiles. Your petnames stay private; any observations you add are separate issuer observations." }
             for contact in contacts().into_iter().filter(|contact| !contact.public_key.is_empty()) {
                 label {
                     input {
@@ -883,7 +1023,7 @@ fn ShareView(
             }
             div { class: "contacts-share-preview",
                 h3 { "Exact preview" }
-                PartyPreview { party: preview.issuer.clone() }
+                p { class: "framework", "Your complete official profile shown above, plus these separately asserted observations:" }
                 for party in preview.parties.clone() {
                     PartyPreview { party }
                 }
@@ -1055,6 +1195,9 @@ fn ImportView(
     mut error: Signal<Option<String>>,
 ) -> Element {
     let mut review = use_signal(|| None::<ImportReview>);
+    let mut signed_review = use_signal(|| None::<kernel::SignedReview>);
+    let mut signed_roots = use_signal(BTreeSet::<Vec<u8>>::new);
+    let mut signed_parties = use_signal(BTreeSet::<u32>::new);
     let mut bytes = use_signal(Vec::<u8>::new);
     let mut source = use_signal(String::new);
     let mut checks = use_signal(BTreeSet::<(u32, String, String)>::new);
@@ -1067,22 +1210,40 @@ fn ImportView(
         generation.set(token);
         busy.set(true);
         review.set(None);
+        signed_review.set(None);
         checks.set(BTreeSet::new());
         included_parties.set(BTreeSet::new());
         bytes.set(next_bytes.clone());
         source.set(next_source);
         spawn(async move {
-            let result = kernel::contacts_import_preview(&next_bytes).await;
+            let signed = kernel::contacts_signed_preview(&next_bytes).await;
+            let result = if signed.is_ok() {
+                None
+            } else {
+                Some(kernel::contacts_import_preview(&next_bytes).await)
+            };
             if generation() != token {
                 return;
             }
             busy.set(false);
-            match result {
-                Ok(value) => {
-                    included_parties.set(value.parties.iter().map(|party| party.index).collect());
-                    review.set(Some(value));
+            if let Ok(value) = signed {
+                signed_roots.set(
+                    value
+                        .identities
+                        .iter()
+                        .map(|identity| identity.root.clone())
+                        .collect(),
+                );
+                signed_review.set(Some(value));
+            } else if let Some(result) = result {
+                match result {
+                    Ok(value) => {
+                        included_parties
+                            .set(value.parties.iter().map(|party| party.index).collect());
+                        review.set(Some(value));
+                    }
+                    Err(message) => error.set(Some(message)),
                 }
-                Err(message) => error.set(Some(message)),
             }
         });
     };
@@ -1093,15 +1254,19 @@ fn ImportView(
             generation.set(token);
             busy.set(true);
             review.set(None);
+            signed_review.set(None);
             checks.set(BTreeSet::new());
             included_parties.set(BTreeSet::new());
             bytes.set(Vec::new());
             source.set("contact link".into());
             spawn(async move {
                 let result = match kernel::decode_link(body).await {
-                    Ok(decoded) => kernel::contacts_import_preview(&decoded)
-                        .await
-                        .map(|review| (decoded, review)),
+                    Ok(decoded) => match kernel::contacts_signed_preview(&decoded).await {
+                        Ok(review) => Ok((decoded, Some(review), None)),
+                        Err(_) => kernel::contacts_import_preview(&decoded)
+                            .await
+                            .map(|review| (decoded, None, Some(review))),
+                    },
                     Err(message) => Err(message),
                 };
                 if generation() != token {
@@ -1109,11 +1274,23 @@ fn ImportView(
                 }
                 busy.set(false);
                 match result {
-                    Ok((decoded, value)) => {
+                    Ok((decoded, signed, value)) => {
                         bytes.set(decoded);
-                        included_parties
-                            .set(value.parties.iter().map(|party| party.index).collect());
-                        review.set(Some(value));
+                        signed_review.set(signed);
+                        if let Some(value) = signed_review() {
+                            signed_roots.set(
+                                value
+                                    .identities
+                                    .iter()
+                                    .map(|identity| identity.root.clone())
+                                    .collect(),
+                            );
+                        }
+                        if let Some(value) = value {
+                            included_parties
+                                .set(value.parties.iter().map(|party| party.index).collect());
+                            review.set(Some(value));
+                        }
                     }
                     Err(message) => error.set(Some(message)),
                 }
@@ -1136,6 +1313,44 @@ fn ImportView(
             }
             if busy() {
                 p { class: "framework", "Reviewing…" }
+            }
+            if let Some(review_value) = signed_review() {
+                p { class: "framework", "Verified signed introduction. Select complete root identities to retain; every profile variant is imported whole." }
+                for identity in review_value.identities.clone() {
+                    section { class: "signed-import-identity", "data-import-root": "{full_key(&identity.root)}",
+                        label { input { r#type: "checkbox", checked: signed_roots().contains(&identity.root), onchange: {
+                            let root = identity.root.clone(); move |event| { let mut roots = signed_roots(); if event.checked() { roots.insert(root.clone()); } else { roots.remove(&root); } signed_roots.set(roots); }
+                        } } "Retain this whole identity" }
+                        code { "root {full_key(&identity.root)}" }
+                        code { "group {full_key(&identity.group)}" }
+                        for (index, claims) in identity.profiles.into_iter().enumerate() {
+                            div { class: "signed-import-profile", "data-import-profile": "{index}",
+                                for (name, value) in claims { AppVoice { text: name } AppVoice { text: value } }
+                            }
+                        }
+                    }
+                }
+                if !review_value.parties.is_empty() {
+                    h3 { "Issuer observations" }
+                    p { class: "framework", "These are separate observations by the introduction issuer, not official claims by their subjects." }
+                    for (index, party) in review_value.parties.iter().enumerate() {
+                        section { class: "signed-import-party", "data-import-party": "{index}",
+                            label { input { r#type: "checkbox", checked: signed_parties().contains(&(index as u32)), onchange: move |event| { let mut parties = signed_parties(); if event.checked() { parties.insert(index as u32); } else { parties.remove(&(index as u32)); } signed_parties.set(parties); } } "Retain these issuer observations" }
+                            code { "subject {full_key(&party.public_key)}" }
+                            for (name, value) in party.claims.clone() { AppVoice { text: AppText::from_kernel(name) } AppVoice { text: AppText::from_kernel(value) } }
+                        }
+                    }
+                }
+                button { disabled: busy(), onclick: move |_| async move {
+                    let roots = signed_roots().into_iter().collect();
+                    let parties = signed_parties().into_iter().collect();
+                    busy.set(true);
+                    match kernel::contacts_signed_accept(&bytes(), roots, parties).await {
+                        Ok(_) => { signed_review.set(None); bytes.set(Vec::new()); refresh_contacts(contacts, profile, records); }
+                        Err(message) => error.set(Some(message)),
+                    }
+                    busy.set(false);
+                }, "Import complete signed profiles" }
             }
             if let Some(review_value) = review() {
                 span { class: "framework", "{review_value.summary}" }
@@ -1240,8 +1455,8 @@ fn MeetView(
     pending_submission: Signal<Option<(u64, Party)>>,
     mut error: Signal<Option<String>>,
 ) -> Element {
+    let _ = (own_choices, shared_name, shared_name_seed);
     let fragment = use_signal(|| initial_fragment.unwrap_or_default());
-    let mut peer_keep = use_signal(BTreeSet::<(String, String)>::new);
     let mut peer_generation = use_signal(|| None::<u32>);
     let active = !matches!(
         meeting(),
@@ -1249,24 +1464,15 @@ fn MeetView(
     );
 
     use_effect(move || {
-        if let Some(value) = profile()
-            && !active
-        {
-            let rebased = rebase_choices(&own_choices(), &value.observations);
-            if rebased != own_choices() {
-                own_choices.set(rebased);
+        if profile().is_some() && !active {
+            if !own_choices().is_empty() {
+                own_choices.set(Vec::new());
             }
-            let next_name = observed_name(None, &value.observations);
-            let baseline = shared_name_seed();
-            if baseline.is_none() || baseline.as_deref() == Some(shared_name().as_str()) {
-                // Same guard as above: only write when the value changes, or
-                // the effect re-dirties its own inputs and spins.
-                if shared_name() != next_name {
-                    shared_name.set(next_name.clone());
-                }
-                if shared_name_seed().as_deref() != Some(next_name.as_str()) {
-                    shared_name_seed.set(Some(next_name));
-                }
+            if !shared_name().is_empty() {
+                shared_name.set(String::new());
+            }
+            if shared_name_seed().is_some() {
+                shared_name_seed.set(None);
             }
         }
     });
@@ -1274,16 +1480,21 @@ fn MeetView(
     let Some(profile_value) = profile() else {
         return rsx! { div { class: "meet-now", "Profile unavailable." } };
     };
+    let meeting_profile = profile_value.clone();
     let card = move || Party {
-        public_key: profile_value.public_key.clone(),
-        claims: with_draft_name(Some(&shared_name()), selected(&own_choices())),
+        public_key: meeting_profile.public_key.clone(),
+        claims: Vec::new(),
+        expected_profiles: meeting_profile
+            .variants
+            .iter()
+            .map(|variant| variant.token.clone())
+            .collect(),
     };
     use_effect(move || {
         if let MeetingPhase::AwaitingConfirm { generation, .. } = meeting()
             && generation_changed(peer_generation(), generation)
         {
             peer_generation.set(Some(generation));
-            peer_keep.set(BTreeSet::new());
         }
         // Guard the reset writes: `Signal::set` marks the scope dirty
         // unconditionally, so writing `None`/empty on every run when the
@@ -1293,9 +1504,6 @@ fn MeetView(
         if !active {
             if peer_generation().is_some() {
                 peer_generation.set(None);
-            }
-            if !peer_keep().is_empty() {
-                peer_keep.set(BTreeSet::new());
             }
         }
     });
@@ -1316,31 +1524,13 @@ fn MeetView(
                         p { class: "framework", "This meeting was started elsewhere; its offered card is not available in this tab." }
                     }
                 } else {
-                    p { class: "framework", "Choose what you will present." }
-                    label {
-                        span { "Shared name" }
-                        input {
-                            value: "{shared_name}",
-                            disabled: pending_submission().is_some(),
-                            oninput: move |event| shared_name.set(event.value()),
-                        }
-                    }
-                    for (index, claim) in own_choices().into_iter().enumerate() {
-                        label {
-                            input {
-                                r#type: "checkbox",
-                                checked: claim.selected,
-                                disabled: pending_submission().is_some(),
-                                onchange: move |event| {
-                                    let mut items = own_choices();
-                                    if let Some(item) = items.get_mut(index) {
-                                        item.selected = event.checked();
-                                    }
-                                    own_choices.set(items);
-                                },
+                    p { class: "framework", "Meeting shares every current root-signed profile variant whole. Individual claims cannot be omitted." }
+                    for (index, variant) in profile_value.variants.iter().enumerate() {
+                        section { class: "meeting-share-profile", "data-meeting-profile": "{index}",
+                            if profile_value.variants.len() > 1 { h4 { "Concurrent variant {index + 1}" } }
+                            for (name, value) in variant.claims.clone() {
+                                div { class: "observation-row", AppVoice { text: name } AppVoice { text: value } }
                             }
-                            AppVoice { text: AppText::from_kernel(claim.name) }
-                            AppVoice { text: AppText::from_kernel(claim.value) }
                         }
                     }
                 }
@@ -1420,40 +1610,24 @@ fn MeetView(
                         }
                         div { class: "meet-sas", "{sas}" }
                         div { class: "key-full", code { "{full_key(&peer_key)}" } }
-                        p { class: "framework", "Choose details to save" }
-                        for (name, value) in claims {
-                            label {
-                                input {
-                                    r#type: "checkbox",
-                                    checked: peer_generation() == Some(generation)
-                                        && peer_keep().contains(&(name.expose().to_string(), value.expose().to_string())),
-                                    onchange: {
-                                        let name_raw = name.expose().to_string();
-                                        let value_raw = value.expose().to_string();
-                                        move |event| {
-                                            let item = (name_raw.clone(), value_raw.clone());
-                                            let mut keep = peer_keep();
-                                            if event.checked() { keep.insert(item); } else { keep.remove(&item); }
-                                            peer_keep.set(keep);
-                                        }
-                                    },
-                                }
+                        p { class: "framework", "Accepting saves this complete root-signed profile. Individual values cannot be omitted." }
+                        for (name, value) in claims.clone() {
+                            div { class: "meeting-official-claim",
                                 AppVoice { text: name.clone() }
                                 AppVoice { text: value.clone() }
                             }
                         }
                         button {
-                            onclick: move |_| async move {
-                                let keep = if peer_generation() == Some(generation) {
-                                    peer_keep().into_iter().collect()
-                                } else {
-                                    Vec::new()
-                                };
+                            onclick: move |_| {
+                                let claims = claims.clone();
+                                async move {
+                                let keep = complete_claims(claims.iter().map(|(name, value)|
+                                    (name.expose().to_string(), value.expose().to_string())).collect());
                                 match kernel::meeting_confirm(generation, keep).await {
                                     Ok(()) => { update_meeting(meeting, meeting_epoch, error).await; }
                                     Err(message) => error.set(Some(message)),
                                 }
-                            },
+                            }},
                             "Confirm"
                         }
                         button {

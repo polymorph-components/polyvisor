@@ -1,0 +1,10 @@
+package polyvisor:backup-kdf@0.1.0;
+
+interface backup-kdf {
+    /// Derive the fixed backup-v1 key. Costs are intentionally not inputs.
+    derive: func(passphrase: string, salt: list<u8>) -> result<list<u8>, string>;
+}
+
+world kdf-worker {
+    export backup-kdf;
+}

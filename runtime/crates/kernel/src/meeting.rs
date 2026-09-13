@@ -81,11 +81,6 @@ struct Session {
     cancelled: Rc<Cell<bool>>,
 }
 
-struct Identity {
-    generation: u32,
-    issuer: [u8; 32],
-}
-
 type Bound = (
     Rc<dyn EngineTransport>,
     mpsc::Receiver<Frame>,
@@ -110,13 +105,16 @@ pub struct Meeting {
     phase: Phase,
     offer: Option<Offer>,
     session: Option<Session>,
-    identity: Option<Identity>,
 }
 
 impl Kernel {
     /// Host one meeting and return its absolute bootstrap link.
-    pub async fn meeting_offer(self: &Rc<Self>, card: Party) -> Result<Status, Error> {
-        self.open()?;
+    pub async fn meeting_offer(
+        self: &Rc<Self>,
+        card: Party,
+        expected_profiles: Vec<Vec<u8>>,
+    ) -> Result<Status, Error> {
+        self.identity_open()?;
         let endpoint_key = self.engine()?.verifying_key().to_bytes();
         if self.endpoint.borrow().is_none() {
             return Err(Error::new(
@@ -126,7 +124,7 @@ impl Kernel {
         }
         let expected_card = card.clone();
         let generation = self.meeting_reserve(card.public_key)?;
-        let introduction = match self.contacts_sign_card(card).await {
+        let introduction = match self.contacts_sign_card(card, expected_profiles).await {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.meeting_set_phase(generation, Phase::Failed(error.message.clone()));
@@ -136,9 +134,10 @@ impl Kernel {
         if !self.meeting_is_current(generation) {
             return Err(Error::new(ErrorCode::Refused, "that meeting was replaced"));
         }
-        let signed = verified_self_introduction(&introduction)
-            .map_err(|why| Error::new(ErrorCode::Failed, why))?;
-        if signed.issuer != expected_card {
+        let signed = self
+            .contacts_validate_meeting_introduction(&introduction)
+            .await?;
+        if review(0, String::new(), signed.introduction()).peer_key != expected_card.public_key {
             return Err(Error::new(
                 ErrorCode::Failed,
                 "the signed meeting card did not match the selected card",
@@ -178,8 +177,9 @@ impl Kernel {
         self: &Rc<Self>,
         fragment: String,
         card: Party,
+        expected_profiles: Vec<Vec<u8>>,
     ) -> Result<Status, Error> {
-        self.open()?;
+        self.identity_open()?;
         let self_endpoint_key = self.engine()?.verifying_key().to_bytes();
         let endpoint = self.endpoint.borrow().clone().ok_or_else(|| {
             Error::new(
@@ -198,7 +198,7 @@ impl Kernel {
         let expected_card = card.clone();
         let generation = self.meeting_reserve(card.public_key)?;
         self.meeting_set_phase(generation, Phase::Dialing(generation));
-        let introduction = match self.contacts_sign_card(card).await {
+        let introduction = match self.contacts_sign_card(card, expected_profiles).await {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.meeting_set_phase(generation, Phase::Failed(error.message.clone()));
@@ -208,9 +208,10 @@ impl Kernel {
         if !self.meeting_is_current(generation) {
             return Err(Error::new(ErrorCode::Refused, "that meeting was replaced"));
         }
-        let signed = verified_self_introduction(&introduction)
-            .map_err(|why| Error::new(ErrorCode::Failed, why))?;
-        if signed.issuer != expected_card {
+        let signed = self
+            .contacts_validate_meeting_introduction(&introduction)
+            .await?;
+        if review(0, String::new(), signed.introduction()).peer_key != expected_card.public_key {
             return Err(Error::new(
                 ErrorCode::Failed,
                 "the signed meeting card did not match the selected card",
@@ -251,7 +252,7 @@ impl Kernel {
         generation: u32,
         keep: Vec<(String, String)>,
     ) -> Result<(), Error> {
-        self.open()?;
+        self.identity_open()?;
         let mut meeting = self.meeting.borrow_mut();
         let Phase::AwaitingConfirm(review) = &meeting.phase else {
             return Err(Error::new(
@@ -274,7 +275,7 @@ impl Kernel {
     }
 
     pub async fn meeting_cancel(&self, generation: u32) -> Result<(), Error> {
-        self.open()?;
+        self.identity_open()?;
         let (new_generation, session) = {
             let mut meeting = self.meeting.borrow_mut();
             if meeting.generation != generation {
@@ -296,7 +297,7 @@ impl Kernel {
     }
 
     pub async fn meeting_status(&self) -> Result<Status, Error> {
-        self.open()?;
+        self.identity_open()?;
         let (generation, expired) = {
             let meeting = self.meeting.borrow();
             (
@@ -315,10 +316,6 @@ impl Kernel {
             generation: meeting.generation,
             phase: meeting.phase.clone(),
         })
-    }
-
-    pub(crate) fn meeting_offering(&self) -> bool {
-        self.meeting.borrow().offer.is_some()
     }
 
     /// Pairing may replace the user's contacts identity. Invalidate any
@@ -389,7 +386,10 @@ impl Kernel {
             Some(_) => return Err(out_of_order()),
             None => return Err(gone()),
         };
-        let host_intro = verified_self_introduction(&host_bytes)?;
+        let host_intro = self
+            .contacts_validate_meeting_introduction(&host_bytes)
+            .await
+            .map_err(|error| error.message)?;
         send_frame(
             transport.as_ref(),
             &Frame::Reveal {
@@ -526,7 +526,10 @@ impl Kernel {
             .try_into()
             .map_err(|_| "that meeting token is malformed".to_string())?;
         let guest_commit = fixed32(&guest_commit, "commitment")?;
-        let guest_intro = verified_self_introduction(&guest_bytes)?;
+        let guest_intro = self
+            .contacts_validate_meeting_introduction(&guest_bytes)
+            .await
+            .map_err(|error| error.message)?;
         let host_endpoint_key = self
             .engine()
             .map_err(|error| error.message)?
@@ -583,9 +586,9 @@ impl Kernel {
         frames: &mut mpsc::Receiver<Frame>,
         confirm: &mut oneshot::Receiver<Vec<(String, String)>>,
         sas: String,
-        peer_intro: Introduction,
+        peer_intro: polyvisor_contacts_model::VerifiedIntroduction,
     ) -> Result<String, String> {
-        let review = review(generation, sas, &peer_intro);
+        let review = review(generation, sas, peer_intro.introduction());
         if !self.meeting_set_phase(generation, Phase::AwaitingConfirm(review)) {
             return Err("that meeting was replaced".into());
         }
@@ -696,10 +699,7 @@ impl Kernel {
             meeting.generation = next_generation(meeting.generation)?;
             meeting.offer = None;
             meeting.phase = Phase::Idle;
-            meeting.identity = Some(Identity {
-                generation: meeting.generation,
-                issuer,
-            });
+            let _issuer = issuer;
             (meeting.generation, meeting.session.take())
         };
         self.meeting_dispose(old);
@@ -799,16 +799,6 @@ impl Kernel {
 
     pub(crate) fn meeting_is_generation(&self, generation: u32) -> bool {
         self.meeting_is_current(generation)
-    }
-
-    /// This session's immutable signed-as contacts identity.
-    pub(crate) fn meeting_identity(&self, generation: u32) -> Option<[u8; 32]> {
-        let meeting = self.meeting.borrow();
-        meeting
-            .identity
-            .as_ref()
-            .filter(|identity| identity.generation == generation)
-            .map(|identity| identity.issuer)
     }
 
     fn meeting_dispose(&self, session: Option<Session>) {
@@ -918,20 +908,21 @@ async fn wait(
     }
 }
 
-fn verified_self_introduction(bytes: &[u8]) -> Result<Introduction, String> {
-    let introduction = polyvisor_contacts_model::verify(bytes)?;
-    if !introduction.parties.is_empty() {
-        return Err("a meeting card must be a self-introduction".into());
-    }
-    Ok(introduction)
-}
-
 fn review(generation: u32, sas: String, introduction: &Introduction) -> MeetingReview {
+    let binding = polyvisor_contacts_model::verify_root_binding(&introduction.issuer.binding)
+        .expect("validated introduction has a valid binding");
+    let claims = introduction
+        .issuer
+        .profiles
+        .iter()
+        .filter_map(|profile| polyvisor_contacts_model::verify_profile(profile).ok())
+        .flat_map(|profile| profile.claims)
+        .collect::<Vec<_>>();
     MeetingReview {
         generation,
         sas,
-        peer_key: introduction.issuer.public_key.to_vec(),
-        claims: claim_pairs(&introduction.issuer.claims),
+        peer_key: binding.root.to_bytes().to_vec(),
+        claims: claim_pairs(&claims),
     }
 }
 
@@ -973,7 +964,6 @@ fn transition(meeting: &mut Meeting, generation: u32, phase: Phase) -> bool {
 fn burn_generation(meeting: &mut Meeting) -> Result<u32, Error> {
     meeting.generation = next_generation(meeting.generation)?;
     meeting.offer = None;
-    meeting.identity = None;
     meeting.phase = Phase::Failed("someone else used this meeting link; make a new one".into());
     Ok(meeting.generation)
 }
@@ -1058,7 +1048,6 @@ fn sas(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polyvisor_contacts_model::ClaimedTime;
 
     #[test]
     fn fragment_round_trips_with_or_without_kind_prefix() {
@@ -1121,28 +1110,6 @@ mod tests {
     }
 
     #[test]
-    fn review_contains_only_verified_issuer_claims() {
-        let introduction = Introduction {
-            issuer: Party {
-                public_key: [8; 32],
-                claims: vec![Claim {
-                    name: "name".into(),
-                    value: "Ada".into(),
-                }],
-            },
-            parties: Vec::new(),
-            issued_at: ClaimedTime {
-                seconds: 1,
-                nanos: 2,
-            },
-        };
-        let review = review(7, "123456".into(), &introduction);
-        assert_eq!(review.generation, 7);
-        assert_eq!(review.peer_key, vec![8; 32]);
-        assert_eq!(review.claims, vec![("name".into(), "Ada".into())]);
-    }
-
-    #[test]
     fn second_claim_invalidates_the_original_generation_before_cleanup() {
         let mut meeting = Meeting {
             generation: 4,
@@ -1159,10 +1126,6 @@ mod tests {
                 introduction: Vec::new(),
             }),
             session: None,
-            identity: Some(Identity {
-                generation: 4,
-                issuer: [3; 32],
-            }),
         };
         assert_eq!(burn_generation(&mut meeting).unwrap(), 5);
         assert!(!transition(&mut meeting, 4, Phase::Done("stale".into())));
@@ -1181,10 +1144,6 @@ mod tests {
                 introduction: Vec::new(),
             }),
             session: None,
-            identity: Some(Identity {
-                generation: 8,
-                issuer: [3; 32],
-            }),
         };
         assert!(transition(&mut meeting, 8, Phase::Done("contact".into())));
         assert!(meeting.offer.is_none());

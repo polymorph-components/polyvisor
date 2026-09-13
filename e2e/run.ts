@@ -540,9 +540,83 @@ async function addProfileClaim(
     .fill(name);
   await profile.locator("label").filter({ hasText: "Claim value" }).locator("input")
     .fill(value);
-  await profile.getByRole("button", { name: "Add to my profile", exact: true })
+  await profile.getByRole("button", { name: "Add to draft", exact: true })
     .click();
-  await profile.getByText(value, { exact: false }).waitFor({ timeout: 10_000 });
+  await profile.locator(".profile-draft-claim").getByText(value, { exact: true })
+    .waitFor({ timeout: 10_000 });
+  await profile.getByRole("button", { name: "Save complete profile", exact: true })
+    .click();
+  await profile.locator("[data-profile-variant]").getByText(value, { exact: true })
+    .waitFor({ timeout: 10_000 });
+}
+
+async function expectRootCustody(page: Page, hasRoot: boolean): Promise<void> {
+  await openContactsView(page, "My profile", ".contacts-profile");
+  const status = contactsSheet(page).locator("#root-custody-status");
+  await status.waitFor({ timeout: 15_000 });
+  eq(
+    (await status.textContent())?.trim(),
+    hasRoot
+      ? "This device holds the user root."
+      : "This device does not hold the user root.",
+    "root custody status",
+  );
+  eq(
+    await contactsSheet(page).locator("#profile-root-required").count(),
+    hasRoot ? 0 : 1,
+    "official profile edit notice did not match root custody",
+  );
+  const profile = contactsSheet(page).locator(".contacts-profile");
+  await profile.locator("label").filter({ hasText: "Claim name" }).locator(
+    "input",
+  )
+    .fill("e2e custody probe");
+  await profile.locator("label").filter({ hasText: "Claim value" }).locator(
+    "input",
+  )
+    .fill("not saved");
+  eq(
+    await profile.getByRole("button", {
+      name: "Add to draft",
+      exact: true,
+    }).isDisabled(),
+    !hasRoot,
+    "official profile edit control did not match root custody",
+  );
+  eq(
+    await profile.locator("#save-profile-draft").isDisabled(),
+    !hasRoot,
+    "complete profile save did not match root custody",
+  );
+  for (const remove of await profile.getByRole("button", {
+    name: "Remove from draft",
+    exact: true,
+  }).all()) {
+    eq(
+      await remove.isDisabled(),
+      !hasRoot,
+      "draft claim removal did not match root custody",
+    );
+  }
+  await profile.locator("label").filter({ hasText: "Claim name" }).locator("input")
+    .fill("");
+  await profile.locator("label").filter({ hasText: "Claim value" }).locator("input")
+    .fill("");
+}
+
+async function waitForRootCustody(page: Page, hasRoot: boolean): Promise<void> {
+  const wanted = hasRoot
+    ? "This device holds the user root."
+    : "This device does not hold the user root.";
+  await openContactsView(page, "My profile", ".contacts-profile");
+  await contactsSheet(page).locator("#root-custody-status").filter({ hasText: wanted }).waitFor({ timeout: 60_000 });
+  await expectRootCustody(page, hasRoot);
+}
+
+async function waitForOfficialValue(page: Page, value: string): Promise<void> {
+  await openContactsView(page, "My profile", ".contacts-profile");
+  await contactsSheet(page).locator("[data-profile-variant]")
+    .getByText(value, { exact: true }).waitFor({ timeout: 60_000 });
 }
 
 function claimCheckbox(scope: Locator, text: string): Locator {
@@ -555,11 +629,6 @@ function importClaimCheckbox(scope: Locator, text: string): Locator {
   return scope.locator(".import-party label").filter({ hasText: text }).locator(
     'input[type="checkbox"]:not(.import-party-include)',
   ).first();
-}
-
-function meetClaimCheckbox(scope: Locator, value: string): Locator {
-  return scope.locator("label").filter({ hasText: value })
-    .locator('input[type="checkbox"]').first();
 }
 
 function labeledInput(scope: Locator, label: string | RegExp): Locator {
@@ -4060,6 +4129,210 @@ const scenarios: Scenario[] = [
   },
 
   {
+    // One representative browser path for the identity contract: pairing
+    // adopts the founder's public identity but not its root secret; an
+    // explicit, named member transfer changes custody and survives reload.
+    name: "identity-root-transfer-and-profile",
+    async run(ctx, origin, browser) {
+      const ctxB = await browser.newContext();
+      const ctxC = await browser.newContext();
+      try {
+        const a = await open(ctx, origin);
+        const b = await open(ctxB, origin);
+        const c = await open(ctxC, origin);
+        await Promise.all([visorReady(a), visorReady(b), visorReady(c)]);
+        await expectRootCustody(a, true);
+        await addProfileClaim(a, "name", "Founder Identity");
+
+        const idA = await endpointId(a);
+        const idB = await endpointId(b);
+        await pair(a, b);
+        await waitForMember(a, idB);
+        await waitForConnectedPeer(b, idA);
+        await waitForOfficialValue(b, "Founder Identity");
+        await expectRootCustody(b, false);
+        await shot(b, "identity-before-root-transfer");
+
+        // A non-root member still has ordinary group authority and can enroll C.
+        const idC = await endpointId(c);
+        await pair(b, c);
+        await waitForMember(b, idC);
+        await waitForOfficialValue(c, "Founder Identity");
+        await expectRootCustody(c, false);
+
+        await openSettings(a);
+        const memberB = devicesSheet(a).locator(
+          `.member-row[data-endpoint-id="${idB}"]`,
+        );
+        await memberB.locator(".root-transfer-start").click();
+        const confirm = memberB.locator(
+          `.root-transfer-confirm[data-transfer-endpoint="${idB}"]`,
+        );
+        await confirm.waitFor();
+        check(
+          (await confirm.textContent() ?? "").includes(idB),
+          "root transfer confirmation did not name B's endpoint",
+        );
+        await confirm.getByRole("button", {
+          name: "Approve permanent root copy",
+          exact: true,
+        }).click();
+        await waitForRootCustody(b, true);
+        // Custody can be visible while its checkpoint is still in flight.
+        // The sender finishes only after the recipient's durable receipt.
+        await confirm.waitFor({ state: "detached", timeout: 60_000 });
+        eq(await devicesSheet(a).locator(".sheet-error").count(), 0,
+          "root transfer reported an error before reload");
+        await shot(b, "identity-after-root-transfer");
+
+        await b.reload();
+        await visorReady(b);
+        await expectRootCustody(b, true);
+
+        // A root holder can copy custody onward; this does not depend on
+        // profile propagation completing first.
+        await openSettings(b);
+        const memberC = devicesSheet(b).locator(
+          `.member-row[data-endpoint-id="${idC}"]`,
+        );
+        await memberC.locator(".root-transfer-start").click();
+        await memberC.locator(".root-transfer-confirm")
+          .getByRole("button", {
+            name: "Approve permanent root copy",
+            exact: true,
+          })
+          .click();
+        await waitForRootCustody(c, true);
+
+        await addProfileClaim(b, "email", "founder@example.test");
+        await openSettings(b);
+        await devicesSheet(b).locator(`.member-row[data-endpoint-id="${idA}"]`)
+          .getByRole("button", { name: "Connect", exact: true }).click();
+        await waitForConnectedPeer(b, idA);
+        await waitForOfficialValue(a, "founder@example.test");
+      } finally {
+        await closeContext(ctxB, "identity-root-transfer-B");
+        await closeContext(ctxC, "identity-root-transfer-C");
+      }
+    },
+  },
+
+  {
+    // File and synced backups use the same passphrase envelope. This keeps
+    // the browser claim to one successful round trip plus meaningful wrong-
+    // passphrase and modified-file boundaries; envelope edge cases stay in
+    // native tests.
+    name: "identity-root-backup-roundtrip",
+    async run(ctx, origin, browser) {
+      const passphrase = "synthetic e2e backup passphrase";
+      const wrongPassphrase = "synthetic wrong passphrase";
+      const ctxB = await browser.newContext();
+      try {
+        const a = await open(ctx, origin);
+        await visorReady(a);
+        await openContactsView(a, "My profile", ".contacts-profile");
+        const profileA = contactsSheet(a).locator(".contacts-profile");
+        const passA = labeledInput(profileA, "Backup passphrase");
+        await passA.fill(passphrase);
+        await profileA.getByRole("button", {
+          name: "Create or replace synced backup",
+          exact: true,
+        }).click();
+        await profileA.locator("#root-backup-status")
+          .getByText("Synced backup enabled.", { exact: true }).waitFor({
+            timeout: 30_000,
+          });
+
+        const downloadPromise = a.waitForEvent("download");
+        await profileA.getByRole("button", {
+          name: "Export backup file",
+          exact: true,
+        }).click();
+        const download = await downloadPromise;
+        const backupPath = "/tmp/opencode/user-identity-root-backup.pvbackup";
+        await download.saveAs(backupPath);
+        const tamperedPath =
+          "/tmp/opencode/user-identity-root-backup-tampered.pvbackup";
+        const tampered = await Deno.readFile(backupPath);
+        check(
+          tampered.length > 32,
+          "exported root backup was unexpectedly short",
+        );
+        tampered[Math.floor(tampered.length / 2)] ^= 1;
+        await Deno.writeFile(tamperedPath, tampered);
+
+        const b = await open(ctxB, origin);
+        await visorReady(b);
+        await pair(a, b);
+        await waitForRootCustody(b, false);
+        await openContactsView(b, "My profile", ".contacts-profile");
+        const profileB = contactsSheet(b).locator(".contacts-profile");
+        const passB = labeledInput(profileB, "Backup passphrase");
+
+        await passB.fill(wrongPassphrase);
+        let chooserPromise = b.waitForEvent("filechooser");
+        await profileB.getByRole("button", {
+          name: "Import backup file",
+          exact: true,
+        }).click();
+        let chooser = await chooserPromise;
+        await chooser.setFiles(backupPath);
+        await contactsSheet(b).locator(".sheet-error").waitFor({
+          timeout: 30_000,
+        });
+        await expectRootCustody(b, false);
+
+        await passB.fill(passphrase);
+        chooserPromise = b.waitForEvent("filechooser");
+        await profileB.getByRole("button", {
+          name: "Import backup file",
+          exact: true,
+        }).click();
+        chooser = await chooserPromise;
+        await chooser.setFiles(tamperedPath);
+        await contactsSheet(b).locator(".sheet-error").waitFor({
+          timeout: 30_000,
+        });
+        await expectRootCustody(b, false);
+
+        await openContactsView(b, "My profile", ".contacts-profile");
+        await labeledInput(
+          contactsSheet(b).locator(".contacts-profile"),
+          "Backup passphrase",
+        )
+          .fill(passphrase);
+        chooserPromise = b.waitForEvent("filechooser");
+        await contactsSheet(b).getByRole("button", {
+          name: "Import backup file",
+          exact: true,
+        }).click();
+        chooser = await chooserPromise;
+        await chooser.setFiles(backupPath);
+        await waitForRootCustody(b, true);
+        await shot(b, "identity-backup-unlocked");
+
+        await openContactsView(b, "My profile", ".contacts-profile");
+        await contactsSheet(b).getByRole("button", {
+          name: "Disable synced backup",
+          exact: true,
+        }).click();
+        await contactsSheet(b).locator("#root-backup-status")
+          .getByText("Synced backup disabled.", { exact: true }).waitFor({
+            timeout: 30_000,
+          });
+        await b.reload();
+        await visorReady(b);
+        await expectRootCustody(b, true);
+        await openContactsView(b, "My profile", ".contacts-profile");
+        await contactsSheet(b).locator("#root-backup-status")
+          .getByText("Synced backup disabled.", { exact: true }).waitFor();
+      } finally {
+        await closeContext(ctxB, "identity-root-backup-B");
+      }
+    },
+  },
+
+  {
     name: "contacts-portable-file-import",
     async run(ctx, origin, browser) {
       const author = await open(ctx, origin);
@@ -4068,132 +4341,127 @@ const scenarios: Scenario[] = [
       await addProfileClaim(author, "email", "ada-portable@example.test");
       await openContactsView(author, "Share", ".contacts-share");
       const share = contactsSheet(author).locator(".contacts-share");
-      const preview = share.locator(".contacts-share-preview");
-      eq(await labeledInput(share, /^Shared name$/).inputValue(), "Ada Portable", "shared name did not default from the profile name");
-      eq(await claimCheckbox(share, "ada-portable@example.test").isChecked(), false, "non-name claim started selected for sharing");
-      check(await preview.getByText("Ada Portable").count() > 0, "share preview did not include the default name claim");
-      eq(await preview.getByText("ada-portable@example.test").count(), 0, "share preview included email before it was selected");
-      await claimCheckbox(share, "ada-portable@example.test").check();
-      await preview.getByText("ada-portable@example.test").waitFor({ timeout: 10_000 });
+      const official = share.locator(".share-official-profile").first();
+      await official.getByText("Ada Portable", { exact: true }).waitFor();
+      await official.getByText("ada-portable@example.test", { exact: true })
+        .waitFor();
+      eq(
+        await share.locator('.share-official-profile input[type="checkbox"]')
+          .count(),
+        0,
+        "official profile exposed selective-claim controls",
+      );
       await shot(author, "contacts-share-preview");
-      await share.getByRole("button", { name: "Sign contact card", exact: true }).click();
-      await share.getByRole("button", { name: "Save contact file", exact: true }).waitFor({ timeout: 10_000 });
+      await share.getByRole("button", {
+        name: "Sign contact card",
+        exact: true,
+      }).click();
+      await share.getByRole("button", {
+        name: "Save contact file",
+        exact: true,
+      }).waitFor({ timeout: 10_000 });
 
       await Deno.mkdir("/tmp/opencode", { recursive: true });
-      const cardPath = "/tmp/opencode/contacts-portable-file-import.polycontact";
+      const cardPath =
+        "/tmp/opencode/contacts-portable-file-import.polycontact";
       const downloadPromise = author.waitForEvent("download");
-      await share.getByRole("button", { name: "Save contact file", exact: true }).click();
+      await share.getByRole("button", {
+        name: "Save contact file",
+        exact: true,
+      }).click();
       const download = await downloadPromise;
       await download.saveAs(cardPath);
       await Deno.stat(cardPath);
 
-      await claimCheckbox(share, "ada-portable@example.test").uncheck();
-      eq(await preview.getByText("ada-portable@example.test").count(), 0, "share preview kept email after it was deselected");
-      eq(await share.getByRole("button", { name: "Save contact file", exact: true }).count(), 0, "changing claim selection left a stale signed export available");
-      eq(await share.getByRole("button", { name: "Copy share link", exact: true }).count(), 0, "changing claim selection left a stale signed share link available");
-
-      const tamperedPath = "/tmp/opencode/contacts-portable-file-import-tampered.polycontact";
+      const tamperedPath =
+        "/tmp/opencode/contacts-portable-file-import-tampered.polycontact";
       const tampered = await Deno.readFile(cardPath);
       check(tampered.length > 0, "saved contact card was empty");
-      tampered[tampered.length - 1] ^= 0x01;
+      tampered[Math.floor(tampered.length / 2)] ^= 0x01;
       await Deno.writeFile(tamperedPath, tampered);
 
       const recipientCtx = await browser.newContext();
       try {
         const recipient = await open(recipientCtx, origin);
         await visorReady(recipient);
-        await openContactsView(recipient, "Create", ".contacts-create");
-        const create = contactsSheet(recipient).locator(".contacts-create");
-        const createName = create.getByRole("textbox", { name: "Petname", exact: true });
-        await create.getByRole("button", { name: "Re-roll contact petname", exact: true }).click();
-        check((await createName.inputValue()).length > 0, "contact create Random left the petname empty");
-        await createName.fill("created friend");
-        await create.getByRole("button", { name: "Choose contact glyph", exact: true }).click();
-        await create.locator(".glyph-picker").getByRole("searchbox", { name: "Enter glyph or search" }).fill("🐕");
-        await create.locator(".glyph-picker").getByRole("button", { name: "Use 🐕", exact: true }).click();
-        await create.getByRole("button", { name: "Create contact", exact: true }).click();
-        const createdDetail = contactsSheet(recipient).locator(".contact-details");
-        await createdDetail.waitFor({ timeout: 10_000 });
-        eq(await createdDetail.getByRole("textbox", { name: "Petname", exact: true }).inputValue(), "created friend", "contact create lost its label");
-        eq((await createdDetail.getByRole("button", { name: "Choose contact glyph", exact: true }).textContent())?.trim(), "🐕", "contact create lost its glyph");
-        await createdDetail.getByRole("textbox", { name: "Petname", exact: true }).fill("discard me");
-        await createdDetail.getByRole("button", { name: "Choose contact glyph", exact: true }).click();
-        const createdPicker = createdDetail.locator(".glyph-picker");
-        const createdSearch = createdPicker.getByRole("searchbox", { name: "Enter glyph or search" });
-        await createdSearch.waitFor();
-        check(await createdSearch.evaluate((input) => input === document.activeElement), "contact picker did not focus search");
-        await createdSearch.fill("🐇");
-        await createdPicker.getByRole("button", { name: "Use 🐇", exact: true }).click();
-        check(await createdDetail.getByRole("button", { name: "Choose contact glyph", exact: true }).evaluate((button) => button === document.activeElement), "contact picker did not return focus to glyph tile");
-        await createdDetail.getByRole("button", { name: "Revert label", exact: true }).click();
-        eq(await createdDetail.getByRole("textbox", { name: "Petname", exact: true }).inputValue(), "created friend", "contact Revert did not restore the saved petname");
-        eq((await createdDetail.getByRole("button", { name: "Choose contact glyph", exact: true }).textContent())?.trim(), "🐕", "contact Revert did not restore the saved glyph");
         await openContactsView(recipient, "Import", ".contacts-import-review");
-        const importView = contactsSheet(recipient).locator(".contacts-import-review");
+        const importView = contactsSheet(recipient).locator(
+          ".contacts-import-review",
+        );
 
         let fileChooserPromise = recipient.waitForEvent("filechooser");
-        await importView.getByRole("button", { name: "Choose contact file", exact: true }).click();
+        await importView.getByRole("button", {
+          name: "Choose contact file",
+          exact: true,
+        }).click();
         let fileChooser = await fileChooserPromise;
         await fileChooser.setFiles(tamperedPath);
-        await contactsSheet(recipient).locator(".sheet-error").waitFor({ timeout: 10_000 });
-        eq(await contactsSheet(recipient).locator(".import-party").count(), 0, "tampered contact file still produced an import review");
+        await contactsSheet(recipient).locator(".sheet-error").waitFor({
+          timeout: 10_000,
+        });
+        eq(
+          await contactsSheet(recipient).locator(".import-party").count(),
+          0,
+          "tampered contact file still produced an import review",
+        );
         await openContactsView(recipient, "Contacts", ".contacts-list");
-        eq(await contactsSheet(recipient).locator(".contact-row").filter({ hasText: "Ada Portable" }).count(), 0, "tampered contact file created a contact");
+        eq(
+          await contactsSheet(recipient).locator(".contact-row").filter({
+            hasText: "Ada Portable",
+          }).count(),
+          0,
+          "tampered contact file created a contact",
+        );
 
         await openContactsView(recipient, "Import", ".contacts-import-review");
         fileChooserPromise = recipient.waitForEvent("filechooser");
-        await importView.getByRole("button", { name: "Choose contact file", exact: true }).click();
+        await importView.getByRole("button", {
+          name: "Choose contact file",
+          exact: true,
+        }).click();
         fileChooser = await fileChooserPromise;
         await fileChooser.setFiles(cardPath);
-        await importView.getByText(/Signature verified/i).waitFor({ timeout: 10_000 });
-        check(await importView.getByText("Ada Portable").count() > 0, "import review did not show the shared name");
-        check(await importView.getByText("ada-portable@example.test").count() > 0, "import review did not show the shared email");
+        await importView.getByText(/Verified signed introduction/i).waitFor({
+          timeout: 10_000,
+        });
+        const signedProfile = importView.locator(".signed-import-profile")
+          .first();
+        await signedProfile.getByText("Ada Portable", { exact: true })
+          .waitFor();
+        await signedProfile.getByText("ada-portable@example.test", {
+          exact: true,
+        }).waitFor();
         await shot(recipient, "contacts-import-review");
-        await importView.locator(".import-party-include").first().check();
-        await importClaimCheckbox(importView, "Ada Portable").check();
-        await importView.getByRole("button", { name: "Import selected claims", exact: true }).click();
+        await importView.getByRole("button", {
+          name: "Import complete signed profiles",
+          exact: true,
+        }).click();
+        await importView.locator(".signed-import-identity").waitFor({
+          state: "detached",
+          timeout: 15_000,
+        });
 
         await openContactsView(recipient, "Contacts", ".contacts-list");
-        const row = contactsSheet(recipient).locator(".contact-row").filter({ hasText: "Ada Portable" }).first();
+        const row = contactsSheet(recipient).locator(".contact-row").first();
         await row.waitFor({ timeout: 10_000 });
         await row.click();
         const detail = contactsSheet(recipient).locator(".contact-details");
         await detail.waitFor({ timeout: 10_000 });
-        const petname = detail.getByRole("textbox", { name: "Petname", exact: true });
-        await petname.fill("portable friend");
-        const glyph = detail.getByRole("button", { name: "Choose contact glyph", exact: true });
-        await glyph.click();
-        const picker = detail.locator(".glyph-picker");
-        await picker.getByRole("searchbox", { name: "Enter glyph or search" }).fill("🐈");
-        await picker.getByRole("button", { name: "Use 🐈", exact: true }).click();
-        await detail.getByRole("button", { name: "Save label", exact: true }).click();
-        check(await detail.getByText("Ada Portable").count() > 0, "imported contact detail did not keep the selected name");
-        eq(await detail.getByText("ada-portable@example.test").count(), 0, "import stored an unselected email claim");
-        await detail.getByText("verified assertion", { exact: false }).waitFor({ timeout: 10_000 });
+        const retained = detail.locator(".contact-official-profile").first();
+        await retained.getByText("Ada Portable", { exact: true }).waitFor();
+        await retained.getByText("ada-portable@example.test", { exact: true })
+          .waitFor();
         await shot(recipient, "contacts-detail");
-        await recipient.setViewportSize({ width: 390, height: 844 });
-        const mobileLabel = detail.locator(".label-control");
-        const mobileGlyph = detail.getByRole("button", { name: "Choose contact glyph", exact: true });
-        const mobileName = detail.getByRole("textbox", { name: "Petname", exact: true });
-        const [controlBox, glyphBox, nameBox] = await Promise.all([mobileLabel.boundingBox(), mobileGlyph.boundingBox(), mobileName.boundingBox()]);
-        check(controlBox !== null && glyphBox !== null && nameBox !== null, "mobile contact label control was not visible");
-        check(glyphBox.x >= controlBox.x && nameBox.x + nameBox.width <= controlBox.x + controlBox.width + 1, "mobile contact label escaped its compound control");
-        check(Math.abs(glyphBox.y - nameBox.y) <= 1, "mobile contact glyph and petname were not aligned");
-        await shot(recipient, "contacts-detail-mobile");
-
-        await contactsSheet(recipient).getByRole("button", { name: "Contacts", exact: true }).click();
-        await contactsSheet(recipient).locator(".contact-row").filter({ hasText: "portable friend" }).waitFor({ timeout: 10_000 });
 
         await recipient.reload();
         await visorReady(recipient);
         await openContactsView(recipient, "Contacts", ".contacts-list");
-        const again = contactsSheet(recipient).locator(".contact-row").filter({ hasText: "Ada Portable" }).first();
+        const again = contactsSheet(recipient).locator(".contact-row").first();
         await again.waitFor({ timeout: 10_000 });
         await again.click();
         const restored = contactsSheet(recipient).locator(".contact-details");
-        await restored.getByText("verified assertion", { exact: false }).waitFor({ timeout: 10_000 });
-        eq(await restored.getByRole("textbox", { name: "Petname", exact: true }).inputValue(), "portable friend", "contact petname did not survive reload");
-        eq((await restored.getByRole("button", { name: "Choose contact glyph", exact: true }).textContent())?.trim(), "🐈", "contact glyph did not survive reload");
+        await restored.locator(".contact-official-profile").first()
+          .getByText("ada-portable@example.test", { exact: true }).waitFor();
       } finally {
         await recipientCtx.close();
       }
@@ -4219,7 +4487,14 @@ const scenarios: Scenario[] = [
         await addProfileClaim(b, "name", "Bob Meeting");
         await openContactsView(a, "Meet now", ".meet-now");
         const meetA = contactsSheet(a).locator(".meet-now");
-        eq(await labeledInput(meetA.locator(".meet-own-claims"), /^Shared name$/).inputValue(), "Ada Meeting", "meeting shared name did not default from the profile name");
+        await meetA.locator(".meeting-share-profile")
+          .getByText("Ada Meeting", { exact: true }).waitFor();
+        eq(
+          await meetA.locator('.meeting-share-profile input[type="checkbox"]')
+            .count(),
+          0,
+          "meeting exposed selective official-profile controls",
+        );
         await meetA.getByRole("button", { name: "Offer meeting", exact: true }).click();
         const offer = contactsSheet(a).locator(".meet-offer");
         await offer.waitFor({ timeout: 30_000 });
@@ -4247,8 +4522,6 @@ const scenarios: Scenario[] = [
         await shot(a, "meet-confirm-host");
         await shot(b, "meet-confirm-joiner");
 
-        await meetClaimCheckbox(confirmA, "Bob Meeting").check();
-        await meetClaimCheckbox(confirmB, "Ada Meeting").check();
         await confirmA.getByRole("button", { name: "Confirm", exact: true }).click();
         await contactsSheet(a).getByText("Waiting for the other person…", { exact: true }).waitFor({ timeout: 10_000 });
         await confirmB.getByRole("button", { name: "Confirm", exact: true }).click();
@@ -4257,10 +4530,18 @@ const scenarios: Scenario[] = [
 
         await contactsTool(a, "Contacts").click();
         await contactsSheet(a).locator(".contacts-list").waitFor({ timeout: 10_000 });
-        await contactsSheet(a).locator(".contact-row").filter({ hasText: "Bob Meeting" }).first().waitFor({ timeout: 10_000 });
+        const contactB = contactsSheet(a).locator(".contact-row").first();
+        await contactB.waitFor({ timeout: 10_000 });
+        await contactB.click();
+        await contactsSheet(a).locator(".contact-official-profile")
+          .getByText("Bob Meeting", { exact: true }).waitFor({ timeout: 10_000 });
         await contactsTool(b, "Contacts").click();
         await contactsSheet(b).locator(".contacts-list").waitFor({ timeout: 10_000 });
-        await contactsSheet(b).locator(".contact-row").filter({ hasText: "Ada Meeting" }).first().waitFor({ timeout: 10_000 });
+        const contactA = contactsSheet(b).locator(".contact-row").first();
+        await contactA.waitFor({ timeout: 10_000 });
+        await contactA.click();
+        await contactsSheet(b).locator(".contact-official-profile")
+          .getByText("Ada Meeting", { exact: true }).waitFor({ timeout: 10_000 });
 
         await openSettings(a);
         eq(await devicesSheet(a).locator(`.member-row[data-endpoint-id="${idB}"]`).count(), 0, "meeting enrolled the peer into A's group membership");
@@ -4887,7 +5168,15 @@ async function main(): Promise<void> {
   let browser: Browser | undefined;
   let failures = 0;
   try {
-    browser = await chromium.launch();
+    // Playwright defaults to --disable-dev-shm-usage, which redirects
+    // Chromium's shared-memory files into /tmp. Some development containers
+    // have a large /dev/shm but a nearly-full /tmp; opt into Chromium's native
+    // Linux shared-memory path for those environments.
+    browser = await chromium.launch({
+      ignoreDefaultArgs: Deno.env.get("E2E_DEV_SHM") === "1"
+        ? ["--disable-dev-shm-usage"]
+        : undefined,
+    });
     for (const scenario of planned) {
       // A fresh context per scenario: a device is per browser context, so
       // scenarios must not inherit each other's IndexedDB or SharedWorker.

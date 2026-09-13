@@ -4,7 +4,7 @@ use std::rc::Rc;
 use futures::future::LocalBoxFuture;
 use polyvisor_kernel::{
     BootConfig, Clock, Fetch, Files, HttpResponse, Kernel, LocalFuture, Locks, Platform, Rng,
-    Seams, Spawn,
+    RootBackupKdf, Seams, Spawn,
 };
 
 use crate::net::IrohNet;
@@ -36,7 +36,7 @@ wit_bindgen::generate!({
 
 use exports::polyvisor::internal as guest;
 use polyvisor::internal::types::{Error, ErrorCode};
-use polyvisor::internal::{kv, locks};
+use polyvisor::internal::{backup_kdf, kv, locks};
 use wasi::filesystem::preopens;
 use wasi::filesystem::types::{Descriptor, DescriptorFlags, OpenFlags, PathFlags};
 
@@ -144,6 +144,19 @@ impl Rng for Random {
             dest[filled..filled + chunk.len()].copy_from_slice(&chunk);
             filled += chunk.len();
         }
+    }
+}
+
+struct BackupKdf;
+
+impl RootBackupKdf for BackupKdf {
+    fn derive(&self, passphrase: String, salt: [u8; 16]) -> LocalFuture<'_, Result<[u8; 32], ()>> {
+        Box::pin(async move {
+            let bytes = backup_kdf::derive(passphrase, salt.to_vec())
+                .await
+                .map_err(|_| ())?;
+            bytes.try_into().map_err(|_| ())
+        })
     }
 }
 
@@ -579,6 +592,112 @@ impl guest::sync::Guest for Component {
     }
 }
 
+fn identity_profile(value: polyvisor_kernel::SelfProfile) -> guest::identity::CurrentProfile {
+    guest::identity::CurrentProfile {
+        root: value.root.to_bytes().to_vec(),
+        variants: value
+            .variants
+            .into_iter()
+            .map(|signed| {
+                let token = signed.as_bytes().to_vec();
+                let claims = polyvisor_contacts_model::verify_profile(&signed)
+                    .expect("kernel self-profile contains a verified signed profile")
+                    .claims
+                    .into_iter()
+                    .map(|claim| (claim.name, claim.value))
+                    .collect();
+                guest::identity::ProfileVariant { token, claims }
+            })
+            .collect(),
+    }
+}
+
+impl guest::identity::Guest for Component {
+    async fn status() -> Result<guest::identity::IdentityStatus, Error> {
+        let value = kernel()?.identity_status().await.map_err(map_error)?;
+        Ok(guest::identity::IdentityStatus {
+            root: value.root.to_vec(),
+            group: value.group.to_vec(),
+            has_root: value.has_root,
+        })
+    }
+
+    async fn profile() -> Result<guest::identity::CurrentProfile, Error> {
+        kernel()?
+            .contacts_profile()
+            .await
+            .map(identity_profile)
+            .map_err(map_error)
+    }
+
+    async fn resolve_profile(
+        expected: Vec<Vec<u8>>,
+        claims: Vec<(String, String)>,
+    ) -> Result<guest::identity::CurrentProfile, Error> {
+        kernel()?
+            .contacts_resolve_profile(
+                expected,
+                claims
+                    .into_iter()
+                    .map(|(name, value)| polyvisor_kernel::Claim { name, value })
+                    .collect(),
+            )
+            .await
+            .map(identity_profile)
+            .map_err(map_error)
+    }
+
+    async fn root_transfer(endpoint_id: String) -> Result<(), Error> {
+        kernel()?
+            .root_transfer(endpoint_id)
+            .await
+            .map_err(map_error)
+    }
+
+    async fn backup_status() -> Result<guest::identity::RootBackupStatus, Error> {
+        let value = kernel()?.root_backup_status().await.map_err(map_error)?;
+        Ok(guest::identity::RootBackupStatus {
+            has_root: value.has_root,
+            synced: value.synced,
+        })
+    }
+
+    async fn backup_export(passphrase: String) -> Result<Vec<u8>, Error> {
+        kernel()?
+            .root_backup_export(&BackupKdf, passphrase)
+            .await
+            .map_err(map_error)
+    }
+
+    async fn backup_import(passphrase: String, envelope: Vec<u8>) -> Result<(), Error> {
+        kernel()?
+            .root_backup_import(&BackupKdf, passphrase, envelope)
+            .await
+            .map_err(map_error)
+    }
+
+    async fn backup_sync_replace(passphrase: String) -> Result<(), Error> {
+        kernel()?
+            .root_backup_sync_replace(&BackupKdf, passphrase)
+            .await
+            .map_err(map_error)
+    }
+
+    async fn backup_sync_disable() -> Result<(), Error> {
+        kernel()?
+            .root_backup_sync_disable()
+            .await
+            .map_err(map_error)
+    }
+
+    async fn backup_sync_unlock(passphrase: String) -> Result<(), Error> {
+        kernel()?
+            .root_backup_sync_unlock(&BackupKdf, passphrase)
+            .await
+            .map_err(map_error)
+    }
+}
+
 /// The kernel's ceremony phase as the WIT spells it. One arm per case and
 /// no default: a phase the kernel grows must be given words here rather
 /// than quietly rendered as some neighbouring state.
@@ -619,7 +738,7 @@ fn contacts_party(value: guest::contacts::Party) -> Result<polyvisor_kernel::Par
             code: ErrorCode::Refused,
             message: "a contact public key must be 32 bytes".into(),
         })?,
-        claims: value
+        observations: value
             .claims
             .into_iter()
             .map(|(name, value)| polyvisor_kernel::Claim { name, value })
@@ -647,7 +766,10 @@ fn contacts_observation(value: polyvisor_kernel::Observation) -> guest::contacts
         name: value.name,
         value: value.value,
         provenance: contacts_provenance(value.provenance),
-        issuer: value.issuer.map(|key| key.to_vec()).unwrap_or_default(),
+        issuer: value
+            .issuer
+            .map(|key| key.to_bytes().to_vec())
+            .unwrap_or_default(),
         claimed: value.claimed.map(contacts_time),
         received: value.received,
         meeting: value.meeting,
@@ -655,11 +777,43 @@ fn contacts_observation(value: polyvisor_kernel::Observation) -> guest::contacts
 }
 
 fn contacts_contact(value: polyvisor_kernel::Contact) -> guest::contacts::Contact {
+    let official_profiles = value
+        .retained_identity
+        .as_ref()
+        .map(|identity| identity.profiles.iter())
+        .into_iter()
+        .flatten()
+        .map(|signed| guest::contacts::ProfileVariant {
+            token: signed.as_bytes().to_vec(),
+            claims: polyvisor_contacts_model::verify_profile(signed)
+                .expect("retained identity contains verified signed profiles")
+                .claims
+                .into_iter()
+                .map(|claim| (claim.name, claim.value))
+                .collect(),
+        })
+        .collect();
+    let authenticated = value.retained_identity.and_then(|identity| {
+        identity.authorities.into_iter().next().map(|authority| {
+            guest::contacts::AuthenticatedIdentity {
+                binding: identity.binding.as_bytes().to_vec(),
+                profiles: identity
+                    .profiles
+                    .iter()
+                    .map(|profile| profile.as_bytes().to_vec())
+                    .collect(),
+                authority_device: authority.device.to_bytes().to_vec(),
+                authority_proof: authority.keyhive_authority_proof,
+            }
+        })
+    });
     guest::contacts::Contact {
         id: value.id,
         public_key: value.public_key.map(|key| key.to_vec()).unwrap_or_default(),
         petname: value.petname,
         glyph: value.glyph,
+        official_profiles,
+        authenticated,
         observations: value
             .observations
             .into_iter()
@@ -685,17 +839,6 @@ impl guest::contacts::Guest for Component {
             .await
             .map(contacts_contact)
             .map_err(map_error)
-    }
-    async fn profile() -> Result<guest::contacts::SelfProfile, Error> {
-        let value = kernel()?.contacts_profile().await.map_err(map_error)?;
-        Ok(guest::contacts::SelfProfile {
-            public_key: value.public_key.to_vec(),
-            observations: value
-                .observations
-                .into_iter()
-                .map(contacts_observation)
-                .collect(),
-        })
     }
     async fn meetings() -> Result<Vec<guest::contacts::MeetingRecord>, Error> {
         Ok(kernel()?
@@ -752,34 +895,59 @@ impl guest::contacts::Guest for Component {
             .await
             .map_err(map_error)
     }
-    async fn set_self_observation(name: String, value: String) -> Result<(), Error> {
-        kernel()?
-            .contacts_set_self_observation(name, value)
-            .await
-            .map_err(map_error)
-    }
-    async fn remove_self_observation(name: String, value: String) -> Result<(), Error> {
-        kernel()?
-            .contacts_remove_self_observation(name, value)
-            .await
-            .map_err(map_error)
-    }
-    async fn share(value: guest::contacts::Introduction) -> Result<Vec<u8>, Error> {
-        let issuer = contacts_party(value.issuer)?;
+    async fn share(
+        expected_root: Vec<u8>,
+        expected_profiles: Vec<Vec<u8>>,
+        forwarded_contact_ids: Vec<String>,
+        expected_forwarded: Vec<guest::contacts::AuthenticatedIdentity>,
+        value: Vec<guest::contacts::Party>,
+    ) -> Result<Vec<u8>, Error> {
+        let expected_root = expected_root.try_into().map_err(|_| Error {
+            code: ErrorCode::Refused,
+            message: "the expected root must be 32 bytes".into(),
+        })?;
+        let expected_forwarded = expected_forwarded
+            .into_iter()
+            .map(|identity| {
+                Ok(polyvisor_kernel::AuthenticatedIdentity {
+                    binding: polyvisor_contacts_model::SignedRootBinding::from_bytes(
+                        identity.binding,
+                    )
+                    .map_err(|message| Error {
+                        code: ErrorCode::Refused,
+                        message,
+                    })?,
+                    profiles: identity
+                        .profiles
+                        .into_iter()
+                        .map(polyvisor_contacts_model::SignedProfile::from_bytes)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|message| Error {
+                            code: ErrorCode::Refused,
+                            message,
+                        })?,
+                    authority_device: polyvisor_contacts_model::DeviceSigningKey::from_bytes(
+                        identity.authority_device.try_into().map_err(|_| Error {
+                            code: ErrorCode::Refused,
+                            message: "the expected authority device must be 32 bytes".into(),
+                        })?,
+                    ),
+                    keyhive_authority_proof: identity.authority_proof,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
         let parties = value
-            .parties
             .into_iter()
             .map(contacts_party)
             .collect::<Result<Vec<_>, _>>()?;
         kernel()?
-            .contacts_share(polyvisor_kernel::Introduction {
-                issuer,
+            .contacts_share(
+                expected_root,
+                expected_profiles,
+                forwarded_contact_ids,
+                expected_forwarded,
                 parties,
-                issued_at: polyvisor_kernel::ClaimedTime {
-                    seconds: 0,
-                    nanos: 0,
-                },
-            })
+            )
             .await
             .map_err(map_error)
     }
@@ -801,9 +969,9 @@ impl guest::contacts::Guest for Component {
                 .map(|party| guest::contacts::ImportParty {
                     index: party.index,
                     public_key: party.public_key.map(|key| key.to_vec()).unwrap_or_default(),
-                    issuer: party.issuer.map(|key| key.to_vec()).unwrap_or_default(),
-                    claimed: party.claimed.map(contacts_time),
-                    provenance: contacts_provenance(party.provenance),
+                    issuer: Vec::new(),
+                    claimed: None,
+                    provenance: guest::contacts::Provenance::Imported,
                     claims: party
                         .claims
                         .into_iter()
@@ -811,17 +979,58 @@ impl guest::contacts::Guest for Component {
                         .collect(),
                 })
                 .collect(),
-            signed: value.signed,
-            summary: value.summary,
+            signed: false,
+            summary: "unsigned contact list".into(),
         })
     }
-    async fn import_accept(
+    async fn signed_preview(
+        bytes: Vec<u8>,
+    ) -> Result<guest::contacts::SignedIntroductionReview, Error> {
+        let value = kernel()?
+            .contacts_signed_preview(bytes)
+            .await
+            .map_err(map_error)?;
+        Ok(guest::contacts::SignedIntroductionReview {
+            identities: value
+                .identities
+                .into_iter()
+                .map(|identity| guest::contacts::AuthenticatedIdentityReview {
+                    root: identity.root.to_vec(),
+                    group: identity.group.to_vec(),
+                    profiles: identity
+                        .profiles
+                        .into_iter()
+                        .map(|claims| {
+                            claims
+                                .into_iter()
+                                .map(|claim| (claim.name, claim.value))
+                                .collect()
+                        })
+                        .collect(),
+                })
+                .collect(),
+            parties: value
+                .parties
+                .into_iter()
+                .map(|party| guest::contacts::Party {
+                    public_key: party.public_key.to_vec(),
+                    claims: party
+                        .observations
+                        .into_iter()
+                        .map(|claim| (claim.name, claim.value))
+                        .collect(),
+                })
+                .collect(),
+            claimed: contacts_time(value.issued_at),
+        })
+    }
+    async fn import_unsigned(
         bytes: Vec<u8>,
         source: String,
         selections: Vec<guest::contacts::Selection>,
     ) -> Result<Vec<String>, Error> {
         kernel()?
-            .contacts_import_accept(
+            .contacts_import_unsigned(
                 bytes,
                 source,
                 selections
@@ -832,6 +1041,27 @@ impl guest::contacts::Guest for Component {
                     })
                     .collect(),
             )
+            .await
+            .map_err(map_error)
+    }
+    async fn import_accept(
+        bytes: Vec<u8>,
+        selected_roots: Vec<Vec<u8>>,
+        selected_parties: Vec<u32>,
+        petname: String,
+        glyph: String,
+    ) -> Result<String, Error> {
+        let selected_roots = selected_roots
+            .into_iter()
+            .map(|root| {
+                root.try_into().map_err(|_| Error {
+                    code: ErrorCode::Refused,
+                    message: "an imported root identity must be 32 bytes".into(),
+                })
+            })
+            .collect::<Result<Vec<[u8; 32]>, Error>>()?;
+        kernel()?
+            .contacts_import_accept(bytes, selected_roots, selected_parties, petname, glyph)
             .await
             .map_err(map_error)
     }
@@ -875,20 +1105,36 @@ fn meeting_status(
 
 impl guest::meeting::Guest for Component {
     async fn offer(
-        card: guest::contacts::Party,
+        expected_root: Vec<u8>,
+        expected_profiles: Vec<Vec<u8>>,
     ) -> Result<polyvisor::internal::types::MeetingStatus, Error> {
+        let card = polyvisor_kernel::Party {
+            public_key: expected_root.try_into().map_err(|_| Error {
+                code: ErrorCode::Refused,
+                message: "the expected root must be 32 bytes".into(),
+            })?,
+            observations: Vec::new(),
+        };
         kernel()?
-            .meeting_offer(contacts_party(card)?)
+            .meeting_offer(card, expected_profiles)
             .await
             .map(meeting_status)
             .map_err(map_error)
     }
     async fn join(
         fragment: String,
-        card: guest::contacts::Party,
+        expected_root: Vec<u8>,
+        expected_profiles: Vec<Vec<u8>>,
     ) -> Result<polyvisor::internal::types::MeetingStatus, Error> {
+        let card = polyvisor_kernel::Party {
+            public_key: expected_root.try_into().map_err(|_| Error {
+                code: ErrorCode::Refused,
+                message: "the expected root must be 32 bytes".into(),
+            })?,
+            observations: Vec::new(),
+        };
         kernel()?
-            .meeting_join(fragment, contacts_party(card)?)
+            .meeting_join(fragment, card, expected_profiles)
             .await
             .map(meeting_status)
             .map_err(map_error)

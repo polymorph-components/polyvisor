@@ -147,6 +147,13 @@ interface locks {
     is-held: async func(name: string) -> bool;
 }
 
+/// The one expensive root-backup operation. The browser host delegates this
+/// call to the dedicated Rust backup worker; the runtime keeps envelope
+/// parsing, context validation and encryption in trusted Rust.
+interface backup-kdf {
+    derive: async func(passphrase: string, salt: list<u8>) -> result<list<u8>, string>;
+}
+
 // ---------------------------------------------------------------------------
 // Kernel: what the runtime component exports. The visor imports the same
 // interfaces; the worker glue proxies them.
@@ -280,6 +287,46 @@ interface sync {
     peers: async func() -> result<list<peer>, error>;
     /// The device group, this device included.
     members: async func() -> result<list<member>, error>;
+}
+
+/// Root-authenticated user identity and optional local root custody.
+interface identity {
+    use types.{error};
+
+    record identity-status {
+        root: list<u8>,
+        group: list<u8>,
+        has-root: bool,
+    }
+
+    /// One complete root-signed current profile. `token` is the exact signed
+    /// value and is returned unchanged when resolving, so a stale screen
+    /// cannot silently overwrite a concurrent variant.
+    record profile-variant {
+        token: list<u8>,
+        claims: list<tuple<string, string>>,
+    }
+
+    record current-profile {
+        root: list<u8>,
+        variants: list<profile-variant>,
+    }
+
+    record root-backup-status {
+        has-root: bool,
+        synced: bool,
+    }
+
+    status: async func() -> result<identity-status, error>;
+    profile: async func() -> result<current-profile, error>;
+    resolve-profile: async func(expected: list<list<u8>>, claims: list<tuple<string, string>>) -> result<current-profile, error>;
+    root-transfer: async func(endpoint-id: string) -> result<_, error>;
+    backup-status: async func() -> result<root-backup-status, error>;
+    backup-export: async func(passphrase: string) -> result<list<u8>, error>;
+    backup-import: async func(passphrase: string, envelope: list<u8>) -> result<_, error>;
+    backup-sync-replace: async func(passphrase: string) -> result<_, error>;
+    backup-sync-disable: async func() -> result<_, error>;
+    backup-sync-unlock: async func(passphrase: string) -> result<_, error>;
 }
 
 /// Device pairing: the ceremony that enrolls a device into the group.
@@ -592,6 +639,11 @@ interface contacts {
         petname: string,
         /// The user's private glyph label. Never exported as an observation.
         glyph: string,
+        /// Complete root-signed profiles retained from a verified
+        /// introduction. These are official subject claims and are shown
+        /// separately from the importing issuer's observations below.
+        official-profiles: list<profile-variant>,
+        authenticated: option<authenticated-identity>,
         /// Every recorded observation, in a stable order.
         observations: list<observation>,
         /// The user's preferred value per claim name — the `set-preferred`
@@ -600,12 +652,16 @@ interface contacts {
         preferred: list<tuple<string, string>>,
     }
 
-    /// The user's own contact identity: the signing public key others key a
-    /// contact to, and the user's self-authored claims. A user-level identity
-    /// synced inside the document, separate from the device endpoint id.
-    record self-profile {
-        public-key: list<u8>,
-        observations: list<observation>,
+    record profile-variant {
+        token: list<u8>,
+        claims: list<tuple<string, string>>,
+    }
+
+    record authenticated-identity {
+        binding: list<u8>,
+        profiles: list<list<u8>>,
+        authority-device: list<u8>,
+        authority-proof: list<u8>,
     }
 
     /// A party in an introduction: the public key and its asserted claims.
@@ -678,6 +734,18 @@ interface contacts {
         summary: string,
     }
 
+    record authenticated-identity-review {
+        root: list<u8>,
+        group: list<u8>,
+        profiles: list<list<tuple<string, string>>>,
+    }
+
+    record signed-introduction-review {
+        identities: list<authenticated-identity-review>,
+        parties: list<party>,
+        claimed: claimed-time,
+    }
+
     /// Exact observations to keep, addressed by review `index` and exact
     /// `(name, value)` tuples — never by name alone, which is ambiguous when
     /// a party asserts several values for one name.
@@ -690,7 +758,6 @@ interface contacts {
 
     items: async func() -> result<list<contact>, error>;
     get: async func(id: string) -> result<contact, error>;
-    profile: async func() -> result<self-profile, error>;
     /// Every meeting record, newest first — the provenance collection the
     /// visor shows for method/source/time/verification detail.
     meetings: async func() -> result<list<meeting-record>, error>;
@@ -722,11 +789,6 @@ interface contacts {
     /// `keyless` must be keyless; `into` must be keyed.
     merge: async func(keyless: string, into: string) -> result<_, error>;
 
-    // -- self profile edits --------------------------------------------------
-
-    set-self-observation: async func(name: string, value: string) -> result<_, error>;
-    remove-self-observation: async func(name: string, value: string) -> result<_, error>;
-
     // -- introduction share --------------------------------------------------
 
     /// Sign and serialize the exact `introduction` the user assembled, as a
@@ -735,7 +797,11 @@ interface contacts {
     /// `issuer.public-key` to equal this user's signing key (mismatch
     /// `refused`), stamps `issued-at`, and validates every party's key is
     /// present, non-weak and unique before signing.
-    share: async func(introduction: introduction) -> result<list<u8>, error>;
+    /// Share this user's complete current official profile variants and,
+    /// optionally, selected contacts' intact authenticated identities plus
+    /// separately labelled issuer observations. There is no selective claim
+    /// omission from an official profile.
+    share: async func(expected-root: list<u8>, expected-profiles: list<list<u8>>, forwarded-contact-ids: list<string>, expected-forwarded: list<authenticated-identity>, parties: list<party>) -> result<list<u8>, error>;
 
     // -- import --------------------------------------------------------------
 
@@ -751,13 +817,16 @@ interface contacts {
     /// signed introduction that does not verify or bytes that are neither
     /// form. Nothing is written.
     import-preview: async func(bytes: list<u8>) -> result<import-review, error>;
+    signed-preview: async func(bytes: list<u8>) -> result<signed-introduction-review, error>;
     /// Accept a reviewed import, re-parsing/re-verifying `bytes` and writing
     /// only the observations in `selections`. `source` is a local
     /// unauthenticated label (a filename or channel label) kept on the
     /// meeting-record. Unselected claims and raw signed bytes are never
     /// persisted. Contacts are created or (same key) merged automatically;
     /// different keys never silently. Returns the affected contact ids.
-    import-accept: async func(bytes: list<u8>, source: string, selections: list<selection>) -> result<list<string>, error>;
+    import-unsigned: async func(bytes: list<u8>, source: string, selections: list<selection>) -> result<list<string>, error>;
+    /// Verify and retain a signed introduction as one authenticated contact.
+    import-accept: async func(bytes: list<u8>, selected-roots: list<list<u8>>, selected-parties: list<u32>, petname: string, glyph: string) -> result<string, error>;
 }
 
 /// Real-time meeting: two devices of *different* users exchange signed
@@ -785,11 +854,11 @@ interface meeting {
     /// this user's own signing key. Returns this operation's own
     /// `meeting-status` (generation + phase) so the caller binds to its own
     /// session, not a racy latest-status read another tab may have replaced.
-    offer: async func(card: party) -> result<meeting-status, error>;
+    offer: async func(expected-root: list<u8>, expected-profiles: list<list<u8>>) -> result<meeting-status, error>;
     /// Guest: begin from a bootstrap link's fragment. Dials the host and runs
     /// the exchange up to `awaiting-confirm`; never auto-accepts. `card` as
     /// in `offer`. Returns this operation's own `meeting-status`.
-    join: async func(fragment: string, card: party) -> result<meeting-status, error>;
+    join: async func(fragment: string, expected-root: list<u8>, expected-profiles: list<list<u8>>) -> result<meeting-status, error>;
     /// After comparing the SAS and reviewing the peer's card. `generation`
     /// must match the current session (a stale one is `refused`, so a tab
     /// confirming a replaced meeting cannot accept the new one). `keep` names
@@ -927,6 +996,7 @@ interface shell {
 world runtime {
     import kv;
     import locks;
+    import backup-kdf;
     import wasi:clocks/monotonic-clock@0.3.1;
     import wasi:clocks/system-clock@0.3.1;
     import wasi:random/random@0.3.1;
@@ -961,6 +1031,7 @@ world runtime {
     export lifecycle;
     export device;
     export sync;
+    export identity;
     export pairing;
     export storage;
     export store;
@@ -978,6 +1049,7 @@ world visor {
 
     import device;
     import sync;
+    import identity;
     import pairing;
     import storage;
     import store;

@@ -1777,6 +1777,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "polyvisor-kdf-component"
+version = "0.1.0"
+dependencies = [
+ "polyvisor-kernel",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "polyvisor-kernel"
 version = "0.1.0"
 dependencies = [
@@ -1825,6 +1833,7 @@ name = "polyvisor-runtime"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "polyvisor-contacts-model",
  "polyvisor-kernel",
  "wit-bindgen",
 ]

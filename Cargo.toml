@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "runtime/component",
+    "runtime/kdf-component",
     "runtime/crates/contacts-model",
     "runtime/crates/document-history",
     "runtime/crates/engine",

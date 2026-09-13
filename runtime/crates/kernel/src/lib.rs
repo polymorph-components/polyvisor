@@ -22,6 +22,8 @@ mod drive;
 mod events;
 mod meeting;
 mod pairing;
+mod root_backup;
+mod root_transfer;
 mod route;
 mod seal;
 mod store;
@@ -29,8 +31,9 @@ mod sync;
 
 pub use apps::{AppInfo, AssetInfo, ComponentArtifacts};
 pub use contacts::{
-    Claim, ClaimedTime, Contact, ImportReview, Introduction, MeetingRecord, Observation, Party,
-    Provenance, Selection, SelfProfile,
+    AuthenticatedIdentity, AuthenticatedIdentityReview, Claim, ClaimedTime, Contact,
+    IdentityStatus, ImportReview, Introduction, MeetingRecord, Observation, Party, Profile,
+    Provenance, Selection, SelfProfile, SignedIntroductionReview, VerifiedIntroduction,
 };
 pub use device::{DeviceStatus, IndexRow, MetaScope, Rest, State, Tier};
 pub use drive::{Binding, HttpResponse};
@@ -39,8 +42,12 @@ pub use meeting::{
     MEETING_ALPN, MeetingOffer, MeetingReview, Phase as MeetingPhase, Status as MeetingStatus,
 };
 pub use pairing::Phase;
+pub use polyvisor_contacts_model::{SignedProfile, verify_profile};
 pub use polyvisor_engine::{EngineTransport, OpaqueItem, OpaqueMode};
 pub use polyvisor_todo_model::{Snapshot, TodoItem};
+pub use root_backup::{
+    DerivedKey, SALT_LEN as ROOT_BACKUP_SALT_LEN, derive_key as derive_backup_key,
+};
 pub use store::LEASE_TTL_MS;
 pub use sync::{Member, Peer};
 
@@ -53,12 +60,14 @@ pub use sync::{Member, Peer};
 /// (see `sync::accept_loop`).
 pub const SUBDUCTION_ALPN: &str = "polyvisor/subduction/0";
 pub const PAIRING_ALPN: &str = "polyvisor/pairing/0";
+pub const ROOT_TRANSFER_ALPN: &str = "polyvisor/root-transfer/0";
 
 use apps::Registry;
 use device::Device;
 use events::Events;
 use seal::{Dek, WrappedDek};
 
+use ed25519_dalek::SigningKey;
 use futures::future::LocalBoxFuture;
 use polyvisor_engine::{DynTransport, Engine};
 use polyvisor_visor_model as visor_model;
@@ -246,6 +255,34 @@ pub trait Rng {
     fn fill(&self, dest: &mut [u8]);
 }
 
+/// The sole expensive backup seam. Browser adapters run this fixed Argon2id
+/// derivation in a dedicated Rust worker; no root seed crosses the seam.
+pub trait RootBackupKdf {
+    fn derive(
+        &self,
+        passphrase: String,
+        salt: [u8; root_backup::SALT_LEN],
+    ) -> LocalFuture<'_, Result<[u8; root_backup::KEY_LEN], ()>>;
+}
+
+/// Native/test implementation. Browser runtime code must use a worker-backed
+/// implementation instead, because Argon2 must not occupy the SharedWorker.
+pub struct NativeRootBackupKdf;
+
+impl RootBackupKdf for NativeRootBackupKdf {
+    fn derive(
+        &self,
+        passphrase: String,
+        salt: [u8; root_backup::SALT_LEN],
+    ) -> LocalFuture<'_, Result<[u8; root_backup::KEY_LEN], ()>> {
+        Box::pin(async move {
+            root_backup::derive_key(&passphrase, &salt)
+                .map(|key| *key.as_bytes())
+                .map_err(|_| ())
+        })
+    }
+}
+
 /// Everything the kernel reaches the world through, in one bundle so `boot`
 /// keeps one parameter as the set grows.
 pub struct Seams {
@@ -277,6 +314,12 @@ pub enum ErrorCode {
 pub struct Error {
     pub code: ErrorCode,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootBackupStatus {
+    pub has_root: bool,
+    pub synced: bool,
 }
 
 impl Error {
@@ -351,6 +394,12 @@ struct DeviceState {
     erased: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IdentityContext {
+    generation: u64,
+    adopting: bool,
+}
+
 pub struct Kernel {
     seams: Seams,
     home_origin: String,
@@ -363,6 +412,7 @@ pub struct Kernel {
     /// The OAuth redirect and the two Drive bases, from `boot-config`.
     drive_config: drive::Config,
     state: RefCell<DeviceState>,
+    identity_context: Cell<IdentityContext>,
     registry: Registry,
     /// Live sessions, session id -> app id.
     sessions: RefCell<BTreeMap<SessionId, String>>,
@@ -458,6 +508,10 @@ impl Kernel {
                 oauth: config.drive_oauth,
             },
             state: RefCell::new(state),
+            identity_context: Cell::new(IdentityContext {
+                generation: 0,
+                adopting: false,
+            }),
             registry,
             sessions: RefCell::new(BTreeMap::new()),
             next_session: RefCell::new(1),
@@ -529,6 +583,56 @@ impl Kernel {
                 "this device is sealed; unseal it first",
             )),
             State::Erased => Err(erased()),
+        }
+    }
+
+    fn identity_open(&self) -> Result<(), Error> {
+        self.open()?;
+        if self.identity_context.get().adopting {
+            Err(Error::new(
+                ErrorCode::Unavailable,
+                "the user identity is being adopted",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn identity_context(&self) -> IdentityContext {
+        self.identity_context.get()
+    }
+
+    pub(crate) fn identity_context_is(&self, expected: IdentityContext) -> bool {
+        self.identity_context.get() == expected
+    }
+
+    pub(crate) fn begin_identity_adoption(&self) -> Result<IdentityContext, Error> {
+        self.open()?;
+        let previous = self.identity_context.get();
+        if previous.adopting {
+            return Err(Error::new(
+                ErrorCode::Unavailable,
+                "the user identity is already being adopted",
+            ));
+        }
+        self.clear_root_custody()?;
+        self.identity_context.set(IdentityContext {
+            generation: previous.generation.saturating_add(1),
+            adopting: true,
+        });
+        Ok(previous)
+    }
+
+    pub(crate) fn finish_identity_adoption(&self, previous: IdentityContext, succeeded: bool) {
+        let current = self.identity_context.get();
+        if succeeded
+            && current.adopting
+            && current.generation == previous.generation.saturating_add(1)
+        {
+            self.identity_context.set(IdentityContext {
+                generation: current.generation,
+                adopting: false,
+            });
         }
     }
 
@@ -908,6 +1012,190 @@ impl Kernel {
         *self.pairing.borrow_mut() = pairing::Pairing::default();
         *self.meeting.borrow_mut() = meeting::Meeting::default();
         Ok(())
+    }
+
+    // -- root backup ---------------------------------------------------------
+
+    const ROOT_BACKUP_SLOT: &'static str = "polyvisor:root-backup:v0";
+
+    pub async fn root_backup_status(&self) -> Result<RootBackupStatus, Error> {
+        self.identity_open()?;
+        Ok(RootBackupStatus {
+            has_root: self.root_seed().is_some(),
+            synced: self
+                .engine()?
+                .opaque_current(Self::ROOT_BACKUP_SLOT)
+                .await
+                .map_err(engine_failed)?
+                .is_some(),
+        })
+    }
+
+    pub async fn root_backup_export(
+        &self,
+        kdf: &dyn RootBackupKdf,
+        passphrase: String,
+    ) -> Result<Vec<u8>, Error> {
+        self.identity_open()?;
+        let context = self.identity_context();
+        let identity = self.identity_status().await?;
+        let seed = self.require_root_seed()?;
+        if SigningKey::from_bytes(&seed).verifying_key().to_bytes() != identity.root {
+            return Err(Error::new(
+                ErrorCode::Unavailable,
+                "local root custody does not match the current identity",
+            ));
+        }
+        let mut salt = [0; 16];
+        let mut nonce = [0; 12];
+        self.seams.rng.fill(&mut salt);
+        self.seams.rng.fill(&mut nonce);
+        let prepared = root_backup::prepare_encrypt(&seed, &identity.group, salt, nonce);
+        let mut key_bytes = kdf
+            .derive(passphrase, *prepared.salt())
+            .await
+            .map_err(|_| Error::new(ErrorCode::Refused, "the backup key could not be derived"))?;
+        let key = root_backup::DerivedKey::from_bytes(key_bytes);
+        key_bytes.fill(0);
+        let result = root_backup::encrypt(prepared, &seed, &key)
+            .map_err(|_| Error::new(ErrorCode::Failed, "the root backup could not be encrypted"));
+        let after = self.identity_status().await?;
+        if !self.identity_context_is(context)
+            || after.root != identity.root
+            || after.group != identity.group
+        {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "the user identity changed during backup",
+            ));
+        }
+        result
+    }
+
+    pub async fn root_backup_import(
+        &self,
+        kdf: &dyn RootBackupKdf,
+        passphrase: String,
+        envelope: Vec<u8>,
+    ) -> Result<(), Error> {
+        self.identity_open()?;
+        let context = self.identity_context();
+        let identity = self.identity_status().await?;
+        let prepared = root_backup::prepare_decrypt(&identity.root, &identity.group, &envelope)
+            .map_err(|_| Error::new(ErrorCode::Refused, "that backup is not for this user"))?;
+        let mut key_bytes = kdf
+            .derive(passphrase, *prepared.salt())
+            .await
+            .map_err(|_| Error::new(ErrorCode::Refused, "the backup key could not be derived"))?;
+        let key = root_backup::DerivedKey::from_bytes(key_bytes);
+        key_bytes.fill(0);
+        let seed = root_backup::decrypt(prepared, &key)
+            .map_err(|_| Error::new(ErrorCode::Refused, "that backup did not open for this user"));
+        let seed = seed?;
+        let after = self.identity_status().await?;
+        if !self.identity_context_is(context)
+            || after.root != identity.root
+            || after.group != identity.group
+        {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "the user identity changed during backup",
+            ));
+        }
+        let previous = self.root_seed();
+        self.install_root_seed(seed)?;
+        if let Err(error) = self.checkpoint_durable().await {
+            if self.identity_context_is(context) {
+                self.replace_root_seed(previous)?;
+                let _rollback = self.checkpoint_durable().await;
+            }
+            return Err(error);
+        }
+        if !self.identity_context_is(context) {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "the user identity changed while installing the backup",
+            ));
+        }
+        self.push_event(Event::ContactsChanged);
+        Ok(())
+    }
+
+    pub async fn root_backup_sync_replace(
+        &self,
+        kdf: &dyn RootBackupKdf,
+        passphrase: String,
+    ) -> Result<(), Error> {
+        let context = self.identity_context();
+        let before = self.identity_status().await?;
+        let envelope = self.root_backup_export(kdf, passphrase).await?;
+        if !self.identity_context_is(context) {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "the user identity changed during backup replacement",
+            ));
+        }
+        let engine = self.engine()?;
+        let tree = engine
+            .opaque_replace(Self::ROOT_BACKUP_SLOT, OpaqueMode::CallerEncrypted)
+            .await
+            .map_err(engine_failed)?;
+        let after_replace = self.identity_status().await?;
+        if !self.identity_context_is(context)
+            || after_replace.root != before.root
+            || after_replace.group != before.group
+        {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "the user identity changed during backup replacement",
+            ));
+        }
+        root_backup::prepare_decrypt(&after_replace.root, &after_replace.group, &envelope)
+            .map_err(|_| Error::new(ErrorCode::Refused, "the backup context changed"))?;
+        engine
+            .opaque_publish(tree, Vec::new(), envelope)
+            .await
+            .map_err(engine_failed)?;
+        if !self.identity_context_is(context) {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "the user identity changed during backup replacement",
+            ));
+        }
+        self.checkpoint_durable().await
+    }
+
+    pub async fn root_backup_sync_disable(&self) -> Result<(), Error> {
+        self.identity_open()?;
+        self.engine()?
+            .opaque_disable(Self::ROOT_BACKUP_SLOT)
+            .await
+            .map_err(engine_failed)?;
+        self.checkpoint_durable().await
+    }
+
+    pub async fn root_backup_sync_unlock(
+        &self,
+        kdf: &dyn RootBackupKdf,
+        passphrase: String,
+    ) -> Result<(), Error> {
+        self.identity_open()?;
+        let engine = self.engine()?;
+        let tree = engine
+            .opaque_current(Self::ROOT_BACKUP_SLOT)
+            .await
+            .map_err(engine_failed)?
+            .ok_or_else(|| Error::new(ErrorCode::NotFound, "there is no synced root backup"))?;
+        engine.opaque_open(tree).await.map_err(engine_failed)?;
+        let mut items = engine.opaque_read(tree).await.map_err(engine_failed)?;
+        if items.len() != 1 {
+            return Err(Error::new(
+                ErrorCode::Refused,
+                "the synced root backup has conflicting payloads",
+            ));
+        }
+        self.root_backup_import(kdf, passphrase, items.remove(0).bytes)
+            .await
     }
 
     // -- store ---------------------------------------------------------------

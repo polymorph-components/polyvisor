@@ -35,6 +35,14 @@ pub(crate) fn selected(claims: &[ClaimChoice]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Meeting acceptance is whole-profile: preserve every displayed value while
+/// matching the kernel's set comparison (sort + deduplicate).
+pub(crate) fn complete_claims(mut claims: Vec<(String, String)>) -> Vec<(String, String)> {
+    claims.sort();
+    claims.dedup();
+    claims
+}
+
 /// An incoming fragment's kind. The visor routes; it never decodes the body.
 pub(crate) enum FragmentRoute {
     Meet(String),
@@ -176,6 +184,23 @@ mod tests {
             ClaimChoice::new("email", "ada@example"),
         ];
         assert_eq!(selected(&claims), vec![("name".into(), "Ada".into())]);
+    }
+
+    #[test]
+    fn meeting_acceptance_keeps_every_reviewed_value_canonically() {
+        assert_eq!(
+            complete_claims(vec![
+                ("phone".into(), "2".into()),
+                ("name".into(), "Ada".into()),
+                ("phone".into(), "2".into()),
+                ("email".into(), "a@example".into()),
+            ]),
+            vec![
+                ("email".into(), "a@example".into()),
+                ("name".into(), "Ada".into()),
+                ("phone".into(), "2".into()),
+            ]
+        );
     }
 
     #[test]
