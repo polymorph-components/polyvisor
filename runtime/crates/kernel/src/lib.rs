@@ -395,6 +395,7 @@ struct DeviceState {
     /// The pointed generation in `kv`; the next checkpoint is this + 1,
     /// whether or not it was the one that loaded (see `checkpoint`).
     generation: u64,
+    engine_head: u64,
     /// Terminal after `erase`.
     erased: bool,
 }
@@ -446,12 +447,9 @@ pub struct Kernel {
     pairing: RefCell<pairing::Pairing>,
     /// The contact meeting ceremony, separate from device pairing.
     meeting: RefCell<meeting::Meeting>,
-    /// Serialises checkpoints — see [`Kernel::checkpoint`].
-    checkpointing: RefCell<Checkpointing>,
-    /// Durable callers coalesced into the active checkpoint. Unlike ordinary
-    /// checkpoint callers, these wait until the pass carrying their mutation
-    /// has either committed or failed.
-    checkpoint_waiters: RefCell<Vec<futures::channel::oneshot::Sender<Result<(), Error>>>>,
+    /// Serializes the one pointer commit stream. A caller holds this through
+    /// preparation and its own write, so later work cannot change its result.
+    persistence_write: futures::lock::Mutex<()>,
     /// The durable store: tokens, the pending consent ceremony, and how the
     /// last sync went (internal.wit `storage`).
     drive: RefCell<drive::Drive>,
@@ -533,8 +531,7 @@ impl Kernel {
             peers: RefCell::new(Vec::new()),
             pairing: RefCell::new(pairing::Pairing::default()),
             meeting: RefCell::new(meeting::Meeting::default()),
-            checkpointing: RefCell::new(Checkpointing::default()),
-            checkpoint_waiters: RefCell::new(Vec::new()),
+            persistence_write: futures::lock::Mutex::new(()),
             drive: RefCell::new(drive),
             syncing: RefCell::new(Checkpointing::default()),
             next_watch: Cell::new(1),
@@ -941,7 +938,7 @@ impl Kernel {
                 "the passphrase did not open this device",
             )
         })?;
-        let (generation, snapshot) = checkpoint::load(
+        let (pointer, snapshot, engine) = checkpoint::load(
             self.seams.files.as_ref(),
             self.seams.platform.as_ref(),
             &dek,
@@ -952,22 +949,23 @@ impl Kernel {
         // so `open_or_mint` refuses a missing state rather than inventing an
         // anchor: unsealing into a blank device would be indistinguishable
         // from unsealing into the right one.
-        let (restored, generation) = open_or_mint(
+        let (restored, _generation) = open_or_mint(
             &self.seams,
             &self.id,
             &dek,
             Tier::Durable,
-            generation,
+            pointer.generation,
             snapshot,
         )
         .await?;
         {
             let mut state = self.state.borrow_mut();
             state.seed = restored.seed;
-            state.engine_state = restored.engine;
+            state.engine_state = engine;
             *self.drive.borrow_mut() = drive::Drive::restore(restored.storage);
             state.device = Some(restored.device);
-            state.generation = generation;
+            state.generation = pointer.generation;
+            state.engine_head = pointer.engine_head;
             state.dek = Some(dek);
             state.wrapped = None;
         }
@@ -994,6 +992,8 @@ impl Kernel {
         // un-erasable)". Nothing here reads the DEK; the namespace is removed
         // by name and the row by key.
         self.not_erased()?;
+        let _write = self.persistence_write.lock().await;
+        self.not_erased()?;
         let apps: Vec<String> = self.sessions.borrow().values().cloned().collect();
         self.sessions.borrow_mut().clear();
         for app in apps {
@@ -1004,7 +1004,7 @@ impl Kernel {
             self.seams.files.as_ref(),
             &self.id,
         )
-        .await;
+        .await?;
         let mut state = self.state.borrow_mut();
         state.erased = true;
         state.dek = None;
@@ -1235,47 +1235,31 @@ impl Kernel {
         change(device)
     }
 
-    /// Seal the whole of the kernel's serializable state into a new
-    /// generation, then refresh the lease.
-    ///
-    /// **At most one checkpoint is ever in flight, and requests made during
-    /// one are coalesced into a single further write.** Since the engine
-    /// landed there are two callers — the export path after a local mutation,
-    /// and the engine's event pump after a remote change — and they are not
-    /// ordered with respect to each other. Two overlapping writers would be
-    /// wrong twice over: the OPFS host refuses concurrent access handles
-    /// outright ("too many calls are being made on file resources"), and even
-    /// if it did not, two runs of `checkpoint::write` racing would advance
-    /// `dev/<id>/gen` out of order and could leave the pointer naming the
-    /// *older* of two generations.
-    ///
-    /// A caller that arrives mid-write is told `Ok` and its data is written
-    /// by the running loop, not by it. That is not a lie: the kernel's
-    /// in-memory state is authoritative and is what every iteration
-    /// serializes, so the loop's next pass carries the coalesced caller's
-    /// change — it simply is not the one that wrote it. Only the caller that
-    /// *started* the loop learns of a write failure, which is the caller that
-    /// can still refuse to claim the mutation landed.
+    /// Commit one captured engine prefix and, when requested, the current
+    /// device metadata. Writers are serialized because the pointer is the
+    /// commit point and OPFS rejects overlapping file handles.
     async fn checkpoint(&self) -> Result<(), Error> {
-        {
-            let mut gate = self.checkpointing.borrow_mut();
-            if gate.running {
-                gate.dirty = true;
-                return Ok(());
-            }
-            gate.running = true;
+        self.persist(true).await
+    }
+
+    async fn persist_engine(&self) -> Result<(), Error> {
+        self.persist(false).await
+    }
+
+    async fn persist(&self, metadata: bool) -> Result<(), Error> {
+        let _write = self.persistence_write.lock().await;
+        self.open()?;
+        if self.identity_context.get().adopting {
+            return Err(Error::new(
+                ErrorCode::Unavailable,
+                "identity adoption is incomplete",
+            ));
         }
-        let result = self.checkpoint_loop().await;
-        for waiter in self.checkpoint_waiters.borrow_mut().drain(..) {
-            let _ = waiter.send(result.clone());
-        }
-        // Unconditionally, including on the error path: a gate left latched
-        // would silently stop every later checkpoint.
-        *self.checkpointing.borrow_mut() = Checkpointing::default();
-        // The store's trigger, chained off this gate rather than off each
+        let result = self.write_persistence(metadata).await;
+        // The store's trigger, chained off this writer rather than off each
         // mutation site: every local change already ends here, and so does
         // every remote one (the engine's pump checkpoints). One place to
-        // schedule from, and it is behind the same coalescing the writes are.
+        // schedule from, and it runs only after local durability.
         //
         // Only on a write that landed: a checkpoint that failed did not
         // change what is on disk, and pushing state the device could not
@@ -1286,88 +1270,82 @@ impl Kernel {
         result
     }
 
-    /// Checkpoint and do not return until this caller's in-memory mutation is
-    /// covered by a completed write. A caller arriving during another writer
-    /// joins its dirty follow-up pass and receives that pass's real result.
     #[doc(hidden)]
     pub async fn checkpoint_durable(&self) -> Result<(), Error> {
-        let wait = {
-            let mut gate = self.checkpointing.borrow_mut();
-            if gate.running {
-                gate.dirty = true;
-                let (send, receive) = futures::channel::oneshot::channel();
-                self.checkpoint_waiters.borrow_mut().push(send);
-                Some(receive)
-            } else {
-                None
-            }
-        };
-        match wait {
-            Some(wait) => wait.await.unwrap_or_else(|_| {
-                Err(Error::new(
-                    ErrorCode::Failed,
-                    "the checkpoint writer stopped before completing",
-                ))
-            }),
-            None => self.checkpoint().await,
-        }
+        self.persist(true).await
     }
 
-    /// Write until nobody has asked again. `dirty` is cleared *before* the
-    /// write, so a request that arrives while it is in flight is seen.
-    async fn checkpoint_loop(&self) -> Result<(), Error> {
-        loop {
-            // An erased device has no data key and nothing left to seal. The
-            // pump can still be running — its engine outlives `erase` by a
-            // turn — and a checkpoint here would panic reaching for the key.
-            if self.state.borrow().erased {
-                return Ok(());
-            }
-            self.checkpointing.borrow_mut().dirty = false;
-            self.write_checkpoint().await?;
-            if !self.checkpointing.borrow().dirty {
-                return Ok(());
-            }
-        }
+    pub(crate) async fn persist_engine_durable(&self) -> Result<(), Error> {
+        self.persist(false).await
     }
 
     /// One generation, sealed and committed, then the lease.
-    async fn write_checkpoint(&self) -> Result<(), Error> {
-        // Taken before the state borrow: `Engine::snapshot` borrows the
-        // engine's own cells, and nothing may hold two of ours at once. It is
-        // also async because it carries the device's keyhive, so the
-        // engine handle is cloned out and the borrow released before awaiting.
+    async fn write_persistence(&self, metadata: bool) -> Result<(), Error> {
         let engine = self.engine.borrow().clone();
-        let engine = match engine {
-            Some(engine) => Some(
-                engine
-                    .snapshot()
-                    .await
-                    .map_err(|why| Error::new(ErrorCode::Failed, why))?,
-            ),
+        let prepared = match &engine {
+            Some(engine) => engine.prepare_persistence().await.map_err(engine_failed)?,
             None => None,
         };
-        let (dek, generation, snapshot) = {
+        let (dek, generation, engine_head, snapshot) = {
             let state = self.state.borrow();
             let dek = state.dek.clone().expect("open implies a data key");
-            let device = state.device.clone().expect("open implies a device");
             (
                 dek,
-                state.generation + 1,
-                checkpoint::Snapshot::new(device, state.seed, engine, self.drive.borrow().sealed()),
+                state.generation + u64::from(metadata),
+                state.engine_head + u64::from(prepared.is_some()),
+                metadata.then(|| {
+                    checkpoint::Snapshot::new(
+                        state.device.clone().expect("open implies a device"),
+                        state.seed,
+                        self.drive.borrow().sealed(),
+                    )
+                }),
             )
         };
-        checkpoint::write(
-            self.seams.files.as_ref(),
-            self.seams.platform.as_ref(),
-            self.seams.rng.as_ref(),
-            &dek,
-            &self.id,
-            generation,
-            &snapshot,
-        )
-        .await?;
-        self.state.borrow_mut().generation = generation;
+        if let Some(delta) = &prepared {
+            checkpoint::write_engine(
+                self.seams.files.as_ref(),
+                self.seams.rng.as_ref(),
+                &dek,
+                &self.id,
+                engine_head,
+                &delta.delta,
+            )
+            .await?;
+        }
+        if let Some(snapshot) = &snapshot {
+            checkpoint::write(
+                checkpoint::Write {
+                    files: self.seams.files.as_ref(),
+                    platform: self.seams.platform.as_ref(),
+                    rng: self.seams.rng.as_ref(),
+                    dek: &dek,
+                    id: &self.id,
+                },
+                generation,
+                engine_head,
+                snapshot,
+            )
+            .await?;
+        } else if prepared.is_some() {
+            checkpoint::commit_pointer(
+                self.seams.platform.as_ref(),
+                &self.id,
+                checkpoint::Pointer {
+                    generation,
+                    engine_head,
+                },
+            )
+            .await;
+        }
+        if let (Some(engine), Some(prepared)) = (engine, prepared) {
+            engine.acknowledge_persistence(prepared);
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            state.generation = generation;
+            state.engine_head = engine_head;
+        }
         self.touch_lease().await
     }
 
@@ -1905,7 +1883,7 @@ impl Kernel {
         let _changed = engine.document_publish(&app, changes).await?;
         // A duplicate may be retrying an accepted change whose preceding
         // checkpoint failed. Always cross the durable barrier before success.
-        self.checkpoint_durable()
+        self.persist_engine_durable()
             .await
             .map_err(|error| error.message)?;
         self.wake_documents(&app);
@@ -2060,7 +2038,7 @@ impl Kernel {
     }
 
     async fn checkpoint_service(&self) -> Result<(), String> {
-        self.checkpoint().await.map_err(|e| e.message)
+        self.persist_engine().await.map_err(|e| e.message)
     }
 
     fn wake_documents(&self, app: &str) {
@@ -2126,9 +2104,10 @@ async fn mint(seams: &Seams, id: &str, now: u64) -> Result<DeviceState, Error> {
         wrapped: None,
         device: Some(snapshot.device),
         seed: snapshot.seed,
-        engine_state: snapshot.engine,
+        engine_state: None,
         storage: snapshot.storage,
         generation,
+        engine_head: 0,
         erased: false,
     })
 }
@@ -2149,14 +2128,17 @@ async fn mint_anchor(seams: &Seams, id: &str, dek: &Dek) -> (checkpoint::Snapsho
     // knows this device by.
     let mut seed = [0u8; 32];
     seams.rng.fill(&mut seed);
-    let snapshot = checkpoint::Snapshot::new(device, seed, None, None);
+    let snapshot = checkpoint::Snapshot::new(device, seed, None);
     let committed = checkpoint::write(
-        seams.files.as_ref(),
-        seams.platform.as_ref(),
-        seams.rng.as_ref(),
-        dek,
-        id,
+        checkpoint::Write {
+            files: seams.files.as_ref(),
+            platform: seams.platform.as_ref(),
+            rng: seams.rng.as_ref(),
+            dek,
+            id,
+        },
         1,
+        0,
         &snapshot,
     )
     .await
@@ -2198,6 +2180,7 @@ async fn resume(seams: &Seams, id: &str, row: IndexRow, now: u64) -> Result<Devi
                 engine_state: None,
                 storage: None,
                 generation: 0,
+                engine_head: 0,
                 erased: false,
             })
         }
@@ -2210,19 +2193,20 @@ async fn resume(seams: &Seams, id: &str, row: IndexRow, now: u64) -> Result<Devi
                     Error::new(ErrorCode::Failed, "this device's data key is missing")
                 })?;
             let dek = Dek::decode(&bytes)?;
-            let (generation, snapshot) =
+            let (pointer, snapshot, engine) =
                 checkpoint::load(seams.files.as_ref(), seams.platform.as_ref(), &dek, id).await?;
             let (snapshot, generation) =
-                open_or_mint(seams, id, &dek, row.tier, generation, snapshot).await?;
+                open_or_mint(seams, id, &dek, row.tier, pointer.generation, snapshot).await?;
             Ok(DeviceState {
                 row,
                 dek: Some(dek),
                 wrapped: None,
                 device: Some(snapshot.device),
                 seed: snapshot.seed,
-                engine_state: snapshot.engine,
+                engine_state: engine,
                 storage: snapshot.storage,
                 generation,
+                engine_head: pointer.engine_head,
                 erased: false,
             })
         }

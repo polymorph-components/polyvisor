@@ -192,7 +192,7 @@ impl Kernel {
                         // The next mutation checkpoints again, over the same
                         // pointed generation.
                         EngineEvent::Changed => {
-                            let _written = kernel.checkpoint().await;
+                            let _written = kernel.persist_engine().await;
                             // A keyhive event can unlock an app envelope that
                             // arrived earlier, so the reporting tree alone is
                             // insufficient. Re-read snapshots; task watches

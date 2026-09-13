@@ -13,7 +13,7 @@ use futures::future::LocalBoxFuture;
 use futures::{executor::LocalPool, task::LocalSpawnExt as _};
 use polyvisor_engine::{
     AppState, DocumentAccess, Engine, EngineClock, EngineEvent, EngineNotify, ItemKind,
-    LocalFuture, OpaqueMode, Snapshot, Spawner, StoreItem, TreeState, document_tree,
+    JournalState, LocalFuture, OpaqueMode, Snapshot, Spawner, StoreItem, TreeState, document_tree,
 };
 use polyvisor_todo_model::Snapshot as TaskSnapshot;
 use polyvisor_visor_model as visor;
@@ -785,6 +785,130 @@ fn opaque_peer_content_and_causal_references_converge_and_notify() {
         assert!(
             changed.get() > 0,
             "opaque receipt did not notify the kernel"
+        );
+    });
+}
+
+#[test]
+fn remote_opaque_item_after_ack_is_journaled_and_replays_offline() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 111, None);
+    let b = device(&pool, 112, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    let (journal, tree) = pool.run_until(async move {
+        enroll(&ea, &eb).await;
+        let tree = ea
+            .opaque_replace("late-persistence", OpaqueMode::CallerEncrypted)
+            .await
+            .unwrap();
+        eb.ingest_items(tree_items(&ea, *polyvisor_engine::us_tree().as_bytes()))
+            .await
+            .unwrap();
+        assert_eq!(
+            eb.opaque_current("late-persistence").await.unwrap(),
+            Some(tree)
+        );
+
+        let mut journal = JournalState::default();
+        let baseline = eb
+            .prepare_persistence()
+            .await
+            .unwrap()
+            .expect("enrollment and opaque control are pending");
+        journal.apply(baseline.delta.clone());
+        eb.acknowledge_persistence(baseline);
+        assert!(eb.prepare_persistence().await.unwrap().is_none());
+
+        ea.opaque_publish(tree, vec![], b"published synthetic payload".to_vec())
+            .await
+            .unwrap();
+        let remote_item = tree_items(&ea, tree);
+        assert_eq!(remote_item.len(), 1);
+        assert!(eb.ingest_items(remote_item).await.unwrap());
+
+        let received = eb
+            .prepare_persistence()
+            .await
+            .unwrap()
+            .expect("the remotely received opaque item must be pending");
+        assert_eq!(received.delta.mutations.len(), 1);
+        journal.apply(received.delta.clone());
+        eb.acknowledge_persistence(received);
+        (journal, tree)
+    });
+
+    let snapshot = journal.snapshot().expect("journal has replayable control");
+    let mut offline_pool = LocalPool::new();
+    let restored = device(&offline_pool, 112, Some(snapshot));
+    offline_pool.run_until(async move {
+        let items = restored.engine.opaque_read(tree).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].bytes, b"published synthetic payload");
+    });
+}
+
+#[test]
+fn shared_descriptor_control_only_delta_replays_without_item_puts() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 113, None);
+    let b = device(&pool, 114, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    let (journal, partition) = pool.run_until(async move {
+        enroll(&ea, &eb).await;
+
+        let mut journal = JournalState::default();
+        let baseline = eb
+            .prepare_persistence()
+            .await
+            .unwrap()
+            .expect("enrollment state is pending");
+        journal.apply(baseline.delta.clone());
+        eb.acknowledge_persistence(baseline);
+        assert!(eb.prepare_persistence().await.unwrap().is_none());
+
+        let shared = ea.create_shared_document().await.unwrap();
+        let descriptor = ea
+            .shared_documents()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|grant| grant.document.partition == shared.partition)
+            .unwrap();
+        eb.adopt_shared_documents(std::slice::from_ref(&descriptor))
+            .await
+            .unwrap();
+
+        let control_only = eb
+            .prepare_persistence()
+            .await
+            .unwrap()
+            .expect("descriptor/frontier adoption changes persisted control");
+        assert!(
+            control_only.delta.mutations.is_empty(),
+            "descriptor/frontier adoption unexpectedly wrote history items"
+        );
+        assert!(
+            control_only
+                .delta
+                .control
+                .partitions
+                .contains(&shared.partition)
+        );
+        journal.apply(control_only.delta.clone());
+        eb.acknowledge_persistence(control_only);
+        (journal, shared.partition)
+    });
+
+    let snapshot = journal.snapshot().expect("journal has replayable control");
+    let mut offline_pool = LocalPool::new();
+    let restored = device(&offline_pool, 114, Some(snapshot));
+    offline_pool.run_until(async move {
+        let descriptors = restored.engine.shared_documents().await.unwrap();
+        assert!(
+            descriptors
+                .iter()
+                .any(|grant| grant.document.partition == partition),
+            "the control-only shared descriptor was absent after replay"
         );
     });
 }
@@ -2317,6 +2441,7 @@ fn commits_at_rest_are_envelopes_a_stranger_cannot_open() {
         keyhive: None,
         vault: None,
         opaque: Vec::new(),
+        unbound: Vec::new(),
     };
     let mut pool = LocalPool::new();
     let outsider = device(&pool, 13, Some(stranger));

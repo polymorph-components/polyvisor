@@ -359,7 +359,7 @@ app-private partition as saved Automerge bytes and raw changes; Markdown is its
 first consumer and owns its Text schema entirely in the app. The engine remains
 schema-neutral: it owns live partition histories, subscriptions, encrypted
 publication/receipt, compaction and snapshots, while the kernel schedules
-checkpoint persistence. No separate provider component exists yet.
+incremental persistence. No separate provider component exists yet.
 
 ## Sync engine: subduction sans-IO
 
@@ -372,7 +372,7 @@ form. Polyvisor owns five implementations:
 | Trait | Implementation |
 |---|---|
 | `Transport` | one per connection over `polymorph:iroh` streams, relay-only: WebRTC is off in the worker because a SharedWorker has no `RTCPeerConnection` (the host backend never resolves there). Framing per `subduction_iroh` (u32 BE length prefix) so native subduction peers interoperate |
-| `Storage` | an in-memory item store serialized into the sealed checkpoint with the automerge docs |
+| `Storage` | an in-memory item store restored from a sealed, append-only local engine journal |
 | `Policy` | own-group membership for private trees; per-document Keyhive authority for shared trees, with independent signed-author validation on ingestion. Envelopes are Keyhive's (`engine/src/vault.rs`) |
 | `Signer` / `NodeEffect::Sign` | `ed25519-dalek` over the sealed device seed, also used by the iroh identity |
 | `Clock` | `wasi:clocks@0.3` |
@@ -614,15 +614,20 @@ peers without authority for any local document are closed after the handshake.
   so it buys nothing at this tier. The signing identity is a seed in the
   same sealed checkpoint; the transport's TLS signer is in-guest (see
   "No JSPI"). Passkey unseal is deferred.
-- **Checkpoints** are AES-GCM over the kernel's serialized state, written
-  to `/<id>/gen-<n>/` on the OPFS root through `wasi:filesystem@0.3` after
-  every mutation. Commit protocol: state, then MANIFEST (generation +
-  digest), then the generation pointer in `kv` — the pointer is the commit
-  point, a failed write never advances it, and a load falls back one
-  generation. The kernel never lists a directory: `read-directory` is one
+- **Persistence** keeps small device metadata checkpoints separate from
+  document history. Checkpoints are AES-GCM over identity, custody and storage
+  binding in `/<id>/gen-<n>/`. Signed Sedimentree item changes and the resulting
+  complete small Keyhive vault/catalog state use sequence-numbered, DEK-sealed
+  engine journal records; Automerge documents are rebuilt from those items.
+  One `kv` pointer commits both checkpoint generation and journal head after
+  their files land, including pairing's atomic identity/group adoption. A
+  committed missing or invalid journal record is an error, never silently
+  skipped. The kernel never lists a directory: `read-directory` is one
   of four sync functions left on the 0.3 track and its OPFS host answers
-  with a Promise (JSPI), so every path is named from the pointer and
-  removal reaches n+1 down to n-2 by name. A founder draws the hue and a
+  with a Promise (JSPI), so every path is named from the pointer. Erase removes
+  journal records through head+1 (including a possible uncommitted write) and
+  the known metadata generations. Journal compaction is not implemented yet;
+  reopening replays the committed records. A founder draws the hue and a
   random user petname from the RNG and writes them to the sealed visor document before
   exposure; later devices adopt that document during pairing. The kernel's
   device record only caches these fields in memory.

@@ -692,6 +692,10 @@ impl Kernel {
             self.meeting_invalidate().await;
         }
         let _sharing = self.sharing_write.lock().await;
+        // No engine-only writer may commit a partially adopted identity. Hold
+        // the pointer stream from before custody changes through the combined
+        // engine/device commit.
+        let _persistence = self.persistence_write.lock().await;
         let adoption = self
             .begin_identity_adoption()
             .map_err(|error| error.message)?;
@@ -707,6 +711,10 @@ impl Kernel {
                 shared: &shared,
             })
             .await;
+        let outcome = match outcome {
+            Ok(()) => self.write_persistence(true).await.map_err(|e| e.message),
+            Err(error) => Err(error),
+        };
         self.finish_identity_adoption(adoption, outcome.is_ok());
         outcome?;
         self.push_event(crate::Event::ContactsChanged);
@@ -774,7 +782,7 @@ impl Kernel {
             .await
             .map_err(|e| e.message)?;
         self.push_event(crate::Event::PersonalizationChanged);
-        self.checkpoint_durable().await.map_err(|e| e.message)
+        Ok(())
     }
 
     // -- session plumbing ----------------------------------------------------

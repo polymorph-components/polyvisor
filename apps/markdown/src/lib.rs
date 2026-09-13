@@ -329,6 +329,23 @@ fn set_progress(mut status: Signal<String>, failed: Signal<bool>, message: &str)
     }
 }
 
+/// Flatten `first` plus every batch already sitting in `batches` (without
+/// waiting for more) into one publish payload, preserving enqueue order.
+/// Returns the flattened changes and how many enqueued batches they cover,
+/// so the caller can decrement `pending` by the right amount.
+fn drain_backlog(
+    batches: &mut UnboundedReceiver<Vec<Vec<u8>>>,
+    first: Vec<Vec<u8>>,
+) -> (Vec<Vec<u8>>, usize) {
+    let mut coalesced = 1;
+    let mut flattened = first;
+    while let Ok(next) = batches.try_recv() {
+        flattened.extend(next);
+        coalesced += 1;
+    }
+    (flattened, coalesced)
+}
+
 fn selection_snapshot_is_stable(composing: bool, state: &TextControlState) -> bool {
     !composing && !state.is_composing
 }
@@ -354,16 +371,25 @@ pub fn app() -> Element {
     let mut pending = use_signal(|| 0_usize);
     let publisher = use_coroutine(
         move |mut batches: UnboundedReceiver<Vec<Vec<u8>>>| async move {
-            while let Some(batch) = batches.next().await {
+            while let Some(first) = batches.next().await {
+                // Drain every batch already queued behind this one and
+                // coalesce them into a single publish call: while one
+                // publish is in flight, edits keep landing locally (see
+                // `enqueue`), so by the time we're free to publish again
+                // there may be several queued batches. Publishing each
+                // separately would serialize their round trips for no
+                // benefit; publishing the flattened backlog is one round
+                // trip and still an exact prefix of the change order.
+                let (batch, coalesced) = drain_backlog(&mut batches, first);
                 if let Err(error) = service::publish(batch).await {
                     failed.set(true);
                     status.set(format!("Save failed: {error}"));
                     return;
                 }
-                let remaining = pending().saturating_sub(1);
+                let remaining = pending().saturating_sub(coalesced);
                 pending.set(remaining);
                 if remaining == 0 {
-                    set_progress(status, failed, "Saved");
+                    set_progress(status, failed, "Saved locally");
                 }
             }
         },
@@ -379,10 +405,10 @@ pub fn app() -> Element {
                         ready.set(true);
                         generation += 1;
                         if remote_has_genesis {
-                            set_progress(status, failed, "Saved");
+                            set_progress(status, failed, "Saved locally");
                         } else {
                             pending += 1;
-                            set_progress(status, failed, "Saving…");
+                            set_progress(status, failed, "Saving locally…");
                             publisher.send(document.peek().borrow().genesis.clone());
                         }
                     }
@@ -441,7 +467,7 @@ pub fn app() -> Element {
     let mut enqueue = move |changes: Result<Vec<Vec<u8>>, String>| match changes {
         Ok(changes) if !changes.is_empty() => {
             pending += 1;
-            set_progress(status, failed, "Saving…");
+            set_progress(status, failed, "Saving locally…");
             publisher.send(changes);
             generation += 1;
         }
@@ -662,7 +688,36 @@ fn MarkdownView(node: MarkdownNode) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::channel::mpsc;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn drain_backlog_flattens_already_queued_batches_in_order() {
+        let (sender, mut receiver) = mpsc::unbounded::<Vec<Vec<u8>>>();
+        // Simulate two more batches having been enqueued while the first
+        // publish was in flight; try_recv must not block waiting for a
+        // fourth that was never sent.
+        sender.unbounded_send(vec![b"b".to_vec()]).unwrap();
+        sender
+            .unbounded_send(vec![b"c1".to_vec(), b"c2".to_vec()])
+            .unwrap();
+
+        let (flattened, coalesced) = drain_backlog(&mut receiver, vec![b"a".to_vec()]);
+
+        assert_eq!(
+            flattened,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c1".to_vec(), b"c2".to_vec()]
+        );
+        assert_eq!(coalesced, 3);
+    }
+
+    #[test]
+    fn drain_backlog_reports_single_batch_when_queue_empty() {
+        let (_sender, mut receiver) = mpsc::unbounded::<Vec<Vec<u8>>>();
+        let (flattened, coalesced) = drain_backlog(&mut receiver, vec![b"solo".to_vec()]);
+        assert_eq!(flattened, vec![b"solo".to_vec()]);
+        assert_eq!(coalesced, 1);
+    }
 
     fn doc(actor: u8) -> MarkdownDocument {
         MarkdownDocument::new(ActorId::from(&[actor][..]))

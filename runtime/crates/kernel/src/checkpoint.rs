@@ -1,14 +1,14 @@
-//! Checkpoints: the kernel's serializable state, sealed under the device's
-//! DEK and written to the state root after every successful mutation
-//! (docs/design.md "Devices": "Generation directories, manifest written
-//! last").
+//! Small device checkpoints and the incremental engine journal. One KV
+//! pointer commits both, so identity adoption cannot expose half old and half
+//! new state.
 //!
 //! Layout, under the device's namespace `/<id>/`:
 //!
 //! ```text
 //! /<id>/gen-<n>/state      nonce || AES-256-GCM(DEK, aad = <id>) over JSON
 //! /<id>/gen-<n>/MANIFEST   { generation: n, sha256: hex(state bytes) }
-//! kv  dev/<id>/gen         n — the pointer, and the commit point
+//! /<id>/engine/<n>         sealed bincode EngineDelta
+//! kv  dev/<id>/gen         { generation, engine_head } — the commit point
 //! ```
 //!
 //! **The kernel never lists a directory** (internal.wit `world runtime`):
@@ -32,10 +32,10 @@
 //! - only after the pointer advances are older generations removed, so there
 //!   is always one intact pointed generation on disk.
 //!
-//! The loader tries the pointed generation and, if it does not verify, `n-1`
-//! once. Cleanup therefore reaches back two: after a fallback load the next
-//! write is `n + 1` while the torn `n` and the loaded `n - 1` are both still
-//! on disk, and only removing both collects them.
+//! A pointed generation or journal record that does not verify is storage
+//! loss. Falling back would silently discard a mutation already acknowledged
+//! as durable. Cleanup still reaches back two to collect files left by older
+//! versions of this experimental format.
 
 use data_encoding::HEXLOWER;
 use serde::{Deserialize, Serialize};
@@ -54,14 +54,24 @@ pub struct Snapshot {
     /// The device's Ed25519 seed. Sealed like everything else here: it is the
     /// whole of the device's identity to its peers, and to iroh.
     pub seed: [u8; 32],
-    /// The sync engine's state: an automerge document and its sedimentree
-    /// items per app. `None` for a device that has not run an engine yet —
-    /// the anchor written at mint, before the engine is built.
-    pub engine: Option<polyvisor_engine::Snapshot>,
     /// The durable store's binding: the sealed OAuth tokens and how the last
     /// sync went (`crate::drive`). Sealed like everything else here, which is
     /// the whole reason a bearer never crosses the port.
     pub storage: Option<crate::drive::Sealed>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pointer {
+    pub generation: u64,
+    pub engine_head: u64,
+}
+
+pub struct Write<'a> {
+    pub files: &'a dyn Files,
+    pub platform: &'a dyn Platform,
+    pub rng: &'a dyn Rng,
+    pub dek: &'a Dek,
+    pub id: &'a str,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,13 +97,13 @@ pub fn pointer_key(id: &str) -> String {
 /// The pointed generation, or 0 for a device that has never checkpointed. An
 /// unreadable pointer reads as 0: the alternative is refusing to boot over a
 /// value nothing else can interpret, and 0 loses at most the last write.
-pub async fn pointer(platform: &dyn Platform, id: &str) -> u64 {
-    platform
-        .get(pointer_key(id))
-        .await
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|text| text.trim().parse().ok())
-        .unwrap_or(0)
+pub async fn pointer(platform: &dyn Platform, id: &str) -> Result<Option<Pointer>, Error> {
+    let Some(bytes) = platform.get(pointer_key(id)).await else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| Error::new(ErrorCode::Failed, "this device's commit pointer is invalid"))
 }
 
 /// Read the pointed generation, falling back to its predecessor once.
@@ -104,17 +114,50 @@ pub async fn load(
     platform: &dyn Platform,
     dek: &Dek,
     id: &str,
-) -> Result<(u64, Option<Snapshot>), Error> {
-    let pointer = pointer(platform, id).await;
-    for generation in [pointer, pointer.saturating_sub(1)] {
-        if generation == 0 {
-            continue;
-        }
-        if let Some(snapshot) = read_generation(files, dek, id, generation).await {
-            return Ok((pointer, Some(snapshot)));
-        }
+) -> Result<
+    (
+        Pointer,
+        Option<Snapshot>,
+        Option<polyvisor_engine::Snapshot>,
+    ),
+    Error,
+> {
+    let pointer = pointer(platform, id).await?.unwrap_or_default();
+    let snapshot = if pointer.generation == 0 {
+        None
+    } else {
+        read_generation(files, dek, id, pointer.generation).await
+    };
+    if pointer.generation != 0 && snapshot.is_none() {
+        return Err(Error::new(
+            ErrorCode::Failed,
+            "this device's committed state did not open",
+        ));
     }
-    Ok((pointer, None))
+    let mut journal = polyvisor_engine::JournalState::default();
+    for sequence in 1..=pointer.engine_head {
+        let path = journal_path(id, sequence);
+        let sealed = files.read(path).await.ok_or_else(|| {
+            Error::new(
+                ErrorCode::Failed,
+                "this device's committed history is missing",
+            )
+        })?;
+        let plain = dek.open(&sealed, &journal_aad(id, sequence)).map_err(|_| {
+            Error::new(
+                ErrorCode::Failed,
+                "this device's committed history did not open",
+            )
+        })?;
+        let delta = bincode::deserialize(&plain).map_err(|_| {
+            Error::new(
+                ErrorCode::Failed,
+                "this device's committed history is invalid",
+            )
+        })?;
+        journal.apply(delta);
+    }
+    Ok((pointer, snapshot, journal.snapshot()))
 }
 
 /// Write generation `generation` — state, then MANIFEST, then the pointer —
@@ -122,14 +165,18 @@ pub async fn load(
 /// `pointer + 1`), and there is only ever one writer: the device's own
 /// worker, holding the device's Web Lock.
 pub async fn write(
-    files: &dyn Files,
-    platform: &dyn Platform,
-    rng: &dyn Rng,
-    dek: &Dek,
-    id: &str,
+    io: Write<'_>,
     generation: u64,
+    engine_head: u64,
     snapshot: &Snapshot,
 ) -> Result<(), Error> {
+    let Write {
+        files,
+        platform,
+        rng,
+        dek,
+        id,
+    } = io;
     let plain = serde_json::to_vec(snapshot).map_err(|e| {
         Error::new(
             ErrorCode::Failed,
@@ -166,7 +213,14 @@ pub async fn write(
 
     // The commit. Nothing before this line is visible to a later boot.
     platform
-        .set(pointer_key(id), generation.to_string().into_bytes())
+        .set(
+            pointer_key(id),
+            serde_json::to_vec(&Pointer {
+                generation,
+                engine_head,
+            })
+            .expect("pointer serializes"),
+        )
         .await;
 
     // Two back, not one: see the module docs on fallback loads. Both may be
@@ -188,14 +242,68 @@ pub async fn write(
 /// load defers cleanup by one (see the module docs). Anything left behind
 /// would keep `/<id>` non-empty and therefore unremovable, leaking the whole
 /// namespace.
-pub async fn destroy(files: &dyn Files, id: &str, pointer: u64) {
+pub async fn destroy(files: &dyn Files, id: &str, pointer: Pointer) {
+    destroy_engine(files, id, pointer.engine_head).await;
     for back in 0..=3 {
-        let generation = (pointer + 1).saturating_sub(back);
+        let generation = (pointer.generation + 1).saturating_sub(back);
         if generation > 0 {
             remove_generation(files, id, generation).await;
         }
     }
     files.remove_dir(namespace(id)).await;
+}
+
+pub async fn write_engine(
+    files: &dyn Files,
+    rng: &dyn Rng,
+    dek: &Dek,
+    id: &str,
+    sequence: u64,
+    delta: &polyvisor_engine::EngineDelta,
+) -> Result<(), Error> {
+    let plain = bincode::serialize(delta).map_err(|e| {
+        Error::new(
+            ErrorCode::Failed,
+            format!("engine history could not be written: {e}"),
+        )
+    })?;
+    let sealed = dek.seal(rng, &plain, &journal_aad(id, sequence))?;
+    files
+        .write(journal_path(id, sequence), sealed)
+        .await
+        .map_err(|_| {
+            Error::new(
+                ErrorCode::Failed,
+                "this device's history could not be written",
+            )
+        })
+}
+
+pub async fn commit_pointer(platform: &dyn Platform, id: &str, pointer: Pointer) {
+    platform
+        .set(
+            pointer_key(id),
+            serde_json::to_vec(&pointer).expect("pointer serializes"),
+        )
+        .await;
+}
+
+pub async fn destroy_engine(files: &dyn Files, id: &str, head: u64) {
+    for sequence in 1..=head.saturating_add(1) {
+        files.remove_file(journal_path(id, sequence)).await;
+    }
+    files.remove_dir(format!("/{id}/engine")).await;
+}
+
+fn journal_path(id: &str, sequence: u64) -> String {
+    format!("/{id}/engine/{sequence}")
+}
+
+fn journal_aad(id: &str, sequence: u64) -> Vec<u8> {
+    let mut aad = b"polyvisor:engine-journal:v1\0".to_vec();
+    aad.extend_from_slice(id.as_bytes());
+    aad.extend_from_slice(&sequence.to_le_bytes());
+    aad
 }
 
 async fn remove_generation(files: &dyn Files, id: &str, generation: u64) {
@@ -229,16 +337,10 @@ async fn read_generation(
 }
 
 impl Snapshot {
-    pub fn new(
-        device: Device,
-        seed: [u8; 32],
-        engine: Option<polyvisor_engine::Snapshot>,
-        storage: Option<crate::drive::Sealed>,
-    ) -> Snapshot {
+    pub fn new(device: Device, seed: [u8; 32], storage: Option<crate::drive::Sealed>) -> Snapshot {
         Snapshot {
             device,
             seed,
-            engine,
             storage,
         }
     }

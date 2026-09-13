@@ -14,7 +14,7 @@
 //! restore would be cheaper and is what replaying the automerge history would
 //! do — and it would quietly relabel their authorship as ours.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 
 use future_form::{FutureForm as _, Local};
@@ -61,12 +61,21 @@ pub struct Snapshot {
     /// current at snapshot time are emitted here.
     #[serde(default)]
     pub opaque: Vec<OpaqueState>,
+    #[serde(default)]
+    pub unbound: Vec<UnboundState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpaqueState {
     pub tree: [u8; 32],
     pub commits: Vec<Item>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnboundState {
+    pub tree: [u8; 32],
+    pub commits: Vec<Item>,
+    pub fragments: Vec<Item>,
 }
 
 /// One app's document and the tree behind it.
@@ -94,7 +103,7 @@ pub struct TreeState {
 /// The store is names plus opaque bytes, but the two item kinds decode into
 /// different envelopes (`Signed<LooseCommit>` vs `Signed<Fragment>`) and are
 /// checked differently, so the record has to say which it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ItemKind {
     /// One automerge change.
@@ -127,11 +136,19 @@ pub struct StoreItem {
     pub kind: ItemKind,
 }
 
+impl StoreItem {
+    pub fn key(&self) -> ([u8; 32], [u8; 32], ItemKind) {
+        (self.tree, self.commit, self.kind)
+    }
+}
+
 /// Map-backed item storage. Interior mutability is a `RefCell`: the driver
 /// task is the only accessor, and this crate is single-threaded throughout.
 #[derive(Debug, Default)]
 pub struct SnapshotStorage {
     trees: RefCell<BTreeMap<SedimentreeId, Tree>>,
+    pending: RefCell<Vec<crate::StorageMutation>>,
+    settled: Cell<usize>,
     lifecycle: crate::opaque::Lifecycle,
     shared: RefCell<Option<crate::policy::SharedAuthorities>>,
 }
@@ -146,6 +163,8 @@ impl SnapshotStorage {
     pub(crate) fn new(lifecycle: crate::opaque::Lifecycle) -> Self {
         Self {
             trees: RefCell::new(BTreeMap::new()),
+            pending: RefCell::new(Vec::new()),
+            settled: Cell::new(0),
             lifecycle,
             shared: RefCell::new(None),
         }
@@ -377,6 +396,13 @@ impl SnapshotStorage {
             .collect();
         for id in &doomed {
             let _dropped = entry.commits.remove(id);
+            self.pending
+                .borrow_mut()
+                .push(crate::StorageMutation::Remove {
+                    tree: *tree.as_bytes(),
+                    commit: *id.as_bytes(),
+                    kind: ItemKind::Commit,
+                });
         }
         doomed.len()
     }
@@ -441,9 +467,29 @@ impl SnapshotStorage {
         let entry = trees.entry(tree).or_default();
         for (head, signed, blob) in accepted_commits {
             let _previous = entry.commits.insert(head, (signed, blob));
+            let item = entry.commits.get(&head).expect("just inserted");
+            self.pending
+                .borrow_mut()
+                .push(crate::StorageMutation::Put(StoreItem {
+                    tree: *tree.as_bytes(),
+                    commit: *head.as_bytes(),
+                    signed: item.0.as_bytes().to_vec(),
+                    blob: item.1.clone(),
+                    kind: ItemKind::Commit,
+                }));
         }
         for (head, signed, blob) in accepted_fragments {
             let _previous = entry.fragments.insert(head, (signed, blob));
+            let item = entry.fragments.get(&head).expect("just inserted");
+            self.pending
+                .borrow_mut()
+                .push(crate::StorageMutation::Put(StoreItem {
+                    tree: *tree.as_bytes(),
+                    commit: *head.as_bytes(),
+                    signed: item.0.as_bytes().to_vec(),
+                    blob: item.1.clone(),
+                    kind: ItemKind::Fragment,
+                }));
         }
     }
 
@@ -455,6 +501,30 @@ impl SnapshotStorage {
     /// sync.
     pub fn forget_tree(&self, tree: SedimentreeId) {
         let _removed = self.trees.borrow_mut().remove(&tree);
+        self.pending
+            .borrow_mut()
+            .push(crate::StorageMutation::ForgetTree(*tree.as_bytes()));
+    }
+
+    pub(crate) fn settled_len(&self) -> usize {
+        self.settled.get()
+    }
+    pub(crate) fn pending_prefix(&self, len: usize) -> Vec<crate::StorageMutation> {
+        self.pending.borrow()[..len].to_vec()
+    }
+    pub(crate) fn acknowledge(&self, len: usize) {
+        self.pending.borrow_mut().drain(..len);
+        self.settled.set(self.settled.get().saturating_sub(len));
+    }
+    pub(crate) fn mark_restored(&self) {
+        self.pending.borrow_mut().clear();
+        self.settled.set(0);
+    }
+    pub(crate) fn settle(&self) {
+        self.settled.set(self.pending.borrow().len());
+    }
+    pub(crate) fn has_unsettled(&self) -> bool {
+        self.pending.borrow().len() > self.settled.get()
     }
 
     /// The whole store, keyed by the app ids the caller supplies alongside
@@ -498,6 +568,7 @@ impl SnapshotStorage {
                     commits: items(stored.commits.values()),
                 })
                 .collect(),
+            unbound: Vec::new(),
         }
     }
 
@@ -599,6 +670,16 @@ impl Storage<Local> for SnapshotStorage {
                     return Err(StorageFailure::Permanent);
                 }
                 let _previous = entry.commits.insert(payload.head(), (signed, blob));
+                let stored_item = entry.commits.get(&payload.head()).expect("just inserted");
+                self.pending
+                    .borrow_mut()
+                    .push(crate::StorageMutation::Put(StoreItem {
+                        tree: *tree.as_bytes(),
+                        commit: *payload.head().as_bytes(),
+                        signed: stored_item.0.as_bytes().to_vec(),
+                        blob: stored_item.1.clone(),
+                        kind: ItemKind::Commit,
+                    }));
                 stored += 1;
             }
             for (signed, blob) in fragments {
@@ -613,6 +694,16 @@ impl Storage<Local> for SnapshotStorage {
                     return Err(StorageFailure::Permanent);
                 };
                 let _previous = entry.fragments.insert(payload.head(), (signed, blob));
+                let stored_item = entry.fragments.get(&payload.head()).expect("just inserted");
+                self.pending
+                    .borrow_mut()
+                    .push(crate::StorageMutation::Put(StoreItem {
+                        tree: *tree.as_bytes(),
+                        commit: *payload.head().as_bytes(),
+                        signed: stored_item.0.as_bytes().to_vec(),
+                        blob: stored_item.1.clone(),
+                        kind: ItemKind::Fragment,
+                    }));
                 stored += 1;
             }
             Ok(stored)
@@ -653,6 +744,9 @@ impl Storage<Local> for SnapshotStorage {
     fn delete_tree(&self, tree: SedimentreeId) -> LocalBoxFuture<'_, Result<(), StorageFailure>> {
         Local::from_future(async move {
             let _removed = self.trees.borrow_mut().remove(&tree);
+            self.pending
+                .borrow_mut()
+                .push(crate::StorageMutation::ForgetTree(*tree.as_bytes()));
             Ok(())
         })
     }

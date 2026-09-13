@@ -68,13 +68,22 @@ pub async fn rows(platform: &dyn Platform) -> Result<Vec<IndexRow>, Error> {
 /// every path the kernel can have written. The index row goes last: a row
 /// without a namespace is recoverable (it boots as a device whose checkpoint
 /// is missing), a namespace without a row is unreachable garbage.
-pub async fn destroy(platform: &dyn Platform, files: &dyn Files, id: &str) {
-    let pointer = crate::checkpoint::pointer(platform, id).await;
+pub async fn destroy(
+    platform: &dyn Platform,
+    files: &dyn Files,
+    id: &str,
+) -> Result<(), crate::Error> {
+    let pointer = match crate::checkpoint::pointer(platform, id).await {
+        Ok(Some(pointer)) => pointer,
+        Ok(None) => Default::default(),
+        Err(error) => return Err(error),
+    };
     crate::checkpoint::destroy(files, id, pointer).await;
     for key in platform.keys(dev_prefix(id)).await {
         platform.delete(key).await;
     }
     platform.delete(index_key(id)).await;
+    Ok(())
 }
 
 /// Destroy every ephemeral device other than `ours` whose worker is gone and
@@ -104,7 +113,7 @@ pub async fn sweep(
         if locks.is_held(lock_name(&row.id)).await {
             continue;
         }
-        destroy(platform, files, &row.id).await;
+        destroy(platform, files, &row.id).await?;
         swept.push(row.id);
     }
     Ok(swept)

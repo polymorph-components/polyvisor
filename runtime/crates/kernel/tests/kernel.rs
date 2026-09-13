@@ -517,6 +517,7 @@ struct FakeFiles {
     peak_in_flight: Rc<Cell<u32>>,
     /// Paths written, in order, for counting checkpoints.
     written: Rc<RefCell<Vec<String>>>,
+    written_bytes: Rc<Cell<usize>>,
     hold_writes: Rc<Cell<bool>>,
     write_waker: Rc<RefCell<Option<std::task::Waker>>>,
 }
@@ -581,6 +582,8 @@ impl Files for FakeFiles {
                 yield_now().await;
             }
             self.written.borrow_mut().push(path.clone());
+            self.written_bytes
+                .set(self.written_bytes.get() + bytes.len());
             self.store.borrow_mut().insert(path, bytes);
             self.in_flight.set(self.in_flight.get() - 1);
             Ok(())
@@ -1483,7 +1486,24 @@ impl World {
             .store
             .borrow()
             .get(&format!("dev/{id}/gen"))
-            .map(|bytes| String::from_utf8(bytes.clone()).unwrap().parse().unwrap())
+            .map(|bytes| {
+                serde_json::from_slice::<serde_json::Value>(bytes).unwrap()["generation"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .unwrap_or(0)
+    }
+
+    fn engine_head(&self, id: &str) -> u64 {
+        self.kv
+            .store
+            .borrow()
+            .get(&format!("dev/{id}/gen"))
+            .map(|bytes| {
+                serde_json::from_slice::<serde_json::Value>(bytes).unwrap()["engine_head"]
+                    .as_u64()
+                    .unwrap()
+            })
             .unwrap_or(0)
     }
 
@@ -1794,21 +1814,11 @@ fn sharing_retry_checkpoints_an_existing_envelope_before_sending() {
         .is_err()
     );
 
-    // Bring the same recipient back, then make the sender's mandatory
-    // pre-send durability barrier fail. The direct retry must not put the
-    // already-built envelope on the wire.
+    // Bring the same recipient back. The envelope was already committed
+    // before the failed network attempt, so retry need not manufacture a
+    // second journal record.
     let bob = bob_world.boot();
     settle();
-    alice_world.files.fail_next_writes(1);
-    assert_eq!(
-        block_on(alice.sharing_retry(&prompt.id))
-            .unwrap_err()
-            .message,
-        "this device's state could not be written"
-    );
-    settle();
-    assert!(block_on(bob.sharing_inbox()).unwrap().is_empty());
-
     block_on(alice.sharing_retry(&prompt.id)).unwrap();
     settle();
     assert_eq!(block_on(bob.sharing_inbox()).unwrap().len(), 1);
@@ -1971,7 +1981,7 @@ fn contacts_import_selects_claims_and_shares_one_meeting() {
 }
 
 #[test]
-fn concurrent_contacts_mutations_wait_for_the_durable_followup() {
+fn concurrent_contacts_mutations_share_or_follow_a_durable_write() {
     let world = World::default();
     let kernel = world.boot();
     world.forget_writes();
@@ -1996,15 +2006,21 @@ fn concurrent_contacts_mutations_wait_for_the_durable_followup() {
     });
     assert_eq!(world.peak_writes(), 1);
     assert_eq!(
-        world.checkpoints(),
-        2,
-        "the coalesced caller awaited its follow-up pass"
+        world
+            .files
+            .written
+            .borrow()
+            .iter()
+            .filter(|path| path.contains("/engine/"))
+            .count(),
+        1,
+        "both mutations were covered by the captured write"
     );
     assert_eq!(block_on(kernel.contacts_items()).unwrap().len(), 2);
 }
 
 #[test]
-fn coalesced_durable_contact_writer_receives_the_checkpoint_failure() {
+fn a_covered_durable_caller_is_not_failed_by_later_work() {
     let world = World::default();
     let kernel = world.boot();
     world.forget_writes();
@@ -2022,13 +2038,10 @@ fn coalesced_durable_contact_writer_receives_the_checkpoint_failure() {
                 .await
         };
         let (first, second) = futures::future::join(first, coalesced).await;
-        assert_eq!(
-            first.unwrap_err().message,
-            "this device's state could not be written"
-        );
+        first.unwrap();
         assert_eq!(
             second.unwrap_err().message,
-            "this device's state could not be written"
+            "this device's history could not be written"
         );
     });
     assert_eq!(
@@ -2135,6 +2148,13 @@ fn failed_pairing_after_group_mutation_leaves_identity_fail_closed() {
             .unwrap_err()
             .code,
         ErrorCode::Unavailable,
+    );
+    drop(joiner);
+    settle();
+    let reopened = here.boot();
+    assert!(
+        block_on(reopened.identity_status()).is_ok(),
+        "failed adoption never moved the durable pointer"
     );
 }
 
@@ -2468,7 +2488,28 @@ fn a_durable_device_whose_state_does_not_open_refuses_to_boot() {
         panic!("a durable device with no readable state must not boot");
     };
     assert_eq!(err.code, ErrorCode::Failed);
-    assert_eq!(err.message, "this device's state did not open");
+    assert_eq!(err.message, "this device's committed state did not open");
+}
+
+#[test]
+fn malformed_commit_pointer_is_not_treated_as_an_uncommitted_ephemeral_device() {
+    let world = World::default();
+    let _kernel = world.boot();
+    world.kv_put(&format!("dev/{ID}/gen"), b"not a pointer".to_vec());
+    let Err(error) = world.try_boot() else {
+        panic!("malformed committed pointer minted a replacement")
+    };
+    assert_eq!(error.message, "this device's commit pointer is invalid");
+}
+
+#[test]
+fn malformed_commit_pointer_also_blocks_keyless_erase() {
+    let world = World::default();
+    let kernel = world.boot();
+    world.kv_put(&format!("dev/{ID}/gen"), b"not a pointer".to_vec());
+    let error = block_on(kernel.erase()).unwrap_err();
+    assert_eq!(error.message, "this device's commit pointer is invalid");
+    assert!(world.row(ID).is_some());
 }
 
 #[test]
@@ -2746,6 +2787,38 @@ fn erase_destroys_the_namespace_and_the_row_and_is_terminal() {
     }
 }
 
+#[test]
+fn erase_waits_for_active_persistence_and_no_late_writer_recreates_state() {
+    let world = World::default();
+    let kernel = world.boot();
+    let session = session(&kernel);
+    world.files.hold_writes();
+    let write = kernel.tasks_add(session, "before erase".into());
+    futures::pin_mut!(write);
+    block_on(futures::future::poll_fn(|cx| {
+        if write.as_mut().poll(cx).is_ready() {
+            panic!("write completed while held")
+        }
+        (world.files.in_flight.get() > 0)
+            .then_some(())
+            .map_or(Poll::Pending, Poll::Ready)
+    }));
+    let erase = kernel.erase();
+    futures::pin_mut!(erase);
+    block_on(futures::future::poll_fn(|cx| {
+        match erase.as_mut().poll(cx) {
+            Poll::Ready(_) => panic!("erase completed before the active writer"),
+            Poll::Pending => Poll::Ready(()),
+        }
+    }));
+    world.files.release_writes();
+    block_on(write).unwrap();
+    block_on(erase).unwrap();
+    settle();
+    assert!(!world.files.under(&format!("/{ID}/")));
+    assert!(!world.kv_has(&format!("index/{ID}")));
+}
+
 // -- the sweep ---------------------------------------------------------------
 
 /// Plant a neighbouring device with a namespace, a key and a row.
@@ -2759,7 +2832,10 @@ fn plant(world: &World, id: &str, tier: Tier, last_used: u64) {
             .write(format!("/{id}/gen-1/state"), b"whatever".to_vec()),
     )
     .unwrap();
-    world.kv_put(&format!("dev/{id}/gen"), b"1".to_vec());
+    world.kv_put(
+        &format!("dev/{id}/gen"),
+        serde_json::to_vec(&serde_json::json!({"generation": 1, "engine_head": 0})).unwrap(),
+    );
     world.kv_put(&format!("dev/{id}/dek"), vec![0; 32]);
 }
 
@@ -2838,7 +2914,7 @@ fn restore_generation(world: &World, id: &str, n: u64, bytes: (Vec<u8>, Vec<u8>)
 }
 
 #[test]
-fn a_generation_the_pointer_never_reached_falls_back_to_the_committed_one() {
+fn a_generation_the_pointer_never_reached_is_ignored() {
     let world = World::default();
     {
         let kernel = world.boot();
@@ -2856,7 +2932,11 @@ fn a_generation_the_pointer_never_reached_falls_back_to_the_committed_one() {
         block_on(kernel.set_name("uncommitted".into())).unwrap();
     }
     restore_generation(&world, ID, 4, committed);
-    world.kv_put(&format!("dev/{ID}/gen"), b"4".to_vec());
+    let pointer = serde_json::json!({"generation": 4, "engine_head": 1});
+    world.kv_put(
+        &format!("dev/{ID}/gen"),
+        serde_json::to_vec(&pointer).unwrap(),
+    );
     assert!(world.files.has(&format!("/{ID}/gen-5/MANIFEST")));
 
     // The pointer is the commit point, so the whole `gen-4` is invisible.
@@ -2871,7 +2951,7 @@ fn a_generation_the_pointer_never_reached_falls_back_to_the_committed_one() {
 }
 
 #[test]
-fn a_torn_pointed_generation_falls_back_to_its_predecessor() {
+fn a_torn_committed_generation_is_refused() {
     // A crash *during* `gen-3/state` leaves the pointer at 3 only if the
     // pointer write also happened — it cannot here, but a half-written file
     // under a pointer that did advance is the shape the fallback exists for,
@@ -2899,7 +2979,10 @@ fn a_torn_pointed_generation_falls_back_to_its_predecessor() {
     .unwrap();
     assert_eq!(world.pointer(ID), 5);
 
-    assert_eq!(world.boot().device_status().unwrap().name, "two");
+    let Err(error) = world.try_boot() else {
+        panic!("torn committed state booted")
+    };
+    assert_eq!(error.message, "this device's committed state did not open");
 }
 
 #[test]
@@ -2913,7 +2996,7 @@ fn a_write_that_fails_does_not_advance_the_pointer() {
     world.files.fail_next_writes(1);
     let err = block_on(kernel.set_name("lost".into())).unwrap_err();
     assert_eq!(err.code, ErrorCode::Failed);
-    assert_eq!(err.message, "this device's state could not be written");
+    assert_eq!(err.message, "this device's history could not be written");
 
     // The pointer did not move, the generation it names is untouched, and no
     // cleanup ran: the previous checkpoint is still exactly what a boot gets.
@@ -3056,7 +3139,8 @@ fn a_checkpoint_moved_into_another_namespace_does_not_open() {
     }
     let dek = world.kv.store.borrow()[&format!("dev/{ID}/dek")].clone();
     world.kv_put("dev/other/dek", dek);
-    world.kv_put("dev/other/gen", world.pointer(ID).to_string().into_bytes());
+    let pointer = serde_json::json!({"generation": world.pointer(ID), "engine_head": 1});
+    world.kv_put("dev/other/gen", serde_json::to_vec(&pointer).unwrap());
     world.put_row(&IndexRow::fresh("other", world.clock.now.get()));
 
     // It does not boot: the pointer names a generation, so an unreadable one
@@ -3064,7 +3148,7 @@ fn a_checkpoint_moved_into_another_namespace_does_not_open() {
     let Err(err) = world.try_boot_as("other") else {
         panic!("a checkpoint that does not authenticate must not be ignored");
     };
-    assert_eq!(err.message, "this device's state did not open");
+    assert_eq!(err.message, "this device's committed state did not open");
 }
 
 #[test]
@@ -3356,6 +3440,117 @@ fn history_publish_is_visible_to_every_session_and_retries_are_idempotent() {
 
     block_on(kernel.history_publish(first, vec![change])).unwrap();
     assert_eq!(block_on(kernel.history_read(second)).unwrap(), published);
+}
+
+#[test]
+fn ordinary_history_writes_only_an_incremental_engine_record() {
+    let world = World::default();
+    let kernel = world.boot();
+    let session = session(&kernel);
+    let before_generation = world.pointer(ID);
+    let before_head = world.engine_head(ID);
+    world.forget_writes();
+
+    let mut source = automerge::Automerge::new();
+    use automerge::transaction::Transactable as _;
+    source
+        .transact(|tx| tx.put(automerge::ROOT, "text", "one"))
+        .unwrap();
+    let change = source.get_last_local_change().unwrap().raw_bytes().to_vec();
+    block_on(kernel.history_publish(session, vec![change])).unwrap();
+
+    assert_eq!(
+        world.pointer(ID),
+        before_generation,
+        "document save did not rewrite device metadata"
+    );
+    assert_eq!(world.engine_head(ID), before_head + 1);
+    assert!(
+        world
+            .files
+            .written
+            .borrow()
+            .iter()
+            .all(|path| !path.ends_with("/state"))
+    );
+    assert_eq!(
+        world
+            .files
+            .written
+            .borrow()
+            .iter()
+            .filter(|path| path.contains("/engine/"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn fixed_edit_write_size_does_not_follow_prior_or_unrelated_history() {
+    let world = World::default();
+    let kernel = world.boot();
+    let session = session(&kernel);
+    let mut author = automerge::Automerge::new();
+    use automerge::transaction::Transactable as _;
+    for index in 0..200 {
+        author
+            .transact(|tx| tx.put(automerge::ROOT, format!("old-{index}"), "x".repeat(128)))
+            .unwrap();
+        let change = author.get_last_local_change().unwrap().raw_bytes().to_vec();
+        block_on(kernel.history_publish(session, vec![change])).unwrap();
+    }
+    // Populate another partition too; its payload must not enter this edit's
+    // journal record.
+    for index in 0..40 {
+        block_on(kernel.contacts_create(Vec::new(), format!("other-{index}"), String::new()))
+            .unwrap();
+    }
+    world.forget_writes();
+    author
+        .transact(|tx| tx.put(automerge::ROOT, "fixed", "z"))
+        .unwrap();
+    let change = author.get_last_local_change().unwrap().raw_bytes().to_vec();
+    block_on(kernel.history_publish(session, vec![change])).unwrap();
+    assert!(
+        world.files.written_bytes.get() < 128 * 1024,
+        "one fixed edit rewrote bulk history"
+    );
+    assert!(
+        world
+            .files
+            .written
+            .borrow()
+            .iter()
+            .all(|path| !path.ends_with("/state"))
+    );
+}
+
+#[test]
+fn committed_engine_corruption_refuses_to_boot() {
+    let world = World::default();
+    let kernel = world.boot();
+    let session = session(&kernel);
+    let mut source = automerge::Automerge::new();
+    use automerge::transaction::Transactable as _;
+    source
+        .transact(|tx| tx.put(automerge::ROOT, "text", "one"))
+        .unwrap();
+    let change = source.get_last_local_change().unwrap().raw_bytes().to_vec();
+    block_on(kernel.history_publish(session, vec![change])).unwrap();
+    let head = world.engine_head(ID);
+    block_on(
+        world
+            .files
+            .write(format!("/{ID}/engine/{head}"), b"torn".to_vec()),
+    )
+    .unwrap();
+    let Err(error) = world.try_boot() else {
+        panic!("corrupt committed engine record booted")
+    };
+    assert_eq!(
+        error.message,
+        "this device's committed history did not open"
+    );
 }
 
 #[test]
@@ -3814,6 +4009,7 @@ impl World {
 
     fn forget_writes(&self) {
         self.files.written.borrow_mut().clear();
+        self.files.written_bytes.set(0);
         self.files.peak_in_flight.set(0);
     }
 }
