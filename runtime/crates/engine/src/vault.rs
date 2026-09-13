@@ -59,6 +59,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use beekem::encrypted::EncryptedContent;
+use bincode::Options;
 use ed25519_dalek::SigningKey;
 use future_form::Local;
 use futures::lock::Mutex;
@@ -73,6 +74,7 @@ use keyhive_core::listener::no_listener::NoListener;
 use keyhive_core::principal::agent::Agent;
 use keyhive_core::principal::document::id::DocumentId;
 use keyhive_core::principal::group::id::GroupId;
+use keyhive_core::principal::group::membership_operation::MembershipOperation;
 use keyhive_core::principal::identifier::Identifier;
 use keyhive_core::principal::membered::Membered;
 use keyhive_core::principal::peer::Peer;
@@ -95,6 +97,16 @@ type Plaintext = Vec<u8>;
 
 type Store = MemoryCiphertextStore<Cref, Plaintext>;
 type Kh = Keyhive<Local, SigningKey, Cref, Plaintext, Store, NoListener, ChaCha20Rng>;
+
+#[derive(Serialize, Deserialize)]
+struct MembershipProof {
+    identities: Vec<ContactCard>,
+    membership: Vec<StaticEvent<Cref>>,
+}
+
+const MAX_MEMBERSHIP_PROOF_BYTES: usize = 256 * 1024;
+const MAX_MEMBERSHIP_IDENTITIES: usize = 1024;
+const MAX_MEMBERSHIP_EVENTS: usize = 4096;
 
 /// One sealed commit as it rests in a sedimentree blob and crosses the wire.
 pub type Ciphertext = EncryptedContent<Plaintext, Cref>;
@@ -248,6 +260,162 @@ impl Vault {
     #[must_use]
     pub fn doc_id(&self) -> [u8; 32] {
         self.doc.get().to_bytes()
+    }
+
+    /// The device signing keys in Keyhive's materialized membership view.
+    /// This is a projection of Keyhive authority, not a second ACL.
+    pub async fn members(&self) -> Result<Vec<[u8; 32]>, String> {
+        let group = self
+            .kh
+            .get_group(self.group.get())
+            .await
+            .ok_or_else(|| "this device has no keyhive group".to_string())?;
+        let mut members: Vec<_> = group
+            .lock()
+            .await
+            .transitive_members()
+            .await
+            .into_iter()
+            .filter_map(|(id, (agent, _))| {
+                matches!(agent, Agent::Individual(..) | Agent::Active(..)).then(|| id.to_bytes())
+            })
+            .collect();
+        members.sort_unstable();
+        Ok(members)
+    }
+
+    /// One complete set of locally known signed public Keyhive operations for
+    /// independently verifying membership. The proof deliberately excludes
+    /// CGKA operations, the archive, and content keys.
+    pub async fn membership_proof(&self) -> Result<Vec<u8>, String> {
+        let membership = self.kh.membership_ops_for_all_agents().await;
+        let mut membership_events = Vec::new();
+        let mut seen = HashSet::new();
+        let mut agents = HashMap::new();
+        if let Some(ops) = membership.ops.get(&Identifier::from(self.group.get())) {
+            for op in ops.values() {
+                if let MembershipOperation::Delegation(delegation) = op {
+                    agents.insert(
+                        delegation.payload().delegate().id(),
+                        delegation.payload().delegate().clone(),
+                    );
+                }
+                let event = StaticEvent::from(Event::<Local, SigningKey, Cref, NoListener>::from(
+                    op.clone(),
+                ));
+                if seen.insert(digest(&event)) {
+                    membership_events.push(event);
+                }
+            }
+        }
+        let mut identity_events = Vec::new();
+        for agent in agents.into_values() {
+            match agent {
+                Agent::Active(_, active) => {
+                    let individual = active.lock().await.individual();
+                    identity_events.push(individual.lock().await.contact_card());
+                }
+                Agent::Individual(_, individual) => {
+                    identity_events.push(individual.lock().await.contact_card());
+                }
+                Agent::Group(..) | Agent::Document(..) => {}
+            }
+        }
+        let proof = bincode::serialize(&MembershipProof {
+            identities: identity_events,
+            membership: membership_events,
+        })
+        .map_err(|e| format!("membership proof: {e}"))?;
+        if proof.len() > MAX_MEMBERSHIP_PROOF_BYTES {
+            return Err("membership proof exceeds the 256 KiB contact envelope budget".into());
+        }
+        Ok(proof)
+    }
+
+    /// Verify `device` as a member of exactly `group` in one complete public
+    /// authority proof, using fresh isolated Keyhive state.
+    ///
+    /// An old proof remains valid evidence of its old state: no offline format
+    /// can reveal an operation created later. Every supplied operation must
+    /// resolve. This is stricter than ordinary
+    /// sync ingestion, where unresolved operations are retained for a later
+    /// batch (`keyhive_core/src/keyhive.rs:2305-2365` at pin a509a2d).
+    pub async fn verify_membership(
+        proof: &[u8],
+        group: [u8; 32],
+        device: [u8; 32],
+    ) -> Result<(), String> {
+        let proof = decode_membership_proof(proof)?;
+        let identities = proof.identities;
+        let membership = proof.membership;
+
+        let group = GroupId::new(identifier(group)?);
+        let device = identifier(device)?;
+
+        // Keyhive owns validation/materialization as an instance API, so the
+        // isolated verifier needs an active identity. Derive a synthetic one
+        // outside every identity namespace supplied by the untrusted proof;
+        // no verifier-generated operation enters the materialized claim.
+        let forbidden: HashSet<_> = identities
+            .iter()
+            .map(|card| card.id().to_bytes())
+            .chain([group.to_bytes(), device.to_bytes()])
+            .collect();
+        let verifier_seed = (0u32..)
+            .map(|counter| {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"polyvisor membership verifier v0");
+                hasher.update(&counter.to_le_bytes());
+                *hasher.finalize().as_bytes()
+            })
+            .find(|seed| {
+                !forbidden.contains(&SigningKey::from_bytes(seed).verifying_key().to_bytes())
+            })
+            .expect("the finite proof cannot occupy the verifier identity space");
+        let verifier = Kh::generate(
+            SigningKey::from_bytes(&verifier_seed),
+            Store::new(),
+            NoListener,
+            ChaCha20Rng::from_seed([0; 32]),
+        )
+        .await
+        .map_err(|e| format!("membership verifier: {e}"))?;
+        for card in identities {
+            verifier
+                .receive_contact_card(&card)
+                .await
+                .map_err(|e| format!("membership proof identity: {e:?}"))?;
+        }
+        let (roots, rest): (Vec<_>, Vec<_>) = membership.into_iter().partition(|event| {
+            matches!(event, StaticEvent::Delegated(delegation) if delegation.payload().proof.is_none())
+        });
+        if !verifier
+            .ingest_unsorted_static_events(roots)
+            .await
+            .is_empty()
+        {
+            return Err("membership proof has an invalid authority root".into());
+        }
+        if !verifier
+            .ingest_unsorted_static_events(rest)
+            .await
+            .is_empty()
+        {
+            return Err("membership proof has unresolved authority dependencies".into());
+        }
+
+        let materialized = verifier
+            .get_group(group)
+            .await
+            .ok_or_else(|| "membership proof does not define the claimed group".to_string())?
+            .lock()
+            .await
+            .transitive_members()
+            .await;
+        match materialized.get(&device) {
+            Some((Agent::Individual(..) | Agent::Active(..), _)) => Ok(()),
+            _ => Err("membership proof does not authorize that device".into()),
+        }
     }
 
     // -- enrollment ----------------------------------------------------------
@@ -953,6 +1121,31 @@ fn identifier(bytes: [u8; 32]) -> Result<Identifier, String> {
         .map_err(|e| format!("not a keyhive identifier: {e}"))
 }
 
+fn decode_membership_proof(bytes: &[u8]) -> Result<MembershipProof, String> {
+    if bytes.len() > MAX_MEMBERSHIP_PROOF_BYTES {
+        return Err("membership proof exceeds the byte limit".into());
+    }
+    let proof: MembershipProof = bincode::options()
+        .with_fixint_encoding()
+        .with_limit(MAX_MEMBERSHIP_PROOF_BYTES as u64)
+        .reject_trailing_bytes()
+        .deserialize(bytes)
+        .map_err(|e| format!("bad membership proof: {e}"))?;
+    if proof.identities.len() > MAX_MEMBERSHIP_IDENTITIES
+        || proof.membership.len() > MAX_MEMBERSHIP_EVENTS
+    {
+        return Err("membership proof contains too many operations".into());
+    }
+    if proof
+        .membership
+        .iter()
+        .any(|event| matches!(event, StaticEvent::CgkaOperation(_)))
+    {
+        return Err("membership proof contains a private epoch operation".into());
+    }
+    Ok(proof)
+}
+
 fn digest<T: Serialize>(value: &T) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&keyhive_crypto::digest::Digest::hash(value).as_slice()[..32]);
@@ -963,11 +1156,149 @@ fn digest<T: Serialize>(value: &T) -> [u8; 32] {
 mod tests {
     use futures::executor::block_on;
     use keyhive_core::crypto::envelope::Envelope;
+    use keyhive_core::event::static_event::StaticEvent;
     use keyhive_core::store::ciphertext::CiphertextStore;
     use keyhive_crypto::symmetric_key::SymmetricKey;
     use std::collections::{BTreeMap, BTreeSet};
 
-    use super::{Ciphertext, Cref, Local, Vault};
+    use super::{Ciphertext, Cref, Local, MembershipProof, Vault};
+
+    async fn enroll(adder: &Vault, joiner: &Vault) -> Vec<u8> {
+        let events = adder
+            .enroll(
+                &joiner.contact_card().await.unwrap(),
+                joiner.kh.id().to_bytes(),
+            )
+            .await
+            .unwrap();
+        joiner
+            .adopt(
+                &events,
+                &adder.export_content_keys().unwrap(),
+                adder.group_id(),
+                adder.doc_id(),
+            )
+            .await
+            .unwrap();
+        events
+    }
+
+    #[test]
+    fn membership_proof_is_public_exact_and_dependency_complete() {
+        block_on(async {
+            // Synthetic deterministic seeds; these are test identities only.
+            let alice = Vault::create([1; 32], [11; 32]).await.unwrap();
+            let bob = Vault::create([2; 32], [12; 32]).await.unwrap();
+            enroll(&alice, &bob).await;
+            let carol = Vault::create([4; 32], [15; 32]).await.unwrap();
+            enroll(&bob, &carol).await;
+
+            let proof = bob.membership_proof().await.unwrap();
+            let events: MembershipProof = bincode::deserialize(&proof).unwrap();
+            assert!(
+                events
+                    .membership
+                    .iter()
+                    .all(|event| !matches!(event, StaticEvent::CgkaOperation(_)))
+            );
+            Vault::verify_membership(&proof, alice.group_id(), bob.kh.id().to_bytes())
+                .await
+                .unwrap();
+            Vault::verify_membership(&proof, alice.group_id(), carol.kh.id().to_bytes())
+                .await
+                .unwrap();
+
+            let colliding_seed = {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"polyvisor membership verifier v0");
+                hasher.update(&0u32.to_le_bytes());
+                *hasher.finalize().as_bytes()
+            };
+            let colliding = Vault::create(colliding_seed, [14; 32]).await.unwrap();
+            let colliding_proof = colliding.membership_proof().await.unwrap();
+            Vault::verify_membership(
+                &colliding_proof,
+                colliding.group_id(),
+                colliding.kh.id().to_bytes(),
+            )
+            .await
+            .unwrap();
+
+            let stranger = Vault::create([3; 32], [13; 32]).await.unwrap();
+            assert!(
+                Vault::verify_membership(&proof, stranger.group_id(), bob.kh.id().to_bytes())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                Vault::verify_membership(&proof, alice.group_id(), stranger.kh.id().to_bytes())
+                    .await
+                    .is_err()
+            );
+
+            let mut incomplete = events;
+            let root = incomplete
+                .membership
+                .iter()
+                .position(|event| {
+                    matches!(event, StaticEvent::Delegated(delegation)
+                        if delegation.issuer().to_bytes() == alice.group_id()
+                            && delegation.payload().proof.is_none())
+                })
+                .unwrap();
+            incomplete.membership.remove(root);
+            let incomplete = bincode::serialize(&incomplete).unwrap();
+            assert!(
+                Vault::verify_membership(&incomplete, alice.group_id(), bob.kh.id().to_bytes())
+                    .await
+                    .is_err()
+            );
+
+            let mut forged: MembershipProof = bincode::deserialize(&proof).unwrap();
+            let delegation = forged
+                .membership
+                .iter_mut()
+                .find_map(|event| match event {
+                    StaticEvent::Delegated(delegation) => Some(delegation),
+                    _ => None,
+                })
+                .unwrap();
+            *delegation = keyhive_crypto::signed::Signed::new(
+                delegation.payload().clone(),
+                *delegation.issuer(),
+                ed25519_dalek::Signature::from_bytes(&[0; 64]),
+            );
+            assert!(
+                Vault::verify_membership(
+                    &bincode::serialize(&forged).unwrap(),
+                    alice.group_id(),
+                    bob.kh.id().to_bytes(),
+                )
+                .await
+                .is_err()
+            );
+
+            assert!(
+                Vault::verify_membership(
+                    &vec![0; super::MAX_MEMBERSHIP_PROOF_BYTES + 1],
+                    alice.group_id(),
+                    bob.kh.id().to_bytes(),
+                )
+                .await
+                .is_err()
+            );
+            let declared_huge_identity_vec = u64::MAX.to_le_bytes();
+            assert!(
+                Vault::verify_membership(
+                    &declared_huge_identity_vec,
+                    alice.group_id(),
+                    bob.kh.id().to_bytes(),
+                )
+                .await
+                .is_err()
+            );
+        });
+    }
 
     #[test]
     fn raw_open_rejects_wrong_identity_and_unsigned_ancestor_without_side_effects() {

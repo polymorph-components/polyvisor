@@ -30,6 +30,54 @@ use subduction_runtime::transport::Transport;
 
 const APP: &str = "todomvc";
 
+#[derive(Clone, Debug)]
+struct TestTransport {
+    inner: MemoryTransport,
+    closes: Rc<Cell<u64>>,
+}
+
+impl TestTransport {
+    fn pair() -> (Self, Self) {
+        let (a, b, _, _) = Self::tracked_pair();
+        (a, b)
+    }
+
+    fn tracked_pair() -> (Self, Self, Rc<Cell<u64>>, Rc<Cell<u64>>) {
+        let (a, b) = MemoryTransport::pair();
+        let a_closes = Rc::new(Cell::new(0));
+        let b_closes = Rc::new(Cell::new(0));
+        (
+            Self {
+                inner: a,
+                closes: Rc::clone(&a_closes),
+            },
+            Self {
+                inner: b,
+                closes: Rc::clone(&b_closes),
+            },
+            a_closes,
+            b_closes,
+        )
+    }
+}
+
+impl Transport<Local> for TestTransport {
+    type Error = <MemoryTransport as Transport<Local>>::Error;
+
+    fn send_bytes(&self, bytes: Vec<u8>) -> LocalBoxFuture<'_, Result<(), Self::Error>> {
+        Transport::<Local>::send_bytes(&self.inner, bytes)
+    }
+
+    fn recv_bytes(&self) -> LocalBoxFuture<'_, Result<Option<Vec<u8>>, Self::Error>> {
+        Transport::<Local>::recv_bytes(&self.inner)
+    }
+
+    fn disconnect(&self) -> LocalBoxFuture<'_, ()> {
+        self.closes.set(self.closes.get() + 1);
+        Transport::<Local>::disconnect(&self.inner)
+    }
+}
+
 /// A clock whose `sleep` never resolves: no protocol deadline should fire on
 /// a happy path, and one that did would otherwise make the test hang rather
 /// than fail (subduction_runtime/tests/common/mod.rs:36).
@@ -444,27 +492,103 @@ fn preexisting_reverse_side_raw_tree_crosses_catalog_phase() {
 }
 
 #[test]
-fn duplicate_peer_connection_is_rejected_without_revoking_ready_connection() {
+fn reconnect_replaces_an_unreported_old_transport_and_ignores_its_late_close() {
     let mut pool = LocalPool::new();
     let a = device(&pool, 103, None);
     let b = device(&pool, 104, None);
-    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    let (ea, eb, closed_a, closed_b) = (
+        Rc::clone(&a.engine),
+        Rc::clone(&b.engine),
+        Rc::clone(&a.closed),
+        Rc::clone(&b.closed),
+    );
     pool.run_until(async move {
-        wire(&ea, &eb).await;
-        let (ta, tb) = MemoryTransport::pair();
-        let attempts = futures::join!(
-            ea.connect(ta, Direction::Outbound, Some(eb.verifying_key())),
-            eb.connect(tb, Direction::Inbound, None),
-        );
-        assert!(attempts.0.is_ok() && attempts.1.is_ok());
+        enroll(&ea, &eb).await;
         let tree = ea
-            .opaque_replace("after-duplicate", OpaqueMode::CallerEncrypted)
+            .opaque_replace("reconnect-pre-control", OpaqueMode::CallerEncrypted)
             .await
             .unwrap();
-        ea.opaque_publish(tree, vec![], b"synthetic encrypted envelope".to_vec())
+        let (old_a, old_b) = TestTransport::pair();
+        let old = futures::join!(
+            ea.connect(old_a, Direction::Outbound, Some(eb.verifying_key())),
+            eb.connect(old_b, Direction::Inbound, None),
+        );
+        assert!(old.0.is_ok() && old.1.is_ok());
+        // Start the replacement in the opposite direction immediately after
+        // authentication. The old connection has not reported transport
+        // closure and its control work may still be queued.
+        let (ta, tb) = TestTransport::pair();
+        let attempts = futures::join!(
+            eb.connect(ta, Direction::Outbound, Some(ea.verifying_key())),
+            ea.connect(tb, Direction::Inbound, None),
+        );
+        assert!(attempts.0.is_ok() && attempts.1.is_ok());
+        ea.opaque_publish(tree, vec![], b"opaque after reconnect".to_vec())
             .await
             .unwrap();
         until(|| async { (eb.opaque_read(tree).await.ok()?.len() == 1).then_some(()) }).await;
+        ea.tasks_add(APP, "after reconnect from a".into())
+            .await
+            .unwrap();
+        eb.tasks_add(APP, "after reconnect from b".into())
+            .await
+            .unwrap();
+        until(|| async {
+            let mut a = titles(&ea.tasks_items(APP).await.ok()?);
+            let mut b = titles(&eb.tasks_items(APP).await.ok()?);
+            a.sort();
+            b.sort();
+            (a == b && a.len() == 2).then_some(())
+        })
+        .await;
+        assert_eq!(closed_a.get(), 0, "the replacement peer stayed connected");
+        assert_eq!(closed_b.get(), 0, "the replacement peer stayed connected");
+    });
+}
+
+#[test]
+fn simultaneous_dials_choose_one_connection_and_sync_both_directions() {
+    let mut pool = LocalPool::new();
+    let a = device(&pool, 105, None);
+    let b = device(&pool, 106, None);
+    let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
+    pool.run_until(async move {
+        enroll(&ea, &eb).await;
+        let (a_out, b_in, a_out_closes, b_in_closes) = TestTransport::tracked_pair();
+        let (b_out, a_in, b_out_closes, a_in_closes) = TestTransport::tracked_pair();
+        let attempts = futures::join!(
+            ea.connect(a_out, Direction::Outbound, Some(eb.verifying_key())),
+            eb.connect(b_in, Direction::Inbound, None),
+            eb.connect(b_out, Direction::Outbound, Some(ea.verifying_key())),
+            ea.connect(a_in, Direction::Inbound, None),
+        );
+        assert!(attempts.0.is_ok() && attempts.1.is_ok());
+        assert!(attempts.2.is_ok() && attempts.3.is_ok());
+        ea.tasks_add(APP, "simultaneous from a".into())
+            .await
+            .unwrap();
+        eb.tasks_add(APP, "simultaneous from b".into())
+            .await
+            .unwrap();
+        until(|| async {
+            let mut a = titles(&ea.tasks_items(APP).await.ok()?);
+            let mut b = titles(&eb.tasks_items(APP).await.ok()?);
+            a.sort();
+            b.sort();
+            (a == b && a.len() == 2).then_some(())
+        })
+        .await;
+        until(|| async {
+            ((a_out_closes.get() > 0 && b_in_closes.get() > 0)
+                || (b_out_closes.get() > 0 && a_in_closes.get() > 0))
+                .then_some(())
+        })
+        .await;
+        assert_ne!(
+            a_out_closes.get() > 0,
+            b_out_closes.get() > 0,
+            "exactly one physical connection survives simultaneous dials"
+        );
     });
 }
 
@@ -688,7 +812,7 @@ fn retirement_clears_missing_ancestor_frontier_entries() {
     });
 }
 
-type TestEngine = Engine<MemoryTransport>;
+type TestEngine = Engine<TestTransport>;
 
 /// Domain conveniences for sync integration tests. Production composition
 /// lives in the kernel; the engine API itself remains schema-neutral.
@@ -1030,7 +1154,7 @@ async fn wire(a: &TestEngine, b: &TestEngine) {
     // than merging its own group of one into it.
     enroll(a, b).await;
 
-    let (ta, tb) = MemoryTransport::pair();
+    let (ta, tb) = TestTransport::pair();
     let b_key = b.verifying_key();
     let inbound = RefCell::new(None);
     let (peer_a, ()) =
@@ -1079,7 +1203,7 @@ async fn enroll(adder: &TestEngine, joiner: &TestEngine) {
 
 /// Wire two engines together without enrolling: the group is already shared.
 async fn wire_only(a: &TestEngine, b: &TestEngine) {
-    let (ta, tb) = MemoryTransport::pair();
+    let (ta, tb) = TestTransport::pair();
     let b_key = b.verifying_key();
     let inbound = RefCell::new(None);
     let _ = futures::future::join(a.connect(ta, Direction::Outbound, Some(b_key)), async {
@@ -1312,7 +1436,7 @@ fn a_dead_connection_notifies_the_caller_once() {
     let (ea, eb) = (Rc::clone(&a.engine), Rc::clone(&b.engine));
 
     pool.run_until(async move {
-        let (ta, tb) = MemoryTransport::pair();
+        let (ta, tb) = TestTransport::pair();
         // A second handle on B's end, to close the wire from outside.
         let b_wire = tb.clone();
         let b_key = eb.verifying_key();
@@ -1565,7 +1689,7 @@ fn a_joiner_walks_the_ancestry_from_a_single_key() {
         .unwrap();
         eb.adopt_keyhive(&keyhive, &trimmed).await.unwrap();
 
-        let (ta, tb) = MemoryTransport::pair();
+        let (ta, tb) = TestTransport::pair();
         let b_key = eb.verifying_key();
         let inbound = RefCell::new(None);
         let _ = futures::future::join(ea.connect(ta, Direction::Outbound, Some(b_key)), async {

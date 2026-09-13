@@ -534,25 +534,58 @@ pub(crate) struct Contact {
     pub(crate) public_key: Vec<u8>,
     pub(crate) petname: String,
     pub(crate) glyph: String,
+    pub(crate) official_profiles: Vec<ProfileVariant>,
+    pub(crate) authenticated: Option<AuthenticatedIdentity>,
     pub(crate) observations: Vec<Observation>,
     pub(crate) preferred: Vec<(String, String)>,
 }
 
 #[derive(Clone, PartialEq)]
+pub(crate) struct AuthenticatedIdentity {
+    pub(crate) binding: Vec<u8>,
+    pub(crate) profiles: Vec<Vec<u8>>,
+    pub(crate) authority_device: Vec<u8>,
+    pub(crate) authority_proof: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq)]
 pub(crate) struct SelfProfile {
     pub(crate) public_key: Vec<u8>,
-    pub(crate) observations: Vec<Observation>,
+    pub(crate) variants: Vec<ProfileVariant>,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct ProfileVariant {
+    pub(crate) token: Vec<u8>,
+    pub(crate) claims: Vec<(AppText, AppText)>,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct IdentityStatus {
+    pub(crate) root: Vec<u8>,
+    pub(crate) group: Vec<u8>,
+    pub(crate) has_root: bool,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct BackupStatus {
+    pub(crate) has_root: bool,
+    pub(crate) synced: bool,
 }
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct Party {
     pub(crate) public_key: Vec<u8>,
     pub(crate) claims: Vec<(String, String)>,
+    pub(crate) expected_profiles: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct Introduction {
     pub(crate) issuer: Party,
+    pub(crate) expected_profiles: Vec<Vec<u8>>,
+    pub(crate) forwarded_contact_ids: Vec<String>,
+    pub(crate) expected_forwarded: Vec<AuthenticatedIdentity>,
     pub(crate) parties: Vec<Party>,
 }
 
@@ -581,6 +614,19 @@ pub(crate) struct ImportReview {
     pub(crate) parties: Vec<ImportParty>,
     pub(crate) signed: bool,
     pub(crate) summary: String,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct SignedIdentityReview {
+    pub(crate) root: Vec<u8>,
+    pub(crate) group: Vec<u8>,
+    pub(crate) profiles: Vec<Vec<(AppText, AppText)>>,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct SignedReview {
+    pub(crate) identities: Vec<SignedIdentityReview>,
+    pub(crate) parties: Vec<Party>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -647,6 +693,24 @@ fn contact(value: api::contacts::Contact) -> Contact {
         public_key: value.public_key,
         petname: value.petname,
         glyph: crate::glyph::normalize_glyph(&value.glyph).to_string(),
+        official_profiles: value
+            .official_profiles
+            .into_iter()
+            .map(|variant| ProfileVariant {
+                token: variant.token,
+                claims: variant
+                    .claims
+                    .into_iter()
+                    .map(|(name, value)| (AppText::from_kernel(name), AppText::from_kernel(value)))
+                    .collect(),
+            })
+            .collect(),
+        authenticated: value.authenticated.map(|identity| AuthenticatedIdentity {
+            binding: identity.binding,
+            profiles: identity.profiles,
+            authority_device: identity.authority_device,
+            authority_proof: identity.authority_proof,
+        }),
         observations: value.observations.into_iter().map(observation).collect(),
         preferred: value.preferred,
     }
@@ -702,13 +766,24 @@ pub(crate) async fn contacts_items() -> Result<Vec<Contact>, String> {
         .collect())
 }
 pub(crate) async fn contacts_profile() -> Result<SelfProfile, String> {
-    api::contacts::profile()
-        .await
-        .map_err(message)
-        .map(|p| SelfProfile {
-            public_key: p.public_key,
-            observations: p.observations.into_iter().map(observation).collect(),
-        })
+    api::identity::profile().await.map_err(message).map(|p| {
+        let variants: Vec<_> = p
+            .variants
+            .into_iter()
+            .map(|variant| ProfileVariant {
+                token: variant.token,
+                claims: variant
+                    .claims
+                    .into_iter()
+                    .map(|(name, value)| (AppText::from_kernel(name), AppText::from_kernel(value)))
+                    .collect(),
+            })
+            .collect();
+        SelfProfile {
+            public_key: p.root,
+            variants,
+        }
+    })
 }
 pub(crate) async fn contacts_meetings() -> Result<Vec<MeetingRecord>, String> {
     Ok(api::contacts::meetings()
@@ -776,27 +851,23 @@ pub(crate) async fn contacts_delete(id: String) -> Result<(), String> {
 pub(crate) async fn contacts_merge(from: String, into: String) -> Result<(), String> {
     api::contacts::merge(from, into).await.map_err(message)
 }
-pub(crate) async fn contacts_set_self_observation(
-    name: String,
-    value: String,
-) -> Result<(), String> {
-    api::contacts::set_self_observation(name, value)
-        .await
-        .map_err(message)
-}
-pub(crate) async fn contacts_remove_self_observation(
-    name: String,
-    value: String,
-) -> Result<(), String> {
-    api::contacts::remove_self_observation(name, value)
-        .await
-        .map_err(message)
-}
 pub(crate) async fn contacts_share(value: Introduction) -> Result<Vec<u8>, String> {
-    api::contacts::share(api::contacts::Introduction {
-        issuer: raw_party(value.issuer),
-        parties: value.parties.into_iter().map(raw_party).collect(),
-    })
+    api::contacts::share(
+        value.issuer.public_key,
+        value.expected_profiles,
+        value.forwarded_contact_ids,
+        value
+            .expected_forwarded
+            .into_iter()
+            .map(|identity| api::contacts::AuthenticatedIdentity {
+                binding: identity.binding,
+                profiles: identity.profiles,
+                authority_device: identity.authority_device,
+                authority_proof: identity.authority_proof,
+            })
+            .collect(),
+        value.parties.into_iter().map(raw_party).collect(),
+    )
     .await
     .map_err(message)
 }
@@ -828,6 +899,42 @@ pub(crate) async fn contacts_import_preview(bytes: &[u8]) -> Result<ImportReview
             summary: r.summary,
         })
 }
+pub(crate) async fn contacts_signed_preview(bytes: &[u8]) -> Result<SignedReview, String> {
+    api::contacts::signed_preview(bytes.to_vec())
+        .await
+        .map_err(message)
+        .map(|review| SignedReview {
+            identities: review
+                .identities
+                .into_iter()
+                .map(|identity| SignedIdentityReview {
+                    root: identity.root,
+                    group: identity.group,
+                    profiles: identity
+                        .profiles
+                        .into_iter()
+                        .map(|profile| {
+                            profile
+                                .into_iter()
+                                .map(|(name, value)| {
+                                    (AppText::from_kernel(name), AppText::from_kernel(value))
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                })
+                .collect(),
+            parties: review
+                .parties
+                .into_iter()
+                .map(|party| Party {
+                    public_key: party.public_key,
+                    claims: party.claims,
+                    expected_profiles: Vec::new(),
+                })
+                .collect(),
+        })
+}
 pub(crate) async fn decode_link(body: String) -> Result<Vec<u8>, String> {
     api::contacts::decode_link(body).await.map_err(message)
 }
@@ -836,7 +943,7 @@ pub(crate) async fn contacts_import_accept(
     source: String,
     selections: Vec<Selection>,
 ) -> Result<Vec<String>, String> {
-    api::contacts::import_accept(
+    api::contacts::import_unsigned(
         bytes.to_vec(),
         source,
         selections
@@ -850,14 +957,88 @@ pub(crate) async fn contacts_import_accept(
     .await
     .map_err(message)
 }
-pub(crate) async fn meeting_offer(card: Party) -> Result<MeetingPhase, String> {
-    api::meeting::offer(raw_party(card))
+pub(crate) async fn contacts_signed_accept(
+    bytes: &[u8],
+    roots: Vec<Vec<u8>>,
+    parties: Vec<u32>,
+) -> Result<String, String> {
+    api::contacts::import_accept(bytes.to_vec(), roots, parties, String::new(), String::new())
+        .await
+        .map_err(message)
+}
+
+pub(crate) async fn identity_status() -> Result<IdentityStatus, String> {
+    api::identity::status()
+        .await
+        .map_err(message)
+        .map(|value| IdentityStatus {
+            root: value.root,
+            group: value.group,
+            has_root: value.has_root,
+        })
+}
+pub(crate) async fn resolve_profile(
+    expected: Vec<Vec<u8>>,
+    claims: Vec<(String, String)>,
+) -> Result<SelfProfile, String> {
+    api::identity::resolve_profile(expected, claims)
+        .await
+        .map_err(message)
+        .map(|_| ())?;
+    contacts_profile().await
+}
+pub(crate) async fn root_transfer(endpoint: String) -> Result<(), String> {
+    api::identity::root_transfer(endpoint)
+        .await
+        .map_err(message)
+}
+pub(crate) async fn backup_status() -> Result<BackupStatus, String> {
+    api::identity::backup_status()
+        .await
+        .map_err(message)
+        .map(|value| BackupStatus {
+            has_root: value.has_root,
+            synced: value.synced,
+        })
+}
+pub(crate) async fn backup_export(passphrase: String) -> Result<Vec<u8>, String> {
+    api::identity::backup_export(passphrase)
+        .await
+        .map_err(message)
+}
+pub(crate) async fn backup_import(passphrase: String, bytes: Vec<u8>) -> Result<(), String> {
+    api::identity::backup_import(passphrase, bytes)
+        .await
+        .map_err(message)
+}
+pub(crate) async fn backup_sync_replace(passphrase: String) -> Result<(), String> {
+    api::identity::backup_sync_replace(passphrase)
+        .await
+        .map_err(message)
+}
+pub(crate) async fn backup_sync_disable() -> Result<(), String> {
+    api::identity::backup_sync_disable().await.map_err(message)
+}
+pub(crate) async fn backup_sync_unlock(passphrase: String) -> Result<(), String> {
+    api::identity::backup_sync_unlock(passphrase)
+        .await
+        .map_err(message)
+}
+pub(crate) async fn meeting_offer(
+    card: Party,
+    expected_profiles: Vec<Vec<u8>>,
+) -> Result<MeetingPhase, String> {
+    api::meeting::offer(card.public_key, expected_profiles)
         .await
         .map_err(message)
         .map(meeting_phase)
 }
-pub(crate) async fn meeting_join(fragment: String, card: Party) -> Result<MeetingPhase, String> {
-    api::meeting::join(fragment, raw_party(card))
+pub(crate) async fn meeting_join(
+    fragment: String,
+    card: Party,
+    expected_profiles: Vec<Vec<u8>>,
+) -> Result<MeetingPhase, String> {
+    api::meeting::join(fragment, card.public_key, expected_profiles)
         .await
         .map_err(message)
         .map(meeting_phase)

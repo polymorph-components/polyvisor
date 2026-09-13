@@ -105,6 +105,9 @@ impl IndexRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
     pub name: String,
+    /// Optional local custody of the user's root signing seed. This is sealed
+    /// in the device checkpoint and never enters a replicated document.
+    pub root_seed: Option<[u8; 32]>,
     #[serde(skip)]
     pub hue: u16,
     #[serde(skip)]
@@ -137,6 +140,7 @@ impl Device {
     pub fn mint(rng: &dyn crate::Rng) -> Device {
         Device {
             name: generate_petname(rng, ""),
+            root_seed: None,
             hue: (draw(rng) % 360) as u16,
             meta: Meta {
                 user: BTreeMap::from([("petname".into(), generate_petname(rng, ""))]),

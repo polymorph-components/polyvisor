@@ -34,6 +34,7 @@ import { socketsImports } from "./platform/sockets.ts";
 
 import { serveInterfaces } from "./rpc.ts";
 import { kv } from "./platform/kv.ts";
+import { createBackupKdf } from "./platform/backup-kdf.ts";
 
 // The `dom` lib does not describe a SharedWorker's global scope, and pulling
 // in `webworker` alongside `dom` conflicts on most of the DOM. This is the
@@ -60,6 +61,8 @@ const I = {
   tasks: "polyvisor:app/tasks@0.1.0",
   contacts: "polyvisor:internal/contacts@0.1.0",
   meeting: "polyvisor:internal/meeting@0.1.0",
+  backupKdf: "polyvisor:internal/backup-kdf@0.1.0",
+  identity: "polyvisor:internal/identity@0.1.0",
 } as const;
 
 /** The runtime's exports, keyed by verbatim interface id. */
@@ -79,6 +82,7 @@ interface Tab {
   port: MessagePort;
   queue: KernelEvent[];
   waiter?: (ev: KernelEvent) => void;
+  helloed: boolean;
 }
 
 /** Deepest a tab's backlog may grow. A tab that stops calling `events.next`
@@ -88,6 +92,55 @@ interface Tab {
 const QUEUE_LIMIT = 64;
 
 const tabs = new Set<Tab>();
+
+let nextKdfRequest = 0;
+let kdfOwner: Tab | undefined;
+const kdfWaiters = new Map<number, {
+  tab: Tab;
+  resolve: (key: Uint8Array) => void;
+  reject: (error: Error) => void;
+  timeout: number;
+}>();
+
+const backupKdf = createBackupKdf(({ passphrase, salt }) => {
+  const tab = kdfOwner;
+  if (tab === undefined || !tab.helloed) {
+    return Promise.reject(new Error("the requesting tab cannot run backup KDF"));
+  }
+  const id = ++nextKdfRequest;
+  return new Promise<Uint8Array>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      kdfWaiters.delete(id);
+      tab.port.postMessage({ t: "kdf-cancel", id });
+      reject(new Error("backup KDF worker timed out"));
+    }, 31_000);
+    kdfWaiters.set(id, { tab, resolve, reject, timeout });
+    tab.port.postMessage({ t: "kdf-request", id, passphrase, salt });
+  });
+});
+
+async function withKdfOwner<T>(tab: Tab, operation: () => Promise<T>): Promise<T> {
+  if (!tab.helloed) throw new Error("the requesting tab has departed");
+  if (kdfOwner !== undefined) throw new Error("backup key derivation is busy");
+  kdfOwner = tab;
+  try {
+    return await operation();
+  } finally {
+    if (kdfOwner === tab) kdfOwner = undefined;
+  }
+}
+
+function depart(tab: Tab): void {
+  tab.helloed = false;
+  tabs.delete(tab);
+  for (const [id, waiter] of kdfWaiters) {
+    if (waiter.tab !== tab) continue;
+    kdfWaiters.delete(id);
+    clearTimeout(waiter.timeout);
+    tab.port.postMessage({ t: "kdf-cancel", id });
+    waiter.reject(new Error("the requesting tab departed"));
+  }
+}
 
 // ---------------------------------------------------------------------------
 // The device this worker is
@@ -221,6 +274,7 @@ async function loadRuntime(device: string): Promise<Exports> {
       ...socketsImports(),
       "polyvisor:internal/kv@0.1.0": kv,
       [I.locks]: locks,
+      [I.backupKdf]: backupKdf,
     },
     // No realm needs JSPI (docs/design.md "No JSPI"). Every glue-implemented
     // import is an `async func` whose callback ABI never blocks a frame, and
@@ -350,7 +404,6 @@ function mintSessionPort(
 const CONTACTS_METHODS = [
   "items",
   "get",
-  "profile",
   "meetings",
   "decodeLink",
   "create",
@@ -360,16 +413,26 @@ const CONTACTS_METHODS = [
   "setPreferred",
   "delete",
   "merge",
-  "setSelfObservation",
-  "removeSelfObservation",
   "share",
   "importPreview",
+  "signedPreview",
+  "importUnsigned",
   "importAccept",
 ] as const;
 
 /// runtime/wit/internal.wit `interface meeting`'s methods, camelCase.
 const MEETING_METHODS = ["offer", "join", "confirm", "cancel", "status"] as
   const;
+
+/// runtime/wit/internal.wit `interface identity`'s methods, camelCase.
+const IDENTITY_METHODS = [
+  "status",
+  "profile",
+  "resolveProfile",
+  "rootTransfer",
+  "backupStatus",
+  "backupSyncDisable",
+] as const;
 
 /**
  * Forward each of `names` verbatim to the runtime's own export of `iface`,
@@ -395,7 +458,7 @@ function forwardMethods(
 
 self.onconnect = (ev: MessageEvent) => {
   const port = ev.ports[0];
-  const tab: Tab = { port, queue: [] };
+  const tab: Tab = { port, queue: [], helloed: false };
   tabs.add(tab);
 
   // Non-WIT control traffic: the device hello and the frame-port request.
@@ -438,9 +501,32 @@ self.onconnect = (ev: MessageEvent) => {
             `this worker is device ${hello.device}, not ${device} — the ` +
             `browser matched two SharedWorker names to one worker`,
         });
-        tabs.delete(tab);
+        depart(tab);
         port.close();
+      } else {
+        tab.helloed = true;
+        tabs.delete(tab);
+        tabs.add(tab);
       }
+      if (hello?.device === device && tabs.has(tab)) tab.helloed = true;
+      return;
+    }
+
+    if (t === "depart") {
+      depart(tab);
+      return;
+    }
+
+    if (t === "kdf-response") {
+      const id = (data as { id: number }).id;
+      const waiter = kdfWaiters.get(id);
+      if (waiter === undefined || waiter.tab !== tab) return;
+      kdfWaiters.delete(id);
+      clearTimeout(waiter.timeout);
+      const key = (data as { key?: unknown }).key;
+      const error = (data as { error?: unknown }).error;
+      if (key instanceof Uint8Array) waiter.resolve(key);
+      else waiter.reject(new Error(String(error ?? "backup KDF failed")));
       return;
     }
 
@@ -557,11 +643,34 @@ self.onconnect = (ev: MessageEvent) => {
         });
       },
     },
-    // Control port only, like `sync`/`pairing`: contacts and meetings are
-    // trusted-runtime state, never reachable from an app session
-    // (`mintSessionPort` above does not serve either).
+    // Control port only, like `sync`/`pairing`: contacts, meetings and
+    // identity are trusted-runtime state, never reachable from an app
+    // session (`mintSessionPort` above serves none of them).
     [I.contacts]: forwardMethods(I.contacts, CONTACTS_METHODS),
     [I.meeting]: forwardMethods(I.meeting, MEETING_METHODS),
+    [I.identity]: {
+      ...forwardMethods(I.identity, IDENTITY_METHODS),
+      backupExport: async (passphrase: string) =>
+        withKdfOwner(
+          tab,
+          async () => (await ready)[I.identity].backupExport(passphrase),
+        ),
+      backupImport: async (passphrase: string, envelope: Uint8Array) =>
+        withKdfOwner(
+          tab,
+          async () => (await ready)[I.identity].backupImport(passphrase, envelope),
+        ),
+      backupSyncReplace: async (passphrase: string) =>
+        withKdfOwner(
+          tab,
+          async () => (await ready)[I.identity].backupSyncReplace(passphrase),
+        ),
+      backupSyncUnlock: async (passphrase: string) =>
+        withKdfOwner(
+          tab,
+          async () => (await ready)[I.identity].backupSyncUnlock(passphrase),
+        ),
+    },
   });
 
   void ready.then(() => {

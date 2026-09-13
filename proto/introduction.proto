@@ -4,17 +4,52 @@ package polyvisor.introduction.v0;
 
 import "google/protobuf/timestamp.proto";
 
+message SignedRootBinding {
+  bytes binding = 1;
+  bytes signature = 2;
+}
+
+message RootBinding {
+  uint32 version = 1;
+  bytes root_public_key = 2;
+  bytes group_id = 3;
+}
+
+message SignedProfile {
+  bytes profile = 1;
+  bytes signature = 2;
+}
+
+message Profile {
+  uint32 version = 1;
+  bytes subject_root = 2;
+  bytes issuer_root = 3;
+  repeated Claim claims = 4;
+}
+
 message SignedIntroduction {
   bytes introduction = 1;
   bytes signature = 2;
 }
 
 message Introduction {
-  Party issuer = 1;
-  repeated Party parties = 2;
-  google.protobuf.Timestamp issued_at = 3;
+  uint32 version = 1;
+  AuthenticatedIdentity issuer = 2;
+  bytes device_signing_key = 3;
+  repeated AuthenticatedIdentity authenticated_identities = 4;
+  repeated Party parties = 5;
+  google.protobuf.Timestamp issued_at = 6;
 }
 
+message AuthenticatedIdentity {
+  bytes root_binding = 1;
+  repeated bytes profiles = 2;
+  bytes authority_device = 3;
+  bytes keyhive_authority_proof = 4;
+}
+
+// These are explicitly observations asserted by issuer_root. They are not
+// official claims made by public_key's holder.
 message Party {
   bytes public_key = 1;
   repeated Claim claims = 2;

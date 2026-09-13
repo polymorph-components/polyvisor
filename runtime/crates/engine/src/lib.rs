@@ -189,6 +189,12 @@ pub struct Engine<T: Transport<Local> + 'static> {
     opaque_nonce: RefCell<u64>,
     control_phases: RefCell<BTreeMap<subduction_protocol::id::ConnId, ControlPhase>>,
     control_initiators: RefCell<BTreeSet<subduction_protocol::id::ConnId>>,
+    /// Connections already authenticated when each replacement attempt
+    /// began. This distinguishes a stale predecessor from a genuinely
+    /// simultaneous opposite-direction dial.
+    connection_predecessors: RefCell<
+        BTreeMap<subduction_protocol::id::ConnId, BTreeSet<subduction_protocol::id::ConnId>>,
+    >,
     remote_catalogs: RefCell<BTreeMap<subduction_protocol::id::ConnId, Vec<SedimentreeId>>>,
     pending_catalogs: RefCell<BTreeMap<subduction_protocol::id::ConnId, Vec<SedimentreeId>>>,
     catalog_sent: RefCell<BTreeSet<subduction_protocol::id::ConnId>>,
@@ -315,6 +321,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             opaque_nonce: RefCell::new(0),
             control_phases: RefCell::new(BTreeMap::new()),
             control_initiators: RefCell::new(BTreeSet::new()),
+            connection_predecessors: RefCell::new(BTreeMap::new()),
             remote_catalogs: RefCell::new(BTreeMap::new()),
             pending_catalogs: RefCell::new(BTreeMap::new()),
             catalog_sent: RefCell::new(BTreeSet::new()),
@@ -766,6 +773,36 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             .await
     }
 
+    /// The stable Keyhive group bound by the user's root identity.
+    pub async fn authority_group(&self) -> Result<[u8; 32], String> {
+        self.open_us().await?;
+        Ok(self.require_vault()?.group_id())
+    }
+
+    /// Public Keyhive authority material for introductions and transfer.
+    pub async fn membership_proof(&self) -> Result<Vec<u8>, String> {
+        self.open_us().await?;
+        self.require_vault()?.membership_proof().await
+    }
+
+    /// Current Keyhive materialized device authority. This is the transfer
+    /// gate; `us` is only the transport-policy mirror.
+    pub async fn authority_members(&self) -> Result<Vec<[u8; 32]>, String> {
+        self.open_us().await?;
+        self.require_vault()?.members().await
+    }
+
+    /// Verify membership from one complete public authority snapshot.
+    pub async fn verify_membership(
+        &self,
+        proof: &[u8],
+        group: [u8; 32],
+        device: [u8; 32],
+    ) -> Result<(), String> {
+        self.open_us().await?;
+        Vault::verify_membership(proof, group, device).await
+    }
+
     // -- keyhive enrollment ---------------------------------------------------
 
     /// This device's keyhive contact card, for the joiner's ACCEPT frame.
@@ -841,6 +878,16 @@ impl<T: Transport<Local> + 'static> Engine<T> {
     pub async fn us_save(&self) -> Result<Vec<u8>, String> {
         self.open_us().await?;
         Ok(self.with_us(UsDoc::save))
+    }
+
+    /// Validate an incoming pairing document without mutating this engine and
+    /// return the Keyhive group it names. The kernel uses this to compare the
+    /// signed user binding before beginning the multi-document adoption.
+    pub fn adoption_group(&self, bytes: &[u8], adder: [u8; 32]) -> Result<[u8; 32], String> {
+        UsDoc::adopt(bytes, self.seed, self.verifying_key().to_bytes(), adder)?
+            .keyhive()
+            .map(|(group, _document)| group)
+            .ok_or_else(|| "that device sent a group with no keyhive state".to_string())
     }
 
     /// **Replace** this device's user-system document with the one an adder
@@ -1007,6 +1054,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         direction: Direction,
         expected_peer: Option<VerifyingKey>,
     ) -> Result<PeerId, String> {
+        let predecessors: BTreeSet<_> = self.conns.borrow().iter().map(Connection::id).collect();
         self.hydrate().await?;
         // Before `trees()`: the group is the one document every device of a
         // user syncs unconditionally, so a connection subscribes to it even
@@ -1022,21 +1070,22 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         // read loop is feeding the driver.
         (self.spawn)(Box::pin(read_loop));
         let conn = pending.authenticated().await.map_err(|e| e.to_string())?;
-        let duplicate = self
-            .conns
-            .borrow()
-            .iter()
-            .any(|existing| existing.peer() == conn.peer());
-        if duplicate {
-            let peer = conn.peer();
-            conn.disconnect().await;
-            return Ok(peer);
-        }
-
         // Register before requesting control: a fast in-memory peer can return
         // SyncFinished before this future is polled again, and the event pump
         // needs the capability to schedule the next (keyhive) phase.
         self.conns.borrow_mut().push(conn.clone());
+        let same_peer_predecessors = self
+            .conns
+            .borrow()
+            .iter()
+            .filter(|existing| {
+                existing.peer() == conn.peer() && predecessors.contains(&existing.id())
+            })
+            .map(Connection::id)
+            .collect();
+        self.connection_predecessors
+            .borrow_mut()
+            .insert(conn.id(), same_peer_predecessors);
         // Every connection runs its own control phase in both directions.
         // Marking the peer pending immediately also prevents a second live
         // connection from inheriting an earlier connection's readiness.
@@ -1125,8 +1174,75 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                     self.control_phases
                         .borrow_mut()
                         .insert(conn, ControlPhase::Ready);
+                    // A reconnect supersedes connections that predated its
+                    // attempt, even if a ghost never completed control. Clear
+                    // their bookkeeping now; their eventual close event must
+                    // not revoke this connection's readiness.
+                    let predecessor_ids = self
+                        .connection_predecessors
+                        .borrow_mut()
+                        .remove(&conn)
+                        .unwrap_or_default();
+                    let predecessors: Vec<_> = self
+                        .conns
+                        .borrow()
+                        .iter()
+                        .filter(|live| predecessor_ids.contains(&live.id()))
+                        .cloned()
+                        .collect();
+                    for predecessor in &predecessors {
+                        self.forget_connection(predecessor.id());
+                    }
+                    for predecessor in predecessors {
+                        predecessor.disconnect().await;
+                    }
                     self.rebuild_ready_peers();
                     let connection = self.conns.borrow().iter().find(|c| c.id() == conn).cloned();
+                    let connection = if let Some(current) = connection {
+                        let peer = current.peer();
+                        // Retire duplicates only after the replacement has
+                        // completed control. Opposite simultaneous dials use
+                        // peer-id order so both endpoints retain the same
+                        // wire; repeated dials in that direction keep the
+                        // newest local connection.
+                        let prefer_outbound = self.peer < peer;
+                        let (winner, losers) = {
+                            let initiators = self.control_initiators.borrow();
+                            let phases = self.control_phases.borrow();
+                            let conns = self.conns.borrow();
+                            let ready: Vec<_> = conns
+                                .iter()
+                                .filter(|live| {
+                                    live.peer() == peer
+                                        && phases.get(&live.id()) == Some(&ControlPhase::Ready)
+                                })
+                                .cloned()
+                                .collect();
+                            let preferred_exists = ready
+                                .iter()
+                                .any(|live| initiators.contains(&live.id()) == prefer_outbound);
+                            let winner = ready
+                                .iter()
+                                .filter(|live| {
+                                    !preferred_exists
+                                        || initiators.contains(&live.id()) == prefer_outbound
+                                })
+                                .max_by_key(|live| live.id())
+                                .expect("the current connection is ready")
+                                .id();
+                            let losers = ready
+                                .into_iter()
+                                .filter(|live| live.id() != winner)
+                                .collect::<Vec<_>>();
+                            (winner, losers)
+                        };
+                        for loser in losers {
+                            loser.disconnect().await;
+                        }
+                        (winner == conn).then_some(current)
+                    } else {
+                        None
+                    };
                     let should_send = self.catalog_sent.borrow_mut().insert(conn);
                     if let Some(connection) = connection
                         && should_send
@@ -1156,14 +1272,17 @@ impl<T: Transport<Local> + 'static> Engine<T> {
                 // in `conns` forever, and every later `open_app` would try to
                 // subscribe a tree on it.
                 AppEvent::ConnectionClosed { conn, peer } => {
-                    self.conns.borrow_mut().retain(|live| live.id() != conn);
-                    self.control_phases.borrow_mut().remove(&conn);
-                    self.control_initiators.borrow_mut().remove(&conn);
-                    self.remote_catalogs.borrow_mut().remove(&conn);
-                    self.pending_catalogs.borrow_mut().remove(&conn);
-                    self.catalog_sent.borrow_mut().remove(&conn);
+                    self.forget_connection(conn);
                     self.rebuild_ready_peers();
-                    notify(EngineEvent::PeerClosed(peer)).await;
+                    // Retiring a predecessor still reports its authenticated
+                    // peer. The peer did not go away while its replacement
+                    // connection remains.
+                    let peer_still_connected = peer.is_some_and(|closed| {
+                        self.conns.borrow().iter().any(|live| live.peer() == closed)
+                    });
+                    if !peer_still_connected {
+                        notify(EngineEvent::PeerClosed(peer)).await;
+                    }
                 }
                 _ => continue,
             }
@@ -1702,6 +1821,20 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             .into_iter()
             .filter_map(|(peer, (all, ready))| (all == ready).then_some((peer, ready)))
             .collect();
+    }
+
+    fn forget_connection(&self, conn: subduction_protocol::id::ConnId) {
+        self.conns.borrow_mut().retain(|live| live.id() != conn);
+        self.control_phases.borrow_mut().remove(&conn);
+        self.control_initiators.borrow_mut().remove(&conn);
+        let mut predecessors = self.connection_predecessors.borrow_mut();
+        predecessors.remove(&conn);
+        for ids in predecessors.values_mut() {
+            ids.remove(&conn);
+        }
+        self.remote_catalogs.borrow_mut().remove(&conn);
+        self.pending_catalogs.borrow_mut().remove(&conn);
+        self.catalog_sent.borrow_mut().remove(&conn);
     }
 
     async fn maybe_sync_catalog(&self, id: subduction_protocol::id::ConnId) {

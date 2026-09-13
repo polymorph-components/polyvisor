@@ -176,52 +176,93 @@ nothing.
 
 ## Component-owned data models (direction)
 
-### Contacts v0: trusted identity management
+### User identity and contacts v0
 
-Contacts belong to the trusted runtime and visor. Identity establishment,
-key bindings, merges, and introductions signed as the user are permission
-decisions; an ordinary app must not silently perform them. A contacts app
-API waits for an actual consumer. The contact store is a new encrypted
-user document, not part of the plaintext `polyvisor:us` device-membership
-document. Its user signing identity is distinct from device transport
-identities and follows the user's device group.
+Identity and contacts belong to the trusted Rust runtime and visor; apps
+have no identity-management API. The contacts document is encrypted with
+the user's other documents. The Ed25519 root public key identifies the
+user, separately from each device's transport/signing key. There is no
+additional user ID or identity log.
 
-An introduction is a Protobuf payload containing an issuer `Party`, zero
-or more additional parties, and an issuer-asserted timestamp. Each party
-contains its Ed25519 public key and name/value claims. All assertions are
-the issuer's, including self-claims; inclusion establishes neither the
-subject's consent nor any relationship between other subjects. An issuer
-alone is a self-introduction. The signature covers the domain
-`polyvisor:introduction:v0`, one NUL byte, and the exact payload bytes;
-verification never depends on protobuf reserialization. V0 has no
-additional secrecy beyond transport encryption.
+The root signs an explicit versioned binding to the stable Keyhive GroupId.
+One group is accepted per root; another root-signed group does not replace
+that binding. Devices remain ordinary Keyhive Admin members, including the
+founding device's existing authority. Any member can enroll another.
+Devices are trusted for the lifetime of this v0 group: removal, rotation,
+succession and recovery authority are deferred. Local erasure is not
+revocation, and the root is not a Keyhive managing principal.
 
-The visor previews and selects claims before signing. Keys are mandatory,
-only name is selected by default, and all other claims require selection.
-A local petname must not silently become a shared name. "Meet now" uses a
-separate encrypted connection, QR/link bootstrap, and explicit mutual
-comparison and acceptance; it never enrolls either participant into the
-other's device group. "Share my contact" exports a portable introduction
-for asynchronous exchange. Temporary rendezvous data belongs to the
-meeting wrapper, not the introduction. Incoming links are processed only
-after unseal and never accept contacts automatically.
+The founder initially holds the independently generated root seed in its
+local sealed checkpoint. Pairing adopts the public binding/profile and
+clears the joiner's prior root custody; it never copies the root secret.
+Any root holder can explicitly copy it to a named member through the visor
+over an authenticated encrypted connection. The recipient checkpoints it
+before acknowledging receipt. Custody is visible in the visor. A copy can
+be copied again and cannot be revoked in v0. Possessing the root alone
+does not restore Keyhive membership or document decryption keys.
 
-On receipt the runtime verifies the introduction transiently, then stores
-only selected extracted observations. Original payloads and signatures
-must never enter document history or checkpoints. The store preserves
-provenance, not transferable proof: claims identify their subject, issuer,
-asserted time, and a stable meeting ID. A separate meeting collection
-records receipt time, source/method, and verification performed. Manual
-edits and contact-list imports have their own provenance; imports cannot
-claim remote authentication. Sharing later creates the user's own signed
-assertions rather than forwarding an earlier issuer's proof.
+The root signs whole official self-profiles. Devices without it can read
+and share these profiles, but cannot edit official claims. Concurrent
+root-holder edits remain current Automerge register conflicts, each with
+its intact signature; no timestamp selects a winner. Resolution writes a
+whole profile against the exact variants the editor observed. There is no
+separate profile-history graph.
 
-Local petnames and preferred values are distinct from observed claims and
-are not overwritten by newer third-party assertions. Imported contacts
-can exist without a public key. Key matches can establish identical
-subjects; names, email addresses, and phone numbers alone cannot justify
-an automatic identity merge. The contact screen presents preferred values
-with an inspectable claim and meeting history.
+Introductions are device-signed Protobuf payloads carrying the issuer's
+binding, profiles and public Keyhive membership proof. Verification checks
+the explicit root binding, each profile's subject/issuer equality, device
+signature and membership in that exact group in isolated Keyhive state.
+Proofs contain public identity/membership operations, not archives or
+content keys; oversized, forged or incomplete proofs are rejected. A
+self-contained proof describes its supplied history, not globally fresh
+offline membership. Signature domains are distinct (`root-group-binding`,
+`self-profile`, `introduction`, each under `polyvisor:…:v0` plus NUL), and
+signatures cover exact payload bytes rather than reserialization.
+
+Portable introductions can forward other subjects' intact root-signed
+profiles and authority material. These are separate from the introducing
+device's observations about them. Local petnames remain private. Official
+profiles are disclosed whole, with every variant shown in the visor; the
+signing call checks the preview's exact profile/binding material. Imports
+select whole authenticated identities and separately select observation
+parties. Root-authenticated artifacts are retained for redistribution;
+the ordinary introduction signature stays transient. Observations keep
+subject, issuer, asserted time and meeting provenance. Unsigned imports
+cannot claim authentication. Local contact IDs are independent of root
+keys, and names/email/phone alone do not justify automatic identity merges.
+
+"Meet now" remains an issuer-only introduction over its own encrypted
+connection with explicit comparison and whole-profile acceptance. It never
+enrolls either participant. Links are processed only after unseal and never
+accept contacts automatically.
+
+### Optional root backups
+
+Backup v1 is one fixed 162-byte envelope shared by file export/import and
+the optional synced backup. Argon2id v1.3 uses 64 MiB, three passes, one
+lane; AES-256-GCM authenticates the format, KDF fields, root, group, salt
+and nonce. Each export draws a fresh salt and nonce. Import validates the
+exact size and costs before derivation, checks the expected root/group,
+and verifies the decrypted seed's public key. Unlock explicitly installs
+root custody locally; no seed enters replicated documents, URLs or logs.
+
+Sync uses one `CallerEncrypted` opaque current slot. Replace/disable uses
+the existing retirement machinery, not Automerge payload history or a
+second blob-sync path. A file recovers only the signing secret, not the
+group's encrypted documents. Retired-tree cleanup is not secure erasure.
+
+Only fixed-cost Argon2 derivation runs in a one-shot Rust Wasm worker. The
+runtime retains envelope checks, AEAD and the root seed. Browser glue
+brokers passphrase/salt and derived-key bytes through the initiating tab
+because Chromium cannot start that worker from the SharedWorker. Departure
+cancels pending work; a bounded timeout handles missing responses.
+
+The approximately five-second recent-phone target is unverified. A local
+Chromium 151 desktop VM measurement of the actual Wasm worker took
+142–148 ms for three derivations; shared-runtime status requests remained
+responsive. This is not a phone estimate. Phone validation should time
+three sequential backup creations on the built site with these unchanged
+costs and check that the visor remains responsive during each derivation.
 
 ### Domain providers
 

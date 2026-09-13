@@ -91,6 +91,16 @@ struct Session {
     cancelled: Rc<Cell<bool>>,
 }
 
+struct AdoptionPayload<'a> {
+    adder_key: [u8; 32],
+    name_key: [u8; 32],
+    us: &'a [u8],
+    keyhive: &'a [u8],
+    read_back: &'a [u8],
+    visor: &'a [u8],
+    contacts: &'a [u8],
+}
+
 /// A bound session's three handles: the shared transport, the frames its
 /// reader task delivers, and the confirmation `pairing.confirm` fires.
 type Bound = (
@@ -638,16 +648,23 @@ impl Kernel {
             .as_slice()
             .try_into()
             .map_err(|_| "that device sent a malformed store key".to_string())?;
-        let engine = self.engine().map_err(|e| e.message)?;
-        engine.adopt_us(&us, adder_key, name_key).await?;
-        engine.adopt_keyhive(&keyhive, &read_back).await?;
-        engine
-            .document_adopt(
-                polyvisor_visor_model::VISOR_APP,
-                &visor,
-                polyvisor_visor_model::adopt,
-            )
-            .await?;
+        let engine = self.engine().map_err(|error| error.message)?;
+        let expected_group = engine.adoption_group(&us, adder_key)?;
+        let adopted = polyvisor_document_history::Document::try_load(
+            &contacts,
+            polyvisor_document_history::actor(
+                b"polyvisor:actor:",
+                self.state.borrow().seed,
+                crate::contacts::CONTACTS_APP.as_bytes(),
+            ),
+            polyvisor_engine::document_tree(crate::contacts::CONTACTS_APP),
+        )?;
+        let profile = polyvisor_contacts_model::self_profile(&adopted)
+            .ok_or_else(|| "that device sent no usable user identity".to_string())?;
+        let bound = polyvisor_contacts_model::verify_root_binding(&profile.binding)?;
+        if bound.group.to_bytes() != expected_group {
+            return Err("the adopted identity is bound to another Keyhive group".into());
+        }
         let meeting_active = !matches!(
             self.meeting_status().await.map_err(|e| e.message)?.phase,
             crate::MeetingPhase::Idle
@@ -657,18 +674,23 @@ impl Kernel {
         if meeting_active {
             self.meeting_invalidate().await;
         }
-        engine
-            .document_adopt(
-                crate::contacts::CONTACTS_APP,
-                &contacts,
-                polyvisor_contacts_model::adopt,
-            )
-            .await?;
-        self.refresh_personalization()
-            .await
-            .map_err(|e| e.message)?;
-        self.push_event(crate::Event::PersonalizationChanged);
-        self.checkpoint().await.map_err(|e| e.message)?;
+        let adoption = self
+            .begin_identity_adoption()
+            .map_err(|error| error.message)?;
+        let outcome = self
+            .adopt_pairing_payload(AdoptionPayload {
+                adder_key,
+                name_key,
+                us: &us,
+                keyhive: &keyhive,
+                read_back: &read_back,
+                visor: &visor,
+                contacts: &contacts,
+            })
+            .await;
+        self.finish_identity_adoption(adoption, outcome.is_ok());
+        outcome?;
+        self.push_event(crate::Event::ContactsChanged);
         // The read receipt, and it is sent *after* the adoption is on disk:
         // it says "the enrollment landed here", so it may not run ahead of
         // the enrollment landing. The adder is parked on this and closes the
@@ -680,6 +702,35 @@ impl Kernel {
         // as enrollment all the same.
         let _acked = send_frame(transport.as_ref(), &Frame::Enrolled).await;
         Ok(())
+    }
+
+    async fn adopt_pairing_payload(&self, payload: AdoptionPayload<'_>) -> Result<(), String> {
+        let engine = self.engine().map_err(|e| e.message)?;
+        engine
+            .adopt_us(payload.us, payload.adder_key, payload.name_key)
+            .await?;
+        engine
+            .adopt_keyhive(payload.keyhive, payload.read_back)
+            .await?;
+        engine
+            .document_adopt(
+                polyvisor_visor_model::VISOR_APP,
+                payload.visor,
+                polyvisor_visor_model::adopt,
+            )
+            .await?;
+        engine
+            .document_adopt(
+                crate::contacts::CONTACTS_APP,
+                payload.contacts,
+                polyvisor_contacts_model::adopt,
+            )
+            .await?;
+        self.refresh_personalization()
+            .await
+            .map_err(|e| e.message)?;
+        self.push_event(crate::Event::PersonalizationChanged);
+        self.checkpoint_durable().await.map_err(|e| e.message)
     }
 
     // -- session plumbing ----------------------------------------------------
