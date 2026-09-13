@@ -245,16 +245,15 @@ There is no special "data model component" kind or elevated runtime trust tier.
   bindings and supplies trustworthy caller context; the provider enforces
   domain policy.
 
-The first, trusted-Rust stage of this split is in place. `todo-model` owns the
-task schema and operations, `visor-model` owns the encrypted visor route,
-install, personalization, and adoption policy, and both operate on the
-`document-history` crate's Automerge document adapter. The engine owns one live
-document per partition plus subscriptions, encrypted publication/receipt,
-in-memory history storage, compaction, and history snapshots; the kernel
-composes model operations with that schema-neutral Rust interface and schedules
-browser checkpoint persistence. These crates still run together inside the
-trusted runtime component. No history WIT interface or separate provider
-component is introduced yet.
+The trusted-Rust domain stage remains in place for tasks and visor state:
+`todo-model` and `visor-model` own those schemas and operations over the
+`document-history` adapter while still running inside the trusted runtime.
+Separately, the public `history` interface now gives an app one confined,
+app-private partition as saved Automerge bytes and raw changes; Markdown is its
+first consumer and owns its Text schema entirely in the app. The engine remains
+schema-neutral: it owns live partition histories, subscriptions, encrypted
+publication/receipt, compaction and snapshots, while the kernel schedules
+checkpoint persistence. No separate provider component exists yet.
 
 ## Sync engine: subduction sans-IO
 
@@ -539,6 +538,16 @@ above. The visor is close to stateless: identity, hue,
 trust table and boot cache are kernel state served over `device`/`apps`,
 so the visor has no persistence import of its own and the same component
 runs under a native shell.
+
+The Markdown reference app uses the app-private history capability directly:
+one deterministic root Automerge Text, a fresh actor per frame, and a plain
+controlled textarea beside a safe AST preview. Stream-dom carries each input's
+value and UTF-16 selection together and applies value plus selection as one
+receiver mutation; the app translates those offsets to stable Automerge
+cursors so incoming history renders immediately without moving the user's
+selection. While an IME composition is active, only the latest incoming full
+snapshot waits; composition end records the final browser value before that
+snapshot is merged.
 
 A Dioxus component that writes a signal it never reads does not subscribe
 to updates. Native tests cannot catch the resulting frozen UI, so visor

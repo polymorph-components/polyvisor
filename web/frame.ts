@@ -10,6 +10,7 @@ import { proxyInterfaces } from "./rpc.ts";
 
 const I = {
   tasks: "polyvisor:app/tasks@0.1.0",
+  history: "polyvisor:app/history@0.1.0",
   apps: "polyvisor:internal/apps@0.1.0",
   route: "polyvisor:app/route@0.1.0",
 } as const;
@@ -45,7 +46,7 @@ async function mount(
   plan: string,
   port: MessagePort,
 ): Promise<void> {
-  const imports = proxyInterfaces(port, [I.tasks]);
+  const imports = proxyInterfaces(port, [I.tasks, I.history]);
   // Only the parent can update the page URL.
   imports[I.route] = {
     get: () => route,

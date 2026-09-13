@@ -30,7 +30,7 @@ confinement.
 | `runtime/` | the `runtime` component: `crates/kernel` (devices, sealing, checkpoints, pairing, contacts, sessions), `crates/engine` (history sync over subduction's sans-IO node), `crates/document-history` (shared Automerge adapter), `crates/{todo,visor,contacts}-model` (domain schemas), `component/` (the world, the iroh transport) |
 | `proto/` | signed introduction wire schema; Rust bindings generated with prost |
 | `visor/` | the `visor` component (trusted pixels) |
-| `apps/` | example/reference apps (`todomvc`) |
+| `apps/` | example/reference apps (`todomvc`, `markdown`) |
 | `web/` | glue TypeScript |
 | `e2e/` | Playwright scenarios |
 | `docs/` | `design.md`, the authority for everything above |
@@ -85,3 +85,8 @@ ciphertext store (OAuth split between kernel and shell; a fake Drive in
 e2e); app history rolled up as sedimentree fragments; private contacts and
 signed introductions in a drawer with responsive sidebar navigation.
 Passkey unseal (#166) and recovery kits (#167) are parked as issues.
+
+The Markdown example owns one Automerge Text through the raw app-history
+capability. Its plain textarea and safe live preview update across replicas;
+stable Automerge cursors preserve the browser's selection when remote text
+lands, including backward selections and Unicode offsets.

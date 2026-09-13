@@ -260,6 +260,14 @@ async function currentBuildDigests(): Promise<Record<string, string>> {
   return {
     "runtime.component.wasm": await sha256File(join(BUILT, "runtime.component.wasm")),
     "visor.component.wasm": await sha256File(join(BUILT, "visor.component.wasm")),
+    // The Markdown scenarios must not accidentally exercise a stale site
+    // assembled before the app was added.
+    "apps/markdown/manifest.json": await sha256File(
+      join(BUILT, "apps", "markdown", "manifest.json"),
+    ),
+    "apps/markdown/app.component.wasm": await sha256File(
+      join(BUILT, "apps", "markdown", "app.component.wasm"),
+    ),
   };
 }
 
@@ -1415,6 +1423,139 @@ async function syncUntil(
 }
 
 const todoFrame = (page: Page) => page.frameLocator("#app-zone iframe");
+const markdownFrame = (page: Page) => page.frameLocator("#app-zone iframe");
+
+async function launchMarkdown(page: Page): Promise<void> {
+  await launchApp(page, "Markdown");
+  await markdownFrame(page).getByRole("textbox", { name: "Markdown source" })
+    .waitFor({ timeout: 30_000 });
+}
+
+async function waitForMarkdownValue(
+  page: Page,
+  predicate: (value: string) => boolean,
+  what: string,
+  ms = 60_000,
+): Promise<string> {
+  const source = markdownFrame(page).getByRole("textbox", {
+    name: "Markdown source",
+  });
+  const deadline = performance.now() + ms;
+  for (;;) {
+    const value = await source.inputValue();
+    if (predicate(value)) return value;
+    if (performance.now() > deadline) {
+      throw new Failure(`${what}: textarea held ${JSON.stringify(value)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function waitForMarkdownSaved(page: Page): Promise<void> {
+  // `Saved` is also the idle label before an edit reaches the publisher.
+  // Let the input event cross the frame boundary before accepting it.
+  await page.waitForTimeout(250);
+  await markdownFrame(page).getByRole("status").getByText("Saved", { exact: true })
+    .waitFor({ timeout: 30_000 });
+}
+
+async function blurMarkdown(page: Page): Promise<void> {
+  await markdownFrame(page).getByRole("textbox", { name: "Markdown source" })
+    .blur();
+}
+
+async function setMarkdown(
+  page: Page,
+  body: string,
+): Promise<void> {
+  await markdownFrame(page).getByRole("textbox", { name: "Markdown source" })
+    .fill(body);
+  // Setup leaves no accidental focus behind; scenarios that exercise cursor
+  // behavior establish their selection explicitly before the remote edit.
+  await blurMarkdown(page);
+  await waitForMarkdownSaved(page);
+}
+
+async function typeMarkdownAt(
+  page: Page,
+  offset: number,
+  text: string,
+): Promise<void> {
+  const source = markdownFrame(page).getByRole("textbox", {
+    name: "Markdown source",
+  });
+  // A real pointer focus gives Chromium's input subsystem (including CDP IME)
+  // a focused widget; DOM focus alone is enough for keyboard presses but not
+  // for imeSetComposition in a sandboxed subframe.
+  await source.click();
+  await source.evaluate((element, at) => {
+    (element as HTMLTextAreaElement).setSelectionRange(at, at);
+  }, offset);
+  // Playwright's keyboard typing dispatches native key/input events per
+  // character. That is intentional: fill() would miss caret preservation and
+  // actor-reuse failures that only appear across successive edits.
+  await source.type(text, { delay: 15 });
+}
+
+async function markdownSelection(page: Page): Promise<{
+  start: number;
+  end: number;
+  direction: string;
+  focused: boolean;
+}> {
+  return await markdownFrame(page).getByRole("textbox", {
+    name: "Markdown source",
+  }).evaluate((element) => {
+    const textarea = element as HTMLTextAreaElement;
+    return {
+      start: textarea.selectionStart,
+      end: textarea.selectionEnd,
+      direction: textarea.selectionDirection,
+      focused: document.activeElement === textarea,
+    };
+  });
+}
+
+async function selectMarkdown(
+  page: Page,
+  start: number,
+  end: number,
+  direction: "forward" | "backward" | "none",
+): Promise<void> {
+  const source = markdownFrame(page).getByRole("textbox", {
+    name: "Markdown source",
+  });
+  // Pointer focus is what Chromium's input subsystem uses for IME dispatch;
+  // programmatic DOM focus is not sufficient in a sandboxed subframe.
+  await source.click();
+  await source.evaluate((element, selection) => {
+    (element as HTMLTextAreaElement).setSelectionRange(
+      selection.start,
+      selection.end,
+      selection.direction,
+    );
+  }, { start, end, direction });
+  // setSelectionRange dispatches the browser selection event consumed by the
+  // app. Let that event/render turn finish before authoring a remote edit.
+  await page.waitForTimeout(100);
+}
+
+async function waitForMarkdownSelection(
+  page: Page,
+  ready: (selection: Awaited<ReturnType<typeof markdownSelection>>) => boolean,
+  what: string,
+  ms = 60_000,
+): Promise<Awaited<ReturnType<typeof markdownSelection>>> {
+  const deadline = performance.now() + ms;
+  for (;;) {
+    const selection = await markdownSelection(page);
+    if (ready(selection)) return selection;
+    if (performance.now() > deadline) {
+      throw new Failure(`${what}: selection was ${JSON.stringify(selection)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
 
 async function addTodo(page: Page, title: string): Promise<void> {
   const input = todoFrame(page).locator("input.new-todo, input").first();
@@ -1676,6 +1817,355 @@ const scenarios: Scenario[] = [
         timeout: 30_000,
       });
       await again.locator("li.completed").first().waitFor({ timeout: 15_000 });
+    },
+  },
+
+  {
+    // One full Markdown path: native textarea input and pulldown-cmark rendered
+    // as safe nodes rather than innerHTML.
+    name: "markdown-edit-preview",
+    async run(ctx, origin) {
+      const page = await open(ctx, origin);
+      await visorReady(page);
+      await launchMarkdown(page);
+
+      const marker = "unicode: 東京 — naïve 👩🏽‍💻";
+      const body = `# Live preview\n\n**bold** ${marker}\n\n` +
+        `<script>globalThis.markdownExecuted = true</script>\n\n` +
+        `<img src="https://invalid.example/markdown-e2e.png">\n\n` +
+        `[outside](https://invalid.example/)`;
+      const external: string[] = [];
+      page.on("request", (request) => {
+        if (request.url().startsWith("https://invalid.example/")) {
+          external.push(request.url());
+        }
+      });
+      await setMarkdown(page, body);
+      const insertion = " freshly typed 🌿";
+      const boldEnd = body.indexOf("**", body.indexOf("**") + 2);
+      await typeMarkdownAt(page, boldEnd + 2, insertion);
+      await waitForMarkdownSaved(page);
+
+      const app = markdownFrame(page);
+      const preview = app.getByRole("region", { name: "Markdown preview" });
+      await preview.locator("h1").getByText("Live preview", { exact: true })
+        .waitFor({ timeout: 15_000 });
+      await preview.locator("strong").getByText("bold", { exact: true })
+        .waitFor({ timeout: 15_000 });
+      await preview.getByText(marker, { exact: false }).waitFor({ timeout: 15_000 });
+      await preview.getByText(insertion.trim(), { exact: false }).waitFor({
+        timeout: 15_000,
+      });
+      eq(await preview.locator("script, img, a").count(), 0,
+        "unsafe/external Markdown created active DOM");
+      eq(external, [], "the Markdown preview made an external request");
+      eq(
+        await preview.evaluate((el) =>
+          (globalThis as Record<string, unknown>).markdownExecuted === true ||
+          el.querySelector("script") !== null
+        ),
+        false,
+        "preview markup executed script",
+      );
+
+      const sample = `# Field notes 🌿\n\n` +
+        `A small **shared Markdown document** with Unicode: 東京.\n\n` +
+        `- Edit on either device\n- Preview as you write\n- Keep every change`;
+      await setMarkdown(page, sample);
+      await blurMarkdown(page);
+      await preview.getByText("Field notes 🌿", { exact: true }).waitFor({
+        timeout: 15_000,
+      });
+      await shot(page, "markdown-desktop-preview");
+      await page.setViewportSize({ width: 390, height: 844 });
+      await app.getByRole("button", { name: "Preview", exact: true }).click();
+      await preview.waitFor({ timeout: 10_000 });
+      await shot(page, "markdown-mobile-preview");
+    },
+  },
+
+  {
+    // Reload proves checkpoint restoration. A focused second session receives
+    // A's native middle typing immediately without losing its own value.
+    name: "markdown-reload-and-two-sessions",
+    async run(ctx, origin) {
+      const a = await open(ctx, origin);
+      await visorReady(a);
+      await launchMarkdown(a);
+      const initialBody = "alpha — Καλημέρα — omega";
+      await setMarkdown(a, initialBody);
+
+      await a.reload();
+      await visorReady(a);
+      // The running app fragment restores the session without another app-list
+      // launch. Waiting on the textarea proves the restored component mounted.
+      await markdownFrame(a).getByRole("textbox", { name: "Markdown source" })
+        .waitFor({ timeout: 30_000 });
+      const appA = markdownFrame(a);
+      eq(await appA.getByRole("textbox", { name: "Markdown source" }).inputValue(),
+        initialBody, "reload lost the Markdown body");
+
+      const anchor = await a.evaluate((key) => sessionStorage.getItem(key), ANCHOR);
+      check(anchor !== null, "the first session had no device anchor");
+      const b = await ctx.newPage();
+      await b.addInitScript(
+        ({ key, value }) => sessionStorage.setItem(key, value),
+        { key: ANCHOR, value: anchor },
+      );
+      await b.goto(origin + "/");
+      await visorReady(b);
+      await launchMarkdown(b);
+      const appB = markdownFrame(b);
+      eq(await appB.getByRole("textbox", { name: "Markdown source" }).inputValue(),
+        initialBody, "second same-device session did not read the body");
+      await typeMarkdownAt(b, initialBody.length, " dirty");
+      const dirtied = initialBody + " dirty";
+      eq(await appB.getByRole("textbox", { name: "Markdown source" }).inputValue(),
+        dirtied, "session B lost its own typed text while focused");
+      const localCaret = await markdownSelection(b);
+      check(
+        localCaret.start === dirtied.length &&
+          localCaret.end === dirtied.length && localCaret.focused,
+        `session B's collapsed caret was wrong after local typing: ${JSON.stringify(localCaret)}`,
+      );
+      await waitForMarkdownSaved(b);
+      await waitForMarkdownValue(a, (value) => value === dirtied,
+        "session A did not receive B's dirty textarea value");
+      await typeMarkdownAt(a, "alpha".length, " local 🌿");
+      const localA = "alpha local 🌿 — Καλημέρα — omega dirty";
+      eq(await appA.getByRole("textbox", { name: "Markdown source" }).inputValue(),
+        localA, "session A lost its own middle insertion while focused");
+      await waitForMarkdownSaved(a);
+      const merged = "alpha local 🌿 — Καλημέρα — omega dirty";
+      await waitForMarkdownValue(b, (value) => value === merged,
+        "focused dirty session B did not receive A's middle insertion");
+      const remoteCaret = await markdownSelection(b);
+      check(
+        remoteCaret.start === merged.length &&
+          remoteCaret.end === merged.length && remoteCaret.focused,
+        `remote insertion before B's collapsed caret did not preserve it: ${JSON.stringify(remoteCaret)}`,
+      );
+      await appB.getByRole("region", { name: "Markdown preview" })
+        .getByText("local 🌿", { exact: false }).waitFor({ timeout: 15_000 });
+    },
+  },
+
+  {
+    // Existing pairing helpers make the cross-device boundary inexpensive to
+    // cover: separate contexts mean separate workers, storage, and app actors.
+    name: "markdown-paired-devices-sync",
+    async run(ctx, origin, browser) {
+      const ctxB = await browser.newContext();
+      try {
+        const a = await open(ctx, origin);
+        const b = await open(ctxB, origin);
+        await visorReady(a);
+        await visorReady(b);
+        const idA = await endpointId(a);
+        const idB = await endpointId(b);
+        check(idA !== idB, "paired Markdown contexts shared an endpoint id");
+        await pair(a, b);
+        await waitForMember(a, idB);
+        await waitForMember(b, idA);
+        await waitForConnectedPeer(a, idB);
+        await waitForConnectedPeer(b, idA);
+
+        await launchMarkdown(a);
+        const base = "left center right";
+        await setMarkdown(a, base);
+        await launchMarkdown(b);
+        await waitForMarkdownValue(b, (value) => value === base,
+          "device B did not receive the base Markdown");
+
+        await Promise.all([
+          typeMarkdownAt(a, "left".length, " from-A🌿"),
+          typeMarkdownAt(b, "left center".length, " from-Bمرحبا"),
+        ]);
+        const afterTypingA = await markdownFrame(a).getByRole("textbox", {
+          name: "Markdown source",
+        }).inputValue();
+        const afterTypingB = await markdownFrame(b).getByRole("textbox", {
+          name: "Markdown source",
+        }).inputValue();
+        check(afterTypingA.includes("from-A🌿"),
+          `device A's own phrase split while typing: ${JSON.stringify(afterTypingA)}`);
+        check(afterTypingB.includes("from-Bمرحبا"),
+          `device B's own phrase split while typing: ${JSON.stringify(afterTypingB)}`);
+        check((await markdownSelection(a)).focused && (await markdownSelection(b)).focused,
+          "a paired textarea lost focus during native typing");
+        const mergedA = await waitForMarkdownValue(a,
+          (value) => value.includes("from-A🌿") && value.includes("from-Bمرحبا"),
+          "focused device A did not receive both concurrent insertions");
+        const mergedB = await waitForMarkdownValue(b,
+          (value) => value.includes("from-A🌿") && value.includes("from-Bمرحبا"),
+          "focused device B did not receive both concurrent insertions");
+        check((await markdownSelection(a)).focused && (await markdownSelection(b)).focused,
+          "a paired textarea lost focus while concurrent updates merged");
+        eq(mergedA, mergedB, "paired devices converged on different Markdown");
+        for (const page of [a, b]) {
+          const preview = markdownFrame(page).getByRole("region", {
+            name: "Markdown preview",
+          });
+          await preview.getByText("from-A🌿", { exact: false }).waitFor({
+            timeout: 15_000,
+          });
+          await preview.getByText("from-Bمرحبا", { exact: false }).waitFor({
+            timeout: 15_000,
+          });
+        }
+      } finally {
+        await closeContext(ctxB, "markdown-paired-devices-sync B");
+      }
+    },
+  },
+
+  {
+    // Selection endpoints are Automerge cursors, not stale numeric offsets.
+    // Exercise UTF-16's two-unit emoji, backward direction, and deletion at
+    // the selected range's end anchor before replacing the range natively.
+    name: "markdown-selection-cursors",
+    async run(ctx, origin) {
+      const a = await open(ctx, origin);
+      await visorReady(a);
+      await launchMarkdown(a);
+      const base = "zero 🌿 target end";
+      await setMarkdown(a, base);
+
+      const anchor = await a.evaluate((key) => sessionStorage.getItem(key), ANCHOR);
+      check(anchor !== null, "the cursor scenario had no device anchor");
+      const b = await ctx.newPage();
+      await b.addInitScript(
+        ({ key, value }) => sessionStorage.setItem(key, value),
+        { key: ANCHOR, value: anchor },
+      );
+      await b.goto(origin + "/");
+      await visorReady(b);
+      await launchMarkdown(b);
+      await waitForMarkdownValue(b, (value) => value === base,
+        "cursor receiver did not read the base Markdown");
+
+      const selected = "🌿 target";
+      const start = base.indexOf(selected);
+      const end = start + selected.length;
+      await selectMarkdown(b, start, end, "backward");
+      eq(await markdownSelection(b), {
+        start,
+        end,
+        direction: "backward",
+        focused: true,
+      }, "the browser did not establish the backward emoji selection");
+
+      const prefix = "REMOTE ";
+      await typeMarkdownAt(a, 0, prefix);
+      await waitForMarkdownValue(b, (value) => value === prefix + base,
+        "focused cursor receiver did not get the preceding insertion");
+      await waitForMarkdownSelection(b, (selection) =>
+        selection.start === start + prefix.length &&
+        selection.end === end + prefix.length &&
+        selection.direction === "backward" && selection.focused,
+      "preceding insertion did not move the backward selection");
+
+      // Delete the final `t` of `target`, immediately before the range's end
+      // cursor. The remote selection must contract while retaining direction.
+      const deleteAt = prefix.length + base.indexOf("target") + "targe".length;
+      await selectMarkdown(a, deleteAt, deleteAt + 1, "forward");
+      await markdownFrame(a).getByRole("textbox", { name: "Markdown source" })
+        .press("Backspace");
+      const afterDelete = prefix + base.slice(0, end - 1) + base.slice(end);
+      await waitForMarkdownValue(b, (value) => value === afterDelete,
+        "cursor receiver did not get the anchor deletion");
+      await waitForMarkdownSelection(b, (selection) =>
+        selection.start === start + prefix.length &&
+        selection.end === end + prefix.length - 1 &&
+        selection.direction === "backward" && selection.focused,
+      "anchor deletion did not contract the backward selection");
+
+      const replacement = "REPLACED🌱";
+      await markdownFrame(b).getByRole("textbox", { name: "Markdown source" })
+        .type(replacement, { delay: 15 });
+      const expected = prefix + base.slice(0, start) + replacement + base.slice(end);
+      await waitForMarkdownValue(a, (value) => value === expected,
+        "typing did not replace the remotely adjusted selection");
+      eq(await markdownFrame(b).getByRole("textbox", {
+        name: "Markdown source",
+      }).inputValue(), expected, "selection replacement produced the wrong local text");
+    },
+  },
+
+  {
+    // Chromium's IME domain drives the browser's real composition lifecycle;
+    // synthetic composition events would not establish what the textarea and
+    // receiver do with their transient value.
+    name: "markdown-ime-composition",
+    async run(ctx, origin) {
+      const a = await open(ctx, origin);
+      await visorReady(a);
+      await launchMarkdown(a);
+      const base = "IME notes: ";
+      await setMarkdown(a, base);
+
+      const anchor = await a.evaluate((key) => sessionStorage.getItem(key), ANCHOR);
+      check(anchor !== null, "the IME scenario had no device anchor");
+      const b = await ctx.newPage();
+      await b.addInitScript(
+        ({ key, value }) => sessionStorage.setItem(key, value),
+        { key: ANCHOR, value: anchor },
+      );
+      await b.goto(origin + "/");
+      await visorReady(b);
+      await launchMarkdown(b);
+      await waitForMarkdownValue(b, (value) => value === base,
+        "IME session did not read the base Markdown");
+      await b.bringToFront();
+      await selectMarkdown(b, base.length, base.length, "none");
+
+      // CDP input goes to the frontmost page's focused control. The textarea
+      // lives in a same-target sandboxed frame, so the page session is the
+      // correct target; bringing B forward above is essential with two tabs.
+      const cdp = await ctx.newCDPSession(b);
+      await cdp.send("Input.imeSetComposition", {
+        text: "に",
+        selectionStart: 1,
+        selectionEnd: 1,
+      });
+      await waitForMarkdownValue(b, (value) => value === base + "に",
+        "Chromium did not expose the transient composition value", 3_000);
+      check((await markdownSelection(b)).focused,
+        "IME composition lost textarea focus");
+
+      const remote = "REMOTE ";
+      await typeMarkdownAt(a, 0, remote);
+      await waitForMarkdownSaved(a);
+      // The transient IME text owns the control until Chromium completes the
+      // composition; applying the remote snapshot here would interrupt it.
+      await b.waitForTimeout(250);
+      eq(await markdownFrame(b).getByRole("textbox", {
+        name: "Markdown source",
+      }).inputValue(), base + "に", "remote text replaced an active composition");
+
+      await cdp.send("Input.imeSetComposition", {
+        text: "日本",
+        selectionStart: 2,
+        selectionEnd: 2,
+      });
+      await cdp.send("Input.insertText", { text: "日本" });
+      const merged = remote + base + "日本";
+      await waitForMarkdownValue(b, (value) => value === merged,
+        "composition completion did not merge the deferred remote text");
+      await waitForMarkdownValue(a, (value) => value === merged,
+        "the completed composition was not published");
+      check((await markdownSelection(b)).focused,
+        "composition completion lost textarea focus");
+
+      await markdownFrame(b).getByRole("textbox", { name: "Markdown source" })
+        .type("!");
+      const final = merged + "!";
+      await waitForMarkdownValue(a, (value) => value === final,
+        "ordinary typing after composition was lost");
+      const status = await markdownFrame(b).getByRole("status").textContent() ?? "";
+      check(!/failed|stopped/i.test(status),
+        `editor failed after composition: ${status}`);
+      await cdp.detach();
     },
   },
 

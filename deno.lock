@@ -15,6 +15,7 @@
     "jsr:@std/media-types@1": "1.1.0",
     "jsr:@std/path@1": "1.1.6",
     "jsr:@std/path@^1.1.5": "1.1.6",
+    "npm:@bufbuild/protobuf@^2.14.1": "2.14.1",
     "npm:@remote-dom/core@^1.11.1": "1.11.1",
     "npm:playwright@1.62.1": "1.62.1",
     "npm:werift@0.24.4": "0.24.4"
@@ -87,6 +88,9 @@
     }
   },
   "npm": {
+    "@bufbuild/protobuf@2.14.1": {
+      "integrity": "sha512-agRJn3+EJDUe8AvxTx/LnHA/GErvLE62pSaSk7+MwFOtOv8eWBu/qCq2qoZjBjVZ3C2aiFJCveuSs17KMkYGOw=="
+    },
     "@fidm/asn1@1.0.4": {
       "integrity": "sha512-esd1jyNvRb2HVaQGq2Gg8Z0kbQPXzV9Tq5Z14KNIov6KfFD6PTaRIO8UpcsYiTNzOqJpmyzWgVTrUwFV3UF4TQ=="
     },
@@ -390,6 +394,20 @@
     }
   },
   "remote": {
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/5942eae23be9dffcfdab737a54f2687e63645216/receiver/src/dispatch.ts": "12ad272b921d94fcb2c69f2adf1c994ff4c66f2db0099345be20ef8f178a268c",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/5942eae23be9dffcfdab737a54f2687e63645216/receiver/src/driver.ts": "fe58e077810703916b5098bfd11bcd2ec08a2c8db23988b6a525eb685672132c",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/5942eae23be9dffcfdab737a54f2687e63645216/receiver/src/events.ts": "e6414573fadc691fd65789581a50fab28c1367b15b423830bb07ab5bfa48d5bc",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/5942eae23be9dffcfdab737a54f2687e63645216/receiver/src/frames.ts": "568c2de97231e955512c3300e2253058e227d6ff76a2ae21aa87e4c3248179f6",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/5942eae23be9dffcfdab737a54f2687e63645216/receiver/src/gen/stream-dom-events.ts": "5e16e2595e1b391760e4fb2294b7727d8b1d03bfe3e9ddc521a275c15ead9206",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/5942eae23be9dffcfdab737a54f2687e63645216/receiver/src/gen/stream-dom.ts": "9b5d81fe47fe9d0f9706e6bcb16143941bc130d18e97dac54fc82871ac99f70f",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/5942eae23be9dffcfdab737a54f2687e63645216/receiver/src/mod.ts": "c2ed8af8743832ec28f2b8ef259f86709cf9599d69705915abc16632129d6dca",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/5942eae23be9dffcfdab737a54f2687e63645216/receiver/src/mount.ts": "80a14c36fb0971f008a4b90b40a7186e14bb435d2ed3ed5d3083ce7fff8abf6d",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/5942eae23be9dffcfdab737a54f2687e63645216/receiver/src/native.ts": "89a15b8ce3747e5cf08c00b6af0f5347922b625926719484a61f40508c553deb",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/5942eae23be9dffcfdab737a54f2687e63645216/receiver/src/policy-desktop.ts": "41dbdc5d2824bffd9327b661340e60ee2acf38e633b8f18d7efeff2d6bd984a8",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/5942eae23be9dffcfdab737a54f2687e63645216/receiver/src/policy.ts": "b28da7c0b3b0886416ed6a5be1a0563b99470e9df1ade94008e7bf30259ba64a",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/5942eae23be9dffcfdab737a54f2687e63645216/receiver/src/receiver.ts": "47ce8ea37b14d6bce2c2bf83fbc7c1b3c4a092f51c5265fac62f60138edcaa7f",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/5942eae23be9dffcfdab737a54f2687e63645216/receiver/src/remote.ts": "4c2062963f09d20dd2ed1e0dae8766cf11b812738dcdf3c1e06ead4cfe5aebb1",
+    "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/5942eae23be9dffcfdab737a54f2687e63645216/receiver/src/templates.ts": "052e1d75bcaa5c9e20e3a0ad826960cd87a8c60e5a84af19163b69816c1b7e1c",
     "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/e35dc357137a3563aa891662a626b3310a7078c4/receiver/src/dispatch.ts": "114107ed7fbd3d535cd194ae5cb425956c6591062eb1ddd6f42f6f0ea0a0c0cf",
     "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/e35dc357137a3563aa891662a626b3310a7078c4/receiver/src/driver.ts": "9adafb4423e0635864ed0565f184de570c14b3f946d5f2edb377b167efcadf8f",
     "https://raw.githubusercontent.com/polymorph-components/polymorph-stream-dom/e35dc357137a3563aa891662a626b3310a7078c4/receiver/src/events.ts": "9f7d431393a2ba300059cf2aa9c32698d19ea8b1115944896a2af8f5564ac9cb",
@@ -417,6 +435,7 @@
       "jsr:@std/fs@1",
       "jsr:@std/media-types@1",
       "jsr:@std/path@1",
+      "npm:@bufbuild/protobuf@^2.14.1",
       "npm:@remote-dom/core@^1.11.1",
       "npm:playwright@1.62.1"
     ]

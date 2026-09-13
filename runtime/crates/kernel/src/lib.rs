@@ -310,6 +310,12 @@ pub struct BootConfig {
 
 pub type SessionId = u32;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorySnapshot {
+    pub revision: u64,
+    pub bytes: Vec<u8>,
+}
+
 /// The device half of the kernel's state, in one cell so a mutation and its
 /// checkpoint see one consistent picture.
 struct DeviceState {
@@ -396,7 +402,7 @@ pub struct Kernel {
     /// coalesced into a single further pass.
     syncing: RefCell<Checkpointing>,
     next_watch: Cell<u64>,
-    task_waiters: RefCell<BTreeMap<u64, (String, Waker)>>,
+    document_waiters: RefCell<BTreeMap<u64, (String, Waker)>>,
 }
 
 /// The checkpoint gate: at most one writer, and one bit of "someone asked
@@ -468,7 +474,7 @@ impl Kernel {
             drive: RefCell::new(drive),
             syncing: RefCell::new(Checkpointing::default()),
             next_watch: Cell::new(1),
-            task_waiters: RefCell::new(BTreeMap::new()),
+            document_waiters: RefCell::new(BTreeMap::new()),
         });
         *kernel.me.borrow_mut() = Rc::downgrade(&kernel);
         // A sealed device has no seed in memory, so it has no engine and no
@@ -875,7 +881,7 @@ impl Kernel {
         let apps: Vec<String> = self.sessions.borrow().values().cloned().collect();
         self.sessions.borrow_mut().clear();
         for app in apps {
-            self.wake_tasks(&app);
+            self.wake_documents(&app);
         }
         store::destroy(
             self.seams.platform.as_ref(),
@@ -1151,7 +1157,7 @@ impl Kernel {
     pub fn close(&self, session: SessionId) {
         let app = self.sessions.borrow_mut().remove(&session);
         if let Some(app) = app {
-            self.wake_tasks(&app);
+            self.wake_documents(&app);
         }
     }
 
@@ -1162,9 +1168,10 @@ impl Kernel {
     /// racing a `close` must not manufacture an ending that already
     /// happened.
     pub fn abort(&self, session: SessionId, reason: String) {
-        if self.sessions.borrow_mut().remove(&session).is_none() {
+        let Some(app) = self.sessions.borrow_mut().remove(&session) else {
             return;
-        }
+        };
+        self.wake_documents(&app);
         self.push_event(Event::SessionEnded(session, reason));
     }
 
@@ -1393,17 +1400,31 @@ impl Kernel {
 
     pub async fn tasks_watch(&self, session: SessionId, after: u64) -> Result<Snapshot, String> {
         let (app, engine) = self.app_engine(session)?;
-        // Opens/absorbs before registration. The poll below then compares and
-        // registers without an await, closing the lost-wakeup window.
         let first = engine
             .document_read(&app, polyvisor_todo_model::snapshot)
             .await?;
         if first.revision != after {
-            if self.sessions.borrow().get(&session) != Some(&app) {
-                return Err("unknown session".to_string());
-            }
+            self.validate_session(session, &app)?;
             return Ok(first);
         }
+        self.wait_document_change(session, &app, &engine, after)
+            .await?;
+        let snapshot = engine
+            .document_read(&app, polyvisor_todo_model::snapshot)
+            .await?;
+        self.validate_session(session, &app)?;
+        Ok(snapshot)
+    }
+
+    /// Park on one partition without losing a change between opening it and
+    /// registering the waker. Shared by every schema projected over history.
+    async fn wait_document_change(
+        &self,
+        session: SessionId,
+        app: &str,
+        engine: &SyncEngine,
+        after: u64,
+    ) -> Result<(), String> {
         let id = self.next_watch.get();
         self.next_watch.set(id.wrapping_add(1));
         struct Guard<'a> {
@@ -1417,29 +1438,79 @@ impl Kernel {
         }
         let guard = Guard {
             id,
-            waiters: &self.task_waiters,
+            waiters: &self.document_waiters,
         };
         std::future::poll_fn(|cx| {
-            if self.sessions.borrow().get(&session) != Some(&app) {
+            if self.validate_session(session, app).is_err() {
                 return Poll::Ready(Err("unknown session".to_string()));
             }
-            if engine.document_revision_open(&app) != Some(after) {
+            if engine.document_revision_open(app) != Some(after) {
                 return Poll::Ready(Ok(()));
             }
-            self.task_waiters
+            self.document_waiters
                 .borrow_mut()
-                .insert(id, (app.clone(), cx.waker().clone()));
+                .insert(id, (app.to_string(), cx.waker().clone()));
             Poll::Pending
         })
         .await?;
         drop(guard);
+        Ok(())
+    }
+
+    pub async fn history_read(&self, session: SessionId) -> Result<HistorySnapshot, String> {
+        let (app, engine) = self.app_engine(session)?;
         let snapshot = engine
-            .document_read(&app, polyvisor_todo_model::snapshot)
+            .document_read(&app, |document| HistorySnapshot {
+                revision: document.revision(),
+                bytes: document.save(),
+            })
             .await?;
-        if self.sessions.borrow().get(&session) != Some(&app) {
-            return Err("unknown session".to_string());
-        }
+        self.validate_session(session, &app)?;
         Ok(snapshot)
+    }
+
+    pub async fn history_watch(
+        &self,
+        session: SessionId,
+        after: u64,
+    ) -> Result<HistorySnapshot, String> {
+        let (app, engine) = self.app_engine(session)?;
+        let first = engine
+            .document_read(&app, |document| HistorySnapshot {
+                revision: document.revision(),
+                bytes: document.save(),
+            })
+            .await?;
+        if first.revision != after {
+            self.validate_session(session, &app)?;
+            return Ok(first);
+        }
+        self.wait_document_change(session, &app, &engine, after)
+            .await?;
+        let snapshot = engine
+            .document_read(&app, |document| HistorySnapshot {
+                revision: document.revision(),
+                bytes: document.save(),
+            })
+            .await?;
+        self.validate_session(session, &app)?;
+        Ok(snapshot)
+    }
+
+    pub async fn history_publish(
+        &self,
+        session: SessionId,
+        changes: Vec<Vec<u8>>,
+    ) -> Result<(), String> {
+        let (app, engine) = self.app_engine(session)?;
+        let _changed = engine.document_publish(&app, changes).await?;
+        // A duplicate may be retrying an accepted change whose preceding
+        // checkpoint failed. Always cross the durable barrier before success.
+        self.checkpoint_durable()
+            .await
+            .map_err(|error| error.message)?;
+        self.wake_documents(&app);
+        self.validate_session(session, &app)
     }
 
     pub(crate) async fn refresh_personalization(&self) -> Result<(), Error> {
@@ -1501,7 +1572,7 @@ impl Kernel {
             .document_mutate(&app, move |doc| polyvisor_todo_model::add(doc, title))
             .await?;
         self.checkpoint_service().await?;
-        self.wake_tasks(&app);
+        self.wake_documents(&app);
         Ok(id)
     }
 
@@ -1519,7 +1590,7 @@ impl Kernel {
             })
             .await?;
         self.checkpoint_service().await?;
-        self.wake_tasks(&app);
+        self.wake_documents(&app);
         Ok(())
     }
 
@@ -1537,7 +1608,7 @@ impl Kernel {
             })
             .await?;
         self.checkpoint_service().await?;
-        self.wake_tasks(&app);
+        self.wake_documents(&app);
         Ok(())
     }
 
@@ -1548,7 +1619,7 @@ impl Kernel {
             .document_mutate(&app, move |doc| polyvisor_todo_model::remove(doc, &id))
             .await?;
         self.checkpoint_service().await?;
-        self.wake_tasks(&app);
+        self.wake_documents(&app);
         Ok(())
     }
 
@@ -1569,13 +1640,26 @@ impl Kernel {
         Ok((app, engine))
     }
 
+    fn validate_session(&self, session: SessionId, app: &str) -> Result<(), String> {
+        if self
+            .sessions
+            .borrow()
+            .get(&session)
+            .is_some_and(|id| id == app)
+        {
+            Ok(())
+        } else {
+            Err("unknown session".to_string())
+        }
+    }
+
     async fn checkpoint_service(&self) -> Result<(), String> {
         self.checkpoint().await.map_err(|e| e.message)
     }
 
-    fn wake_tasks(&self, app: &str) {
+    fn wake_documents(&self, app: &str) {
         let wakes: Vec<Waker> = {
-            let mut waiters = self.task_waiters.borrow_mut();
+            let mut waiters = self.document_waiters.borrow_mut();
             let ids: Vec<u64> = waiters
                 .iter()
                 .filter(|(_, (a, _))| a == app)

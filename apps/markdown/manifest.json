@@ -1,0 +1,13 @@
+{
+  "id": "markdown",
+  "title": "Markdown",
+  "component": "app.component.wasm",
+  "plan": "app.component.plan.json",
+  "assets": [
+    {
+      "handle": "0430efa1fd64dcfd582ad29ff44da4102afef1fdb99dd26110f0deb36ff2cfea",
+      "path": "markdown-app.css",
+      "media_type": "text/css"
+    }
+  ]
+}

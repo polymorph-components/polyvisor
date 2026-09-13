@@ -171,7 +171,7 @@ async function app(id: string): Promise<void> {
   await copy(manifestPath, join(dest, "manifest.json"), { overwrite: true });
 }
 
-const APPS = ["todomvc"];
+const APPS = ["todomvc", "markdown"];
 
 /** Test-only bundles, built by `deno task build:fixtures` (`--fixtures`) and
  * by nothing else. `apps/hostile` exists to be refused by the frame policy,

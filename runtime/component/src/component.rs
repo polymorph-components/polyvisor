@@ -1124,6 +1124,35 @@ impl guest::app_services::Guest for Component {
             .tasks_remove(session, &id)
             .await
     }
+    async fn history_read(session: u32) -> Result<polyvisor::app::history::Snapshot, String> {
+        let snapshot = kernel()
+            .map_err(|_| unavailable_service())?
+            .history_read(session)
+            .await?;
+        Ok(polyvisor::app::history::Snapshot {
+            revision: snapshot.revision,
+            bytes: snapshot.bytes,
+        })
+    }
+    async fn history_watch(
+        session: u32,
+        after: u64,
+    ) -> Result<polyvisor::app::history::Snapshot, String> {
+        let snapshot = kernel()
+            .map_err(|_| unavailable_service())?
+            .history_watch(session, after)
+            .await?;
+        Ok(polyvisor::app::history::Snapshot {
+            revision: snapshot.revision,
+            bytes: snapshot.bytes,
+        })
+    }
+    async fn history_publish(session: u32, changes: Vec<Vec<u8>>) -> Result<(), String> {
+        kernel()
+            .map_err(|_| unavailable_service())?
+            .history_publish(session, changes)
+            .await
+    }
 }
 
 export!(Component);

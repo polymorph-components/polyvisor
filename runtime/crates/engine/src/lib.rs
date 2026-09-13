@@ -148,6 +148,10 @@ pub struct Engine<T: Transport<Local> + 'static> {
     spawn: Spawner,
     /// One automerge document per app id, keyed by app id.
     documents: RefCell<BTreeMap<String, Document>>,
+    /// Publication is serialized per partition from validation through
+    /// storage acceptance and frontier confirmation. Different documents do
+    /// not block one another.
+    document_writes: RefCell<BTreeMap<String, Rc<futures::lock::Mutex<()>>>>,
     /// The user-system document — this device's group. `None` until it is
     /// opened, which [`Engine::open_us`] does on the first touch and on
     /// every `connect`.
@@ -301,6 +305,7 @@ impl<T: Transport<Local> + 'static> Engine<T> {
             storage,
             spawn,
             documents: RefCell::new(apps),
+            document_writes: RefCell::new(BTreeMap::new()),
             vault: RefCell::new(None),
             pending_vault: RefCell::new(pending_vault),
             vault_rng_seed: mix(b"polyvisor:keyhive-rng", &seed, &entropy),
@@ -366,6 +371,17 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         change: impl FnOnce(&mut Document) -> Result<R, String>,
     ) -> Result<R, String> {
         self.mutate(partition, change).await
+    }
+
+    /// Accept raw application-authored Automerge changes through the same
+    /// publication path as trusted model transactions.
+    pub async fn document_publish(
+        &self,
+        partition: &str,
+        changes: Vec<Vec<u8>>,
+    ) -> Result<bool, String> {
+        self.mutate(partition, move |document| document.publish(changes))
+            .await
     }
 
     pub fn document_revision_open(&self, partition: &str) -> Option<u64> {
@@ -1883,41 +1899,35 @@ impl<T: Transport<Local> + 'static> Engine<T> {
         app: &str,
         change: impl FnOnce(&mut Document) -> Result<R, String>,
     ) -> Result<R, String> {
+        let serial = self
+            .document_writes
+            .borrow_mut()
+            .entry(app.to_string())
+            .or_insert_with(|| Rc::new(futures::lock::Mutex::new(())))
+            .clone();
+        let _serial = serial.lock().await;
         self.open_document(app).await?;
         let (answer, tree, commits) = self.with_document(app, |doc| {
             let answer = change(doc);
             Ok((answer, doc.tree(), doc.drain_local_commits()))
         })?;
         if !commits.is_empty() {
-            let mut published = Vec::with_capacity(commits.len());
-            let mut sealed_commits = Vec::with_capacity(commits.len());
             for commit in commits {
                 let (commit, sealed) = self.seal(commit).await?;
-                published.push(commit);
-                sealed_commits.push(sealed);
+                self.handle
+                    .add_commits(tree, vec![commit])
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // A child authored in the same callback must see its accepted
+                // parent's key on the frontier. Confirm each commit only after
+                // the driver has persisted it, then seal the next one.
+                let _heads = self
+                    .handle
+                    .tree_heads(tree)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.require_vault()?.confirm(&sealed);
             }
-            self.handle
-                .add_commits(tree, published)
-                .await
-                .map_err(|e| e.to_string())?;
-            // Only now: until the driver has taken the commit, the parents
-            // whose keys are inside it must stay on the frontier.
-            let vault = self.require_vault()?;
-            for sealed in &sealed_commits {
-                vault.confirm(sealed);
-            }
-            // A durability barrier, and the reason the kernel may checkpoint
-            // the moment this returns. `add_commits` only queues a command;
-            // the driver signs and persists it inside `drain_effects`, which
-            // runs to completion before the driver takes its next input
-            // (subduction_runtime/src/driver.rs:241). So a round-trip that
-            // the driver answers after this one is proof the commit is in
-            // storage — and therefore in the next `snapshot`.
-            let _heads = self
-                .handle
-                .tree_heads(tree)
-                .await
-                .map_err(|e| e.to_string())?;
             // Encrypting may have advanced the document's CGKA epoch, and the
             // update op is what lets the other devices follow.
             self.publish_keyhive().await?;

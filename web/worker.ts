@@ -58,6 +58,7 @@ const I = {
   appServices: "polyvisor:internal/app-services@0.1.0",
   locks: "polyvisor:internal/locks@0.1.0",
   tasks: "polyvisor:app/tasks@0.1.0",
+  history: "polyvisor:app/history@0.1.0",
   contacts: "polyvisor:internal/contacts@0.1.0",
   meeting: "polyvisor:internal/meeting@0.1.0",
 } as const;
@@ -334,6 +335,12 @@ function mintSessionPort(
       setTitle: (id: string, title: string) =>
         svc.tasksSetTitle(session, id, title),
       remove: (id: string) => svc.tasksRemove(session, id),
+    },
+    [I.history]: {
+      read: () => svc.historyRead(session),
+      watch: (after: bigint) => svc.historyWatch(session, after),
+      publish: (changes: Uint8Array[]) =>
+        svc.historyPublish(session, changes),
     },
     // Only these three: a session port is not a way to enumerate or launch
     // apps.
